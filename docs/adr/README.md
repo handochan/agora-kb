@@ -1,0 +1,16 @@
+# Architecture Decision Records
+
+Each ADR captures one load-bearing decision: context, the decision, and consequences. Change a
+decision only by adding a new ADR that supersedes the old one (don't silently rewrite history).
+
+Format: lightweight [MADR](https://adr.github.io/madr/)-style.
+
+| ADR | Decision | Status |
+|---|---|---|
+| [0001](0001-markdown-git-source-of-truth.md) | Markdown + git is the source of truth (no canonical DB) | Accepted |
+| [0002](0002-cqrs-single-writer-curator.md) | CQRS + single-writer curator for concurrency | Accepted |
+| [0003](0003-one-core-many-faces.md) | One core API, many faces (MCP / web / dashboard) | Accepted |
+| [0004](0004-pluggable-adapters.md) | Three pluggable adapter families (input / read / write) | Accepted |
+| [0005](0005-fully-oss-bom.md) | Fully-OSS BOM; proprietary pieces are optional plugins | Accepted |
+| [0006](0006-repo-as-tenant-boundary.md) | Repo = tenant boundary (team & personal repos) | Accepted |
+| [0007](0007-memory-harvester-safety.md) | Memory harvester with provenance/gate/scope safety | Accepted |

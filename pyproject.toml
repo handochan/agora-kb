@@ -1,0 +1,56 @@
+[project]
+name = "agora-kb"
+version = "0.0.0"
+description = "Self-hostable, OSS, multi-tenant shared memory hub for AI agents (markdown + git + MCP)"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "Apache-2.0" }
+authors = [{ name = "dochan" }]
+keywords = ["mcp", "agent-memory", "knowledge-base", "llm-wiki", "markdown", "self-hosted"]
+
+# Core deps kept minimal & permissively licensed. Optional features live in extras so the
+# core library stays small and dependency-light (see ADR-0005: fully-OSS BOM).
+dependencies = [
+    "fastmcp>=2.0",       # MCP server face
+    "pyyaml>=6.0",        # config (adapters.yaml), frontmatter
+    "pydantic>=2.0",      # data models (inbox item, repo meta, state)
+]
+
+[project.optional-dependencies]
+web = [
+    "fastapi>=0.115",     # web + dashboard face
+    "uvicorn>=0.30",
+]
+ingest = [
+    "trafilatura>=1.8",   # URL extraction (Apache)
+    "pdfminer.six>=2024", # PDF extraction (MIT) — avoid AGPL pymupdf
+    "markitdown>=0.0.1",  # docx/xlsx/pptx (MIT)
+]
+metrics = [
+    "prometheus-client>=0.20",  # dashboard time-series export
+]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.6",
+    "mypy>=1.11",
+]
+
+[project.scripts]
+agora = "agora_kb.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/agora_kb"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

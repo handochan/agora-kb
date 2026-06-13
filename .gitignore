@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Env / secrets
+.env
+.env.local
+*.key
+*.pem
+
+# OS
+.DS_Store
+*.swp
+*~
+
+# Local KB instances / runtime data (never commit a user's knowledge repos)
+/var/
+/data/
+*.sqlite
+*.db
