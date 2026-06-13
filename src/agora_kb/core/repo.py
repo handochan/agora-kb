@@ -203,6 +203,65 @@ class Repo:
         """Name of the checked-out branch in the main working copy."""
         return self._git("symbolic-ref", "--short", "HEAD").stdout.strip()
 
+    # --- repo-owner sync / admin commit ---------------------------------------------------------
+    def sync_to_branch(self, branch: str | None = None) -> str:
+        """Fast-forward the MAIN working copy to the curated branch tip; return the new HEAD sha.
+
+        After the curator advances the curated ref via :meth:`compare_and_swap_branch` (ADR-0008
+        step 5), the durable publish lives at the branch tip; the repo-owner's main working copy
+        must be brought up to that commit so the read path (``core.Wiki`` / ``kb_query``, which read
+        the on-disk tree) resolves the PUBLISHED content (ADR-0008: "readers resolve a published
+        commit"). FAST-FORWARD ONLY: this never creates a merge commit and never rewrites a fork.
+
+        Two post-CAS shapes are reconciled, both SAFE (raise :class:`GitError` not clobber):
+
+        * HEAD is strictly BEHIND the branch tip — ``git merge --ff-only`` advances HEAD + checks
+          out the tip, refusing if the working tree is dirty or has diverged (no fast-forward).
+        * HEAD already EQUALS the branch tip but the index/working tree are STALE — the
+          single-writer CAS moves ``refs/heads/<branch>`` (which HEAD symbolically tracks), so the
+          ref jumps ahead of the unmaterialized tree. ``git read-tree -m -u`` does a two-way merge
+          to the tip that materializes the published files while REFUSING (GitError) to overwrite a
+          conflicting uncommitted owner edit — the same never-clobber guarantee as ``--ff-only``.
+
+        Hooks are neutralized by the global ``core.hooksPath`` override in :meth:`_git`. A genuine
+        no-op (tip already checked out, tree clean) returns the unchanged HEAD. ``branch`` defaults
+        to the curated branch.
+
+        IDENTITY-INDEPENDENT (so omitting ``env=_commit_env`` is intentional, not an oversight):
+        this is the only mutating git path in this module that does not pass through
+        :meth:`_commit_env`, and that is safe because it creates NO commit object. ``merge
+        --ff-only`` is a pure ref/worktree fast-forward that REFUSES (raising :class:`GitError`)
+        rather than falling back to a merge commit, and ``read-tree -m -u`` is a two-way merge that
+        only materializes a tree — neither authors a commit, so no committer identity is consumed
+        and the hermeticity rationale of :meth:`_commit_env` does not apply. If a merge-commit
+        fallback is ever added here, it MUST take ``env=_commit_env`` to stay hermetic."""
+        ref = f"refs/heads/{branch or self._branch}"
+        tip = self.branch_commit(branch)
+        if self.head_commit() != tip:
+            # HEAD is behind: a real fast-forward (advances HEAD, updates the tree, refuses dirty).
+            self._git("merge", "--ff-only", ref)
+            return self.head_commit()
+        # HEAD already at the tip (the CAS moved the tracked ref under HEAD): materialize the stale
+        # index/working tree to the tip without clobbering uncommitted owner edits (two-way merge).
+        self._git("read-tree", "-m", "-u", tip)
+        return self.head_commit()
+
+    def commit_all(self, message: str, *, when: datetime) -> str:
+        """Stage (``git add -A``) + commit the MAIN working tree on the current branch; return sha.
+
+        For repo-init / admin operations (e.g. committing the schema emitted by
+        :func:`agora_kb.schema.emit.emit_schema`) — NOT the transactional curator publish, which
+        commits a detached worktree via :meth:`commit_worktree` and publishes via CAS. Identity,
+        dates, and config are hermetic (see :meth:`_commit_env`) and hooks are neutralized
+        (``--no-verify`` + the global ``core.hooksPath`` override), so the commit is reproducible
+        and credential-free (ADR-0010 D1). ``when`` pins the author+committer date."""
+        if when.tzinfo is None:
+            raise ValueError("commit timestamp must be timezone-aware (UTC)")
+        env = self._commit_env(name=_DEFAULT_AUTHOR_NAME, email=_DEFAULT_AUTHOR_EMAIL, when=when)
+        self._git("add", "-A", env=env)
+        self._commit(message, env=env)
+        return self.head_commit()
+
     def is_published(self, commit: str, *, branch: str | None = None) -> bool:
         """True iff ``commit`` is reachable from the curated branch tip (i.e. it was published).
 

@@ -201,6 +201,103 @@ def test_cas_false_when_branch_absent(repo: Repo) -> None:
     assert repo.compare_and_swap_branch(expected=base, new=base, branch="nope") is False
 
 
+# --- repo-owner sync (read-after-publish) -----------------------------------------------------
+def _publish_via_cas(repo: Repo, rel: str, content: str) -> str:
+    """Simulate one curator publish: commit ``rel`` in a detached worktree at base, then CAS the
+    curated ref to it. Returns the new tip. The MAIN working copy is left STALE — the CAS moved the
+    ref (which HEAD tracks) but never materialized the new tree, exactly the post-publish state the
+    owner sync must reconcile."""
+    base = repo.head_commit()
+    with repo.worktree(at=base) as wt:
+        path = wt / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+        new = repo.commit_worktree(wt, f"publish {rel}", when=WHEN)
+    assert repo.compare_and_swap_branch(expected=base, new=new) is True
+    return new
+
+
+def test_sync_to_branch_fast_forwards_a_behind_working_copy(repo: Repo) -> None:
+    new = _publish_via_cas(repo, "wiki/n.md", "published")
+    # The CAS advanced refs/heads/main (which HEAD tracks) but never materialized the tree, so the
+    # published file is NOT on disk yet — the read path would miss it without the owner sync.
+    assert not (repo.root / "wiki" / "n.md").exists()
+
+    synced = repo.sync_to_branch()
+
+    assert synced == new == repo.head_commit() == repo.branch_commit("main")
+    # The published content is now materialized in the owner's on-disk tree (read-after-publish).
+    assert (repo.root / "wiki" / "n.md").read_text(encoding="utf-8") == "published"
+    assert _git(repo.root, "status", "--porcelain") == ""  # working tree reconciled, clean
+
+
+def test_sync_to_branch_fast_forwards_a_genuinely_behind_detached_head(repo: Repo) -> None:
+    # The pure --ff-only case: HEAD is left STRICTLY behind the branch tip (detached at base, so it
+    # does NOT track the moved ref), so sync_to_branch fast-forwards it onto the materialized tip.
+    base = repo.head_commit()
+    new = _publish_via_cas(repo, "wiki/n.md", "published")
+    subprocess.run(["git", "checkout", "-q", "--detach", base], cwd=str(repo.root), check=True)
+    assert repo.head_commit() == base  # genuinely behind the branch tip
+
+    synced = repo.sync_to_branch()
+
+    assert synced == new == repo.head_commit()  # fast-forwarded HEAD to the published tip
+    assert (repo.root / "wiki" / "n.md").read_text(encoding="utf-8") == "published"
+
+
+def test_sync_to_branch_is_noop_when_already_at_tip(repo: Repo) -> None:
+    head = repo.head_commit()
+    assert _git(repo.root, "status", "--porcelain") == ""  # clean tree already at the tip
+    assert repo.sync_to_branch() == head  # already at the curated tip + materialized
+    assert repo.head_commit() == head
+    assert _git(repo.root, "status", "--porcelain") == ""  # still clean (a true no-op)
+
+
+def test_sync_to_branch_refuses_a_dirty_working_tree(repo: Repo) -> None:
+    # The published commit MODIFIES index.md; the owner has an uncommitted edit to the SAME file, so
+    # materializing the tip would overwrite it — the two-way merge refuses rather than clobbering.
+    _publish_via_cas(repo, "index.md", "PUBLISHED index content\n")
+    owner_edit = "uncommitted owner edit\n"
+    (repo.root / "index.md").write_text(owner_edit, encoding="utf-8")
+    with pytest.raises(GitError):
+        repo.sync_to_branch()
+    assert (repo.root / "index.md").read_text(encoding="utf-8") == owner_edit  # edit preserved
+
+
+def test_sync_to_branch_refuses_a_diverged_working_copy(repo: Repo) -> None:
+    base = repo.head_commit()
+    published = _publish_via_cas(repo, "branch.md", "from-branch")
+    # The owner commits divergent history: detach at base, commit locally, so HEAD is a fork of the
+    # branch tip (neither is an ancestor of the other) — --ff-only cannot fast-forward it.
+    subprocess.run(["git", "checkout", "-q", "--detach", base], cwd=str(repo.root), check=True)
+    (repo.root / "local.md").write_text("from-owner", encoding="utf-8")
+    diverged = repo.commit_all("owner local commit", when=WHEN)
+    assert diverged != published
+    with pytest.raises(GitError):  # --ff-only cannot fast-forward a diverged history
+        repo.sync_to_branch()
+    assert repo.head_commit() == diverged  # the owner's divergent HEAD is never rewritten
+
+
+# --- admin commit (commit_all) ----------------------------------------------------------------
+def test_commit_all_commits_the_working_tree_with_explicit_date(repo: Repo) -> None:
+    (repo.root / "doc.md").write_text("admin content", encoding="utf-8")
+    base = repo.head_commit()
+    new = repo.commit_all("docs: admin commit", when=WHEN)
+    assert new != base
+    assert new == repo.head_commit() == repo.branch_commit("main")  # advanced the current branch
+    assert _git(repo.root, "show", "HEAD:doc.md") == "admin content"
+    # The explicit date is pinned on both author + committer (hermetic, ADR-0010 D1).
+    epoch = str(int(WHEN.timestamp()))
+    assert _git(repo.root, "show", "-s", "--format=%at", new) == epoch
+    assert _git(repo.root, "show", "-s", "--format=%ct", new) == epoch
+
+
+def test_commit_all_rejects_naive_datetime(repo: Repo) -> None:
+    (repo.root / "doc.md").write_text("x", encoding="utf-8")
+    with pytest.raises(ValueError):
+        repo.commit_all("msg", when=datetime(2026, 6, 13, 3, 0, 12))  # noqa: DTZ001
+
+
 # --- publish-state detection (recovery) -------------------------------------------------------
 def test_is_published(repo: Repo) -> None:
     base = repo.head_commit()
