@@ -21,6 +21,9 @@ build/
 *.swp
 *~
 
+# Agent/tooling local state (oh-my-claudecode)
+.omc/
+
 # Local KB instances / runtime data (never commit a user's knowledge repos)
 /var/
 /data/
