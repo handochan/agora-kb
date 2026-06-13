@@ -7,14 +7,14 @@ conceptual model; this doc maps it to modules and runtime processes.
 
 ```
 core/                 The single internal API. Everything else is a face or adapter over this.
-  inbox.py            append-only write path: write(target, item) → inbox/<repo>/<writer>/<id>.md
-  wiki.py             read path: navigate MOC → [[links]] → grep; returns answers + citations
+  inbox.py            append-only write path: write(target, item) → _kb/inbox/<writer>/<id>.md
+  wiki.py             deterministic retrieval: QueryResult with ordered SearchHit citations
   repo.py             Repo/tenant model: resolve repo, git ops (commit, push, PR), layout
-  state.py            curator state (_kb/state.json): cursors, counters, seen-hashes, last_run
+  state.py            curator state (_kb/state.json): counters, event keys, published runs
   schema.py           emit/validate a repo's KB schema (AGENTS.md + symlinks, templates)
 
 curator/              Sleep-time consolidation (one worker per repo).
-  worker.py           the run loop: lock → snapshot → dedup → delegate → log → move → commit
+  worker.py           claim → sandboxed worktree → validate → publish → finalize
   backends.py         WRITE adapters: registry of agent "brains" from adapters.yaml (headless CLIs)
   triggers.py         cron / threshold / idle trigger logic
   review.py           candidate gate + direct-commit vs PR (team/review mode)
@@ -54,8 +54,9 @@ A deployment is a small set of long-lived processes (containers):
 
 | Process | Role | Scale |
 |---|---|---|
-| **MCP gateway** | serves the MCP face (stdio locally, Streamable HTTP for teams); enforces auth | 1..N behind LB |
-| **Web/dashboard** | FastAPI app (browse, upload, dashboard) | 1..N |
+| **MCP gateway** | serves the MCP face (stdio locally, Streamable HTTP for teams); enforces auth | 1 through Phase 4 |
+| **Web/dashboard** | FastAPI app (browse, upload, dashboard) | 1 through Phase 4 |
+| **Repo owner** | owns each repo working copy and accepts routed captures | exactly 1 per repo |
 | **Curator worker(s)** | one logical curator **per repo**; consolidates that repo's inbox | 1 per repo (serialized) |
 | **Harvester** | scheduled scans of configured memory sources → candidates | 1 |
 | **git remote** | Forgejo/Gitea — source-of-truth distribution + repo ACL | 1 (or external) |
@@ -64,7 +65,8 @@ A deployment is a small set of long-lived processes (containers):
 
 Key constraint: **per-repo curator singleton.** Concurrency safety depends on exactly one writer to a
 repo's wiki. Enforced by `curator.lock` (flock) + a single scheduled worker; if scaled horizontally,
-repos are sharded so each repo is owned by one worker.
+repos are sharded so each repo is owned by one repo-owner/worker pair. Gateways never write to
+independent clones; they route each capture to the owner of the target repo.
 
 ## 3. Data flow
 
@@ -73,14 +75,14 @@ repos are sharded so each repo is owned by one worker.
 agent/web → core.write(target, item)
   ├─ auth: caller may write target repo?            (auth/policy)
   ├─ resolve repo + writer namespace                (core/repo)
-  ├─ compute content_sha256                         (idempotency)
-  └─ append inbox/<repo>/<writer>/<id>.md           (core/inbox)  ── O(1), returns immediately
+  ├─ accept optional event_key; compute content_sha256
+  └─ append _kb/inbox/<writer>/<id>.md              (core/inbox)  ── O(1), returns immediately
 ```
 
 ### 3.2 Upload — capture with extraction
 ```
 web upload (file/url/text) → ingest extractor → markdown
-  ├─ save verbatim original → raw/<repo>/<domain>/<date>-<slug>.<ext>   (immutable + sha256)
+  ├─ save verbatim original → raw/<domain>/<date>-<slug>.<ext>          (immutable + sha256)
   └─ core.write(target, item linking the raw source, source=web:<user>)
 ```
 
@@ -88,28 +90,32 @@ web upload (file/url/text) → ingest extractor → markdown
 ```
 harvester (scheduled) → connector.scan(since cursor)
   └─ for each new/changed memory fact:
-       core.write(target=<scope-bound repo>, item{source=harvest:<agent>, status=candidate, confidence=low})
+       core.write(target=<scope-bound repo>, item{source=harvest:<agent>, kind=candidate, confidence=low})
 ```
 
 ### 3.4 Consolidate (curator) — single writer
 ```
 trigger (cron/threshold/idle) → curator.worker.run(repo)
   ├─ flock curator.lock (else exit)
-  ├─ snapshot inbox (FIFO), dedup by sha256
+  ├─ atomically claim FIFO items → _kb/processing/<run-id>/ + manifest
+  ├─ event_key idempotency; content hash equivalence retains/merges provenance
   ├─ candidate gate: harvested/low-confidence items require keep/merge/drop decision (curator/review)
-  ├─ delegate INGEST batch → write-adapter (headless agent + model)   ← edits wiki/, MOC, backlinks
-  ├─ append log.md ; move processed→processed/ , failed→failed/
-  ├─ git commit (or open PR in review mode)
-  └─ update state.json ; release lock ; export metrics
+  ├─ create temporary git worktree; run backend in sandbox with no network/credentials
+  ├─ validate allowlisted diff + schema; discard invalid/partial changes
+  ├─ commit and compare-and-swap curated branch ref (or publish validated commit as PR)
+  └─ finalize processed/failed; update state; remove worktree; release lock
 ```
 
 ### 3.5 Query (read)
 ```
-agent/web → core.read(scope, question)
+agent/web → core.read(scope, question) -> QueryResult
   ├─ auth: filter to readable repos+domains            (auth/policy)
   ├─ navigate: read <domain>-moc.md → follow [[links]] → grep synonyms   (core/wiki)
-  └─ answer with citations to note paths (or "not found" — never invent)
+  └─ return ordered SearchHit{repo,path,anchor,excerpt,reason,score}
 ```
+
+Phase 1 `kb_query` renders these evidence hits directly. Optional prose synthesis is a later adapter
+and may use only the returned hits; `not_found` is explicit and never synthesized around.
 
 ### 3.6 Dashboard (meta)
 ```
@@ -130,7 +136,7 @@ web/dashboard → core.meta(scope)   reads: inbox count, state.json, log.md, git
  │  [adapters] ingest extractors · harvester connectors · curator backends        │
  │  [workers]  per-repo curator (singleton)   ·   harvester (scheduled)           │
  │  [auth]    Keycloak/Authentik (OIDC)   ·   OpenFGA / Forgejo (ACL)             │
- │  [storage] knowledge repos (git working copies)   ·   SQLite/PG (metadata)     │
+ │  [storage] curated git refs/worktrees · git-ignored _kb spools · SQLite/PG cache │
  │  [observ.] Prometheus → Grafana (optional)                                     │
  └────────────────────────────────────────────────────────────────────────────────┘
         │ git push/pull (source of truth)            │ read-only static build
@@ -138,23 +144,25 @@ web/dashboard → core.meta(scope)   reads: inbox count, state.json, log.md, git
    Forgejo/Gitea (shared remote, repo ACL, PRs)   Quartz site (team read view)
         │
         ▼  clone
-   Obsidian / Logseq (personal power-editing)
+   Obsidian / Logseq (browse/read; contributions use inbox or reviewed PR)
 ```
 
 **Progression** (same code, more pieces — see [ROADMAP.md](ROADMAP.md)):
-1. **Personal:** MCP stdio + filesystem inbox + local-model curator + Obsidian. No auth, no web.
+1. **Personal:** MCP stdio + filesystem inbox + local-model curator + Obsidian browse/read. No auth/web.
 2. **+ Harvester:** file connectors (Claude/Hermes memory), personal-repo scope.
 3. **Small team:** MCP-HTTP + Forgejo (repos/roles) + Tailscale + Quartz web + web upload/dashboard.
 4. **Full team:** Keycloak + OpenFGA (domain ACL) + PR review mode + API connectors.
 
 ## 5. Failure & recovery (operational invariants)
-- **Crash mid-consolidation:** items not yet moved remain in inbox → reprocessed next run. Items
-  marked `processing` past a timeout are reset to `pending`. (Idempotent via `content_sha256`.)
-- **Atomicity:** inbox→processed uses same-filesystem `rename` (atomic). One git commit per run is the
-  rollback unit.
+- **Crash mid-consolidation:** the run manifest distinguishes unpublished, published, and finalized
+  runs. Unpublished events return unchanged to inbox; published runs finalize without backend replay.
+- **Atomicity:** claiming/finalization use same-filesystem `rename`; publication compare-and-swaps the
+  curated branch ref. Readers resolve published commits and never inspect a partial backend worktree.
 - **Lock:** `curator.lock` (flock) prevents concurrent curators; the write path never touches shared
   wiki files, so captures stay safe even mid-consolidation.
-- **Distribution conflicts:** git pull --rebase before push; disjoint files auto-merge; the curator is
-  the only writer so same-file conflicts are rare and resolvable.
+- **Distribution conflicts:** one repo owner advances the curated branch. Human edits arrive as inbox
+  events or reviewed PRs; gateways do not push competing working-copy commits.
+- **Backend isolation:** the temporary worktree is the only writable mount; network, credentials,
+  `_kb/`, git configuration, and hooks are unavailable to the backend (ADR-0008).
 - **Rebuildable metadata:** any SQLite/PG index must be reconstructable from the markdown — markdown is
   the source of truth (ADR-0001).

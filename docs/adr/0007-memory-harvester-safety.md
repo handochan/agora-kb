@@ -15,7 +15,7 @@ mandatory safety mechanisms:
 1. **Provenance + origin marking** breaks loops: inbox items carry `source=harvest:<agent>`; resulting
    note regions are tagged `origin: harvest:<agent>`; connectors **skip any fact whose origin traces
    back to Agora**.
-2. **Candidate gate** prevents pollution: harvested items enter as `status=candidate, confidence=low`
+2. **Candidate gate** prevents pollution: harvested items enter as `kind=candidate, confidence=low`
    and **must pass the curator's keep/merge/drop review** before promotion to `wiki/`. They are never
    written to the wiki directly.
 3. **Scope lock** protects privacy: a personal agent-memory source may feed **only** a personal repo;

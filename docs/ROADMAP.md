@@ -9,14 +9,17 @@ the core (capture → consolidate → query) on a single local repo before addin
 
 ## Phase 1 — Personal MVP (core + MCP face)
 Goal: a single local markdown repo with capture, scheduled consolidation, and query — zero infra.
-- [ ] `core.inbox` (append write), `core.wiki` (navigate/query), `core.repo` (layout, git), `core.state`.
-- [ ] `curator.worker` run loop (lock → snapshot → dedup → delegate → commit) with the **local-model**
+- [ ] `core.inbox` (immutable events + event-key idempotency), deterministic `core.wiki`
+      (`QueryResult`/`SearchHit`), `core.repo` (layout, git), `core.state`.
+- [ ] `curator.worker` transactional run loop (claim manifest → sandboxed worktree → validate → publish
+      → finalize) with the **local-model**
       write-adapter (Qwen via Ollama) as default brain.
 - [ ] `curator.triggers`: cron + threshold + idle.
 - [ ] MCP face: `kb_remember`, `kb_query`, `kb_status`, `kb_curate` (FastMCP, stdio).
 - [ ] `agora` CLI: `serve`, `curate`, `repo init`, `doctor`.
 - [ ] Register with Claude Code + Hermes; dogfood on `~/knowledge`.
-**Exit:** capture from any MCP client → curator files it → query returns it with citations.
+**Exit:** capture from any MCP client → curator atomically files it → deterministic query returns it
+with path/anchor citations; injected or failed backend output cannot modify the live wiki.
 
 ## Phase 2 — Pluggable brains + harvester
 Goal: tool-agnostic curator and autonomous accumulation, still single-user.
@@ -37,6 +40,7 @@ Goal: humans contribute and observe via the browser.
 ## Phase 4 — Small team (multi-tenant, network)
 Goal: a few trusted people share repos over a private network.
 - [ ] `core.repo` multi-repo + team/personal kinds; write routing + read scope.
+- [ ] Single repo-owner service per working copy; gateways route captures to the owner (no competing clones).
 - [ ] MCP **Streamable HTTP** transport.
 - [ ] AuthN/AuthZ via **Forgejo delegation** (repos, teams, roles); token auth + Tailscale.
 - [ ] Shared git remote (Forgejo); Quartz read-only web view.
@@ -48,6 +52,7 @@ Goal: production-grade access control and review.
 - [ ] **OAuth 2.1 + PKCE** via Keycloak/Authentik.
 - [ ] PR review mode (curator opens PRs instead of direct commits).
 - [ ] API harvester connectors (Letta, mem0); horizontal curator sharding by repo.
+- [ ] Horizontal face scaling with repo-affine owner routing and failover fencing.
 - [ ] Packaging: Docker Compose, Helm (optional), published `agora-kb` (PyPI) + images.
 **Exit:** self-hostable multi-team deployment with auth, review, and governance.
 

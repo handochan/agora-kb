@@ -61,14 +61,14 @@ WRITE side (many writers, conflict-free)      READ-MODEL side (one writer, no ra
 ────────────────────────────────────────     ─────────────────────────────────────
 kb_remember / upload / harvest                curator consolidates the inbox →
   → append ONE file to                          edits wiki/ + indexes + log.md
-    inbox/<repo>/<writer>/<id>.md               (exactly one process per repo)
+    _kb/inbox/<writer>/<id>.md                  (exactly one process per repo)
   (disjoint keys ⇒ no write conflicts)        → git commit (audit + OCC backstop)
 ```
 
 - N concurrent writers touch **disjoint files** → zero write conflicts (event-sourcing append log).
 - The **shared** files (`wiki/`, indexes, `log.md`) are edited by **exactly one** curator per repo
   → no races, no locks needed across the network. (ADR-0002.)
-- git is the audit log, the rollback point, and the optimistic-concurrency backstop for distribution.
+- git is the canonical-content audit log, rollback point, and publication boundary.
 - **Consistency model:** *eventually consistent*. A captured item is durable immediately (in inbox,
   git-able) but becomes queryable only after consolidation. `kb_status` surfaces the pending backlog.
 
@@ -100,16 +100,19 @@ repo's own `AGENTS.md`/`SCHEMA.md`, tool-agnostic via symlinks `CLAUDE.md`/`QWEN
     themes/                            durable, atomic concept pages
   assets/                              binary assets (images), referenced from notes
   _templates/                          note templates
-  _kb/                                 operational area (NOT wiki content)
+  _kb/                                 git-ignored operational area (NOT wiki content)
     inbox/<writer>/                    WRITE path: append-only captures
+    processing/<run-id>/               atomically claimed immutable items + run manifest
     processed/<date>/                  consolidated items (audit trail)
-    failed/                            items that failed consolidation (+ error)
-    state.json                         curator state: cursors, counters, last_run, seen-hashes
+    failed/                            terminal failures + separate error records
+    state.json                         curator state: counters, last_run, published runs
     curator.lock                       flock held during a consolidation run
 ```
 
-`raw/` + `wiki/` + indexes are the **knowledge** (git source of truth). `_kb/` is the **engine's
-operational data**. Schemas for inbox items, repo metadata, and state are in [DATA-MODEL.md](DATA-MODEL.md).
+`raw/` + `wiki/` + indexes are the **knowledge** tracked in git. `_kb/` is the engine's git-ignored
+operational spool; it is durable on the repo owner's storage but is not canonical knowledge. Its
+indexes/state are rebuildable from retained events and git history. Schemas are in
+[DATA-MODEL.md](DATA-MODEL.md).
 
 ## 4. The curator (sleep-time consolidation)
 
@@ -117,19 +120,26 @@ A background worker, one per repo, triggered by **cron** + **threshold** (inbox 
 (no writes for M minutes and backlog > 0). Run loop:
 
 1. **Acquire `curator.lock`** (flock, non-blocking; if held, exit — a run is already in progress).
-2. **Snapshot** `inbox/<repo>/**` sorted by id (FIFO); ignore items written after the snapshot.
-3. **Dedup** by `content_sha256` against `state.json` seen-index (idempotency).
-4. **Delegate INGEST** to the configured **write adapter** (a headless agent + model). The agent reads
-   the repo's SCHEMA, summarizes each item, classifies its domain, greps for related themes, updates
-   theme pages + backlinks, and updates the domain MOC. Harvested *candidates* are gated (see §6).
-5. **Append** one line per item to `log.md`.
-6. **Move** processed items → `processed/<date>/` (atomic `rename`); failures → `failed/` with error.
-7. **Commit** (one commit per run) — or open a **PR** in team/review mode (ADR-0006).
-8. **Update** `state.json` (cursors, counters, last_run). **Release** the lock.
+2. **Claim** a FIFO snapshot by atomically moving unchanged events from `_kb/inbox/` to
+   `_kb/processing/<run-id>/`; write a run manifest and ignore later arrivals.
+3. **Classify duplicates:** `event_key` handles delivery idempotency; `content_sha256` finds equivalent
+   content whose provenance must still be merged rather than silently discarded.
+4. **Create an isolated temporary git worktree** at the current curated revision.
+5. **Delegate INGEST** to the configured **write adapter** inside an OS sandbox. The backend has no
+   network or credentials by default and can write only the temporary repo content paths. Harvested
+   *candidates* are gated (see §6).
+6. **Validate** the diff deterministically: reject path escapes, symlinks, malformed schema, and any
+   backend change to `_kb/`, git configuration, hooks, or other non-allowlisted paths.
+7. **Commit and publish:** commit the validated worktree and compare-and-swap the curated branch from
+   the manifest's base commit to the new commit — or publish that commit as a PR in review mode.
+8. **Finalize** events to `processed/<date>/`; terminal failures go to `failed/` with a separate error
+   record. Update `state.json`, remove the worktree, and release the lock. An interrupted run is
+   recovered from its manifest without rerunning a commit that was already published.
 
 The orchestration (lock, queue, dedup, git) is **deterministic code**; only the *cognitive* INGEST
-step is delegated to a swappable agent — so changing the brain never threatens data integrity.
-(ADR-0004.) Routing is supported: bulk/simple → local open-weight model (free); hard merges /
+step is delegated to a swappable agent. Transactional worktrees, validation, and sandboxing keep the
+backend outside the integrity boundary. (ADR-0004, ADR-0008.) Routing is supported: bulk/simple →
+local open-weight model (free); hard merges /
 contradiction resolution → a stronger (optional, possibly proprietary) backend.
 
 ## 5. Faces
@@ -140,7 +150,7 @@ FastMCP over stdio (local) or Streamable HTTP (team). Tools:
 | Tool | Side | Behavior |
 |---|---|---|
 | `kb_remember(text, target?, domain?, tags?, source?)` | write | append inbox item, return `{id, queued, inbox_depth}` — **non-blocking** |
-| `kb_query(question, scope?)` | read | navigate MOC → `[[links]]` → grep across in-scope repos; answer **with citations** |
+| `kb_query(question, scope?)` | read | return ordered evidence hits with path/anchor citations; optional later synthesis may use only those hits |
 | `kb_status(scope?)` | meta | `{inbox_depth, last_consolidation, processed_today, failed}` |
 | `kb_curate(target, force?)` | admin | trigger a consolidation run now (also invoked by triggers) |
 
@@ -178,7 +188,7 @@ agent memory sources                          candidate flow
 ─────────────────────                          ──────────────
 Claude Code  ~/.claude/.../MEMORY.md  (file)   diff vs cursor → new/changed only
 Codex        ~/.codex                 (file)   → inbox item:
-Hermes       ~/.hermes/MEMORY.md      (file)      source=harvest:<agent>, status=candidate,
+Hermes       ~/.hermes/MEMORY.md      (file)      source=harvest:<agent>, kind=candidate,
 Letta        memory blocks            (API)       confidence=low
 mem0         vector store             (API)   → curator review gate: keep / merge / drop
 ```
@@ -188,7 +198,7 @@ Three safety mechanisms are mandatory (without them this feature poisons the bas
 | Risk | Mitigation |
 |---|---|
 | **Feedback loop** (KB → agent memory → harvest → KB …) | provenance tags (`harvest:<agent>`) + origin marking; never re-harvest KB-originated facts |
-| **Noise pollution** | harvested items are `candidate` / `confidence=low` → must pass the curator review gate before promotion to `wiki/`; never written directly |
+| **Noise pollution** | harvested items are `kind=candidate` / `confidence=low` → must pass the curator review gate before promotion to `wiki/`; never written directly |
 | **Privacy leakage** | scope enforcement: a personal agent-memory source feeds **only** the personal repo, never a team repo; team harvest requires explicitly-designated team sources; consent-based |
 
 Effect: Agora becomes the **shared long-term memory of all the user's/team's agents** — the
@@ -203,8 +213,16 @@ state + schema. **Team repos** (shared) and **personal repos** (private to one u
 - **Write routing:** `target="team:engineering" | "personal"` selects the repo's inbox (default: personal).
 - **Read scope:** `scope=[...]` queries across the repos the caller may read.
 - **Roles:** `owner > editor > reader` per repo; optionally per-domain ACL (`wiki/<domain>`).
-- **Isolation is hard:** writes land in `inbox/<repo>/<user>/…`; a repo's curator only ever touches
+- **Isolation is hard:** writes land in that repo's `_kb/inbox/<user>/…`; a repo's curator only ever touches
   that repo's files. Cross-repo leakage is structurally impossible (separate git repos).
+
+Team mode initially uses one **repo-owner process** per repo working copy. Gateways route captures to
+that owner; they do not mount or mutate independent clones. Horizontal scale later uses repo-affine
+sharding, still with one owner and one curated branch writer per repo.
+
+External editors are read/browse tools by default. Direct edits to `wiki/` are unsupported while a
+curator owns the branch; human contributions use `kb_remember`/upload, or a review-mode PR that the
+repo owner imports. This preserves the single-writer invariant.
 
 **Access control, OSS, two tiers:**
 1. **Delegate to the git host (Forgejo/Gitea):** repos, teams, roles, and PRs already exist there;
