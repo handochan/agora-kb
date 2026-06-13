@@ -8,7 +8,8 @@ own — those are properties of the core (DESIGN §2.1). Each tool delegates str
 - ``kb_remember`` → :meth:`agora_kb.core.inbox.Inbox.write` (the only write path; non-blocking).
 - ``kb_query``    → :meth:`agora_kb.core.wiki.Wiki.query` (the deterministic, model-free read path).
 - ``kb_status``   → :class:`agora_kb.core.state.StateStore` + live inbox/failed counts (meta face).
-- ``kb_curate``   → :func:`agora_kb.curator.evaluate` (a trigger *probe* — see its note below).
+- ``kb_curate``   → :func:`agora_kb.curator.worker.recover` + :func:`agora_kb.curator.worker.run`
+  (a real consolidation run against the configured ``adapters.yaml`` backend; see its note below).
 
 **Testability split (the architecture this module is built around).** The cognitive part — turning
 a tool call into a core-API call and shaping a JSON-serializable result — lives in
@@ -28,8 +29,10 @@ import argparse
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from agora_kb.config import load_backend_registry, load_repo_config
 from agora_kb.core import Inbox, Repo, StateStore, Wiki
-from agora_kb.curator import TriggerConfig, evaluate
+from agora_kb.curator.subprocess_backend import SubprocessBackend
+from agora_kb.curator.worker import recover, run
 
 if TYPE_CHECKING:
     from datetime import datetime
@@ -141,11 +144,18 @@ class AgoraHandlers:
         }
 
     def _failed_count(self) -> int:
-        """Number of terminal-failure entries under ``_kb/failed/`` (0 if the dir is absent)."""
+        """Number of terminal-failure events under ``_kb/failed/`` (0 if the dir is absent).
+
+        The worker writes terminal failures NESTED at ``failed/<date>/<run-id>/<event>.md`` (with
+        an ``error.json`` retry record alongside, ``worker._fail``), NOT as direct children of
+        ``failed/`` — so this RECURSIVELY globs ``*.md`` to count the real on-disk layout. Events
+        are the only ``.md`` under ``failed/`` (the retry record is ``error.json``), so the count
+        tracks terminally-failed events exactly.
+        """
         failed_dir = self._repo.layout.failed_dir
         if not failed_dir.is_dir():
             return 0
-        return sum(1 for _ in failed_dir.glob("*.md"))
+        return sum(1 for _ in failed_dir.rglob("*.md"))
 
     def _processed_today_count(self) -> int:
         """Number of items consolidated today under ``_kb/processed/<today-UTC>/`` (0 if absent).
@@ -160,56 +170,71 @@ class AgoraHandlers:
 
     # --- admin ----------------------------------------------------------------------------------
     def curate(self, *, target: str = "personal", force: bool = False) -> dict[str, object]:
-        """``kb_curate``: a trigger **probe** — report whether a consolidation run is due.
+        """``kb_curate``: run ONE consolidation against the configured ``adapters.yaml`` backend.
 
-        It loads curator state, applies the default :class:`TriggerConfig`, and calls
-        :func:`agora_kb.curator.evaluate` with ``cron_due=False`` (the MCP face is not the
-        scheduler, so it does not evaluate the cron expression). ``force=True`` short-circuits to a
-        ``"force"``-flavoured "should run" so an operator can request a drain on demand — an
-        operator override, distinct from the backlog ``"threshold"`` signal, matching the sibling
-        ``agora_kb.cli`` ``curate`` command.
+        Order (ADR-0011 §9 then §0): :func:`agora_kb.curator.worker.recover` finalizes/returns any
+        in-flight run first, then :func:`agora_kb.curator.worker.run` executes the transactional run
+        (claim → bundle → PASS-1 PLAN → APPLY → PASS-2 AUTHOR → validate → commit → CAS publish).
+        The backend is OUTSIDE the integrity boundary (ADR-0008/0011 §7): the deterministic gates
+        decide success, so this face adds none of its own logic — it only loads the configured brain
+        and shapes the :class:`~agora_kb.curator.worker.RunReport` into a JSON-serializable dict.
 
-        ``target`` defaults to ``"personal"`` for the Phase-1 single-repo MVP (the only repo until
-        multi-tenancy lands); DESIGN §5.1 lists it as a required ``kb_curate(target, force?)`` arg.
-
-        NOTE: the **actual** consolidation run (claim → worktree → backend INGEST → commit →
-        compare-and-swap) is executed by ``agora_kb.curator.worker``, which is **not yet wired**.
-        Until then ``kb_curate`` only *reports* whether a run is due; it never mutates the wiki.
+        Returns ``{status, published_commit, counts, ...}``. When no ``adapters.yaml`` backend is
+        configured (or the configured brain is unknown), it returns ``{status: "no_backend", note:
+        ...}`` rather than raising — a clear, actionable signal to the caller. ``force`` is accepted
+        for signature stability (DESIGN §5.1 ``kb_curate(target, force?)``); the worker itself
+        no-ops an empty/all-deduped inbox, so a forced call over an empty inbox simply reports
+        ``noop``. ``target`` defaults to ``"personal"`` (the only repo until multi-tenancy lands).
         """
-        state = self._state.load()
-        depth = self._inbox.depth()
-        config = TriggerConfig()
-
-        if force:
-            note = (
-                f"force=True: a run was requested for target={target!r}; "
-                "actual consolidation is performed by curator.worker (not yet wired)."
-            )
+        cfg = load_repo_config(self._repo.layout)
+        backend = self._build_backend(cfg.default_backend)
+        if backend is None:
             return {
-                "should_run": True,
-                "reason": "force",
-                "inbox_depth": depth,
-                "note": note,
+                "status": "no_backend",
+                "published_commit": None,
+                "counts": {},
+                "inbox_depth": self._inbox.depth(),
+                "note": (
+                    f"no backend configured for target={target!r}: create an adapters.yaml with a "
+                    "'backends:' mapping and 'default_backend' (DATA-MODEL §8) so curator.worker "
+                    "can run consolidation."
+                ),
             }
 
-        decision = evaluate(
-            inbox_depth=depth,
+        recovered = [
+            {"run_id": r.run_id, "status": r.status, "counts": r.counts}
+            for r in recover(self._repo, state_store=self._state)
+        ]
+        report = run(
+            self._repo,
+            backend=backend,
+            state_store=self._state,
             now=_now(),
-            last_write=None,
-            last_run=state.last_run,
-            config=config,
-            cron_due=False,
-        )
-        note = (
-            f"trigger probe for target={target!r}; actual consolidation is performed by "
-            "curator.worker (not yet wired). kb_curate only reports whether a run is due."
+            taxonomy=cfg.taxonomy,
+            max_attempts=cfg.max_attempts,
         )
         return {
-            "should_run": decision.should_run,
-            "reason": decision.reason,
-            "inbox_depth": depth,
-            "note": note,
+            "status": report.status,
+            "published_commit": report.published_commit,
+            "counts": report.counts,
+            "recovered": recovered,
         }
+
+    def _build_backend(self, backend_name: str) -> SubprocessBackend | None:
+        """Resolve the configured WRITE-adapter into a :class:`SubprocessBackend`, or ``None``.
+
+        Loads ``adapters.yaml`` (DATA-MODEL §8) from the repo root. ``None`` (an absent file or an
+        unknown configured brain) is the caller's "no backend configured" signal; a missing
+        executable surfaces later at invocation as a clear error from the backend itself.
+        """
+        adapters_path = self._repo.layout.root / "adapters.yaml"
+        registry = load_backend_registry(adapters_path)
+        if registry is None:
+            return None
+        try:
+            return SubprocessBackend(registry.get(backend_name))
+        except KeyError:
+            return None
 
 
 def _now() -> datetime:
@@ -274,10 +299,11 @@ def build_server(*, repo_path: Path, writer: str = DEFAULT_WRITER) -> FastMCP:
 
     @mcp.tool
     def kb_curate(target: str = "personal", force: bool = False) -> dict[str, object]:
-        """Probe whether a consolidation run is due. ``force=True`` is an operator override.
+        """Run one consolidation against the configured backend. Returns status/commit/counts.
 
-        ``target`` defaults to ``"personal"`` — the only repo until multi-tenancy lands. The run
-        itself is performed by ``curator.worker`` (not yet wired); this only reports.
+        Recovers any in-flight run, then runs ``curator.worker`` over the ``adapters.yaml`` brain.
+        ``target`` defaults to ``"personal"`` — the only repo until multi-tenancy lands. Returns
+        ``status: "no_backend"`` (not an error) when no backend is configured.
         """
         return handlers.curate(target=target, force=force)
 

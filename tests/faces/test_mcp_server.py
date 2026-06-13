@@ -8,10 +8,78 @@ exercises :func:`build_server` to confirm the 4 tools are registered.
 from __future__ import annotations
 
 import asyncio
+import shutil
+import sys
+from datetime import UTC, datetime
 from pathlib import Path
 
-from agora_kb.core import Repo
+import pytest
+
+from agora_kb.core import Inbox, Repo
+from agora_kb.core.wiki import Wiki
 from agora_kb.faces.mcp_server import AgoraHandlers, build_server
+from agora_kb.schema import Taxonomy, emit_schema
+
+requires_git = pytest.mark.skipif(shutil.which("git") is None, reason="git not available")
+
+# A model-free stub curator brain shelled by SubprocessBackend: PASS 1 (cwd = bundle dir) emits a
+# CREATE_THEME plan to stdout; PASS 2 (cwd = worktree) fills the agora:body sentinels with prose.
+_STUB_BRAIN = """\
+import json, re, sys
+from pathlib import Path
+
+cwd = Path.cwd()
+candidates = cwd / "candidates.json"
+START = re.compile(r"<!-- agora:body:start id=(.+?) -->")
+
+if candidates.is_file():
+    doc = json.loads(candidates.read_text())
+    c0 = doc["candidates"][0]
+    disp = {
+        "candidate_id": c0["candidate_id"],
+        "event_ids": [p["event_id"] for p in c0["provenance"]],
+        "op": "CREATE_THEME",
+        "domain": c0.get("domain") or "ai-tech",
+        "basename": "curator-concurrency",
+        "title": "Curator concurrency model",
+        "summary": "One curator advances the curated branch under a per-repo lock.",
+        "status": "active",
+        "tags": ["curator", "concurrency"],
+        "aliases": [],
+        "links": [],
+        "needs_prose": True,
+        "reason": "New concept.",
+    }
+    print(json.dumps({"schema_version": 1, "run_id": doc["run_id"], "finished": True,
+                      "dispositions": [disp]}))
+    sys.exit(0)
+
+for note in (cwd / "wiki").rglob("*.md"):
+    text = note.read_text()
+    out, in_region = [], False
+    for line in text.split("\\n"):
+        if START.search(line):
+            out.append(line)
+            out.append("The single curator holds a per-repo flock.")
+            in_region = True
+            continue
+        if "agora:body:end" in line:
+            in_region = False
+            out.append(line)
+            continue
+        if in_region:
+            continue
+        out.append(line)
+    note.write_text("\\n".join(out))
+sys.exit(0)
+"""
+
+_TAXONOMY = Taxonomy(
+    schema_version=1,
+    taxonomy_policy="open",
+    allowed_tags=("curator", "concurrency"),
+    domains=("ai-tech",),
+)
 
 
 # --- fixture helpers ----------------------------------------------------------------------------
@@ -19,6 +87,36 @@ def _init_repo(tmp_path: Path) -> Repo:
     """Create + initialize a knowledge repo and return it."""
     repo = Repo.resolve(tmp_path)
     repo.init()
+    return repo
+
+
+def _init_curatable_repo(tmp_path: Path) -> Repo:
+    """Init a repo with the schema/taxonomy committed + a stub adapters.yaml, ready to curate.
+
+    Mirrors `agora repo init` (schema + taxonomy committed at the curated tip so the bundle/lint
+    inputs exist) plus a stub-brain adapters.yaml the SubprocessBackend shells. No real model.
+    """
+    repo = Repo.resolve(tmp_path)
+    repo.init(when=datetime(2026, 6, 12, 0, 0, 0, tzinfo=UTC))
+    emit_schema(repo.layout, taxonomy=_TAXONOMY)
+    repo.commit_all("chore: emit schema", when=datetime(2026, 6, 12, 1, 0, 0, tzinfo=UTC))
+
+    brain = tmp_path / "stub_brain.py"
+    brain.write_text(_STUB_BRAIN, encoding="utf-8")
+    (tmp_path / "adapters.yaml").write_text(
+        "backends:\n"
+        f"  stub: {{ argv: [{sys.executable!r}, {str(brain)!r}], "
+        'cwd: "{worktree}", prompt: stdin }\n'
+        "default_backend: stub\n",
+        encoding="utf-8",
+    )
+    # repo.yaml carries the matching taxonomy domain + the stub as the default brain.
+    (repo.layout.kb_dir).mkdir(parents=True, exist_ok=True)
+    (repo.layout.kb_dir / "repo.yaml").write_text(
+        "name: personal\nkind: personal\nschema_version: 1\ndomains: [ai-tech]\n"
+        "curator:\n  backend: stub\n",
+        encoding="utf-8",
+    )
     return repo
 
 
@@ -141,13 +239,18 @@ def test_status_reflects_pending_and_failed(tmp_path: Path) -> None:
     handlers.remember("one pending capture")
     handlers.remember("another pending capture")
 
-    # Simulate a terminal failure record under _kb/failed/.
-    failed_dir = repo.layout.failed_dir
-    failed_dir.mkdir(parents=True, exist_ok=True)
-    (failed_dir / "20260613T000000Z-deadbeef.md").write_text("oops\n", encoding="utf-8")
+    # Simulate a terminal failure laid out the way worker._fail actually writes it:
+    # failed/<date>/<run-id>/<event>.md (the terminal event) + error.json (the §5.1 retry record).
+    # The count must track this NESTED layout, not a fabricated top-level file (the regression the
+    # buggy `glob("*.md")` masked).
+    run_dir = repo.layout.failed_dir / "2026-06-13" / "20260613T000000Z-deadbeef"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "20260613T024010Z-a1b2c3.md").write_text("oops\n", encoding="utf-8")
+    (run_dir / "error.json").write_text('{"failed_checks": []}\n', encoding="utf-8")
 
     result = handlers.status()
     assert result["inbox_depth"] == 2
+    # One terminal event under the nested run dir; error.json is NOT counted (it is not *.md).
     assert result["failed"] == 1
 
 
@@ -171,45 +274,58 @@ def test_status_processed_today_counts_today_partition(tmp_path: Path) -> None:
     assert result["processed_today"] == 2
 
 
-# --- curate (admin trigger probe) ---------------------------------------------------------------
-def test_curate_none_when_idle(tmp_path: Path) -> None:
-    repo = _init_repo(tmp_path)
-    handlers = AgoraHandlers(repo, writer="local")
-
-    result = handlers.curate()
-
-    assert result["should_run"] is False
-    assert result["reason"] == "none"
-    assert result["inbox_depth"] == 0
-    assert "curator.worker" in result["note"]
-
-
-def test_curate_force_reports_force_reason_below_threshold(tmp_path: Path) -> None:
+# --- curate (real consolidation run) ------------------------------------------------------------
+def test_curate_no_backend_returns_clear_note(tmp_path: Path) -> None:
+    """A repo with NO adapters.yaml reports status='no_backend' (a clear note), never crashes."""
     repo = _init_repo(tmp_path)
     handlers = AgoraHandlers(repo, writer="local")
     handlers.remember("a single capture")
 
-    result = handlers.curate(force=True)
+    result = handlers.curate()
 
-    # A forced run is an operator override, not a backlog-threshold trigger — even at depth 1
-    # (below the default threshold of 10) the reason must read "force", matching agora_kb.cli.
-    assert result["should_run"] is True
-    assert result["reason"] == "force"
-    assert result["inbox_depth"] == 1
+    assert result["status"] == "no_backend"
+    assert result["published_commit"] is None
+    assert "no backend configured" in result["note"]
 
 
-def test_curate_threshold_when_depth_meets_default(tmp_path: Path) -> None:
-    repo = _init_repo(tmp_path)
-    handlers = AgoraHandlers(repo, writer="local")
-    # The default TriggerConfig threshold is 10; reach it so the probe fires without force.
-    for i in range(10):
-        handlers.remember(f"capture number {i}")
+@requires_git
+def test_curate_with_stub_backend_publishes(tmp_path: Path) -> None:
+    """`kb_curate` runs curator.worker against a STUB backend and PUBLISHES a theme.
+
+    End-to-end through the MCP handler: a capture is consolidated into a CREATE_THEME by the stub
+    brain (PASS 1 plan + PASS 2 prose), the worker commits + CAS-publishes, and the handler returns
+    {status: published, published_commit, counts}. The synced working copy then resolves the theme.
+    """
+    repo = _init_curatable_repo(tmp_path)
+    handlers = AgoraHandlers(repo, writer="dochan")
+    Inbox(repo.layout).write(
+        text="One curator advances the branch under a lock.",
+        writer="dochan",
+        source="claude-code",
+        domain="ai-tech",
+        now=datetime(2026, 6, 13, 2, 40, 10, tzinfo=UTC),
+    )
 
     result = handlers.curate()
 
-    assert result["should_run"] is True
-    assert result["reason"] == "threshold"
-    assert result["inbox_depth"] == 10
+    assert result["status"] == "published"
+    assert isinstance(result["published_commit"], str) and result["published_commit"]
+    assert result["counts"].get("CREATE_THEME") == 1
+    # Read-after-publish: the theme is on disk and the deterministic query resolves it.
+    theme = repo.layout.wiki_dir / "ai-tech" / "themes" / "curator-concurrency.md"
+    assert theme.is_file()
+    assert Wiki(repo.layout).query("curator concurrency").status == "ok"
+
+
+def test_curate_empty_inbox_with_backend_is_noop(tmp_path: Path) -> None:
+    """With a backend configured but an empty inbox, curator.worker no-ops (nothing to claim)."""
+    repo = _init_curatable_repo(tmp_path)
+    handlers = AgoraHandlers(repo, writer="dochan")
+
+    result = handlers.curate()
+
+    assert result["status"] == "noop"
+    assert result["published_commit"] is None
 
 
 # --- build_server wiring smoke test -------------------------------------------------------------

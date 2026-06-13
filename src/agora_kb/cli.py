@@ -2,10 +2,12 @@
 
 A dependency-light :mod:`argparse` front-end over the core API. Subcommands:
 
-- ``agora repo init <path>`` — initialize a knowledge repo (``Repo.init``) and print its commit.
+- ``agora repo init <path>`` — initialize a knowledge repo: ``Repo.init`` + emit the KB schema +
+  taxonomy + a starter ``_kb/repo.yaml``, committed as one admin commit (the result lints clean).
 - ``agora status [--repo PATH]`` — print inbox depth + curator state (last run/commit, counters).
-- ``agora curate [--repo PATH] [--force]`` — evaluate the consolidation triggers and print the
-  decision. The real consolidation run is :mod:`agora_kb.curator` ``worker`` (pending).
+- ``agora curate [--repo PATH] [--force]`` — recover any in-flight run, then execute ONE real
+  consolidation run via :mod:`agora_kb.curator` ``worker`` against the configured ``adapters.yaml``
+  backend, and print the resulting :class:`~agora_kb.curator.worker.RunReport`.
 - ``agora serve [--repo PATH] [--writer W]`` — run the MCP stdio server face. The face is imported
   lazily so the rest of the CLI works even when an MCP transport dependency is missing.
 - ``agora doctor`` — print a health report (git, python, key deps, repo init state).
@@ -24,8 +26,12 @@ import sys
 from datetime import UTC, datetime
 from pathlib import Path
 
+from .config import load_backend_registry, load_repo_config, write_default_repo_config
 from .core import Inbox, Repo, RepoLayout, StateStore
-from .curator import TriggerConfig, evaluate
+from .curator import evaluate
+from .curator.subprocess_backend import SubprocessBackend
+from .curator.worker import recover, run
+from .schema import Taxonomy, emit_schema, lint
 
 __all__ = ["main", "build_parser"]
 
@@ -45,6 +51,29 @@ def build_parser() -> argparse.ArgumentParser:
     repo_sub = p_repo.add_subparsers(dest="repo_command", metavar="<subcommand>")
     p_repo_init = repo_sub.add_parser("init", help="initialize a knowledge repo")
     p_repo_init.add_argument("path", help="repo root to initialize")
+    p_repo_init.add_argument(
+        "--name", default=None, help="repo name written to _kb/repo.yaml (default: dir basename)"
+    )
+    p_repo_init.add_argument(
+        "--kind",
+        choices=("personal", "team"),
+        default="personal",
+        help="repo kind written to _kb/repo.yaml (DATA-MODEL §3; default: personal)",
+    )
+    p_repo_init.add_argument(
+        "--domain",
+        action="append",
+        default=None,
+        metavar="DOMAIN",
+        help="an allowed taxonomy domain (repeatable; default: general)",
+    )
+    p_repo_init.add_argument(
+        "--tag",
+        action="append",
+        default=None,
+        metavar="TAG",
+        help="an allowed taxonomy tag (repeatable; default: none)",
+    )
     p_repo_init.set_defaults(func=_cmd_repo_init)
     p_repo.set_defaults(func=_cmd_repo_missing)
 
@@ -92,8 +121,52 @@ def main(argv: list[str] | None = None) -> int:
 
 # --- commands -----------------------------------------------------------------------------------
 def _cmd_repo_init(args: argparse.Namespace) -> int:
+    """``agora repo init <path>``: init git + emit schema/taxonomy + repo.yaml in one admin commit.
+
+    The single ``now`` is injected into ``Repo.init`` and ``commit_all`` so the seed ``index.md``
+    and the admin commit carry the SAME date (reproducible, no wall-clock drift, ADR-0010 D1). The
+    emitted taxonomy's ``domains``/``allowed_tags`` come from ``--domain``/``--tag`` (defaulting to
+    a single ``general`` domain and no tags), so the seed ``index.md`` (empty tags) lints clean. The
+    init commit sha is printed last.
+
+    IDEMPOTENT: re-running on an already-initialized repo re-emits the (idempotent) schema and the
+    git-ignored ``_kb/repo.yaml`` without a new curated commit — there is nothing new to commit, so
+    the existing HEAD is re-printed (matching ``Repo.init``'s own idempotency).
+    """
+    now = datetime.now(UTC)
     repo = Repo.resolve(args.path)
-    sha = repo.init()
+    layout = repo.layout
+
+    domains = tuple(args.domain) if args.domain else ("general",)
+    tags = tuple(args.tag) if args.tag else ()
+    name = args.name or layout.root.name
+
+    already = repo.is_initialized()
+    repo.init(when=now)
+    taxonomy = Taxonomy(
+        schema_version=1, taxonomy_policy="open", allowed_tags=tags, domains=domains
+    )
+    # emit_schema + the starter repo.yaml are idempotent (existing curated files are left untouched;
+    # _kb/repo.yaml is git-ignored), so a re-init produces no curated diff — only the first init's
+    # admin commit advances the curated branch.
+    emit_schema(layout, taxonomy=taxonomy)
+    write_default_repo_config(layout, name=name, domains=domains, kind=args.kind)
+
+    if already:
+        sha = repo.head_commit()
+    else:
+        sha = repo.commit_all("chore: emit KB schema + repo config", when=now)
+
+    # The freshly-initialized repo MUST lint clean (schema.lint ok) — a dashboard-style read (no
+    # run_date) so only the structural rules apply. A non-clean result here is a setup bug, surfaced
+    # rather than swallowed.
+    result = lint(layout, taxonomy=taxonomy)
+    if not result.ok:
+        for finding in result.findings:
+            print(f"  lint {finding.code} {finding.path}: {finding.message}", file=sys.stderr)
+        print(f"{_PROG} repo init: emitted repo did not lint clean", file=sys.stderr)
+        return 1
+
     print(sha)
     return 0
 
@@ -120,28 +193,89 @@ def _cmd_status(args: argparse.Namespace) -> int:
 
 
 def _cmd_curate(args: argparse.Namespace) -> int:
-    layout = RepoLayout(Path(args.repo))
+    """``agora curate``: recover in-flight runs, then run ONE real consolidation if due (or forced).
+
+    Order (ADR-0011 §9 then §0): recover() first so any crashed run is finalized/returned before a
+    fresh run; then evaluate the configured triggers (``--force`` overrides). When a run is due,
+    load the ``adapters.yaml`` WRITE-adapter registry, build a :class:`SubprocessBackend` over the
+    configured default brain, and execute :func:`agora_kb.curator.worker.run`. The integrity verdict
+    is the worker's (the backend is outside the boundary), so this prints the resulting RunReport
+    (status / published commit / per-op counts). A missing/absent ``adapters.yaml`` is a clear
+    error, not a crash.
+    """
+    repo = Repo.resolve(args.repo)
+    layout = repo.layout
+    cfg = load_repo_config(layout)
+    now = datetime.now(UTC)
+
+    # ADR-0011 §9: finalize/return any in-flight run BEFORE deciding on a new one.
+    for rep in recover(repo, state_store=StateStore(layout)):
+        print(f"recovered: run={rep.run_id} status={rep.status} counts={rep.counts}")
+
     depth = Inbox(layout).depth()
     state = StateStore(layout).load()
-    config = TriggerConfig()
     decision = evaluate(
         inbox_depth=depth,
-        now=datetime.now(UTC),
+        now=now,
         last_write=None,
         last_run=state.last_run,
-        config=config,
+        config=cfg.triggers,
         cron_due=False,
     )
-    # --force = operator override: run regardless of the trigger policy. We still print the
-    # underlying policy decision so the operator can see what *would* have happened.
     should_run = True if args.force else decision.should_run
     reason = "force" if args.force else decision.reason
+
     print(f"repo: {layout.root}")
     print(f"inbox depth: {depth}")
     print(f"should_run: {should_run}")
     print(f"reason: {reason}")
-    print("note: consolidation run is curator.worker (pending); no changes were made")
+
+    if not should_run:
+        print("note: no consolidation run was due; nothing was changed")
+        return 0
+
+    backend = _build_backend(layout, cfg.default_backend)
+    if backend is None:
+        return 1
+
+    report = run(
+        repo,
+        backend=backend,
+        state_store=StateStore(layout),
+        now=now,
+        taxonomy=cfg.taxonomy,
+        max_attempts=cfg.max_attempts,
+    )
+    counts = ", ".join(f"{op}={n}" for op, n in sorted(report.counts.items())) or "-"
+    print(f"status: {report.status}")
+    print(f"published_commit: {report.published_commit or '-'}")
+    print(f"counts: {counts}")
     return 0
+
+
+def _build_backend(layout: RepoLayout, backend_name: str) -> SubprocessBackend | None:
+    """Resolve the configured WRITE-adapter into a :class:`SubprocessBackend`, or print why not.
+
+    Loads ``adapters.yaml`` (DATA-MODEL §8) from the repo root. Returns ``None`` (after printing a
+    clear stderr message) when the file is absent (no brain configured) or the configured
+    ``default_backend`` is not among its ``backends`` — so the caller exits non-zero instead of
+    crashing. The actual missing-executable case surfaces later, at invocation, as a clear error.
+    """
+    adapters_path = layout.root / "adapters.yaml"
+    registry = load_backend_registry(adapters_path)
+    if registry is None:
+        print(
+            f"{_PROG} curate: no backend configured — create {adapters_path} with a 'backends:' "
+            f"mapping and 'default_backend' (DATA-MODEL §8).",
+            file=sys.stderr,
+        )
+        return None
+    try:
+        spec = registry.get(backend_name)
+    except KeyError as exc:
+        print(f"{_PROG} curate: {exc}", file=sys.stderr)
+        return None
+    return SubprocessBackend(spec)
 
 
 def _cmd_serve(args: argparse.Namespace) -> int:
