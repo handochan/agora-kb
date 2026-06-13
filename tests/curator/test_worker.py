@@ -220,6 +220,129 @@ def test_happy_path_publishes_theme_advances_ref_and_finalizes(tmp_path: Path) -
     assert manifest.published_commit == new_tip
 
 
+# --- (1b) read-after-publish: the owner working copy is synced to the published tip -------------
+
+
+def test_happy_path_syncs_owner_working_copy_so_query_sees_published_theme(tmp_path: Path) -> None:
+    """ADR-0008 read-after-publish: after a successful CAS publish the worker fast-forwards the
+    repo-owner's MAIN working copy to the curated tip, so ``core.Wiki`` over
+    ``RepoLayout(repo.root)`` resolves the published theme WITHOUT any manual ``git reset`` — the
+    read path reads the on-disk tree, and the CAS alone leaves it stale.
+    """
+    from agora_kb.core.wiki import Wiki
+
+    repo = _init_repo(tmp_path)
+    layout = repo.layout
+    inbox = Inbox(layout)
+
+    e1 = _write_capture(inbox, text="One curator advances the branch under a lock.", second=10)
+    _seed_raw(repo, e1)
+    base = repo.head_commit()
+    plan = _create_theme_plan("ignored", "c1", e1)
+
+    report = _run(
+        repo, FakeBackend(plan, prose={"c1": "The single curator holds a per-repo flock."})
+    )
+
+    assert report.status == "published"
+    new_tip = report.published_commit
+    assert new_tip is not None
+    assert new_tip != base
+    # The MAIN working copy is AT the new tip (no manual git reset) — read-after-publish.
+    assert repo.head_commit() == new_tip
+    # The published theme is materialized on disk, so a plain Wiki over the repo root sees it.
+    theme = layout.wiki_dir / "ai-tech" / "themes" / "curator-concurrency.md"
+    assert theme.is_file()
+    result = Wiki(RepoLayout(repo.root)).query("curator concurrency")
+    assert result.status == "ok"
+    assert any(h.path == "wiki/ai-tech/themes/curator-concurrency.md" for h in result.hits)
+
+
+def test_sync_failure_after_publish_does_not_unpublish_or_unfinalize(tmp_path: Path) -> None:
+    """ADR-0008 guarded sync: a post-finalize ``sync_to_branch`` GitError must NOT flip a published
+    run to failed or undo it. The CAS already landed and state is finalized, so a sync failure
+    leaves the publish durable in git; the worker only logs it and surfaces an observable signal.
+    """
+    from agora_kb.core.repo import GitError
+
+    repo = _init_repo(tmp_path)
+    layout = repo.layout
+    inbox = Inbox(layout)
+
+    e1 = _write_capture(inbox, text="One curator advances the branch under a lock.", second=10)
+    _seed_raw(repo, e1)
+    base = repo.head_commit()
+    plan = _create_theme_plan("ignored", "c1", e1)
+
+    # Make the post-publish sync raise: the CAS lands + finalize completes, then sync_to_branch
+    # fails (as if the owner working tree were dirtied just before the read-after-publish sync).
+    def boom(branch: str | None = None) -> str:
+        raise GitError("simulated dirty owner working tree on post-publish sync")
+
+    repo.sync_to_branch = boom  # type: ignore[method-assign]
+
+    report = _run(
+        repo, FakeBackend(plan, prose={"c1": "The single curator holds a per-repo flock."})
+    )
+
+    # The run is STILL published and the commit is durable in git despite the sync failure.
+    assert report.status == "published"
+    new_tip = report.published_commit
+    assert new_tip is not None
+    assert new_tip != base
+    assert repo.branch_commit() == new_tip  # durable: the curated ref advanced
+    # The stuck working copy is surfaced as an observable signal, not silently swallowed.
+    assert report.counts.get("owner_working_copy_unsynced") == 1
+    # state + manifest reflect a finalized publish (the sync failure un-did neither).
+    state = StateStore(layout).load()
+    assert state.published_runs[report.run_id] == new_tip
+    manifest = read_manifest(manifest_path(layout, report.run_id))
+    assert manifest.phase == "finalized"
+    assert manifest.published_commit == new_tip
+
+
+def test_failed_run_leaves_owner_working_copy_unchanged(tmp_path: Path) -> None:
+    """A failed run publishes nothing and never touches the owner working copy: HEAD stays at base
+    and no theme appears on disk (the sync runs ONLY on a published/recovered run)."""
+    repo = _init_repo(tmp_path)
+    layout = repo.layout
+    inbox = Inbox(layout)
+
+    e1 = _write_capture(inbox, text="A fact in a non-existent domain.", second=10)
+    _seed_raw(repo, e1)
+    base = repo.head_commit()
+
+    bad_plan = json.dumps(
+        {
+            "schema_version": 1,
+            "run_id": "ignored",
+            "finished": True,
+            "dispositions": [
+                {
+                    "candidate_id": "c1",
+                    "event_ids": [e1],
+                    "op": "CREATE_THEME",
+                    "domain": "not-a-real-domain",
+                    "basename": "rogue-theme",
+                    "title": "Rogue",
+                    "summary": "Should never be created.",
+                    "status": "active",
+                    "tags": [],
+                    "aliases": [],
+                    "links": [],
+                    "needs_prose": True,
+                    "reason": "Invalid domain.",
+                }
+            ],
+        }
+    )
+    report = _run(repo, FakeBackend(bad_plan, prose={"c1": "unreachable"}))
+
+    assert report.status == "failed"
+    assert repo.head_commit() == base  # the owner working copy never advanced
+    assert not (layout.wiki_dir / "ai-tech" / "themes" / "rogue-theme.md").exists()
+
+
 # --- (2) INVALID PLAN ---------------------------------------------------------------------------
 
 
@@ -718,6 +841,45 @@ def test_malformed_plan_text_fails_with_plan_parse(tmp_path: Path) -> None:
     assert error_files
     checks = json.loads(error_files[0].read_text(encoding="utf-8"))["failed_checks"]
     assert any("PLAN-PARSE" in c for c in checks)
+
+
+# --- (9b) backend cannot run: a fatal PASS-1 invocation failure is a clean FAILED run -----------
+
+
+class _UnavailablePlanBackend:
+    """A :class:`Backend` whose PASS-1 ``plan`` raises ``BackendUnavailableError`` (no executable).
+
+    The real SubprocessBackend raises this when the configured brain is missing / exits non-zero.
+    It is NOT a PlanParseError, so without the worker mapping it would escape ``run()`` uncaught —
+    the contract this guards is "model outside the integrity boundary → deterministic FAILED run".
+    """
+
+    def plan(self, bundle_dir: Path) -> str:  # noqa: ARG002
+        from agora_kb.curator.subprocess_backend import BackendUnavailableError
+
+        raise BackendUnavailableError("backend 'ghost' could not be executed")
+
+    def author(self, worktree: Path, needs_prose: dict[str, list[str]]) -> None:  # noqa: ARG002
+        raise AssertionError("author must never be reached when PASS 1 fails to run")
+
+
+def test_backend_unavailable_on_plan_fails_cleanly_without_escaping(tmp_path: Path) -> None:
+    repo = _init_repo(tmp_path)
+    inbox = Inbox(repo.layout)
+
+    e1 = _write_capture(inbox, text="One curator advances the branch under a lock.", second=10)
+    _seed_raw(repo, e1)
+    base = repo.head_commit()
+
+    # No traceback escapes run(): a missing/non-zero backend maps to a deterministic FAILED run.
+    report = _run(repo, _UnavailablePlanBackend())
+
+    assert report.status == "failed"
+    assert repo.branch_commit() == base  # nothing published
+    error_files = list(repo.layout.failed_dir.rglob("error.json"))
+    assert error_files
+    checks = json.loads(error_files[0].read_text(encoding="utf-8"))["failed_checks"]
+    assert any("PLAN-BACKEND" in c for c in checks)
 
 
 # --- (10) tier-1 event_keys: recorded at finalize + cross-run dedup -----------------------------

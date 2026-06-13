@@ -49,6 +49,7 @@ allowlisted final-diff assertion) is the integrity gate REGARDLESS of any sandbo
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import shutil
@@ -61,7 +62,7 @@ from typing import Literal, Protocol
 from ..core import frontmatter
 from ..core.ids import new_event_id
 from ..core.layout import RepoLayout
-from ..core.repo import Repo
+from ..core.repo import GitError, Repo
 from ..core.state import CuratorState, StateStore
 from ..schema.emit import Taxonomy
 from ..schema.lint import lint
@@ -82,6 +83,7 @@ from .constants import (
 )
 from .manifest import RunManifest, list_processing, write_manifest
 from .plan import Disposition, Plan, PlanParseError, validate_plan
+from .subprocess_backend import BackendUnavailableError
 
 __all__ = [
     "Backend",
@@ -96,6 +98,8 @@ __all__ = [
 # failure body the worker substitutes when a note's PASS-2 diff is rejected, so the run still
 # publishes a structurally-valid (but prose-pending) note.
 _RESET_PLACEHOLDER = "> _summary pending_"
+
+_logger = logging.getLogger(__name__)
 
 
 class Backend(Protocol):
@@ -196,13 +200,17 @@ def run(
     state_store: StateStore,
     now: datetime,
     taxonomy: Taxonomy,
+    max_attempts: int = DEFAULT_MAX_ATTEMPTS,
 ) -> RunReport:
     """Execute ONE transactional curator run (ADR-0008 steps 1-6 / DESIGN §4 / ADR-0011 §0).
 
     Deterministic orchestration around the two delegated acts. ``now`` is the injected commit
     timestamp (the run reads no wall clock for the commit/dates — ADR-0010 D1); ``taxonomy``
     supplies
-    the FIXED ``allowed_tags``/``domains`` the §4.1 / §4.4 gates enforce.
+    the FIXED ``allowed_tags``/``domains`` the §4.1 / §4.4 gates enforce. ``max_attempts`` is the
+    §5.1 per-event retry budget (``repo.yaml curator.max_attempts``, default
+    :data:`~agora_kb.curator.constants.DEFAULT_MAX_ATTEMPTS`); keyword-only + additive so the frozen
+    signature is preserved while an operator-configured budget is honored end-to-end.
 
     Returns a :class:`RunReport`. A held lock or empty/all-deduped inbox is a ``noop``; a PLAN,
     LINT,
@@ -216,7 +224,12 @@ def run(
     try:
         with curator_lock(layout):
             return _run_locked(
-                repo, backend=backend, state_store=state_store, now=now, taxonomy=taxonomy
+                repo,
+                backend=backend,
+                state_store=state_store,
+                now=now,
+                taxonomy=taxonomy,
+                max_attempts=max_attempts,
             )
     except LockHeld:
         # A run is already in progress for this repo (ADR-0008 step 1 / DESIGN §4 step 1): exit
@@ -231,12 +244,26 @@ def _run_locked(
     state_store: StateStore,
     now: datetime,
     taxonomy: Taxonomy,
+    max_attempts: int = DEFAULT_MAX_ATTEMPTS,
 ) -> RunReport:
     """The body of :func:`run`, executed UNDER the held curator lock (ADR-0011 §0)."""
     layout = repo.layout
     state = state_store.load()
 
-    base_commit = repo.head_commit()
+    # ADR-0008 (read-after-publish, best-effort): a PRIOR run's post-publish sync may have failed
+    # (owner working tree dirty/diverged), leaving HEAD behind the curated ref. Try a best-effort
+    # fast-forward here so a transient dirty tree that has since been cleaned is reconciled before
+    # we read the base. GUARDED by the same GitError swallow as the post-publish sync — a
+    # still-dirty tree never aborts the run; we read the AUTHORITATIVE base from the ref below.
+    _sync_owner_working_copy(repo, run_id="<pre-run>")
+
+    # The CAS base is the curated branch ref (the authoritative published tip), NOT the owner's
+    # working-copy HEAD: a stale HEAD left behind by a failed post-publish sync would otherwise
+    # poison this run (plan against missing content + a CAS expected=stale that can never land —
+    # a durable livelock). Reading the ref means a prior failed sync degrades the read path only,
+    # never the next run's ability to make progress (ADR-0008 note: the read-after-publish sync is
+    # best-effort and the CAS base is the curated ref, not the owner HEAD).
+    base_commit = repo.branch_commit()
     run_id = _new_run_id(now)
     run_date = run_id[:10]
 
@@ -264,7 +291,13 @@ def _run_locked(
         # zero tracked changes.
         _ignore_scratch(wt)
 
-        # PASS 1 — DELEGATED: the backend reads the bundle and returns plan.json text.
+        # PASS 1 — DELEGATED: the backend reads the bundle and returns plan.json text. A bad-plan
+        # TEXT is a PlanParseError; a backend that cannot run at all (missing/non-zero executable →
+        # BackendUnavailableError, or a hung backend → subprocess.TimeoutExpired) is the OTHER
+        # failure channel of the real SubprocessBackend seam. BOTH map to a deterministic FAILED run
+        # here (lock released, worktree torn down, NOTHING published) so the "model outside the
+        # integrity boundary → clean FAILED run" contract holds end-to-end — never an uncaught
+        # traceback out of run() (ADR-0011 §4 / FOCUS/INGEST contract).
         try:
             plan = Plan.from_json(backend.plan(bundle.bundle_dir))
         except PlanParseError as exc:
@@ -274,6 +307,16 @@ def _run_locked(
                 state_store,
                 now=now,
                 reasons=[f"PLAN-PARSE: {exc}"],
+                max_attempts=max_attempts,
+            )
+        except (BackendUnavailableError, subprocess.TimeoutExpired) as exc:
+            return _fail(
+                layout,
+                manifest,
+                state_store,
+                now=now,
+                reasons=[f"PLAN-BACKEND: {exc}"],
+                max_attempts=max_attempts,
             )
 
         # §4.1 PLAN validation (pure deterministic, model-independent).
@@ -292,6 +335,7 @@ def _run_locked(
                 state_store,
                 now=now,
                 reasons=[f"{e.check}: {e.message}" for e in plan_errors],
+                max_attempts=max_attempts,
             )
 
         # APPLY (deterministic, §3): the worker materializes ALL
@@ -326,7 +370,21 @@ def _run_locked(
         prose_complete = True
         if needs_prose:
             base_state = {rel: (wt / rel).read_text(encoding="utf-8") for rel in needs_prose}
-            backend.author(wt, needs_prose)
+            # A fatal backend-invocation failure on PASS 2 (missing executable / hung process) is
+            # the same "model cannot run" channel as PASS 1: map it to a clean FAILED run rather
+            # than let it escape run() as a traceback. A per-note NON-ZERO exit is NOT fatal — the
+            # SubprocessBackend leaves it for the §4.2 AUTHOR-diff degrade path below.
+            try:
+                backend.author(wt, needs_prose)
+            except (BackendUnavailableError, subprocess.TimeoutExpired) as exc:
+                return _fail(
+                    layout,
+                    manifest,
+                    state_store,
+                    now=now,
+                    reasons=[f"AUTHOR-BACKEND: {exc}"],
+                    max_attempts=max_attempts,
+                )
             # §4.6 deterministic stray-wikilink strip BEFORE validation: a `[[X]]` PASS 2 emitted
             # that is not a plan link for that note has its delimiters removed (inner text kept), so
             # an otherwise-good prose pass is repaired byte-deterministically instead of degrading
@@ -360,6 +418,7 @@ def _run_locked(
                 state_store,
                 now=now,
                 reasons=[f"LINT {f.code} {f.path}: {f.message}" for f in lint_result.findings],
+                max_attempts=max_attempts,
             )
 
         # §4.3 LOG (worker-only, AFTER validation): append ONE structured log.md entry. The model
@@ -377,7 +436,14 @@ def _run_locked(
             wt, base_commit=base_commit, raw_writes=raw_writes
         )
         if allowlist_errors:
-            return _fail(layout, manifest, state_store, now=now, reasons=allowlist_errors)
+            return _fail(
+                layout,
+                manifest,
+                state_store,
+                now=now,
+                reasons=allowlist_errors,
+                max_attempts=max_attempts,
+            )
 
         # Commit once (advances only the detached worktree HEAD; the branch ref is unchanged until
         # the CAS below). `git add -A` is now safe — the final-diff gate already rejected anything
@@ -408,6 +474,7 @@ def _run_locked(
                 now=now,
                 reasons=["CAS: curated ref moved since base_commit; conflict, discard + retry"],
                 cas_conflict=True,
+                max_attempts=max_attempts,
             )
 
     # --- published: the diff is durable in git. Record state + finalize (ADR-0008 step 5, §4.3).
@@ -438,6 +505,22 @@ def _run_locked(
         prose_complete=prose_complete,
         published_commit=new_commit,
     )
+
+    # ADR-0008 (readers resolve a PUBLISHED commit): the CAS moved only the curated ref; the
+    # repo-owner's MAIN working copy is still parked at base_commit, so core.Wiki/kb_query (which
+    # read the on-disk tree) would not yet see the published theme. Fast-forward the working copy to
+    # the new tip AFTER state is saved + the manifest is finalized, so the read-after-publish
+    # contract holds. GUARDED: a sync failure (e.g. an owner left the working tree dirty) must NOT
+    # undo a durable publish — the diff is already in git and state is finalized; we keep
+    # status=published and only log the sync failure.
+    synced = _sync_owner_working_copy(repo, run_id)
+    if not synced:
+        # Surface the stuck state as a LOUD, observable RunReport signal (not just a log line): the
+        # publish is durable in git, but HEAD now diverges from the curated tip so the read path is
+        # stale until the owner reconciles the working tree. The next run still reads the
+        # authoritative base from the curated ref and keeps making progress, so this is purely an
+        # operator/dashboard signal that the working copy needs manual attention.
+        counts = {**counts, "owner_working_copy_unsynced": 1}
 
     return RunReport(run_id=run_id, status="published", published_commit=new_commit, counts=counts)
 
@@ -523,6 +606,12 @@ def _finalize_recovered(
         prose_complete=manifest.prose_complete,
         published_commit=commit,
     )
+
+    # Same read-after-publish sync as the happy path (ADR-0008): a run finalized on restart already
+    # advanced the curated ref, but the owner's working copy may still be behind, so fast-forward it
+    # to the published commit. GUARDED: a sync failure never un-finalizes the recovered run.
+    _sync_owner_working_copy(repo, run_id)
+
     return RunReport(
         run_id=run_id, status="recovered", published_commit=commit, counts={"finalized": 1}
     )
@@ -692,6 +781,32 @@ def _return_one_to_inbox(layout: RepoLayout, event_path: Path) -> bool:
 
 
 # --- helpers -----------------------------------------------------------------------------------
+
+
+def _sync_owner_working_copy(repo: Repo, run_id: str) -> bool:
+    """Fast-forward the repo-owner's MAIN working copy to the published curated tip (ADR-0008).
+
+    Called after a run is durably published + finalized (happy path or recovery), and best-effort at
+    the START of a run to reconcile a working tree left behind by a prior failed sync. The CAS moves
+    the curated ref but leaves the owner's on-disk working copy at base_commit, so the read path
+    (``core.Wiki`` / ``kb_query``, which read the on-disk tree) would not yet resolve the published
+    content. :meth:`Repo.sync_to_branch` does a safe ``--ff-only`` advance. GUARDED: the publish is
+    already durable in git and state is finalized, so a sync failure (e.g. a dirty/diverged owner
+    working tree) must NOT undo it — log a warning and return ``False``, keeping status=published.
+    Returns ``True`` iff the working copy is now at the curated tip.
+    """
+    try:
+        repo.sync_to_branch()
+    except GitError as exc:
+        _logger.warning(
+            "curator run %s published but the owner working copy could not be fast-forwarded "
+            "to the curated tip (%s); the publish is durable in git — resolve the working tree "
+            "manually so the read path reflects it",
+            run_id,
+            exc,
+        )
+        return False
+    return True
 
 
 def _new_run_id(now: datetime) -> str:

@@ -18,6 +18,7 @@ from .manifest import (
     write_manifest,
 )
 from .plan import Disposition, Plan, PlanError, PlanParseError, validate_plan
+from .subprocess_backend import BackendUnavailableError, SubprocessBackend
 from .triggers import TriggerConfig, TriggerDecision, TriggerReason, evaluate
 from .worker import Backend, FakeBackend, RunReport, recover, run
 
@@ -55,4 +56,6 @@ __all__ = [
     "RunReport",
     "run",
     "recover",
+    "SubprocessBackend",
+    "BackendUnavailableError",
 ]
