@@ -1,0 +1,311 @@
+"""Repo + adapter configuration loaders (DATA-MODEL §3 ``_kb/repo.yaml`` / §8 ``adapters.yaml``).
+
+This is the Phase-2 *wiring* seam between the on-disk operator config and the typed inputs the
+curator run-loop already consumes. Two config surfaces are read here, both plain YAML:
+
+* ``_kb/repo.yaml`` (DATA-MODEL §3) — per-repo identity + curator policy. :func:`load_repo_config`
+  maps it onto a :class:`RepoConfig` that bundles the pieces the worker/CLI need: the repo
+  ``name``/``kind`` (forward-looking identity fields, round-tripped but not yet consumed), the FIXED
+  :class:`~agora_kb.schema.emit.Taxonomy` (``domains`` /
+  ``allowed_tags`` / ``taxonomy_policy`` / ``schema_version`` — the §4.1/§4.4 gate input), the
+  :class:`~agora_kb.curator.triggers.TriggerConfig` (cron/threshold/idle), the ``default_backend``
+  name, and the ``max_attempts`` retry budget (ADR-0011 §5.1). A repo with no ``repo.yaml`` yet
+  loads sensible defaults so ``agora status`` / ``curate`` work on a freshly-cloned tree.
+* ``adapters.yaml`` (DATA-MODEL §8) — the WRITE-adapter registry. :func:`load_backend_registry` is a
+  thin wrapper over :meth:`agora_kb.curator.BackendRegistry.from_file`; an absent file returns
+  ``None`` (an explicit "no brain configured" signal the CLI/MCP surface as a clear note, not a
+  crash — a :class:`BackendRegistry` requires ≥1 backend by construction, so a 0-backend registry
+  cannot exist). The registry's own typing/validation owns the backend specs.
+
+Nothing here invokes a model, touches git, or writes the wiki — it is pure config I/O that produces
+the typed inputs the deterministic run-loop already takes (so the integrity boundary is unchanged).
+
+The taxonomy on disk is the AUTHORITATIVE input (``_meta/taxonomy.yaml`` is what the bundle copies +
+the lint reads, ADR-0010 D6); ``repo.yaml`` is the operator-facing summary. :func:`load_repo_config`
+PREFERS the emitted ``_meta/taxonomy.yaml`` for ``allowed_tags`` (the closed tag set the gate
+enforces) and only falls back to ``repo.yaml domains`` when the taxonomy file is absent, so the
+config never widens the closed vocabulary the curator validates against.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import yaml
+from pydantic import BaseModel, ConfigDict, Field
+
+from .core.layout import RepoLayout
+from .curator import BackendRegistry, TriggerConfig
+from .curator.constants import DEFAULT_MAX_ATTEMPTS
+from .schema import Taxonomy
+
+__all__ = [
+    "ConfigError",
+    "RepoConfig",
+    "load_repo_config",
+    "write_default_repo_config",
+    "load_backend_registry",
+]
+
+# DATA-MODEL §3: the per-repo config lives in the git-ignored operational spool at _kb/repo.yaml.
+_REPO_CONFIG_NAME = "repo.yaml"
+# DATA-MODEL §3 defaults mirror the documented example (kept in sync with TriggerConfig defaults).
+_DEFAULT_NAME = "personal"
+_DEFAULT_KIND = "personal"
+# Reuse the single source of truth for the §5.1 retry budget (curator/constants.py) so RepoConfig's
+# default can never silently drift from the worker's actual DEFAULT_MAX_ATTEMPTS.
+_DEFAULT_MAX_ATTEMPTS = DEFAULT_MAX_ATTEMPTS
+# The OSS default brain (ADR-0005 / INGEST-CONTRACT §8: local Qwen via Ollama, zero API cost). Only
+# a NAME here; the executable/argv binding lives in adapters.yaml (DATA-MODEL §8).
+_DEFAULT_BACKEND = "qwen"
+
+
+class ConfigError(ValueError):
+    """A config file on disk is malformed (unparseable YAML, or a typed-mismatch operator value).
+
+    Raised so the CLI/MCP can present a clean, actionable message instead of letting a raw
+    ``yaml.YAMLError`` / ``ValueError`` escape as a stacktrace out of ``agora status`` / ``curate``
+    / MCP ``kb_curate``. ``repo.yaml`` is operator-local policy-with-defaults, so a typo there fails
+    CLEARLY rather than silently changing the operator's stated policy.
+    """
+
+
+class RepoConfig(BaseModel):
+    """Typed view of ``_kb/repo.yaml`` (DATA-MODEL §3) — the curator/CLI policy inputs.
+
+    Bundles the pieces the run-loop + CLI take: the FIXED :class:`Taxonomy` (the §4.1/§4.4 closed
+    vocabulary), the :class:`TriggerConfig` (cron/threshold/idle, DATA-MODEL §3
+    ``curator.triggers``, consumed by ``agora curate``), ``default_backend`` (the brain name read by
+    the CLI/MCP), and ``max_attempts`` (the §5.1 retry budget threaded into ``worker.run``).
+    ``name``/``kind`` are first-class §3 IDENTITY fields that round-trip but are not yet consumed by
+    any surface (forward-looking until status output / MCP repo identity wires them). Defaults match
+    the DATA-MODEL §3 example so a repo with no ``repo.yaml`` still loads a usable policy.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = _DEFAULT_NAME
+    kind: str = _DEFAULT_KIND
+    taxonomy: Taxonomy = Field(default_factory=Taxonomy)
+    triggers: TriggerConfig = Field(default_factory=TriggerConfig)
+    default_backend: str = _DEFAULT_BACKEND
+    max_attempts: int = Field(default=_DEFAULT_MAX_ATTEMPTS, ge=1)
+
+
+def repo_config_path(layout: RepoLayout) -> Path:
+    """Path of the per-repo config ``_kb/repo.yaml`` (DATA-MODEL §3)."""
+    return layout.kb_dir / _REPO_CONFIG_NAME
+
+
+def load_repo_config(layout: RepoLayout) -> RepoConfig:
+    """Load ``_kb/repo.yaml`` into a :class:`RepoConfig`; return defaults when it is absent.
+
+    A missing ``repo.yaml`` is NOT an error (a freshly-cloned or pre-config repo): the documented
+    DATA-MODEL §3 defaults load so ``agora status`` / ``curate`` keep working. The ``curator``
+    sub-mapping is read for ``backend`` (→ ``default_backend``), ``max_attempts``, and
+    ``triggers`` (cron/threshold/idle). The taxonomy is assembled by PREFERRING the emitted
+    ``_meta/taxonomy.yaml`` (the authoritative closed vocabulary the gate enforces, ADR-0010 D6) and
+    falling back to ``repo.yaml domains`` only when that file is absent — the config never widens
+    the closed tag/domain set the curator validates against.
+    """
+    raw = _read_yaml_mapping(repo_config_path(layout))
+
+    name = _opt_str(raw.get("name")) or _DEFAULT_NAME
+    kind = _opt_str(raw.get("kind")) or _DEFAULT_KIND
+    repo_domains = _str_list(raw.get("domains"))
+    repo_schema_version = raw.get("schema_version")
+
+    curator = _sub_mapping(raw.get("curator"))
+    default_backend = _opt_str(curator.get("backend")) or _DEFAULT_BACKEND
+    max_attempts = _opt_int(
+        curator.get("max_attempts"), _DEFAULT_MAX_ATTEMPTS, key="curator.max_attempts"
+    )
+    triggers = _build_triggers(curator.get("triggers"))
+
+    taxonomy = _load_taxonomy(
+        layout,
+        repo_domains=repo_domains,
+        repo_schema_version=repo_schema_version,
+    )
+
+    return RepoConfig(
+        name=name,
+        kind=kind,
+        taxonomy=taxonomy,
+        triggers=triggers,
+        default_backend=default_backend,
+        max_attempts=max_attempts,
+    )
+
+
+def write_default_repo_config(
+    layout: RepoLayout,
+    *,
+    name: str,
+    domains: list[str] | tuple[str, ...],
+    kind: str = _DEFAULT_KIND,
+) -> Path:
+    """Emit a starter ``_kb/repo.yaml`` (DATA-MODEL §3); return its path.
+
+    Written at ``agora repo init`` alongside the schema emit. The shape mirrors the DATA-MODEL §3
+    example (identity + ``curator`` policy with the default OSS backend, the §5.1 retry budget, and
+    the cron/threshold/idle triggers). ``_kb/`` is git-ignored, so this is operator-local config —
+    derived policy, not canonical knowledge — and an idempotent re-init simply overwrites it.
+    ``kind`` defaults to ``"personal"`` (the Phase-1 MVP); a ``"team"`` repo passes ``kind="team"``
+    so the §3 first-class identity field is settable rather than hardcoded.
+    """
+    triggers = TriggerConfig()
+    doc: dict[str, object] = {
+        "name": name,
+        "kind": kind,
+        "schema_version": 1,
+        "domains": list(domains),
+        "review_mode": "direct",
+        "curator": {
+            "backend": _DEFAULT_BACKEND,
+            "max_attempts": _DEFAULT_MAX_ATTEMPTS,
+            "triggers": {
+                "cron": triggers.cron,
+                "threshold": triggers.threshold,
+                "idle_minutes": triggers.idle_minutes,
+            },
+        },
+    }
+    path = repo_config_path(layout)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(yaml.safe_dump(doc, sort_keys=False, allow_unicode=True), encoding="utf-8")
+    return path
+
+
+def load_backend_registry(path: str | Path) -> BackendRegistry | None:
+    """Load the WRITE-adapter registry from ``adapters.yaml`` (DATA-MODEL §8); ``None`` when absent.
+
+    A thin wrapper over :meth:`agora_kb.curator.BackendRegistry.from_file`. An ABSENT
+    ``adapters.yaml`` returns ``None`` so the caller (CLI/MCP) can surface a clear "no backend
+    configured" note rather than crash — a :class:`BackendRegistry` requires ≥1 backend by
+    construction, so there is no "empty registry" object to return. A PRESENT-but-malformed file
+    still RAISES via the registry's own validation (a typo'd backend spec is a config error).
+    """
+    p = Path(path)
+    if not p.is_file():
+        return None
+    return BackendRegistry.from_file(p)
+
+
+# --- internals ----------------------------------------------------------------------------------
+
+
+def _load_taxonomy(
+    layout: RepoLayout,
+    *,
+    repo_domains: list[str],
+    repo_schema_version: object,
+) -> Taxonomy:
+    """Build the FIXED :class:`Taxonomy` from disk, PREFERRING ``_meta/taxonomy.yaml`` (D6).
+
+    The emitted ``_meta/taxonomy.yaml`` is the authoritative closed vocabulary the bundle copies and
+    the lint reads, so it wins for ``allowed_tags`` / ``domains`` / ``taxonomy_policy`` /
+    ``schema_version``. Only when that file is absent (a pre-emit repo) do we fall back to
+    ``repo.yaml domains`` so a freshly-cloned repo still has a usable domain hint. ``allowed_tags``
+    is NEVER synthesized from ``repo.yaml`` (which lists no tags), so the config can never widen the
+    closed tag set the curator validates against.
+    """
+    meta = _read_yaml_mapping(layout.root / "_meta" / "taxonomy.yaml")
+    if meta:
+        # _meta/taxonomy.yaml allowed_tags is a mapping {tag: {}} (emit.py); domains is a list.
+        allowed_tags = meta.get("allowed_tags")
+        if isinstance(allowed_tags, dict):
+            tags = tuple(str(t) for t in allowed_tags)
+        else:
+            tags = tuple(_str_list(allowed_tags))
+        return Taxonomy(
+            schema_version=_opt_int(meta.get("schema_version"), 1, key="schema_version"),
+            taxonomy_policy=_opt_str(meta.get("taxonomy_policy")) or "open",
+            allowed_tags=tags,
+            domains=tuple(_str_list(meta.get("domains"))),
+        )
+    return Taxonomy(
+        schema_version=_opt_int(repo_schema_version, 1, key="schema_version"),
+        taxonomy_policy="open",
+        allowed_tags=(),
+        domains=tuple(repo_domains),
+    )
+
+
+def _build_triggers(raw: object) -> TriggerConfig:
+    """Build a :class:`TriggerConfig` from the ``curator.triggers`` mapping (defaults if absent).
+
+    Only the keys :class:`TriggerConfig` knows (cron/threshold/idle_minutes) are forwarded, each
+    narrowed to its expected type; a non-mapping or extra documented trigger context falls back to
+    the field default rather than tripping ``extra='forbid'``.
+    """
+    triggers = _sub_mapping(raw)
+    defaults = TriggerConfig()
+    return TriggerConfig(
+        cron=_opt_str(triggers.get("cron")) or defaults.cron,
+        threshold=_opt_int(
+            triggers.get("threshold"), defaults.threshold, key="curator.triggers.threshold"
+        ),
+        idle_minutes=_opt_int(
+            triggers.get("idle_minutes"),
+            defaults.idle_minutes,
+            key="curator.triggers.idle_minutes",
+        ),
+    )
+
+
+def _read_yaml_mapping(path: Path) -> dict[str, object]:
+    """Parse ``path`` as a YAML mapping; ``{}`` for an absent/empty/non-mapping file.
+
+    A syntactically-MALFORMED file (e.g. an unquoted ``cron: @daily``) is re-raised as a typed
+    :class:`ConfigError` naming the path, so a typo in ``repo.yaml`` / ``_meta/taxonomy.yaml`` is
+    surfaced cleanly by the CLI/MCP rather than escaping as a raw ``yaml.YAMLError`` stacktrace out
+    of ``agora status`` / ``curate``. (Absent/empty/non-mapping still degrades to ``{}`` defaults.)
+    """
+    if not path.is_file():
+        return {}
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except yaml.YAMLError as exc:
+        raise ConfigError(f"malformed YAML in {path}: {exc}") from exc
+    return data if isinstance(data, dict) else {}
+
+
+def _sub_mapping(value: object) -> dict[str, object]:
+    """Return ``value`` as a ``dict[str, object]`` iff it is a mapping, else ``{}`` (narrowing).
+
+    Used so a missing/non-mapping ``curator``/``triggers`` sub-block reads as an empty mapping —
+    every ``.get`` then returns ``None`` (the field default) — not a type error or attribute crash.
+    """
+    return {str(k): v for k, v in value.items()} if isinstance(value, dict) else {}
+
+
+def _opt_str(value: object) -> str | None:
+    return value if isinstance(value, str) and value else None
+
+
+def _opt_int(value: object, default: int, *, key: str = "value") -> int:
+    """Coerce an operator-supplied numeric to ``int``, or fall back to ``default`` when absent.
+
+    An absent value (``None``) takes the ``default``. A genuine ``int`` (NOT bool — bool is an int
+    subclass, so ``true``/``false`` would otherwise coerce to 1/0) is honored as-is. An INTEGRAL
+    float (``5.0`` — a plausible operator typo) is accepted as its integer value rather than
+    silently discarded. A supplied-but-wrong value (a non-integral float like ``5.5``, a string, …)
+    raises a clear :class:`ConfigError` so the operator's stated policy is never silently replaced
+    with a different default.
+    """
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        raise ConfigError(f"{key} must be an integer, got boolean {value!r}")
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    raise ConfigError(f"{key} must be an integer, got {value!r}")
+
+
+def _str_list(value: object) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [str(v) for v in value if isinstance(v, str)]
