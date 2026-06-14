@@ -44,6 +44,7 @@ __all__ = [
     "RepoConfig",
     "load_repo_config",
     "write_default_repo_config",
+    "write_default_adapters_yaml",
     "load_backend_registry",
 ]
 
@@ -172,6 +173,52 @@ def write_default_repo_config(
         },
     }
     path = repo_config_path(layout)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(yaml.safe_dump(doc, sort_keys=False, allow_unicode=True), encoding="utf-8")
+    return path
+
+
+def write_default_adapters_yaml(layout: RepoLayout, *, model: str | None = None) -> Path:
+    """Emit a starter ``adapters.yaml`` (DATA-MODEL §8) wiring the OSS default brain; return path.
+
+    Written at ``agora repo init`` so a freshly-initialized repo is IMMEDIATELY curate-able with the
+    local-model brain (ADR-0005 / INGEST-CONTRACT §8: local Qwen via Ollama, zero API cost). The
+    single ``qwen`` backend shells the ``agora-ollama-brain`` console script (its argv) — the
+    generic :class:`SubprocessBackend` invokes it for BOTH curator passes over stdin. ``cwd`` is the
+    ``{worktree}`` placeholder the worker resolves (PASS 2 writes there); ``network: loopback``
+    documents that this backend reaches the localhost Ollama HTTP API (it is metadata for the
+    operator, not enforcement). When ``model`` is given, ``--model <m>`` is appended to the argv so
+    the brain targets a specific local model. The emitted name ``qwen`` MUST match
+    :data:`_DEFAULT_BACKEND` and the ``curator.backend`` default in ``repo.yaml`` so the wiring is
+    consistent out of the box.
+
+    IDEMPOTENT + non-destructive: an EXISTING ``adapters.yaml`` is left untouched (its path is
+    returned without a rewrite) so an operator's hand-tuned backend registry survives a re-init.
+    Only the :class:`BackendSpec`-valid keys (``argv``/``cwd``/``prompt``/``sandbox``/``network``/
+    ``timeout_s``) are emitted — ``BackendSpec`` is ``extra='forbid'`` — so the file round-trips
+    through :func:`load_backend_registry` cleanly.
+    """
+    path = layout.root / "adapters.yaml"
+    if path.is_file():
+        # Non-destructive: never clobber an operator's hand-tuned registry on re-init.
+        return path
+
+    argv = ["agora-ollama-brain"]
+    if model is not None:
+        argv += ["--model", model]
+    doc: dict[str, object] = {
+        "backends": {
+            _DEFAULT_BACKEND: {
+                "argv": argv,
+                "cwd": "{worktree}",
+                "prompt": "stdin",
+                "sandbox": "strict",
+                "network": "loopback",
+                "timeout_s": 600,
+            },
+        },
+        "default_backend": _DEFAULT_BACKEND,
+    }
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(yaml.safe_dump(doc, sort_keys=False, allow_unicode=True), encoding="utf-8")
     return path

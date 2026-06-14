@@ -196,6 +196,9 @@ def test_curate_force_without_backend_reports_no_backend(
     target = tmp_path / "kb"
     assert main(["repo", "init", str(target), "--domain", "ai-tech"]) == 0
     capsys.readouterr()
+    # `repo init` now emits a default adapters.yaml (the OSS brain wiring); remove it to exercise
+    # the explicit "no backend configured" path this test guards.
+    (target / "adapters.yaml").unlink()
 
     rc = main(["curate", "--repo", str(target), "--force"])
     assert rc == 1

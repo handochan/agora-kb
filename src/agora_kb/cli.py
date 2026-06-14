@@ -26,7 +26,12 @@ import sys
 from datetime import UTC, datetime
 from pathlib import Path
 
-from .config import load_backend_registry, load_repo_config, write_default_repo_config
+from .config import (
+    load_backend_registry,
+    load_repo_config,
+    write_default_adapters_yaml,
+    write_default_repo_config,
+)
 from .core import Inbox, Repo, RepoLayout, StateStore
 from .curator import evaluate
 from .curator.subprocess_backend import SubprocessBackend
@@ -151,6 +156,10 @@ def _cmd_repo_init(args: argparse.Namespace) -> int:
     # admin commit advances the curated branch.
     emit_schema(layout, taxonomy=taxonomy)
     write_default_repo_config(layout, name=name, domains=domains, kind=args.kind)
+    # Wire the OSS default brain so the fresh repo is IMMEDIATELY curate-able (idempotent +
+    # non-destructive: an existing adapters.yaml is left untouched). adapters.yaml lives at the
+    # repo root and is operator-facing registry config, not part of the curated admin commit.
+    adapters_path = write_default_adapters_yaml(layout)
 
     if already:
         sha = repo.head_commit()
@@ -167,6 +176,9 @@ def _cmd_repo_init(args: argparse.Namespace) -> int:
         print(f"{_PROG} repo init: emitted repo did not lint clean", file=sys.stderr)
         return 1
 
+    # The adapters registry path is informational init output (the brain wiring), printed to stderr
+    # so stdout stays the single machine-parseable admin-commit sha (the established init contract).
+    print(f"adapters: {adapters_path}", file=sys.stderr)
     print(sha)
     return 0
 
