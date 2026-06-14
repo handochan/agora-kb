@@ -21,6 +21,7 @@ from agora_kb.curator.apply import (
     ApplyError,
     apply_plan,
     body_sentinels,
+    region_sentinel_id,
     strip_stray_wikilinks,
     validate_author_diff,
 )
@@ -135,8 +136,8 @@ def test_create_theme_writes_full_c2_frontmatter_and_sentinels(tmp_path: Path) -
     assert fm["body_status"] == "pending"
     assert "origin" not in fm  # not harvested
 
-    # Body sentinel pair keyed by candidate_id (§3).
-    start, end = body_sentinels("c1")
+    # Body sentinel pair keyed by the RUN-SCOPED region id (§3, region_sentinel_id).
+    start, end = body_sentinels(region_sentinel_id(RUN_ID, "c1"))
     assert start in body and end in body
     assert body.index(start) < body.index(end)
 
@@ -150,6 +151,7 @@ def test_create_theme_produces_exact_bytes(tmp_path: Path) -> None:
     plan = _plan(_create_theme())
     apply_plan(plan, worktree=wt, run_date=RUN_DATE, provenance=_provenance("c1", E1))
     theme = wt / "wiki" / "ai-tech" / "themes" / "curator-concurrency.md"
+    cid = region_sentinel_id(RUN_ID, "c1")  # the run-scoped persisted id, {run_id}--c1
     expected = (
         "---\n"
         "title: Curator concurrency model\n"
@@ -170,9 +172,9 @@ def test_create_theme_produces_exact_bytes(tmp_path: Path) -> None:
         "body_status: pending\n"
         "---\n"
         "\n"
-        "<!-- agora:body:start id=c1 -->\n"
+        f"<!-- agora:body:start id={cid} -->\n"
         "_summary pending_\n"
-        "<!-- agora:body:end id=c1 -->\n"
+        f"<!-- agora:body:end id={cid} -->\n"
     )
     assert theme.read_text(encoding="utf-8") == expected
 
@@ -397,7 +399,7 @@ def test_append_daily_creates_dated_section(tmp_path: Path) -> None:
     assert str(fm["date"]) == RUN_DATE
     assert fm["run_id"] == RUN_ID
     assert f"## {RUN_DATE}" in body
-    start, end = body_sentinels("d1")
+    start, end = body_sentinels(region_sentinel_id(RUN_ID, "d1"))
     assert start in body and end in body
 
 
@@ -413,8 +415,8 @@ def test_two_daily_dispositions_one_file_stable_order(tmp_path: Path) -> None:
     daily = wt / "wiki" / "ai-tech" / "daily" / f"ai-tech-{RUN_DATE}.md"
     fm, body = frontmatter.parse(daily.read_text(encoding="utf-8"))
     # Both sentinel regions present; d1's section appears before d2's (E1 < E3).
-    start_d1, _ = body_sentinels("d1")
-    start_d2, _ = body_sentinels("d2")
+    start_d1, _ = body_sentinels(region_sentinel_id(RUN_ID, "d1"))
+    start_d2, _ = body_sentinels(region_sentinel_id(RUN_ID, "d2"))
     assert body.index(start_d1) < body.index(start_d2)
     # sources unioned across both dispositions.
     assert f"raw/ai-tech/{E1}.md" in fm["sources"]
@@ -456,7 +458,7 @@ def test_append_daily_cross_run_preserves_prior_run_id(tmp_path: Path) -> None:
     assert str(fm["updated"]) == RUN_DATE  # bumped
     assert fm["sources"] == [f"raw/ai-tech/{E1}.md", f"raw/ai-tech/{E2}.md"]  # unioned
     assert prior_start in body and prior_end in body  # prior region preserved
-    new_start, _ = body_sentinels("d1")
+    new_start, _ = body_sentinels(region_sentinel_id(RUN_ID, "d1"))
     assert new_start in body  # new region appended
 
 
@@ -503,7 +505,7 @@ def test_merge_unions_sources_and_appends_sub_region(tmp_path: Path) -> None:
     assert fm["sources"] == [f"raw/ai-tech/{E1}.md", f"raw/ai-tech/{E2}.md"]
     # prior prose preserved; a NEW sentinel sub-region appended below it.
     assert "Existing CQRS prose." in body
-    start, _ = body_sentinels("m1")
+    start, _ = body_sentinels(region_sentinel_id(RUN_ID, "m1"))
     assert start in body
     assert body.index("Existing CQRS prose.") < body.index(start)
 
@@ -976,6 +978,6 @@ def test_author_diff_end_to_end_from_apply_output(tmp_path: Path) -> None:
         changed_paths=[rel],
         per_file_old={rel: old},
         per_file_new={rel: new},
-        sentinels={rel: {"c1"}},
+        sentinels={rel: {region_sentinel_id(RUN_ID, "c1")}},
     )
     assert errors == []

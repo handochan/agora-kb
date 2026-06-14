@@ -56,13 +56,20 @@ __all__ = [
     "strip_stray_wikilinks",
     "ApplyError",
     "body_sentinels",
+    "region_sentinel_id",
     "DEFAULT_MAX_BODY_BYTES",
 ]
 
 # --- sentinels (ADR-0011 §3 / §3.1) -----------------------------------------------------------
 
-# The body sentinel pair is keyed by candidate_id EVERYWHERE (never basename), because multiple
-# APPEND_DAILY dispositions can target one daily file (§3.1), so basename is not unique per region.
+# The PERSISTED body sentinel id is RUN-SCOPED — ``{run_id}--{candidate_id}`` (see
+# :func:`region_sentinel_id`) — NOT the bare candidate_id. The bare candidate_id ("c1","c2",…) is
+# reassigned per RUN by :func:`agora_kb.curator.bundle._dedup_tier2`, so it is NOT unique across
+# runs: a MERGE_INTO_THEME / cross-run APPEND_DAILY appends a NEW region to a note that may ALREADY
+# hold a region with the same bare candidate_id from a PRIOR run, producing two identical
+# ``id=c1`` markers in one note. ``run_id`` is globally unique per run (and regex-safe for the
+# sentinel grammar), so prefixing with it makes every persisted region id globally unique while
+# multiple APPEND_DAILY dispositions in ONE run still get distinct ids (their candidate_ids differ).
 # PASS 2 writes ONLY between the start/end markers; APPLY places them empty (CREATE_THEME wraps the
 # whole body; MERGE_INTO_THEME wraps a NEW augmentation sub-region appended below prior prose).
 _SENTINEL_START = "<!-- agora:body:start id={cid} -->"
@@ -104,11 +111,30 @@ class ApplyError(ValueError):
     """
 
 
-def body_sentinels(candidate_id: str) -> tuple[str, str]:
-    """Return the ``(start, end)`` body-sentinel marker lines for ``candidate_id`` (§3 / §3.1)."""
+def region_sentinel_id(run_id: str, candidate_id: str) -> str:
+    """Return the globally-unique PERSISTED body-sentinel id for a region (ADR-0011 §3 / §3.1).
+
+    The id is ``{run_id}--{candidate_id}``. ``candidate_id`` ("c1","c2",…) is reassigned per RUN by
+    :func:`agora_kb.curator.bundle._dedup_tier2`, so it is NOT unique across runs; ``run_id`` is
+    globally unique per run, so the composite is globally unique across runs while two regions
+    placed in ONE run still differ (their candidate_ids differ). This is the SINGLE SOURCE OF TRUTH
+    for the persisted id — APPLY (placement) and the worker's ``_needs_prose_map`` (the §4.2
+    ``sentinels`` set) BOTH call it, so they can never drift. ``run_id`` is regex-safe for the
+    sentinel grammar (no ``" -->"`` substring, no newline) so the composite parses unambiguously.
+    """
+    return f"{run_id}--{candidate_id}"
+
+
+def body_sentinels(sentinel_id: str) -> tuple[str, str]:
+    """Return the ``(start, end)`` body-sentinel marker lines for ``sentinel_id`` (§3 / §3.1).
+
+    ``sentinel_id`` is the FINAL persisted region id — for placed regions the run-scoped
+    :func:`region_sentinel_id` value, never the bare per-run candidate_id. This formatter is
+    generic: it wraps whatever id string it is given, so it is reused by tests/validators too.
+    """
     return (
-        _SENTINEL_START.format(cid=candidate_id),
-        _SENTINEL_END.format(cid=candidate_id),
+        _SENTINEL_START.format(cid=sentinel_id),
+        _SENTINEL_END.format(cid=sentinel_id),
     )
 
 
@@ -328,9 +354,14 @@ def _daily_frontmatter(
 # --- region rendering -------------------------------------------------------------------------
 
 
-def _empty_body_region(candidate_id: str) -> str:
-    """Render a fresh, sentinel-wrapped body region with a placeholder line (PASS 2 fills it)."""
-    start, end = body_sentinels(candidate_id)
+def _empty_body_region(sentinel_id: str) -> str:
+    """Render a fresh, sentinel-wrapped body region with a placeholder line (PASS 2 fills it).
+
+    ``sentinel_id`` is the FINAL persisted region id (the run-scoped :func:`region_sentinel_id`
+    value at every placement site), never the bare per-run candidate_id — so a MERGE / cross-run
+    APPEND_DAILY into a note already holding a prior-run region never collides on the bare id.
+    """
+    start, end = body_sentinels(sentinel_id)
     return f"{start}\n{_BODY_PLACEHOLDER}\n{end}"
 
 
@@ -434,6 +465,7 @@ def apply_plan(
             _apply_create_theme(
                 disp,
                 worktree=worktree,
+                run_id=run_id,
                 run_date=run_date,
                 provenance=prov,
                 confidence=conf,
@@ -445,7 +477,12 @@ def apply_plan(
             daily_dispositions.append(disp)
         elif disp.op == "MERGE_INTO_THEME":
             _apply_merge(
-                disp, worktree=worktree, run_date=run_date, provenance=prov, raw_writes=raw_writes
+                disp,
+                worktree=worktree,
+                run_id=run_id,
+                run_date=run_date,
+                provenance=prov,
+                raw_writes=raw_writes,
             )
         elif disp.op == "MARK_CONTESTED":
             _apply_contested(
@@ -482,6 +519,7 @@ def _apply_create_theme(
     disp: Disposition,
     *,
     worktree: Path,
+    run_id: str,
     run_date: str,
     provenance: list[dict[str, object]],
     confidence: str,
@@ -497,7 +535,10 @@ def _apply_create_theme(
     fm = _theme_frontmatter(
         disp, run_date=run_date, sources=sources, origin=origin, confidence=confidence
     )
-    body = _empty_body_region(disp.candidate_id) if disp.needs_prose else ""
+    if disp.needs_prose:
+        body = _empty_body_region(region_sentinel_id(run_id, disp.candidate_id))
+    else:
+        body = ""
     path = worktree / "wiki" / disp.domain / "themes" / f"{disp.basename}.md"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(frontmatter.render(fm, body), encoding="utf-8")
@@ -517,7 +558,8 @@ def _apply_append_daily(
         raise ApplyError(f"candidate {disp.candidate_id!r}: APPEND_DAILY requires a domain")
     basename = disp.basename or f"{disp.domain}-{run_date}"
     path = worktree / "wiki" / disp.domain / "daily" / f"{basename}.md"
-    section = f"## {run_date}\n\n{_empty_body_region(disp.candidate_id)}"
+    region = _empty_body_region(region_sentinel_id(run_id, disp.candidate_id))
+    section = f"## {run_date}\n\n{region}"
     new_sources = _sources_union(disp.domain, provenance, worktree=worktree, raw_writes=raw_writes)
 
     if path.is_file():
@@ -569,6 +611,7 @@ def _apply_merge(
     disp: Disposition,
     *,
     worktree: Path,
+    run_id: str,
     run_date: str,
     provenance: list[dict[str, object]],
     raw_writes: dict[str, str],
@@ -611,7 +654,7 @@ def _apply_merge(
 
     if disp.needs_prose:
         fm["body_status"] = "pending"
-        augmentation = _empty_body_region(disp.candidate_id)
+        augmentation = _empty_body_region(region_sentinel_id(run_id, disp.candidate_id))
         body = f"{body}\n\n{augmentation}" if body else augmentation
     path.write_text(frontmatter.render(fm, body), encoding="utf-8")
 

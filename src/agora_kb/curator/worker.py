@@ -70,6 +70,7 @@ from ..schema.notes import parse_all_notes
 from .apply import (
     apply_plan,
     body_sentinels,
+    region_sentinel_id,
     strip_stray_wikilinks,
     validate_author_diff,
 )
@@ -1060,17 +1061,17 @@ def _advance(
 def _needs_prose_map(
     plan: Plan, worktree: Path, run_date: str
 ) -> tuple[dict[str, list[str]], dict[str, set[str]]]:
-    """Map ``needs_prose`` notes to their candidate ids + build the §4.2 ``sentinels`` set.
+    """Map ``needs_prose`` notes to their RUN-SCOPED region ids + build the §4.2 ``sentinels`` set.
 
-    Returns ``(needs_prose, sentinels)`` where ``needs_prose`` is ``{rel_path: [candidate_id,
-    ...]}``
-    (the PASS-2 instruction the backend receives) and ``sentinels`` is
-    ``{rel_path: {candidate_id}}`` — the COMPLETE set of body-sentinel regions
-    :func:`validate_author_diff` expects in each note at post-APPLY state. CREATE_THEME →
-    ``wiki/<domain>/themes/<basename>.md``; APPEND_DAILY →
+    Returns ``(needs_prose, sentinels)`` where ``needs_prose`` is ``{rel_path: [region_id, ...]}``
+    (the PASS-2 instruction the backend receives) and ``sentinels`` is ``{rel_path: {region_id}}`` —
+    the COMPLETE set of body-sentinel regions :func:`validate_author_diff` expects in each note at
+    post-APPLY state. Each ``region_id`` is the run-scoped ``region_sentinel_id`` value
+    (``{run_id}--{candidate_id}``), computed via the SAME helper APPLY uses to PLACE the region so
+    the two can never drift (the bare candidate_id is per-run and collides across runs).
+    CREATE_THEME → ``wiki/<domain>/themes/<basename>.md``; APPEND_DAILY →
     ``wiki/<domain>/daily/<domain>-<run_date>.md`` (multiple dispositions can share one daily file,
-    so
-    candidate ids accumulate); MERGE_INTO_THEME → the target theme path resolved in the live tree.
+    so ids accumulate); MERGE_INTO_THEME → the target theme path resolved in the live tree.
     """
     needs: dict[str, list[str]] = {}
     sentinels: dict[str, set[str]] = {}
@@ -1080,8 +1081,13 @@ def _needs_prose_map(
         rel = _disposition_note_rel_path(disp, worktree, run_date)
         if rel is None:
             continue
-        needs.setdefault(rel, []).append(disp.candidate_id)
-        sentinels.setdefault(rel, set()).add(disp.candidate_id)
+        # The PERSISTED region id is RUN-SCOPED (region_sentinel_id), computed via the SAME shared
+        # helper APPLY uses to PLACE the region, so the §4.2 sentinels set can never drift from the
+        # ids on disk. The bare candidate_id is per-run and would collide across runs (a MERGE /
+        # cross-run daily append into a note holding a prior-run region).
+        sentinel_id = region_sentinel_id(plan.run_id, disp.candidate_id)
+        needs.setdefault(rel, []).append(sentinel_id)
+        sentinels.setdefault(rel, set()).add(sentinel_id)
     # A note that already carried prior-run sentinel regions must list ALL live regions in
     # `sentinels` (validate_author_diff enforces exact set equality). Re-scan each touched note for
     # every present start-sentinel id so a prior CREATE_THEME body under a now-MERGED theme is kept.

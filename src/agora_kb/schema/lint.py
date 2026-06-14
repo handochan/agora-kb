@@ -12,8 +12,8 @@ Purity contract (ADR-0010 D1, "reads no wall clock"):
 * :func:`lint` is a pure function of ``(layout, taxonomy, run_date, run_id)`` plus what is on disk
   in the worktree. It reads NO system clock.
 * The STRUCTURAL rules (basenames, links, required frontmatter, enums, MOC children, sources,
-  contested shape, encoding, schema_version, origin) apply ALWAYS. The date-FORMAT half of L1-12
-  (must be ``YYYY-MM-DD``) is likewise structural and runs either way.
+  contested shape, encoding, schema_version, origin, body-sentinel integrity) apply ALWAYS. The
+  date-FORMAT half of L1-12 (must be ``YYYY-MM-DD``) is likewise structural and runs either way.
 * The run-relative date checks — L1-12's NO-FUTURE half (``created``/``updated``/``date`` ``>
   run_date`` fails; this is a ``<= run_date`` bound, NOT an equality) and the daily ``date`` /
   ``run_id`` equality (L1-14) — fire ONLY when ``run_date`` is provided. The curator passes the
@@ -85,6 +85,15 @@ _CONTESTED_CALLOUT_RE = re.compile(r"^> \[!contested\]", re.MULTILINE)
 
 # A daily basename is `<domain>-YYYY-MM-DD`; the trailing 10 chars are the date (ADR-0010, L1-14).
 _DAILY_DATE_RE = re.compile(r"-(?P<date>\d{4}-\d{2}-\d{2})\Z")
+
+# L1-20 body-sentinel grammar (ADR-0011 §4.4 check 6 / ADR-0010 §2.6 L1 sentinel integrity). These
+# MUST match the curator's apply.py sentinel grammar BYTE-FOR-BYTE so the gate the curator runs at
+# §4.4 and the dashboard's reuse agree; kept LOCAL (not imported from curator) so schema/ never
+# depends on the curator package (no import cycle). The persisted id is run-scoped
+# (`{run_id}--{candidate_id}`, apply.region_sentinel_id) but this check is id-opaque — it only pairs
+# starts/ends and forbids unmatched/nested/duplicated markers, so it works for ANY id string.
+_BODY_SENTINEL_START_RE = re.compile(r"\A<!-- agora:body:start id=(?P<cid>.+) -->\Z")
+_BODY_SENTINEL_END_RE = re.compile(r"\A<!-- agora:body:end id=(?P<cid>.+) -->\Z")
 
 
 def _date_str(value: object) -> str | None:
@@ -401,6 +410,56 @@ def _resolve_targets(notes: list[Note]) -> set[str]:
     return known
 
 
+def _check_body_sentinels(note: Note) -> list[LintFinding]:
+    """L1-20: body-sentinel integrity (ADR-0011 §4.4 check 6 / ADR-0010 L1 sentinel integrity).
+
+    Scan the note BODY for ``agora:body:start/end`` markers and FAIL on any of: an unmatched start
+    (no closing end), an unmatched end (no open start), a mismatched id on an end, a nested/
+    overlapping pair (a start before the prior end), or a DUPLICATED id within the note. This is the
+    check that should have failed the corrupted dogfood run, where a cross-run MERGE / daily-append
+    produced two identical ``agora:body:start id=…`` markers in one note (the bare per-run
+    candidate_id collided); the persisted id is now run-scoped (apply.region_sentinel_id), and this
+    gate hard-rejects any note that still carries colliding/unbalanced markers.
+
+    Uses the SAME line grammar as :func:`agora_kb.curator.apply._extract_sentinel_regions` (kept
+    local to avoid importing the curator package into ``schema/``). A malformed marker line that
+    does not match the exact grammar is treated as ordinary content (not a sentinel) — like apply.
+    """
+    path = note.rel_path
+
+    def fail(msg: str) -> list[LintFinding]:
+        return [LintFinding("L1-20", "error", path, msg)]
+
+    open_cid: str | None = None
+    seen_ids: set[str] = set()
+    for line in note.body.split("\n"):
+        start = _BODY_SENTINEL_START_RE.match(line)
+        end = _BODY_SENTINEL_END_RE.match(line)
+        if start is not None:
+            if open_cid is not None:
+                return fail(
+                    f"nested/overlapping agora:body sentinel: start "
+                    f"id={start.group('cid')!r} before close of id={open_cid!r}"
+                )
+            open_cid = start.group("cid")
+            continue
+        if end is not None:
+            cid = end.group("cid")
+            if open_cid is None:
+                return fail(f"unmatched agora:body:end id={cid!r} (no open start)")
+            if cid != open_cid:
+                return fail(
+                    f"mismatched agora:body sentinel: end id={cid!r} closes start id={open_cid!r}"
+                )
+            if cid in seen_ids:
+                return fail(f"duplicated agora:body sentinel id={cid!r} in note")
+            seen_ids.add(cid)
+            open_cid = None
+    if open_cid is not None:
+        return fail(f"unmatched agora:body:start id={open_cid!r} (no closing end)")
+    return []
+
+
 def lint(
     layout: RepoLayout,
     *,
@@ -529,6 +588,11 @@ def lint(
 
         # L1-4 / L1-11 required frontmatter + enums.
         findings.extend(_check_required_frontmatter(n))
+
+        # L1-20 body-sentinel integrity (no unmatched/nested/duplicated agora:body markers,
+        # ADR-0011 §4.4 check 6). Runs on every note; only theme/daily carry markers, so a
+        # moc/index with no markers always passes.
+        findings.extend(_check_body_sentinels(n))
 
         # L1-12 dates (format always; no-future only when run_date given).
         findings.extend(_check_dates(n, run_date))

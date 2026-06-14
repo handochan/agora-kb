@@ -27,7 +27,7 @@ from agora_kb.core.inbox import Inbox
 from agora_kb.core.layout import RepoLayout
 from agora_kb.core.repo import Repo
 from agora_kb.core.state import StateStore
-from agora_kb.curator.apply import body_sentinels
+from agora_kb.curator.apply import body_sentinels, region_sentinel_id
 from agora_kb.curator.claim import curator_lock
 from agora_kb.curator.manifest import RunManifest, manifest_path, read_manifest, write_manifest
 from agora_kb.curator.worker import Backend, FakeBackend, RunReport, recover, run
@@ -171,7 +171,12 @@ def test_happy_path_publishes_theme_advances_ref_and_finalizes(tmp_path: Path) -
             ],
         }
     )
-    backend = FakeBackend(plan, prose={"c1": "The single curator holds a per-repo flock."})
+    # The PERSISTED sentinel id is run-scoped ({plan.run_id}--{candidate_id}); FakeBackend keys
+    # prose by the id it receives in needs_prose, so seed it run-scoped (plan.run_id="ignored").
+    backend = FakeBackend(
+        plan,
+        prose={region_sentinel_id("ignored", "c1"): "The single curator holds a per-repo flock."},
+    )
 
     report = _run(repo, backend)
 
@@ -241,7 +246,13 @@ def test_happy_path_syncs_owner_working_copy_so_query_sees_published_theme(tmp_p
     plan = _create_theme_plan("ignored", "c1", e1)
 
     report = _run(
-        repo, FakeBackend(plan, prose={"c1": "The single curator holds a per-repo flock."})
+        repo,
+        FakeBackend(
+            plan,
+            prose={
+                region_sentinel_id("ignored", "c1"): "The single curator holds a per-repo flock."
+            },
+        ),
     )
 
     assert report.status == "published"
@@ -253,6 +264,8 @@ def test_happy_path_syncs_owner_working_copy_so_query_sees_published_theme(tmp_p
     # The published theme is materialized on disk, so a plain Wiki over the repo root sees it.
     theme = layout.wiki_dir / "ai-tech" / "themes" / "curator-concurrency.md"
     assert theme.is_file()
+    # PASS-2 prose actually landed in the published body (run-scoped region id matched needs_prose).
+    assert "per-repo flock" in theme.read_text(encoding="utf-8")
     result = Wiki(RepoLayout(repo.root)).query("curator concurrency")
     assert result.status == "ok"
     assert any(h.path == "wiki/ai-tech/themes/curator-concurrency.md" for h in result.hits)
@@ -637,7 +650,7 @@ def test_author_failure_degrades_prose_but_run_still_publishes(tmp_path: Path) -
         fm, body = frontmatter.parse(theme.read_text(encoding="utf-8"))
         assert fm["body_status"] == "pending"
         assert "rogue" not in fm  # the out-of-region frontmatter tamper was discarded
-        start, end = body_sentinels("c1")
+        start, end = body_sentinels(region_sentinel_id("ignored", "c1"))
         region = body[body.find(start) + len(start) : body.find(end)]
         assert region.strip() == "> _summary pending_"
         assert lint(RepoLayout(published), taxonomy=TAXONOMY, run_date=RUN_DATE).ok
@@ -657,7 +670,9 @@ def test_stray_wikilink_is_stripped_and_run_publishes(tmp_path: Path) -> None:
     plan = _create_theme_plan("ignored", "c1", e1)
     # PASS 2 emits prose containing a stray [[ghost]] not in the plan links — §4.6 strips it
     # (delimiters removed, inner text kept) so the otherwise-good pass publishes, NOT degrades.
-    backend = _StrayLinkBackend(plan, prose={"c1": "See [[ghost]] for the flock detail."})
+    backend = _StrayLinkBackend(
+        plan, prose={region_sentinel_id("ignored", "c1"): "See [[ghost]] for the flock detail."}
+    )
 
     report = _run(repo, backend)
 
@@ -1030,8 +1045,10 @@ def test_append_daily_needs_prose_maps_to_the_daily_path(tmp_path: Path) -> None
         )
         needs, sentinels = _needs_prose_map(plan_default, wt, RUN_DATE)
         key = f"wiki/ai-tech/daily/ai-tech-{RUN_DATE}.md"
-        assert needs == {key: ["c1"]}
-        assert sentinels == {key: {"c1"}}
+        # The PERSISTED region id is run-scoped ({plan.run_id}--{candidate_id}); plan.run_id == "r".
+        region_id = region_sentinel_id("r", "c1")
+        assert needs == {key: [region_id]}
+        assert sentinels == {key: {region_id}}
 
 
 # --- (13) recovery: conservative return-to-inbox for an unpublished claimed/applied run ---------
@@ -1266,7 +1283,13 @@ def test_free_text_capture_publishes_with_engine_materialized_raw_source(tmp_pat
 
     plan = _create_theme_plan("ignored", "c1", e1)
     report = _run(
-        repo, FakeBackend(plan, prose={"c1": "The single curator holds a per-repo flock."})
+        repo,
+        FakeBackend(
+            plan,
+            prose={
+                region_sentinel_id("ignored", "c1"): "The single curator holds a per-repo flock."
+            },
+        ),
     )
 
     # The run published — the integration gap is closed.
@@ -1283,8 +1306,11 @@ def test_free_text_capture_publishes_with_engine_materialized_raw_source(tmp_pat
         # The raw/ artifact carries the immutable capture body (the engine wrote it from the event).
         assert raw.read_text(encoding="utf-8") == "One curator advances the branch under a lock."
         theme = published / "wiki" / "ai-tech" / "themes" / "curator-concurrency.md"
-        fm, _ = frontmatter.parse(theme.read_text(encoding="utf-8"))
+        theme_text = theme.read_text(encoding="utf-8")
+        fm, _ = frontmatter.parse(theme_text)
         assert fm["sources"] == [f"raw/ai-tech/{e1}.md"]
+        # PASS-2 prose actually landed (run-scoped region id matched the needs_prose instruction).
+        assert "per-repo flock" in theme_text
         result = lint(
             RepoLayout(published), taxonomy=TAXONOMY, run_date=RUN_DATE, run_id=report.run_id
         )

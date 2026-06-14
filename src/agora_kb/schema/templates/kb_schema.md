@@ -642,9 +642,10 @@ upload / raw path and a disposition only LINKS an existing asset.
 
 ### 7.3 PASS 2 — AUTHOR (prose only, between sentinels)
 
-For each note flagged `needs_prose`, you are re-invoked to write body prose ONLY between its
-`<!-- agora:body:start id=<candidate_id> -->` and `<!-- agora:body:end id=<candidate_id> -->` markers
-(sentinel id is always the `candidate_id`, never the basename — daily sections share a basename).
+For each note flagged `needs_prose`, you are re-invoked to write body prose ONLY between the
+worker-placed `<!-- agora:body:start id=<id> -->` and `<!-- agora:body:end id=<id> -->` markers
+(the worker keys each region with a run-scoped id `<run_id>--<candidate_id>` so merge/daily sub-regions
+never collide across runs — you only edit BETWEEN the markers you are handed and never author the id).
 `CREATE_THEME` wraps the whole body; `MERGE_INTO_THEME` wraps only a NEW augmentation sub-region appended
 below existing prose, so you never rewrite — and never lose — prior prose. Do NOT edit frontmatter, do
 NOT add new `[[wikilinks]]` (links are structure, owned by APPLY — stray links you add are

@@ -255,10 +255,17 @@ mutation itself, so correctness is by construction, not by post-hoc rejection:
 - add MOC entries (`<domain>-moc.md`) and root `index.md` entries;
 - render the templated `MARK_CONTESTED` callout + frontmatter (§2.1) byte-for-byte; create dated daily
   sections (§3.1);
-- place body sentinels keyed by **candidate_id** for notes flagged `needs_prose`:
-  `<!-- agora:body:start id=<candidate_id> -->` … `<!-- agora:body:end id=<candidate_id> -->`
+- place body sentinels for notes flagged `needs_prose`:
+  `<!-- agora:body:start id=<region-id> -->` … `<!-- agora:body:end id=<region-id> -->`
   (CREATE_THEME wraps the whole body; MERGE_INTO_THEME wraps only a NEW augmentation sub-region appended
-  below existing prose, so a small model never rewrites — and never loses — prior prose).
+  below existing prose, so a small model never rewrites — and never loses — prior prose). The PERSISTED
+  sentinel `<region-id>` is **run-scoped** — `{run_id}--{candidate_id}` (`apply.region_sentinel_id`,
+  the single source of truth shared by APPLY and the §4.2 `sentinels` set) — so it stays globally unique
+  across runs. The bare `candidate_id` (`c1`,`c2`,…) is reassigned per run by tier-2 dedup and is NOT
+  unique across runs: a `MERGE_INTO_THEME` or cross-run `APPEND_DAILY` appends a region into a note that
+  may already hold a region with the same bare id from a prior run, which would produce two identical
+  `id=c1` markers in one note (caught now by lint L1-20, §4.4 check 6). Within ONE run, regions still
+  get distinct ids because their `candidate_id`s differ.
 
 After APPLY the worktree holds a structurally-complete, link-resolved, schema-valid wiki with
 placeholder/empty body regions; `run.json.phase=applied`, `prose_complete=false`. The model never edits
@@ -268,9 +275,13 @@ frontmatter, links, MOC, index, `log.md`, or assets.
 Daily basenames are exempt from global uniqueness, so multiple non-gated `APPEND_DAILY` dispositions in one
 run may target the same `<domain>-<YYYY-MM-DD>.md`. The worker writes ONE dated `## ` section per
 disposition, in **stable manifest-event order** (sort by the first event_id of each disposition), each
-wrapped in its own sentinel pair keyed by `candidate_id`. PASS 2 authors each section independently per its
-candidate_id. This is why the sentinel id is `id=<candidate_id>` everywhere (§3, §8.2) and never `basename`
-(which would collide for daily).
+wrapped in its own sentinel pair keyed by the per-run `candidate_id`. PASS 2 authors each section
+independently per its candidate_id. This is why the sentinel id derives from `candidate_id` (§3, §8.2)
+and never `basename` (which would collide for daily). The PERSISTED id, however, is the **run-scoped**
+`{run_id}--{candidate_id}` (`apply.region_sentinel_id`): the bare per-run `candidate_id` is unique only
+*within* a run, so a cross-run append into the SAME daily file would otherwise re-use `id=c1` and collide
+with a prior run's region in that file — prefixing the globally-unique `run_id` keeps every region id
+unique while distinct candidates in one run still differ.
 
 ---
 ## 4. OUTPUT / SUCCESS-DETECTION CONTRACT (decide success WITHOUT trusting the model)
