@@ -217,6 +217,7 @@ def validate_plan(
     allowed_tags: set[str],
     domains: set[str],
     live_basenames: set[str],
+    theme_basenames: set[str],
     gated_candidate_ids: set[str],
 ) -> list[PlanError]:
     """Run ALL ten §4.1 PLAN checks against ``plan`` and return the failures (``[]`` iff valid).
@@ -229,7 +230,16 @@ def validate_plan(
       (ADR-0010 D6). TAXONOMY (check 4) rejects any tag ∉ ``allowed_tags`` or domain ∉ ``domains``.
     * ``live_basenames`` — every note basename present in the live worktree tree at ``base_commit``
       (the AUTHORITATIVE registry, §1.2). BASENAME (check 5) requires a new ``basename`` to be
-      absent here (daily exempt) and a ``target_basename`` to be present.
+      absent here (daily exempt, AND absent from ALL live basenames incl. MOC/index/daily so a new
+      theme can never collide with a non-theme note); LINK resolvability (check 7) resolves links
+      against this set ∪ same-plan new basenames.
+    * ``theme_basenames`` — the SUBSET of ``live_basenames`` that are THEME notes
+      (``wiki/<domain>/themes/<basename>.md``). MERGE_INTO_THEME / MARK_CONTESTED are theme-scoped
+      ops (§2 op table) whose ``target_basename`` is resolved by ``apply._resolve_target_path`` with
+      ``theme_only=True``: BASENAME (check 5) and PROVENANCE (check 8) therefore require their
+      ``target_basename`` to be in ``theme_basenames`` (NOT merely in ``live_basenames``), so a
+      validator-clean MERGE/CONTEST can never name a MOC/index/daily that APPLY then fails to
+      materialize (the "validate-valid but apply-unmaterializable" class).
     * ``gated_candidate_ids`` — candidate ids the worker flagged ``is_gated`` (kind=candidate OR
       confidence=low, §6). CANDIDATE-GATE (check 10) restricts their op to
       {MERGE_INTO_THEME, MARK_CONTESTED, DROP}.
@@ -324,9 +334,12 @@ def validate_plan(
             )
 
     # 5. BASENAME — a NEW basename (CREATE_THEME / APPEND_DAILY) must be absent from the live tree
-    #    AND unique within the plan (daily EXEMPT from both, §3.1); a target_basename
-    #    (MERGE / MARK_CONTESTED) must EXIST in the live tree. The bundle registry is advisory; this
-    #    re-checks against the authoritative live_basenames (§1.2).
+    #    (ALL basenames, incl. MOC/index/daily) AND unique within the plan (daily EXEMPT from both,
+    #    §3.1); a target_basename (MERGE / MARK_CONTESTED) must EXIST as a THEME note. MERGE/CONTEST
+    #    are theme-scoped ops (§2 op table; apply._resolve_target_path theme_only=True), so naming a
+    #    MOC/index/daily is rejected HERE — otherwise a validator-clean plan would crash APPLY. The
+    #    bundle registry is advisory; this re-checks against the authoritative live_basenames /
+    #    theme_basenames (§1.2).
     within_plan_new: set[str] = set()
     for disp in plan.dispositions:
         if disp.op in _BASENAME_OPS:
@@ -385,13 +398,13 @@ def validate_plan(
                         ),
                     )
                 )
-            elif target not in live_basenames:
+            elif target not in theme_basenames:
                 errors.append(
                     PlanError(
                         check="BASENAME",
                         message=(
-                            f"candidate {disp.candidate_id!r}: target_basename {target!r} does "
-                            f"not exist in the live worktree tree"
+                            f"candidate {disp.candidate_id!r}: target_basename {target!r} is not "
+                            f"an existing THEME note (merge/contest may only target a theme)"
                         ),
                     )
                 )
@@ -449,9 +462,10 @@ def validate_plan(
                 )
 
     # 8. PROVENANCE — every content op (CREATE_THEME / APPEND_DAILY / MERGE_INTO_THEME /
-    #    MARK_CONTESTED) lists ≥1 event_id; the target-bearing ops' target_basename must exist (the
-    #    existence half overlaps BASENAME check 5 but is restated per §4.1.8 so PROVENANCE is a
-    #    complete check). DROP/NOOP need no provenance.
+    #    MARK_CONTESTED) lists ≥1 event_id; the target-bearing ops' target_basename must exist AS A
+    #    THEME (the existence half overlaps BASENAME check 5 but is restated per §4.1.8 so it is a
+    #    complete check — and like check 5 it grades against theme_basenames, since MERGE/CONTEST
+    #    only resolve to a theme at APPLY). DROP/NOOP need no provenance.
     for disp in plan.dispositions:
         if disp.op in CONTENT_OPS and not disp.event_ids:
             errors.append(
@@ -465,13 +479,13 @@ def validate_plan(
             )
         if disp.op in _TARGET_OPS:
             target = disp.target_basename
-            if target is not None and target not in live_basenames:
+            if target is not None and target not in theme_basenames:
                 errors.append(
                     PlanError(
                         check="PROVENANCE",
                         message=(
                             f"candidate {disp.candidate_id!r}: {disp.op} target_basename "
-                            f"{target!r} does not exist in the live worktree tree"
+                            f"{target!r} is not an existing THEME note in the live worktree tree"
                         ),
                     )
                 )

@@ -50,6 +50,7 @@ __all__ = [
     "extract_json_object",
     "parse_taxonomy",
     "related_basenames",
+    "related_theme_basenames",
     "normalize_plan",
     "sanitize_prose",
     "parse_author_context",
@@ -243,6 +244,35 @@ def related_basenames(related_docs: list[dict]) -> set[str]:
     return names
 
 
+def related_theme_basenames(related_docs: list[dict]) -> set[str]:
+    """Return ``Path(hit["path"]).stem`` for THEME hits (paths containing ``/themes/``).
+
+    The THEME-only subset of :func:`related_basenames`: MERGE_INTO_THEME / MARK_CONTESTED resolve
+    their target (and a contest's competing notes) to a theme at APPLY
+    (``apply._resolve_target_path`` ``theme_only=True``), and the §4.1 BASENAME/PROVENANCE checks
+    now require those targets to be THEME notes. The shim mirrors that so it never EMITS a merge/
+    contest naming a MOC/index/daily (e.g. contesting the domain MOC) — a defensive-quality
+    narrowing; the worker re-grades regardless. Malformed/missing entries are skipped.
+    """
+    names: set[str] = set()
+    for doc in related_docs:
+        if not isinstance(doc, dict):
+            continue
+        hits = doc.get("hits")
+        if not isinstance(hits, list):
+            continue
+        for hit in hits:
+            if not isinstance(hit, dict):
+                continue
+            path = hit.get("path")
+            if not isinstance(path, str) or "/themes/" not in path:
+                continue
+            stem = Path(path).stem
+            if stem:
+                names.add(stem)
+    return names
+
+
 # --- slugging + prose sanitation --------------------------------------------------------------
 
 
@@ -318,6 +348,7 @@ def normalize_plan(
     allowed_tags: set[str],
     domains: set[str],
     live_basenames: set[str],
+    live_theme_basenames: set[str],
     run_id: str,
 ) -> dict:
     """Reshape the model's raw plan into one valid-by-construction vs :func:`plan.validate_plan`.
@@ -331,8 +362,9 @@ def normalize_plan(
       union is an exact partition of the manifest;
     * op forced into the closed vocabulary, with cascading downgrades to DROP when the model's
       choice can't be honored (gated candidate originating; no valid domain; un-slugifiable name; a
-      MERGE/CONTEST target not in the live registry; a MARK_CONTESTED with no resolvable competing
-      link — which validate_plan accepts but apply._apply_contested rejects);
+      MERGE/CONTEST target not in the live THEME registry — ``live_theme_basenames``, since those
+      ops may only target a theme; a MARK_CONTESTED with no resolvable competing THEME link — which
+      validate_plan / apply._apply_contested reject);
     * tags filtered to ``allowed_tags``; domain ∈ ``domains``; status in the C1 enum (never
       ``contested`` outside MARK_CONTESTED); basenames slugified + made unique; links filtered to
       resolvable basenames; aliases slugified + de-collided against basenames ∪ aliases (so the
@@ -414,19 +446,23 @@ def normalize_plan(
             # domain is guaranteed valid here (step 3); daily is exempt from uniqueness.
             basename = f"{domain}-{run_date}"
         elif op in _TARGET_OPS:
+            # MERGE/CONTEST may only target a THEME (apply._resolve_target_path theme_only=True;
+            # validate_plan now requires target ∈ theme_basenames), so a non-theme target downgrades
+            # to DROP exactly like an unknown target would.
             md_target = md.get("target_basename")
-            if isinstance(md_target, str) and md_target in live_basenames:
+            if isinstance(md_target, str) and md_target in live_theme_basenames:
                 target_basename = md_target
             else:
                 op = "DROP"
             if op == "MARK_CONTESTED":
-                # apply._apply_contested needs >=1 resolvable competing basename in links;
-                # validate_plan does not enforce this, so downgrade to DROP when none resolve.
-                resolvable_now = live_basenames | within_plan_new
+                # apply._apply_contested needs >=1 resolvable competing THEME in links;
+                # validate_plan does not enforce non-emptiness, so downgrade to DROP when none
+                # resolve. Competitors must themselves be THEME notes (a contest names rival themes,
+                # never a MOC/index/daily) — filter to live_theme_basenames, excluding the target.
                 contest_links = [
                     link
                     for link in _as_str_list(md.get("links"))
-                    if link in resolvable_now and link != target_basename
+                    if link in live_theme_basenames and link != target_basename
                 ]
                 if not contest_links:
                     op = "DROP"
@@ -737,6 +773,7 @@ def run_plan(
                 related_by_id[cid] = doc
 
     live_basenames = related_basenames(list(related_by_id.values()))
+    live_theme_basenames = related_theme_basenames(list(related_by_id.values()))
 
     resolved_model = _resolve_model(model, host)
 
@@ -761,6 +798,7 @@ def run_plan(
         allowed_tags=allowed_tags,
         domains=domains,
         live_basenames=live_basenames,
+        live_theme_basenames=live_theme_basenames,
         run_id=run_id,
     )
     return json.dumps(plan)

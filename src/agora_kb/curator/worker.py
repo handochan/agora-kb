@@ -66,7 +66,7 @@ from ..core.repo import GitError, Repo
 from ..core.state import CuratorState, StateStore
 from ..schema.emit import Taxonomy
 from ..schema.lint import lint
-from ..schema.notes import parse_all_notes
+from ..schema.notes import Note, parse_all_notes
 from .apply import (
     apply_plan,
     body_sentinels,
@@ -159,6 +159,20 @@ class FakeBackend:
                     continue
                 text = _replace_sentinel_region(text, cid, prose)
             path.write_text(text, encoding="utf-8")
+
+
+def _is_theme_note(note: Note) -> bool:
+    """True iff ``note`` lives at ``wiki/<domain>/themes/<basename>.md`` (a THEME note).
+
+    Path-based, mirroring :func:`apply._resolve_target_path`'s ``theme_only`` semantics so the §4.1
+    BASENAME/PROVENANCE THEME-target check grades EXACTLY what APPLY will accept — robust to a wrong
+    or missing ``type:`` frontmatter value (the live tree's directory is authoritative).
+    MERGE/CONTEST may only target such a note; a MOC/index/daily basename must be rejected at the
+    PLAN gate rather than crash APPLY.
+    """
+    parts = note.rel_path.split("/")
+    # wiki / <domain> / themes / <basename>.md  (exactly four POSIX segments)
+    return len(parts) == 4 and parts[0] == "wiki" and parts[2] == "themes"
 
 
 def _replace_sentinel_region(text: str, candidate_id: str, prose: str) -> str:
@@ -283,7 +297,12 @@ def _run_locked(
     # the committed worktree, so the §4.1 BASENAME/LINK checks grade against the real tree.
     with repo.worktree(at=base_commit) as wt:
         wt_layout = RepoLayout(wt)
-        live_basenames = {n.basename for n in parse_all_notes(wt_layout)}
+        # Parse the live tree ONCE and derive BOTH registries: the all-basenames set (CREATE
+        # uniqueness + LINK resolvability grade against this) and the THEME-only subset (MERGE/
+        # CONTEST targets grade against this, mirroring apply._resolve_target_path theme_only).
+        notes = parse_all_notes(wt_layout)
+        live_basenames = {n.basename for n in notes}
+        theme_basenames = {n.basename for n in notes if _is_theme_note(n)}
 
         # ADR-0011 §0 / §4.3: append `_agora_scratch/` to the WORKTREE's own .gitignore BEFORE
         # invoking the backend, so the backend's PASS-1 plan.json + any model scratch are writable
@@ -327,6 +346,7 @@ def _run_locked(
             allowed_tags=set(taxonomy.allowed_tags),
             domains=set(taxonomy.domains),
             live_basenames=live_basenames,
+            theme_basenames=theme_basenames,
             gated_candidate_ids=bundle.gated_candidate_ids,
         )
         if plan_errors:

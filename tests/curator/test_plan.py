@@ -29,6 +29,9 @@ E3 = "2026-06-13T02-42-00.000Z--beef01"
 ALLOWED_TAGS = {"curator", "concurrency", "architecture"}
 DOMAINS = {"ai-tech", "economy", "general"}
 LIVE = {"cqrs", "single-writer-invariant", "ai-tech-moc"}
+# The THEME subset of LIVE (wiki/<domain>/themes/<basename>.md): the MOC ``ai-tech-moc`` is NOT a
+# theme, so MERGE/CONTEST may never target it (BASENAME/PROVENANCE grade against THEMES, not LIVE).
+THEMES = {"cqrs", "single-writer-invariant"}
 
 
 def _disp(**overrides: object) -> Disposition:
@@ -222,6 +225,7 @@ def _validate(plan: Plan, *, gated: set[str] | None = None) -> list[PlanError]:
         allowed_tags=ALLOWED_TAGS,
         domains=DOMAINS,
         live_basenames=LIVE,
+        theme_basenames=THEMES,
         gated_candidate_ids=gated or set(),
     )
 
@@ -316,6 +320,7 @@ def test_coverage_exact_partition_passes() -> None:
         allowed_tags=ALLOWED_TAGS,
         domains=DOMAINS,
         live_basenames=LIVE,
+        theme_basenames=THEMES,
         gated_candidate_ids=set(),
     )
     assert errors == []
@@ -329,6 +334,7 @@ def test_coverage_orphaned_manifest_event_fails() -> None:
         allowed_tags=ALLOWED_TAGS,
         domains=DOMAINS,
         live_basenames=LIVE,
+        theme_basenames=THEMES,
         gated_candidate_ids=set(),
     )
     assert "COVERAGE" in _checks(errors)
@@ -346,6 +352,7 @@ def test_coverage_duplicate_emits_exact_ordered_errors() -> None:
         allowed_tags=ALLOWED_TAGS,
         domains=DOMAINS,
         live_basenames=LIVE,
+        theme_basenames=THEMES,
         gated_candidate_ids=set(),
     )
     coverage = [e for e in errors if e.check == "COVERAGE"]
@@ -384,6 +391,7 @@ def test_coverage_duplicate_event_fails() -> None:
         allowed_tags=ALLOWED_TAGS,
         domains=DOMAINS,
         live_basenames=LIVE,
+        theme_basenames=THEMES,
         gated_candidate_ids=set(),
     )
     assert "COVERAGE" in _checks(errors)
@@ -397,6 +405,7 @@ def test_coverage_foreign_event_fails() -> None:
         allowed_tags=ALLOWED_TAGS,
         domains=DOMAINS,
         live_basenames=LIVE,
+        theme_basenames=THEMES,
         gated_candidate_ids=set(),
     )
     assert "COVERAGE" in _checks(errors)
@@ -444,6 +453,7 @@ def test_closed_vocab_all_six_ops_pass() -> None:
         allowed_tags=ALLOWED_TAGS,
         domains=DOMAINS,
         live_basenames=LIVE,
+        theme_basenames=THEMES,
         gated_candidate_ids=set(),
     )
     assert "CLOSED-VOCAB" not in _checks(errors)
@@ -475,6 +485,7 @@ def test_closed_vocab_unknown_op_fails_via_construct() -> None:
         allowed_tags=ALLOWED_TAGS,
         domains=DOMAINS,
         live_basenames=LIVE,
+        theme_basenames=THEMES,
         gated_candidate_ids=set(),
     )
     assert "CLOSED-VOCAB" in _checks(errors)
@@ -528,6 +539,7 @@ def test_basename_new_and_target_existing_pass() -> None:
         allowed_tags=ALLOWED_TAGS,
         domains=DOMAINS,
         live_basenames=LIVE,
+        theme_basenames=THEMES,
         gated_candidate_ids=set(),
     )
     # This plan is intended to be FULLY valid (not merely BASENAME-clean), so assert no findings.
@@ -536,6 +548,14 @@ def test_basename_new_and_target_existing_pass() -> None:
 
 def test_basename_collides_with_live_tree_fails() -> None:
     errors = _validate(_plan(_disp(basename="cqrs", links=())))  # already in LIVE
+    assert "BASENAME" in _checks(errors)
+
+
+def test_basename_create_theme_collides_with_moc_fails() -> None:
+    # CREATE_THEME uniqueness must keep checking ALL live basenames (incl. the MOC), NOT just
+    # themes: a new theme may not collide with a MOC/index/daily name even though MERGE/CONTEST
+    # targets are now theme-only.
+    errors = _validate(_plan(_disp(basename="ai-tech-moc", links=())))  # MOC name, in LIVE
     assert "BASENAME" in _checks(errors)
 
 
@@ -562,6 +582,7 @@ def test_basename_duplicate_within_plan_fails() -> None:
         allowed_tags=ALLOWED_TAGS,
         domains=DOMAINS,
         live_basenames=LIVE,
+        theme_basenames=THEMES,
         gated_candidate_ids=set(),
     )
     assert "BASENAME" in _checks(errors)
@@ -583,6 +604,71 @@ def test_basename_missing_target_fails() -> None:
     )
     errors = _validate(plan)
     assert "BASENAME" in _checks(errors)
+
+
+def test_basename_merge_target_non_theme_fails() -> None:
+    # ``ai-tech-moc`` is in LIVE but is a MOC, NOT a theme (not in THEMES). MERGE_INTO_THEME may
+    # only target a theme (apply._resolve_target_path theme_only=True), so naming the MOC is a
+    # BASENAME rejection — otherwise validate_plan would accept a plan that crashes APPLY.
+    plan = _plan(
+        _disp(
+            op="MERGE_INTO_THEME",
+            domain=None,
+            basename=None,
+            target_basename="ai-tech-moc",  # in LIVE, NOT in THEMES
+            title=None,
+            summary="merge",
+            tags=(),
+            aliases=(),
+            links=(),
+        )
+    )
+    errors = _validate(plan)
+    assert "BASENAME" in _checks(errors)
+    basename_errors = [e for e in errors if e.check == "BASENAME"]
+    assert any("is not an existing THEME note" in e.message for e in basename_errors)
+
+
+def test_basename_contest_target_non_theme_fails() -> None:
+    # Same for MARK_CONTESTED: the MOC is in LIVE but not a theme, so it is rejected.
+    plan = _plan(
+        _disp(
+            op="MARK_CONTESTED",
+            domain=None,
+            basename=None,
+            target_basename="ai-tech-moc",  # in LIVE, NOT in THEMES
+            title=None,
+            summary="contradicts",
+            status="contested",
+            tags=(),
+            aliases=(),
+            links=(),
+            needs_prose=False,
+        )
+    )
+    errors = _validate(plan)
+    assert "BASENAME" in _checks(errors)
+    assert any(
+        "is not an existing THEME note" in e.message for e in errors if e.check == "BASENAME"
+    )
+
+
+def test_basename_merge_target_theme_passes() -> None:
+    # The SAME shape but targeting ``cqrs`` (a real theme in THEMES) is fully valid.
+    plan = _plan(
+        _disp(
+            op="MERGE_INTO_THEME",
+            domain=None,
+            basename=None,
+            target_basename="cqrs",  # in THEMES
+            title=None,
+            summary="merge",
+            tags=(),
+            aliases=(),
+            links=(),
+        )
+    )
+    assert _validate(plan) == []
 
 
 def test_basename_daily_exempt_from_uniqueness() -> None:
@@ -615,6 +701,7 @@ def test_basename_daily_exempt_from_uniqueness() -> None:
         allowed_tags=ALLOWED_TAGS,
         domains=DOMAINS,
         live_basenames=LIVE,
+        theme_basenames=THEMES,
         gated_candidate_ids=set(),
     )
     assert "BASENAME" not in _checks(errors)
@@ -694,6 +781,7 @@ def test_links_resolve_to_live_and_same_plan() -> None:
         allowed_tags=ALLOWED_TAGS,
         domains=DOMAINS,
         live_basenames=LIVE,
+        theme_basenames=THEMES,
         gated_candidate_ids=set(),
     )
     assert "LINK-RESOLVABILITY" not in _checks(errors)
@@ -724,6 +812,7 @@ def test_provenance_missing_event_ids_on_content_op_fails() -> None:
         allowed_tags=ALLOWED_TAGS,
         domains=DOMAINS,
         live_basenames=LIVE,
+        theme_basenames=THEMES,
         gated_candidate_ids=set(),
     )
     assert "PROVENANCE" in _checks(errors)
@@ -775,6 +864,7 @@ def test_provenance_drop_needs_no_event_ids() -> None:
         allowed_tags=ALLOWED_TAGS,
         domains=DOMAINS,
         live_basenames=LIVE,
+        theme_basenames=THEMES,
         gated_candidate_ids=set(),
     )
     assert "PROVENANCE" not in _checks(errors)

@@ -115,6 +115,25 @@ def test_related_basenames_union() -> None:
     assert ob.related_basenames(docs) == {"foo", "bar", "baz"}
 
 
+def test_related_theme_basenames_only_theme_paths() -> None:
+    # Only hits whose path contains "/themes/" are themes; a MOC/index/daily path is excluded.
+    docs = [
+        {
+            "hits": [
+                {"path": "wiki/ai-tech/themes/foo.md"},  # theme -> kept
+                {"path": "wiki/ai-tech/ai-tech-moc.md"},  # MOC -> excluded
+                {"path": "wiki/ai-tech/daily/ai-tech-2026-06-13.md"},  # daily -> excluded
+            ]
+        },
+        {"hits": [{"path": "wiki/economy/themes/bar.md"}, {"path": "index.md"}]},  # theme + index
+        {"hits": "malformed"},
+        "not a dict",
+    ]
+    assert ob.related_theme_basenames(docs) == {"foo", "bar"}
+    # It is a subset of the all-stems set.
+    assert ob.related_theme_basenames(docs) <= ob.related_basenames(docs)
+
+
 # --- normalize_plan (the crux) ----------------------------------------------------------------
 
 
@@ -166,6 +185,7 @@ def test_normalize_plan_passes_validator() -> None:
         allowed_tags=ALLOWED_TAGS,
         domains=DOMAINS,
         live_basenames=live_basenames,
+        live_theme_basenames=live_basenames,  # "existing-note" is a theme (c2 merges into it)
         run_id=RUN_ID,
     )
     plan = Plan.from_json(json.dumps(plan_dict))
@@ -175,6 +195,7 @@ def test_normalize_plan_passes_validator() -> None:
         allowed_tags=ALLOWED_TAGS,
         domains=DOMAINS,
         live_basenames=live_basenames,
+        theme_basenames=live_basenames,
         gated_candidate_ids={"c2"},
     )
     assert errors == [], errors
@@ -210,6 +231,7 @@ def test_normalize_plan_gated_create_downgraded_to_drop() -> None:
         allowed_tags=ALLOWED_TAGS,
         domains=DOMAINS,
         live_basenames=set(),
+        live_theme_basenames=set(),
         run_id=RUN_ID,
     )
     disp = plan_dict["dispositions"][0]
@@ -244,6 +266,7 @@ def test_normalize_plan_merge_unknown_target_downgraded_to_drop() -> None:
         allowed_tags=ALLOWED_TAGS,
         domains=DOMAINS,
         live_basenames={"existing-note"},
+        live_theme_basenames={"existing-note"},
         run_id=RUN_ID,
     )
     disp = plan_dict["dispositions"][0]
@@ -257,9 +280,118 @@ def test_normalize_plan_merge_unknown_target_downgraded_to_drop() -> None:
         allowed_tags=ALLOWED_TAGS,
         domains=DOMAINS,
         live_basenames={"existing-note"},
+        theme_basenames={"existing-note"},
         gated_candidate_ids=set(),
     )
     assert errors == [], errors
+
+
+def test_normalize_plan_merge_non_theme_target_downgraded_to_drop() -> None:
+    """A MERGE_INTO_THEME whose target is a live note but NOT a theme (e.g. the MOC) becomes DROP.
+
+    The target IS in ``live_basenames`` but absent from ``live_theme_basenames`` — MERGE/CONTEST may
+    only target a theme (apply._resolve_target_path theme_only=True / validate_plan), so the shim
+    downgrades exactly like an unknown target rather than emitting a plan APPLY would crash on.
+    """
+    candidates = [_candidate("c1", text="claim", event_id=E1, gated=False, domain="ai-tech")]
+    raw = {
+        "dispositions": [
+            {
+                "candidate_id": "c1",
+                "op": "MERGE_INTO_THEME",
+                "target_basename": "ai-tech-moc",  # live, but a MOC (not a theme)
+                "reason": "x",
+            }
+        ]
+    }
+    plan_dict = ob.normalize_plan(
+        raw,
+        candidates=candidates,
+        allowed_tags=ALLOWED_TAGS,
+        domains=DOMAINS,
+        live_basenames={"existing-note", "ai-tech-moc"},
+        live_theme_basenames={"existing-note"},  # MOC excluded
+        run_id=RUN_ID,
+    )
+    disp = plan_dict["dispositions"][0]
+    assert disp["op"] == "DROP"
+    assert disp["target_basename"] is None
+    plan = Plan.from_json(json.dumps(plan_dict))
+    errors = validate_plan(
+        plan,
+        manifest_event_ids={E1},
+        allowed_tags=ALLOWED_TAGS,
+        domains=DOMAINS,
+        live_basenames={"existing-note", "ai-tech-moc"},
+        theme_basenames={"existing-note"},
+        gated_candidate_ids=set(),
+    )
+    assert errors == [], errors
+
+
+def test_normalize_plan_contest_non_theme_target_downgraded_to_drop() -> None:
+    """A MARK_CONTESTED whose target is a non-theme (the MOC) becomes DROP."""
+    candidates = [_candidate("c1", text="claim", event_id=E1, gated=False, domain="ai-tech")]
+    raw = {
+        "dispositions": [
+            {
+                "candidate_id": "c1",
+                "op": "MARK_CONTESTED",
+                "target_basename": "ai-tech-moc",  # MOC, not a theme
+                "links": ["existing-note"],  # a real theme competitor
+                "reason": "x",
+            }
+        ]
+    }
+    plan_dict = ob.normalize_plan(
+        raw,
+        candidates=candidates,
+        allowed_tags=ALLOWED_TAGS,
+        domains=DOMAINS,
+        live_basenames={"existing-note", "ai-tech-moc"},
+        live_theme_basenames={"existing-note"},
+        run_id=RUN_ID,
+    )
+    disp = plan_dict["dispositions"][0]
+    assert disp["op"] == "DROP"
+    assert disp["target_basename"] is None
+    assert disp["links"] == []
+
+
+def test_normalize_plan_contest_only_non_theme_link_downgraded_to_drop() -> None:
+    """A MARK_CONTESTED whose ONLY competing link is a non-theme downgrades to DROP (empty links).
+
+    The target is a real theme, but the sole competitor names the MOC. A contest names rival THEMES;
+    the non-theme competitor is filtered out, leaving zero competing links, which downgrades the
+    contest to DROP via the existing empty-contest-links rule.
+    """
+    candidates = [_candidate("c1", text="claim", event_id=E1, gated=False, domain="ai-tech")]
+    raw = {
+        "dispositions": [
+            {
+                "candidate_id": "c1",
+                "op": "MARK_CONTESTED",
+                "target_basename": "existing-note",  # a real theme
+                "links": ["ai-tech-moc"],  # only competitor is a MOC -> filtered out
+                "reason": "x",
+            }
+        ]
+    }
+    plan_dict = ob.normalize_plan(
+        raw,
+        candidates=candidates,
+        allowed_tags=ALLOWED_TAGS,
+        domains=DOMAINS,
+        live_basenames={"existing-note", "ai-tech-moc"},
+        live_theme_basenames={"existing-note"},
+        run_id=RUN_ID,
+    )
+    disp = plan_dict["dispositions"][0]
+    assert disp["op"] == "DROP"
+    assert disp["target_basename"] is None
+    assert disp["links"] == []
+    assert disp["status"] is None
+    assert disp["event_ids"] == [E1]
 
 
 def test_normalize_plan_unknown_op_becomes_drop() -> None:
@@ -271,6 +403,7 @@ def test_normalize_plan_unknown_op_becomes_drop() -> None:
         allowed_tags=ALLOWED_TAGS,
         domains=DOMAINS,
         live_basenames=set(),
+        live_theme_basenames=set(),
         run_id=RUN_ID,
     )
     assert plan_dict["dispositions"][0]["op"] == "DROP"
@@ -305,6 +438,7 @@ def test_normalize_plan_create_basename_uniqueness() -> None:
         allowed_tags=ALLOWED_TAGS,
         domains=DOMAINS,
         live_basenames={"mutex-guards"},
+        live_theme_basenames={"mutex-guards"},
         run_id=RUN_ID,
     )
     bases = [d["basename"] for d in plan_dict["dispositions"]]
@@ -317,6 +451,7 @@ def test_normalize_plan_create_basename_uniqueness() -> None:
         allowed_tags=ALLOWED_TAGS,
         domains=DOMAINS,
         live_basenames={"mutex-guards"},
+        theme_basenames={"mutex-guards"},
         gated_candidate_ids=set(),
     )
     assert errors == [], errors
@@ -335,6 +470,7 @@ def test_normalize_plan_no_valid_domain_downgrades() -> None:
         allowed_tags=ALLOWED_TAGS,
         domains=DOMAINS,
         live_basenames=set(),
+        live_theme_basenames=set(),
         run_id=RUN_ID,
     )
     assert plan_dict["dispositions"][0]["op"] == "DROP"
@@ -368,6 +504,7 @@ def test_normalize_plan_contested_no_links_downgraded_to_drop(tmp_path) -> None:
         allowed_tags=ALLOWED_TAGS,
         domains=DOMAINS,
         live_basenames={"existing-note"},
+        live_theme_basenames={"existing-note"},
         run_id=RUN_ID,
     )
     disp = plan_dict["dispositions"][0]
@@ -385,6 +522,7 @@ def test_normalize_plan_contested_no_links_downgraded_to_drop(tmp_path) -> None:
         allowed_tags=ALLOWED_TAGS,
         domains=DOMAINS,
         live_basenames={"existing-note"},
+        theme_basenames={"existing-note"},
         gated_candidate_ids=set(),
     )
     assert errors == [], errors
@@ -421,6 +559,7 @@ def test_normalize_plan_contested_with_link_survives() -> None:
         allowed_tags=ALLOWED_TAGS,
         domains=DOMAINS,
         live_basenames={"existing-note", "rival-note"},
+        live_theme_basenames={"existing-note", "rival-note"},
         run_id=RUN_ID,
     )
     disp = plan_dict["dispositions"][0]
@@ -436,6 +575,7 @@ def test_normalize_plan_contested_with_link_survives() -> None:
         allowed_tags=ALLOWED_TAGS,
         domains=DOMAINS,
         live_basenames={"existing-note", "rival-note"},
+        theme_basenames={"existing-note", "rival-note"},
         gated_candidate_ids=set(),
     )
     assert errors == [], errors
@@ -479,6 +619,7 @@ def test_normalize_plan_colliding_alias_dropped() -> None:
         allowed_tags=ALLOWED_TAGS,
         domains=DOMAINS,
         live_basenames={"existing-note"},
+        live_theme_basenames={"existing-note"},
         run_id=RUN_ID,
     )
     by_id = {d["candidate_id"]: d for d in plan_dict["dispositions"]}

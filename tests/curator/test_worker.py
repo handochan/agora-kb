@@ -418,6 +418,77 @@ def test_invalid_plan_fails_leaves_branch_unchanged_and_events_in_failed(tmp_pat
     assert StateStore(layout).load().counters.failed == 0
 
 
+def test_merge_targeting_a_moc_is_rejected_by_validate_plan_not_crash_apply(tmp_path: Path) -> None:
+    """A MERGE_INTO_THEME whose target is a MOC (not a theme) FAILS at the §4.1 PLAN gate.
+
+    Regression for the integrity-core bug: live_basenames includes MOC/index/daily stems, so a
+    MERGE/CONTEST naming the domain MOC was validate_plan-ACCEPTED but apply._resolve_target_path
+    (theme_only=True) then raised ApplyError — uncaught around apply_plan — crashing the run with
+    the events stuck in processing/. With the THEME-only target check the plan is rejected cleanly
+    here: the run FAILS (nothing published, branch unchanged), never an uncaught APPLY traceback.
+    """
+    repo = _init_repo(tmp_path)
+    layout = repo.layout
+    inbox = Inbox(layout)
+
+    # Run 1 (happy path): publish a theme so the domain MOC ``ai-tech-moc`` is materialized live.
+    e0 = _write_capture(inbox, text="One curator advances the branch under a lock.", second=5)
+    _seed_raw(repo, e0)
+    report0 = _run(
+        repo,
+        FakeBackend(
+            _create_theme_plan("ignored", "c1", e0),
+            prose={"c1": "The single curator holds a per-repo flock."},
+        ),
+    )
+    assert report0.status == "published"
+    # Sanity: the MOC exists in the live tree but is NOT a theme.
+    with repo.worktree(at=repo.branch_commit()) as wt:
+        assert (wt / "wiki" / "ai-tech" / "ai-tech-moc.md").is_file()
+        assert not (wt / "wiki" / "ai-tech" / "themes" / "ai-tech-moc.md").exists()
+
+    # Run 2: a MERGE_INTO_THEME whose target is the MOC basename — in live_basenames, NOT a theme.
+    e1 = _write_capture(inbox, text="A claim that overlaps an existing topic.", second=10)
+    _seed_raw(repo, e1)
+    # Capture the curated tip AFTER seeding raw/ (which advances the branch) so the failed run's
+    # "ref unchanged" assertion compares against the true pre-run base.
+    pre_run_tip = repo.branch_commit()
+    bad_plan = json.dumps(
+        {
+            "schema_version": 1,
+            "run_id": "ignored",
+            "finished": True,
+            "dispositions": [
+                {
+                    "candidate_id": "c1",
+                    "event_ids": [e1],
+                    "op": "MERGE_INTO_THEME",
+                    "domain": "ai-tech",
+                    "target_basename": "ai-tech-moc",  # a MOC, not a theme
+                    "title": None,
+                    "summary": "Overlaps the topic.",
+                    "status": "active",
+                    "tags": [],
+                    "aliases": [],
+                    "links": [],
+                    "needs_prose": True,
+                    "reason": "Merge into existing (but it's the MOC).",
+                }
+            ],
+        }
+    )
+    report = _run(repo, FakeBackend(bad_plan, prose={"c1": "unreachable"}))
+
+    # The run FAILS at the PLAN gate (BASENAME), publishing NOTHING — never an uncaught ApplyError.
+    assert report.status == "failed"
+    assert repo.branch_commit() == pre_run_tip  # ref unchanged by the failed run
+    failed_run = layout.failed_dir / RUN_DATE / report.run_id
+    error = json.loads((failed_run / "error.json").read_text(encoding="utf-8"))
+    assert any("BASENAME" in c for c in error["failed_checks"])
+    # Nothing stuck in processing/ (the crash symptom): the dir was cleared.
+    assert not (layout.processing_dir / report.run_id).exists()
+
+
 def test_plan_failure_goes_terminal_to_failed_at_retry_budget(tmp_path: Path) -> None:
     """§5.1: once an event reaches curator.max_attempts, a PLAN failure moves it TERMINAL to failed.
 
