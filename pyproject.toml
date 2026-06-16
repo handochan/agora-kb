@@ -33,10 +33,12 @@ dev = [
     "pytest>=8.0",
     "ruff>=0.6",
     "mypy>=1.11",
+    "types-PyYAML>=6.0",  # mypy stubs for pyyaml
 ]
 
 [project.scripts]
 agora = "agora_kb.cli:main"
+agora-ollama-brain = "agora_kb.adapters.ollama_brain:main"
 
 [build-system]
 requires = ["hatchling"]
