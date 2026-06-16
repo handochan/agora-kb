@@ -6,8 +6,9 @@ module owns TODAY (the deterministic gates own success):
 
 * :meth:`plan` runs the configured argv with ``cwd`` = the bundle dir and returns its STDOUT
   verbatim (the worker parses that as ``plan.json``); a non-zero PASS-1 exit becomes a clear error;
-* :meth:`author` runs the configured argv with ``cwd`` = the worktree once per ``needs_prose`` note,
-  and the stub fills the candidate-id body sentinel in place;
+* :meth:`author` runs the configured argv with ``cwd`` = the worktree once per REGION, feeding the
+  §8.2 GROUNDED prompt (op + title + summary + verbatim source + the file/candidate_ids control
+  lines) on stdin, and the stub fills the candidate-id body sentinel in place;
 * a missing/unrunnable executable surfaces as :class:`BackendUnavailableError`, not a raw OSError.
 """
 
@@ -21,6 +22,7 @@ import pytest
 from agora_kb.curator.apply import body_sentinels
 from agora_kb.curator.backends import BackendSpec
 from agora_kb.curator.subprocess_backend import BackendUnavailableError, SubprocessBackend
+from agora_kb.curator.worker import AuthorRegion
 
 
 def _python_spec(name: str, code: str) -> BackendSpec:
@@ -103,11 +105,14 @@ def test_author_fills_sentinel_region_in_worktree(tmp_path: Path) -> None:
     )
     backend = SubprocessBackend(_python_spec("stub", code))
 
-    backend.author(tmp_path, {note_rel: ["c1"]})
+    region = AuthorRegion(
+        op="CREATE_THEME", title="T", summary="s", source_text="curator holds a per-repo flock"
+    )
+    backend.author(tmp_path, {note_rel: ["c1"]}, {"c1": region})
 
     text = note.read_text(encoding="utf-8")
-    region = text[text.find(start) + len(start) : text.find(end)]
-    assert "AUTHORED PROSE" in region
+    region_text = text[text.find(start) + len(start) : text.find(end)]
+    assert "AUTHORED PROSE" in region_text
     # Frontmatter and markers are preserved (the stub only rewrites between the markers).
     assert "title: T" in text
     assert start in text and end in text
@@ -122,7 +127,84 @@ def test_author_nonzero_exit_does_not_raise(tmp_path: Path) -> None:
     backend = SubprocessBackend(_python_spec("stub", "import sys; sys.exit(2)"))
 
     # Must not raise: a flaky prose pass is handled by the deterministic AUTHOR-diff gate, not here.
-    backend.author(tmp_path, {note_rel: ["c1"]})
+    backend.author(tmp_path, {note_rel: ["c1"]}, {})
+
+
+def _stdin_capture_spec(capture_path: Path) -> BackendSpec:
+    """A stub argv that appends its STDIN (one record, NUL-delimited) to ``capture_path``."""
+    code = f"import sys;open({str(capture_path)!r}, 'a').write(sys.stdin.read() + chr(0))"
+    return BackendSpec(name="capture", argv=(sys.executable, "-c", code))
+
+
+def test_author_invokes_once_per_region_with_grounded_prompt(tmp_path: Path) -> None:
+    """`author` invokes the argv ONCE PER REGION; each prompt carries that region's §8.2 grounding.
+
+    Two regions in one note → two invocations, each prompt grounded in its OWN op + source text +
+    the load-bearing ``file =`` / ``candidate_ids =`` control lines (the shim parses by them).
+    """
+    note_rel = "wiki/ai-tech/themes/multi.md"
+    note = tmp_path / note_rel
+    note.parent.mkdir(parents=True, exist_ok=True)
+    note.write_text("body\n", encoding="utf-8")
+
+    capture = tmp_path / "stdin_capture.txt"
+    backend = SubprocessBackend(_stdin_capture_spec(capture))
+
+    context = {
+        "r--c1": AuthorRegion(
+            op="CREATE_THEME",
+            title="Curator concurrency",
+            summary="single writer",
+            source_text="ONE curator holds a per-repo flock",
+        ),
+        "r--c2": AuthorRegion(
+            op="MERGE_INTO_THEME",
+            title="Curator concurrency",
+            summary="single writer",
+            source_text="the lock is a per-tenant boundary",
+        ),
+    }
+    backend.author(tmp_path, {note_rel: ["r--c1", "r--c2"]}, context)
+
+    records = [r for r in capture.read_text(encoding="utf-8").split("\0") if r.strip()]
+    assert len(records) == 2  # ONE invocation per region, not one per note.
+
+    by_sid = {("r--c1" if "r--c1" in r else "r--c2"): r for r in records}
+    assert set(by_sid) == {"r--c1", "r--c2"}
+
+    # Each prompt carries the load-bearing control lines pointing at its OWN region + the note.
+    for sid, prompt in by_sid.items():
+        assert f"file = {note_rel}" in prompt
+        assert f"candidate_ids = {sid}" in prompt
+
+    create_prompt = by_sid["r--c1"]
+    assert "ONE curator holds a per-repo flock" in create_prompt  # this region's source.
+    assert "the lock is a per-tenant boundary" not in create_prompt  # not the OTHER region's.
+    assert "op = CREATE_THEME" in create_prompt
+    assert "write the FULL note body" in create_prompt  # op-aware CREATE instruction.
+
+    merge_prompt = by_sid["r--c2"]
+    assert "the lock is a per-tenant boundary" in merge_prompt
+    assert "op = MERGE_INTO_THEME" in merge_prompt
+    assert "write ONLY the NEW claim" in merge_prompt  # op-aware MERGE instruction.
+
+
+def test_author_missing_context_falls_back_to_minimal_prompt(tmp_path: Path) -> None:
+    """A region with no §8.2 context entry feeds the minimal prompt (keeps the control lines)."""
+    note_rel = "wiki/ai-tech/themes/m.md"
+    note = tmp_path / note_rel
+    note.parent.mkdir(parents=True, exist_ok=True)
+    note.write_text("body\n", encoding="utf-8")
+
+    capture = tmp_path / "stdin_capture.txt"
+    backend = SubprocessBackend(_stdin_capture_spec(capture))
+
+    backend.author(tmp_path, {note_rel: ["r--c1"]}, {})  # empty context → minimal fallback.
+
+    prompt = capture.read_text(encoding="utf-8").rstrip("\0")
+    assert f"file = {note_rel}" in prompt
+    assert "candidate_ids = r--c1" in prompt
+    assert "--- BEGIN SOURCE ---" not in prompt  # the grounded source block is absent.
 
 
 # --- missing executable -------------------------------------------------------------------------
@@ -146,4 +228,4 @@ def test_author_missing_executable_raises_backend_unavailable(tmp_path: Path) ->
     backend = SubprocessBackend(spec)
 
     with pytest.raises(BackendUnavailableError):
-        backend.author(tmp_path, {"wiki/x.md": ["c1"]})
+        backend.author(tmp_path, {"wiki/x.md": ["c1"]}, {})

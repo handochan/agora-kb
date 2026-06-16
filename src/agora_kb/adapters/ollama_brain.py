@@ -54,6 +54,7 @@ __all__ = [
     "normalize_plan",
     "sanitize_prose",
     "parse_author_context",
+    "grounded_author_prompt",
     "list_ollama_models",
     "call_ollama",
     "run_plan",
@@ -81,6 +82,15 @@ _CANDIDATE_IDS_LINE_RE = re.compile(r"^\s*candidate_ids\s*=", re.MULTILINE)
 # Capturing variants used to actually parse the AUTHOR context block.
 _FILE_VALUE_RE = re.compile(r"^\s*file\s*=\s*(?P<val>.+?)\s*$", re.MULTILINE)
 _CANDIDATE_IDS_VALUE_RE = re.compile(r"^\s*candidate_ids\s*=\s*(?P<val>.*?)\s*$", re.MULTILINE)
+
+# The §8.2 grounded-prompt source block (SubprocessBackend._PASS2_GROUNDED_PROMPT_TEMPLATE). Its
+# presence is how the shim knows the worker substituted real source facts (vs the minimal prompt),
+# so it can ground the model in the prompt rather than the note frontmatter. DOTALL: the source may
+# span many lines between the BEGIN/END delimiters.
+_SOURCE_BLOCK_RE = re.compile(
+    r"---\s*BEGIN SOURCE\s*---\n(?P<src>.*?)\n\s*---\s*END SOURCE\s*---",
+    re.DOTALL,
+)
 
 # Slug shape (must match plan.py PATH/ALLOWLIST safe-token expectations: alnum-led, slug-safe).
 _SLUG_OK_RE = re.compile(r"\A[a-z0-9][a-z0-9-]*\Z")
@@ -587,6 +597,42 @@ def parse_author_context(prompt: str) -> tuple[str, list[str]]:
     return file_path, candidate_ids
 
 
+def grounded_author_prompt(stdin_prompt: str) -> str | None:
+    """Return the model-ready AUTHOR prompt when the stdin prompt is §8.2-GROUNDED, else ``None``.
+
+    The worker's :class:`~agora_kb.curator.subprocess_backend.SubprocessBackend` now substitutes the
+    full §8.2 prompt — op + title + summary + a ``--- BEGIN/END SOURCE ---`` block of the
+    candidate's verbatim source — on stdin. When that source block is present the shim grounds the
+    model in THIS prompt (not the note frontmatter): we strip only the ``file =`` / ``candidate_ids
+    =`` control lines (engine plumbing the model should not echo) and hand the rest to Ollama. The
+    control-line strip is applied ONLY to the regions OUTSIDE the ``--- BEGIN/END SOURCE ---``
+    block; the source block itself is preserved verbatim, so a candidate whose source legitimately
+    contains a ``file = ...`` or ``candidate_ids = ...`` line (config/YAML/code captures) is NOT
+    silently emptied of the exact facts the model must ground on. A MINIMAL prompt (no source block)
+    returns ``None`` so :func:`run_author` falls back to the frontmatter + region grounding (keeping
+    the shim robust to both prompt shapes).
+    """
+    match = _SOURCE_BLOCK_RE.search(stdin_prompt)
+    if match is None:
+        return None
+
+    def _strip_control_lines(segment: str) -> str:
+        kept: list[str] = []
+        for line in segment.split("\n"):
+            stripped = line.strip()
+            if stripped.startswith("file =") or stripped.startswith("candidate_ids ="):
+                continue
+            kept.append(line)
+        return "\n".join(kept)
+
+    # Strip control lines only OUTSIDE the verbatim source block (prefix + suffix), keeping the
+    # `--- BEGIN/END SOURCE ---` body byte-identical so the model grounds on the real captured text.
+    prefix = _strip_control_lines(stdin_prompt[: match.start()])
+    source_block = stdin_prompt[match.start() : match.end()]
+    suffix = _strip_control_lines(stdin_prompt[match.end() :])
+    return (prefix + source_block + suffix).strip()
+
+
 # --- Ollama HTTP (stdlib only) ----------------------------------------------------------------
 
 
@@ -863,10 +909,12 @@ Do NOT reference or imply other notes. Do NOT add links. Body:"""
 def _region_body(text: str, candidate_id: str) -> str:
     """Return the current body text between ``candidate_id``'s body-sentinel markers (or ``""``).
 
-    The worker/apply pass seeds each region with the candidate's own source text before PASS 2; this
-    extracts that per-region content so each region's prompt is grounded in its OWN distinct fact
-    rather than only the note-wide frontmatter (which would collapse multi-region notes to identical
-    prose). Pure string surgery between the exact ``agora:body:start/end id=<cid>`` markers.
+    APPLY seeds each region with the ``_summary pending_`` placeholder (apply._BODY_PLACEHOLDER),
+    NOT the candidate source — so this extracted content is WEAK grounding, used ONLY in the minimal
+    -prompt FALLBACK path of :func:`run_author`. The real §8.2 grounding comes from the worker's
+    grounded prompt (see :func:`grounded_author_prompt`, which carries the verbatim source); this
+    fallback only keeps the shim working when a backend sends a minimal (ungrounded) prompt. Pure
+    string surgery between the exact ``agora:body:start/end id=<cid>`` markers.
     """
     start, end = body_sentinels(candidate_id)
     si = text.find(start)
@@ -886,11 +934,15 @@ def run_author(
 ) -> None:
     """PASS 2 — fill THIS run's requested body-sentinel regions with sanitized model prose.
 
-    Parses the AUTHOR context, reads the worktree file, and for each candidate_id that BOTH this run
-    requested (``candidate_ids`` from :func:`parse_author_context`) AND is actually present via
-    :func:`present_sentinel_ids`, asks the model for a body grounded in the note's frontmatter
-    title/summary AND that region's own source text, sanitizes it, and splices it into that sentinel
-    region. Regions from prior runs or for non-requested candidates are left BYTE-IDENTICAL (so
+    Parses the AUTHOR context and, for each candidate_id that BOTH this run requested
+    (``candidate_ids`` from :func:`parse_author_context`) AND is actually present via
+    :func:`present_sentinel_ids`, asks the model for a body, sanitizes it, and splices it into that
+    sentinel region. GROUNDING source: when the stdin prompt is the worker's §8.2 GROUNDED prompt
+    (it carries the candidate's verbatim ``--- BEGIN/END SOURCE ---`` block + op-aware instruction —
+    see :func:`grounded_author_prompt`), the model is grounded in THAT prompt (the control lines are
+    stripped); otherwise (a minimal prompt) the shim falls back to the note's frontmatter
+    title/summary + that region's own seeded source text, so the shim works against BOTH prompt
+    shapes. Regions from prior runs or for non-requested candidates are left BYTE-IDENTICAL (so
     already-published prose is never clobbered). The file is written back ONCE. A per-region call
     failure is logged to stderr and LEAVES that region unchanged (the worker's §4.2 gate degrades
     it) — it never aborts the whole pass. A missing file is a fatal :class:`BrainError`.
@@ -910,6 +962,10 @@ def run_author(
     title = str(fm.get("title", "")) if isinstance(fm, dict) else ""
     summary = str(fm.get("summary", "")) if isinstance(fm, dict) else ""
 
+    # The §8.2 grounded prompt (incl. verbatim source) when the worker substituted one; None for a
+    # minimal prompt (then we fall back to frontmatter + the region's own seeded source per region).
+    grounded = grounded_author_prompt(stdin_prompt)
+
     # Only author the regions THIS run asked for: prior-run / non-targeted regions stay untouched.
     targets = present_sentinel_ids(text) & set(candidate_ids)
     if not targets:
@@ -919,13 +975,20 @@ def run_author(
 
     changed = False
     for cid in sorted(targets):
-        region_source = _region_body(text, cid) or "(no region source text)"
-        prompt = _AUTHOR_BODY_TEMPLATE.format(
-            title=title or "(none)",
-            summary=summary or "(none)",
-            region_source=region_source,
-            n_bytes=_DEFAULT_BODY_BYTE_BOUND,
-        )
+        # A §8.2 grounded prompt names exactly ONE region (SubprocessBackend invokes the argv once
+        # per region), so it applies to a single target. Only use it when there is exactly one
+        # target — a (rare, non-production) grounded prompt naming several ids would otherwise reuse
+        # one region's source for all; in that case ground each region in its own seeded content.
+        if grounded is not None and len(targets) == 1:
+            prompt = grounded
+        else:
+            region_source = _region_body(text, cid) or "(no region source text)"
+            prompt = _AUTHOR_BODY_TEMPLATE.format(
+                title=title or "(none)",
+                summary=summary or "(none)",
+                region_source=region_source,
+                n_bytes=_DEFAULT_BODY_BYTE_BOUND,
+            )
         try:
             response = call_ollama(
                 prompt, model=resolved_model, host=host, temperature=temperature, timeout=600.0
@@ -940,6 +1003,7 @@ def run_author(
                 "model": resolved_model,
                 "file": rel_path,
                 "region": cid,
+                "grounded": grounded is not None,
                 "raw_response": response,
                 "prose_bytes": len(prose.encode("utf-8")),
             }

@@ -820,6 +820,119 @@ def test_run_author_grounds_prompt_in_region_source(tmp_path, monkeypatch) -> No
     assert seen_prompts[0] != seen_prompts[1]
 
 
+# --- grounded_author_prompt + the §8.2 grounded run_author path -------------------------------
+
+
+def _grounded_prompt(rel_path: str, sid: str, *, op: str, source: str) -> str:
+    """A §8.2 GROUNDED PASS-2 prompt (mirrors SubprocessBackend._PASS2_GROUNDED_PROMPT_TEMPLATE)."""
+    return (
+        "SYSTEM\nYou are the Agora curator WRITER. Write the BODY of ONE wiki note region.\n"
+        "CONTEXT\n"
+        f"  file = {rel_path}\n"
+        f"  candidate_ids = {sid}\n"
+        "GROUNDING (the facts to write from)\n"
+        f"  op = {op}\n"
+        "  title = Curator concurrency\n"
+        "  summary = single writer\n"
+        "  source facts (verbatim captured text; ground your prose ONLY in this):\n"
+        "  --- BEGIN SOURCE ---\n"
+        f"{source}\n"
+        "  --- END SOURCE ---\n"
+        "TASK\nThis is a NEW theme note: write the FULL note body from the source facts. "
+        "Write a concise body (<= 8192 bytes).\n"
+    )
+
+
+def test_grounded_author_prompt_detects_and_strips_control_lines() -> None:
+    """A prompt with a source block is grounded; ``file =`` / ``candidate_ids =`` lines stripped."""
+    prompt = _grounded_prompt(
+        "wiki/ai-tech/themes/foo.md", "r--c1", op="CREATE_THEME", source="ONE per-repo flock"
+    )
+    grounded = ob.grounded_author_prompt(prompt)
+    assert grounded is not None
+    # The verbatim source + op-aware instruction survive into the model prompt.
+    assert "ONE per-repo flock" in grounded
+    assert "write the FULL note body" in grounded
+    # The engine-plumbing control lines are stripped before the model sees the prompt.
+    assert "file =" not in grounded
+    assert "candidate_ids =" not in grounded
+
+
+def test_grounded_author_prompt_minimal_returns_none() -> None:
+    """A MINIMAL prompt (no source block) → None, so run_author uses the frontmatter fallback."""
+    minimal = "curator WRITER\n  file = wiki/x.md\n  candidate_ids = c1\n"
+    assert ob.grounded_author_prompt(minimal) is None
+
+
+def test_grounded_author_prompt_preserves_control_lookalikes_in_source() -> None:
+    """Control-lookalike lines INSIDE the verbatim source block must survive (not be stripped).
+
+    Regression for the bug where the ``file =`` / ``candidate_ids =`` strip ran over the WHOLE
+    prompt, silently emptying a candidate's source of config/YAML/code lines that happen to start
+    with those tokens — defeating the grounding for that input class.
+    """
+    source = (
+        "The config uses these keys:\n"
+        "file = is a YAML key naming the target note\n"
+        "candidate_ids = [a, b] lists the run-scoped ids\n"
+        "Both are load-bearing fields."
+    )
+    prompt = _grounded_prompt(
+        "wiki/ai-tech/themes/cfg.md", "r--c1", op="CREATE_THEME", source=source
+    )
+    grounded = ob.grounded_author_prompt(prompt)
+    assert grounded is not None
+    # The control-lookalike SOURCE lines survive verbatim into the model prompt.
+    assert "file = is a YAML key naming the target note" in grounded
+    assert "candidate_ids = [a, b] lists the run-scoped ids" in grounded
+    # The engine-plumbing control lines OUTSIDE the source block are still stripped.
+    assert "file = wiki/ai-tech/themes/cfg.md" not in grounded
+    assert "candidate_ids = r--c1" not in grounded
+
+
+def test_run_author_grounds_in_provided_source_not_frontmatter(tmp_path, monkeypatch) -> None:
+    """With a §8.2 grounded prompt, the model is grounded in the prompt's SOURCE, not frontmatter.
+
+    The note frontmatter title/summary are deliberately generic; the prompt's verbatim source is the
+    distinguishing fact. The model prompt must carry the source (and NOT be the frontmatter
+    fallback), proving PASS-2 grounding reaches Ollama.
+    """
+    note = tmp_path / "wiki" / "ai-tech" / "themes" / "foo.md"
+    note.parent.mkdir(parents=True)
+    note.write_text(
+        "---\ntitle: GENERIC TITLE\nsummary: GENERIC SUMMARY\n---\n\n"
+        "<!-- agora:body:start id=r--c1 -->\nPLACEHOLDER\n<!-- agora:body:end id=r--c1 -->\n",
+        encoding="utf-8",
+    )
+
+    seen: list[str] = []
+
+    def _capture(prompt, **k):
+        seen.append(prompt)
+        return "Authored from the grounded source."
+
+    monkeypatch.setattr(ob, "call_ollama", _capture)
+
+    prompt = _grounded_prompt(
+        "wiki/ai-tech/themes/foo.md",
+        "r--c1",
+        op="CREATE_THEME",
+        source="the curator holds a per-repo flock so writes serialize",
+    )
+    ob.run_author(tmp_path, prompt, model="x", host="http://h", temperature=0.0)
+
+    assert len(seen) == 1
+    model_prompt = seen[0]
+    # Grounded in the prompt's verbatim SOURCE, not the (generic) note frontmatter.
+    assert "the curator holds a per-repo flock so writes serialize" in model_prompt
+    assert "GENERIC TITLE" not in model_prompt
+    assert "GENERIC SUMMARY" not in model_prompt
+    # The region was authored from the model output.
+    result = note.read_text(encoding="utf-8")
+    assert "Authored from the grounded source." in result
+    assert "PLACEHOLDER" not in result
+
+
 def test_arg_parser_temperature_defaults_to_zero() -> None:
     # A curator wants reproducible plans: the shim defaults to greedy decoding (temp 0.0).
     args = ob._build_arg_parser().parse_args([])
@@ -873,3 +986,34 @@ def test_run_author_emits_debug_record_when_env_set(monkeypatch, tmp_path) -> No
     assert rec["file"] == "note.md"
     assert rec["region"] == "c1"
     assert rec["prose_bytes"] == len(b"authored body")
+
+
+def test_run_author_grounded_prompt_not_reused_across_multiple_targets(
+    monkeypatch, tmp_path
+) -> None:
+    # A §8.2 grounded prompt is single-region by construction. If one ever names >1 region, the shim
+    # must NOT reuse that single region's source for every region — it falls back to per-region.
+    note = tmp_path / "daily.md"
+    note.write_text(
+        "---\ntitle: T\nsummary: S\n---\n\n"
+        "<!-- agora:body:start id=r--c1 -->\nseed1\n<!-- agora:body:end id=r--c1 -->\n\n"
+        "<!-- agora:body:start id=r--c2 -->\nseed2\n<!-- agora:body:end id=r--c2 -->\n",
+        encoding="utf-8",
+    )
+    captured: list[str] = []
+
+    def _capture(prompt, **k):
+        captured.append(prompt)
+        return "body"
+
+    monkeypatch.setattr(ob, "call_ollama", _capture)
+    grounded_prompt = (
+        "curator WRITER\nCONTEXT\n  file = daily.md\n  candidate_ids = r--c1, r--c2\n"
+        "  --- BEGIN SOURCE ---\nONLY-C1-SOURCE-FACT\n  --- END SOURCE ---\nTASK write.\n"
+    )
+    # Sanity: this prompt IS detected as grounded (single-region path would use it verbatim).
+    assert ob.grounded_author_prompt(grounded_prompt) is not None
+    ob.run_author(tmp_path, grounded_prompt, model="m", host="http://h", temperature=0.0)
+    assert len(captured) == 2
+    # Guard kicked in (2 targets) -> per-region fallback; the single grounded source is not reused.
+    assert all("ONLY-C1-SOURCE-FACT" not in p for p in captured)
