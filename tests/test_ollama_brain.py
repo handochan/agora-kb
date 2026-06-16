@@ -818,3 +818,58 @@ def test_run_author_grounds_prompt_in_region_source(tmp_path, monkeypatch) -> No
     assert "FACT ABOUT CACHES" in joined
     # The two prompts differ (not byte-identical), so prose can differ per region.
     assert seen_prompts[0] != seen_prompts[1]
+
+
+def test_arg_parser_temperature_defaults_to_zero() -> None:
+    # A curator wants reproducible plans: the shim defaults to greedy decoding (temp 0.0).
+    args = ob._build_arg_parser().parse_args([])
+    assert args.temperature == 0.0
+    # ...but it stays overridable for exploratory use.
+    assert ob._build_arg_parser().parse_args(["--temperature", "0.7"]).temperature == 0.7
+
+
+def test_debug_dump_noop_when_env_unset(monkeypatch, tmp_path) -> None:
+    monkeypatch.delenv(ob._DEBUG_ENV, raising=False)
+    # Must not raise and must not create any file.
+    ob._debug_dump({"pass": "plan", "x": 1})
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_debug_dump_appends_json_lines_when_env_set(monkeypatch, tmp_path) -> None:
+    log = tmp_path / "brain-debug.jsonl"
+    monkeypatch.setenv(ob._DEBUG_ENV, str(log))
+    ob._debug_dump({"pass": "plan", "op": "CREATE_THEME"})
+    ob._debug_dump({"pass": "author", "region": "c1"})
+    lines = log.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 2
+    assert json.loads(lines[0])["op"] == "CREATE_THEME"
+    assert json.loads(lines[1])["region"] == "c1"
+
+
+def test_debug_dump_swallows_io_error(monkeypatch, tmp_path) -> None:
+    # A path under a non-existent directory is unwritable; diagnostics must never fail the run.
+    monkeypatch.setenv(ob._DEBUG_ENV, str(tmp_path / "no-such-dir" / "x.jsonl"))
+    ob._debug_dump({"pass": "plan"})  # must not raise
+
+
+def test_run_author_emits_debug_record_when_env_set(monkeypatch, tmp_path) -> None:
+    # Locks the observability contract: run_author actually calls _debug_dump with the author shape.
+    log = tmp_path / "dbg.jsonl"
+    monkeypatch.setenv(ob._DEBUG_ENV, str(log))
+    note = tmp_path / "note.md"
+    note.write_text(
+        "---\ntitle: T\nsummary: S\n---\n\n"
+        "<!-- agora:body:start id=c1 -->\nseed\n<!-- agora:body:end id=c1 -->\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(ob, "call_ollama", lambda *a, **k: "authored body")
+    prompt = "curator WRITER\n  file = note.md\n  candidate_ids = c1\n"
+    ob.run_author(tmp_path, prompt, model="m", host="http://h", temperature=0.0)
+
+    recs = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
+    assert len(recs) == 1
+    rec = recs[0]
+    assert rec["pass"] == "author"
+    assert rec["file"] == "note.md"
+    assert rec["region"] == "c1"
+    assert rec["prose_bytes"] == len(b"authored body")

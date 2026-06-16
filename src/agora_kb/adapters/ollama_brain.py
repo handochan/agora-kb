@@ -67,6 +67,12 @@ _DEFAULT_HOST = "http://localhost:11434"
 # Env var the model name may be pinned in (after the explicit --model flag, before auto-select).
 _MODEL_ENV = "AGORA_OLLAMA_MODEL"
 
+# Optional path: when set, the shim APPENDS one JSON diagnostic record per pass (raw model output +
+# the normalized decision) so an operator can see WHY a run produced a given plan/prose without
+# rebuilding an ad-hoc probe. Opt-in, never affects the run (the model is outside the integrity
+# boundary); a missing var or an I/O error is a silent no-op.
+_DEBUG_ENV = "AGORA_BRAIN_DEBUG"
+
 # Default PASS-2 body byte ceiling (mirrors SubprocessBackend._DEFAULT_BODY_BYTE_BOUND).
 _DEFAULT_BODY_BYTE_BOUND = 8192
 
@@ -659,6 +665,27 @@ def _read_json(path: Path) -> Any:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def _debug_dump(record: dict[str, object]) -> None:
+    """Append a JSON diagnostic ``record`` to the file named by ``$AGORA_BRAIN_DEBUG`` (if set).
+
+    Opt-in operability hook for dogfooding/tuning: lets an operator inspect the RAW model output
+    and the shim's normalized decision after a run. Purely diagnostic (the model is outside the
+    integrity boundary). A missing env var is a no-op; ANY I/O error is swallowed so diagnostics
+    can never fail a curate run.
+    """
+    path = os.environ.get(_DEBUG_ENV)
+    if not path:
+        return
+    try:
+        # default=str so a non-JSON-native value degrades to its string form instead of raising —
+        # keeps the "diagnostics never fail a curate run" promise unconditional (not just for I/O).
+        line = json.dumps(record, ensure_ascii=False, default=str)
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+    except OSError:
+        pass
+
+
 def _resolve_model(model: str | None, host: str) -> str:
     """Resolve the model name, only hitting ``/api/tags`` when auto-selection is actually needed.
 
@@ -801,6 +828,24 @@ def run_plan(
         live_theme_basenames=live_theme_basenames,
         run_id=run_id,
     )
+    _debug_dump(
+        {
+            "pass": "plan",
+            "model": resolved_model,
+            "run_id": run_id,
+            "raw_response": response,
+            "normalized": [
+                {
+                    "candidate_id": d["candidate_id"],
+                    "op": d["op"],
+                    "basename": d.get("basename"),
+                    "target_basename": d.get("target_basename"),
+                    "reason": d.get("reason"),
+                }
+                for d in plan["dispositions"]
+            ],
+        }
+    )
     return json.dumps(plan)
 
 
@@ -889,6 +934,16 @@ def run_author(
             print(f"agora ollama_brain: region {cid!r} left unchanged: {exc}", file=sys.stderr)
             continue
         prose = sanitize_prose(response, byte_bound=_DEFAULT_BODY_BYTE_BOUND)
+        _debug_dump(
+            {
+                "pass": "author",
+                "model": resolved_model,
+                "file": rel_path,
+                "region": cid,
+                "raw_response": response,
+                "prose_bytes": len(prose.encode("utf-8")),
+            }
+        )
         new_text = fill_sentinel_region(text, cid, prose)
         if new_text != text:
             text = new_text
@@ -901,6 +956,29 @@ def run_author(
 # --- CLI entrypoint ---------------------------------------------------------------------------
 
 
+def _build_arg_parser() -> argparse.ArgumentParser:
+    """Build the shim's CLI parser. ``--temperature`` defaults to 0.0 (deterministic).
+
+    A curator should produce REPRODUCIBLE plans/prose for the same captures — the deterministic
+    integrity contract grades a pure function of ``(plan, diff, lint)``, so greedy decoding (temp 0)
+    is the right default; measured locally, temp 0 yields stable CREATE/MERGE decisions with no
+    spurious DROPs of clean novel captures. Raise ``--temperature`` for more exploratory behavior.
+    """
+    parser = argparse.ArgumentParser(
+        prog="agora-ollama-brain",
+        description="Ollama curator-brain WRITE-adapter shim (PLAN + AUTHOR passes).",
+    )
+    parser.add_argument("--model", default=None)
+    parser.add_argument("--host", default=os.environ.get("AGORA_OLLAMA_HOST", _DEFAULT_HOST))
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=0.0,
+        help="sampling temperature (default 0.0 = deterministic, reproducible curator plans)",
+    )
+    return parser
+
+
 def main(argv: list[str] | None = None) -> int:
     """Entrypoint the registry shells: read stdin, dispatch on :func:`detect_mode`, exit 0/1.
 
@@ -910,17 +988,7 @@ def main(argv: list[str] | None = None) -> int:
     in place and returns 0; only a TOTAL failure (missing file / daemon down before any region)
     returns 1.
     """
-    parser = argparse.ArgumentParser(
-        prog="agora-ollama-brain",
-        description="Ollama curator-brain WRITE-adapter shim (PLAN + AUTHOR passes).",
-    )
-    parser.add_argument("--model", default=None)
-    parser.add_argument(
-        "--host",
-        default=os.environ.get("AGORA_OLLAMA_HOST", _DEFAULT_HOST),
-    )
-    parser.add_argument("--temperature", type=float, default=0.1)
-    args = parser.parse_args(argv)
+    args = _build_arg_parser().parse_args(argv)
 
     stdin_prompt = sys.stdin.read()
     cwd = Path.cwd()
