@@ -30,7 +30,14 @@ from agora_kb.core.state import StateStore
 from agora_kb.curator.apply import body_sentinels, region_sentinel_id
 from agora_kb.curator.claim import curator_lock
 from agora_kb.curator.manifest import RunManifest, manifest_path, read_manifest, write_manifest
-from agora_kb.curator.worker import Backend, FakeBackend, RunReport, recover, run
+from agora_kb.curator.worker import (
+    AuthorRegion,
+    Backend,
+    FakeBackend,
+    RunReport,
+    recover,
+    run,
+)
 from agora_kb.schema.emit import Taxonomy, emit_schema
 from agora_kb.schema.lint import lint
 
@@ -638,7 +645,12 @@ class _OutOfRegionBackend:
     def plan(self, bundle_dir: Path) -> str:  # noqa: ARG002
         return self._plan_text
 
-    def author(self, worktree: Path, needs_prose: dict[str, list[str]]) -> None:
+    def author(
+        self,
+        worktree: Path,
+        needs_prose: dict[str, list[str]],
+        context: dict[str, AuthorRegion],  # noqa: ARG002 — out-of-region fake ignores grounding
+    ) -> None:
         for rel_path in needs_prose:
             path = worktree / rel_path
             text = path.read_text(encoding="utf-8")
@@ -653,8 +665,13 @@ class _StrayLinkBackend(FakeBackend):
 class _OffAllowlistBackend(FakeBackend):
     """A :class:`FakeBackend` that ALSO writes a file outside the allowlist + one under scratch."""
 
-    def author(self, worktree: Path, needs_prose: dict[str, list[str]]) -> None:
-        super().author(worktree, needs_prose)
+    def author(
+        self,
+        worktree: Path,
+        needs_prose: dict[str, list[str]],
+        context: dict[str, AuthorRegion],
+    ) -> None:
+        super().author(worktree, needs_prose, context)
         # A file OUTSIDE the canonical allowlist (the final-diff gate must reject the run).
         (worktree / "_templates").mkdir(parents=True, exist_ok=True)
         (worktree / "_templates" / "evil.md").write_text("planted\n", encoding="utf-8")
@@ -666,8 +683,13 @@ class _OffAllowlistBackend(FakeBackend):
 class _ScratchOnlyBackend(FakeBackend):
     """A :class:`FakeBackend` that also writes under ``_agora_scratch/`` (publish must survive)."""
 
-    def author(self, worktree: Path, needs_prose: dict[str, list[str]]) -> None:
-        super().author(worktree, needs_prose)
+    def author(
+        self,
+        worktree: Path,
+        needs_prose: dict[str, list[str]],
+        context: dict[str, AuthorRegion],
+    ) -> None:
+        super().author(worktree, needs_prose, context)
         (worktree / "_agora_scratch").mkdir(parents=True, exist_ok=True)
         (worktree / "_agora_scratch" / "plan.json").write_text("{}\n", encoding="utf-8")
 
@@ -687,8 +709,13 @@ class _RawForgingBackend(FakeBackend):
         self._forge_ref = forge_ref
         self._plant_ref = plant_ref
 
-    def author(self, worktree: Path, needs_prose: dict[str, list[str]]) -> None:
-        super().author(worktree, needs_prose)
+    def author(
+        self,
+        worktree: Path,
+        needs_prose: dict[str, list[str]],
+        context: dict[str, AuthorRegion],
+    ) -> None:
+        super().author(worktree, needs_prose, context)
         forged = worktree / self._forge_ref
         forged.parent.mkdir(parents=True, exist_ok=True)
         forged.write_text(
@@ -945,7 +972,12 @@ class _UnavailablePlanBackend:
 
         raise BackendUnavailableError("backend 'ghost' could not be executed")
 
-    def author(self, worktree: Path, needs_prose: dict[str, list[str]]) -> None:  # noqa: ARG002
+    def author(
+        self,
+        worktree: Path,  # noqa: ARG002
+        needs_prose: dict[str, list[str]],  # noqa: ARG002
+        context: dict[str, AuthorRegion],  # noqa: ARG002
+    ) -> None:
         raise AssertionError("author must never be reached when PASS 1 fails to run")
 
 
@@ -1114,12 +1146,23 @@ def test_append_daily_needs_prose_maps_to_the_daily_path(tmp_path: Path) -> None
             _disposition_note_rel_path(d0, wt, RUN_DATE)
             == f"wiki/ai-tech/daily/ai-tech-{RUN_DATE}.md"
         )
-        needs, sentinels = _needs_prose_map(plan_default, wt, RUN_DATE)
+        needs, sentinels, context = _needs_prose_map(
+            plan_default, wt, RUN_DATE, {"c1": "Daily capture source facts."}
+        )
         key = f"wiki/ai-tech/daily/ai-tech-{RUN_DATE}.md"
         # The PERSISTED region id is run-scoped ({plan.run_id}--{candidate_id}); plan.run_id == "r".
         region_id = region_sentinel_id("r", "c1")
         assert needs == {key: [region_id]}
         assert sentinels == {key: {region_id}}
+        # The §8.2 context carries the candidate's verbatim source + op keyed by the run-scoped id.
+        assert context == {
+            region_id: AuthorRegion(
+                op="APPEND_DAILY",
+                title=None,
+                summary="s",
+                source_text="Daily capture source facts.",
+            )
+        }
 
 
 # --- (13) recovery: conservative return-to-inbox for an unpublished claimed/applied run ---------

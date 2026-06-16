@@ -87,6 +87,7 @@ from .plan import Disposition, Plan, PlanParseError, validate_plan
 from .subprocess_backend import BackendUnavailableError
 
 __all__ = [
+    "AuthorRegion",
     "Backend",
     "FakeBackend",
     "RunReport",
@@ -101,6 +102,23 @@ __all__ = [
 _RESET_PLACEHOLDER = "> _summary pending_"
 
 _logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class AuthorRegion:
+    """PASS-2 grounding for ONE run-scoped body-sentinel region (INGEST-CONTRACT §8.2).
+
+    The worker substitutes these deterministically into the PASS-2 AUTHOR prompt so the backend
+    grounds its prose in the candidate's verbatim captured ``source_text`` and is OP-AWARE (a MERGE
+    region writes only the NEW claim, a CREATE writes the whole body, a daily writes the dated
+    capture). Keyed by the run-scoped ``region_sentinel_id`` in the worker's context map; only THIS
+    run's authored regions carry one (prior-run regions are not re-authored).
+    """
+
+    op: str
+    title: str | None
+    summary: str | None
+    source_text: str  # the candidate's verbatim captured text (the "source facts", §8.2)
 
 
 class Backend(Protocol):
@@ -122,13 +140,20 @@ class Backend(Protocol):
         """
         ...
 
-    def author(self, worktree: Path, needs_prose: dict[str, list[str]]) -> None:
+    def author(
+        self,
+        worktree: Path,
+        needs_prose: dict[str, list[str]],
+        context: dict[str, AuthorRegion],
+    ) -> None:
         """PASS 2 — fill the candidate-id body sentinels in ``worktree`` (§3 / §4.2).
 
-        ``needs_prose`` maps each note's repo-relative path to the candidate ids whose
-        ``agora:body:start id=<cid> … end`` sentinel regions the backend must author. The backend
-        writes ONLY between those markers; the worker validates the diff with
-        :func:`validate_author_diff` and strips/degrades anything out of bounds.
+        ``needs_prose`` maps each note's repo-relative path to the run-scoped region ids whose
+        ``agora:body:start id=<sid> … end`` sentinel regions the backend must author. ``context``
+        maps each of those run-scoped ids to its :class:`AuthorRegion` grounding (op + title +
+        summary + the candidate's verbatim source text, §8.2) so the backend can ground its prose
+        and honor the op. The backend writes ONLY between those markers; the worker validates the
+        diff with :func:`validate_author_diff` and strips/degrades anything out of bounds.
         """
         ...
 
@@ -149,7 +174,12 @@ class FakeBackend:
     def plan(self, bundle_dir: Path) -> str:  # noqa: ARG002 — bundle is unused by the fake
         return self._plan_text
 
-    def author(self, worktree: Path, needs_prose: dict[str, list[str]]) -> None:
+    def author(
+        self,
+        worktree: Path,
+        needs_prose: dict[str, list[str]],
+        context: dict[str, AuthorRegion],  # noqa: ARG002 — canned prose ignores grounding
+    ) -> None:
         for rel_path, cids in needs_prose.items():
             path = worktree / rel_path
             text = path.read_text(encoding="utf-8")
@@ -386,8 +416,10 @@ def _run_locked(
         _advance(layout, manifest, phase="applied", prose_complete=False)
 
         # PASS 2 — DELEGATED: author prose between the candidate-id sentinels, then validate the
-        # diff.
-        needs_prose, sentinels = _needs_prose_map(plan, wt, run_date)
+        # diff. The §8.2 context grounds each region in its candidate's verbatim source + op; it is
+        # advisory backend input only — base_state/changed/sentinels (the §4.2 gate) are unchanged.
+        candidate_texts = {c.candidate_id: c.text for c in bundle.candidates}
+        needs_prose, sentinels, context = _needs_prose_map(plan, wt, run_date, candidate_texts)
         prose_complete = True
         if needs_prose:
             base_state = {rel: (wt / rel).read_text(encoding="utf-8") for rel in needs_prose}
@@ -396,7 +428,7 @@ def _run_locked(
             # than let it escape run() as a traceback. A per-note NON-ZERO exit is NOT fatal — the
             # SubprocessBackend leaves it for the §4.2 AUTHOR-diff degrade path below.
             try:
-                backend.author(wt, needs_prose)
+                backend.author(wt, needs_prose, context)
             except (BackendUnavailableError, subprocess.TimeoutExpired) as exc:
                 return _fail(
                     layout,
@@ -1079,22 +1111,28 @@ def _advance(
 
 
 def _needs_prose_map(
-    plan: Plan, worktree: Path, run_date: str
-) -> tuple[dict[str, list[str]], dict[str, set[str]]]:
-    """Map ``needs_prose`` notes to their RUN-SCOPED region ids + build the §4.2 ``sentinels`` set.
+    plan: Plan, worktree: Path, run_date: str, candidate_texts: dict[str, str]
+) -> tuple[dict[str, list[str]], dict[str, set[str]], dict[str, AuthorRegion]]:
+    """Map ``needs_prose`` notes to RUN-SCOPED region ids + the §4.2 set + the §8.2 context.
 
-    Returns ``(needs_prose, sentinels)`` where ``needs_prose`` is ``{rel_path: [region_id, ...]}``
-    (the PASS-2 instruction the backend receives) and ``sentinels`` is ``{rel_path: {region_id}}`` —
-    the COMPLETE set of body-sentinel regions :func:`validate_author_diff` expects in each note at
-    post-APPLY state. Each ``region_id`` is the run-scoped ``region_sentinel_id`` value
-    (``{run_id}--{candidate_id}``), computed via the SAME helper APPLY uses to PLACE the region so
-    the two can never drift (the bare candidate_id is per-run and collides across runs).
-    CREATE_THEME → ``wiki/<domain>/themes/<basename>.md``; APPEND_DAILY →
+    Returns ``(needs_prose, sentinels, context)`` where ``needs_prose`` is
+    ``{rel_path: [region_id, ...]}`` (the PASS-2 instruction the backend receives), ``sentinels`` is
+    ``{rel_path: {region_id}}`` — the COMPLETE set of body-sentinel regions
+    :func:`validate_author_diff` expects in each note at post-APPLY state — and ``context`` is
+    ``{region_id: AuthorRegion}`` carrying the op + title + summary + candidate ``source_text`` so
+    the backend can ground its prose (INGEST-CONTRACT §8.2). ``candidate_texts`` is
+    ``{candidate_id: text}`` (the bundle's verbatim captures); only THIS run's authored regions get
+    a context entry — the prior-run ``present`` ids unioned into ``sentinels`` are NOT re-authored.
+    Each ``region_id`` is the run-scoped ``region_sentinel_id`` (``{run_id}--{candidate_id}``),
+    computed via the SAME helper APPLY uses to PLACE the region so the two can never drift (the bare
+    candidate_id is per-run and collides across runs). CREATE_THEME →
+    ``wiki/<domain>/themes/<basename>.md``; APPEND_DAILY →
     ``wiki/<domain>/daily/<domain>-<run_date>.md`` (multiple dispositions can share one daily file,
     so ids accumulate); MERGE_INTO_THEME → the target theme path resolved in the live tree.
     """
     needs: dict[str, list[str]] = {}
     sentinels: dict[str, set[str]] = {}
+    context: dict[str, AuthorRegion] = {}
     for disp in plan.dispositions:
         if not disp.needs_prose:
             continue
@@ -1108,13 +1146,20 @@ def _needs_prose_map(
         sentinel_id = region_sentinel_id(plan.run_id, disp.candidate_id)
         needs.setdefault(rel, []).append(sentinel_id)
         sentinels.setdefault(rel, set()).add(sentinel_id)
+        # §8.2 grounding for THIS region only (keyed by the run-scoped id the backend will fill).
+        context[sentinel_id] = AuthorRegion(
+            op=disp.op,
+            title=disp.title,
+            summary=disp.summary,
+            source_text=candidate_texts.get(disp.candidate_id, ""),
+        )
     # A note that already carried prior-run sentinel regions must list ALL live regions in
     # `sentinels` (validate_author_diff enforces exact set equality). Re-scan each touched note for
     # every present start-sentinel id so a prior CREATE_THEME body under a now-MERGED theme is kept.
     for rel in list(sentinels):
         present = _present_sentinel_ids(worktree / rel)
         sentinels[rel] |= present
-    return needs, sentinels
+    return needs, sentinels, context
 
 
 def _disposition_note_rel_path(disp: Disposition, worktree: Path, run_date: str) -> str | None:
