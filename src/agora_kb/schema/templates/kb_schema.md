@@ -218,6 +218,25 @@ wiki file.
 Boundary: cognitive judgement (*is this contested?*) stays with you, the delegated brain; graph facts
 (*is this orphan / stale?*) are derived, never stored.
 
+### 2.7 OKF v0.1 conformance fields (additive; emitted by default — ADR-0014 D2)
+
+Every Agora repo is **also a conformant [Open Knowledge Format (OKF) v0.1](https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md)
+bundle** (ADR-0014). Conformance is the **default** posture — these fields are emitted at `repo init`
+and on every curated note, no opt-in flag. They are **purely additive**: they do not change any link
+grammar, any required-field rule, or any L1 lint check. **You do not author them** — deterministic
+worker code (APPLY) materializes them from the run, exactly like `created`/`updated`.
+
+| field | on which notes | value | why |
+|---|---|---|---|
+| `description` | every note | **the SAME string as `summary`** | OKF's one-line concept field; `summary` stays Agora's canonical name (ratified #2), `description` carries the same value for OKF readers. Placed immediately **after `summary`**. |
+| `timestamp` | every note | **`<updated>T00:00:00Z`** (e.g. `updated: 2026-06-13` → `timestamp: '2026-06-13T00:00:00Z'`) | OKF's "last meaningful change" datetime, derived **deterministically** from `updated` (== `run_date`) — **never a wall clock**, so ADR-0010 D1 replay determinism holds (ratified #5). Placed immediately **after `updated`**. |
+| `okf_version: '0.1'` | **root `index.md` ONLY** | the literal `'0.1'` | OKF marks the **bundle-root** with its version; per the OKF spec this lives on the root listing only, **never** on themes/dailies/mocs. Placed immediately **after `type`**. |
+| `resource` | themes (OPTIONAL) | a canonical external URI for the concept | **Accepted on read** (a foreign/imported note may carry it) but **NOT emitted by default** — the curator has no canonical URI for a theme it distils. Document-only for now. |
+
+These coexist with `schema_version` (Agora's internal editorial axis, ADR-0010 D6): `okf_version` is
+the **orthogonal external** axis; the two evolve independently (ADR-0014 D6). A conformant OKF consumer
+MUST NOT reject a bundle for the extra keys, so emitting them is safe for both faces.
+
 ---
 
 ## 3. Link, MOC & citation conventions

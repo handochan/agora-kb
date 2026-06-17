@@ -163,8 +163,12 @@ def test_create_theme_produces_exact_bytes(tmp_path: Path) -> None:
         "- concurrency\n"
         f"created: '{RUN_DATE}'\n"
         f"updated: '{RUN_DATE}'\n"
+        # OKF v0.1 (ADR-0014 D2): timestamp right after updated, description right after summary;
+        # NO okf_version on a theme (bundle-root index.md only).
+        f"timestamp: '{RUN_DATE}T00:00:00Z'\n"
         "status: active\n"
         "summary: One curator advances the curated branch under a per-repo lock.\n"
+        "description: One curator advances the curated branch under a per-repo lock.\n"
         "sources:\n"
         f"- raw/ai-tech/{E1}.md\n"
         "related: []\n"

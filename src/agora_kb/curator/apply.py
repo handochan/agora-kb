@@ -283,6 +283,41 @@ def _stamp_harvest_origin(fm: dict[str, object], provenance: list[dict[str, obje
         fm["origin"] = origin
 
 
+# --- OKF v0.1 producer fields (ADR-0014 D2) ----------------------------------------------------
+
+# The OKF v0.1 bundle-root version string, emitted on the root ``index.md`` ONLY (per the OKF spec;
+# ADR-0014 D2 / D6). It is the EXTERNAL conformance axis, orthogonal to the internal
+# ``schema_version`` (ADR-0010 D6 / L1-17) — the two evolve independently. Never on theme/daily/moc.
+_OKF_VERSION = "0.1"
+
+
+def _okf_timestamp(updated: str) -> str:
+    """Return OKF's ``timestamp`` for a note, derived DETERMINISTICALLY from ``updated`` (D2).
+
+    OKF v0.1 expects an ISO-8601 datetime for "last meaningful change"; Agora's canonical clock is a
+    DATE (``updated`` == ``run_date``, ADR-0010 D1) read from the injected run manifest, never the
+    wall clock. So the OKF datetime is the run date pinned to midnight UTC — ``<updated>T00:00:00Z``
+    — which satisfies OKF WITHOUT reintroducing a system clock (ADR-0014 ratified decision #5 / D1
+    replay determinism). ``updated`` is the same ``YYYY-MM-DD`` string APPLY already materializes,
+    so ``timestamp`` is a pure function of it and the run stays byte-reproducible.
+    """
+    return f"{updated}T00:00:00Z"
+
+
+def _set_updated(fm: dict[str, object], run_date: str) -> None:
+    """Bump ``updated`` AND re-derive the OKF ``timestamp`` together, in lock-step (D2).
+
+    The OKF invariant ``timestamp == <updated>T00:00:00Z`` must hold on EVERY note after EVERY
+    curator edit (ADR-0014 D2 / kb_schema.md §2.7), not just at CREATE. Every UPDATE branch that
+    advances ``updated`` to ``run_date`` (append-daily re-touch, MERGE, MARK_CONTESTED, MOC /
+    index re-render) MUST go through this helper so ``timestamp`` can never drift stale behind
+    ``updated``. The CREATE branches pair the two keys inline at note-build time (key order matters
+    there); this helper is the single update-path equivalent.
+    """
+    fm["updated"] = run_date
+    fm["timestamp"] = _okf_timestamp(run_date)
+
+
 # --- theme frontmatter (ADR-0010 C2 / §2) -----------------------------------------------------
 
 
@@ -303,8 +338,20 @@ def _theme_frontmatter(
     by the model, ADR-0011 §2, so the backend can never inflate it), and ``body_status: pending``
     when the note needs prose. Key order matches the ADR-0010 §2 documented shape so the rendered
     YAML is stable.
+
+    OKF v0.1 conformance (ADR-0014 D2) is ADDITIVE — the WORKER (never the model) also materializes
+    ``description`` (the OKF one-line field, carrying the SAME value as ``summary`` so an OKF-aware
+    reader sees the precis under its standard key; ratified decision #2) and ``timestamp`` (OKF's
+    "last meaningful change", derived DETERMINISTICALLY as ``<updated>T00:00:00Z`` so no wall clock
+    is reintroduced — ADR-0014 ratified decision #5 / ADR-0010 D1 replay determinism).
+    ``description`` is placed immediately after ``summary`` and ``timestamp`` immediately after
+    ``updated`` so the key order stays a stable superset of the ADR-0010 §2 shape. The OPTIONAL OKF
+    ``resource`` URI is NOT emitted (the curator has no canonical URI for a theme it distils;
+    ADR-0014 D2 documents it as accepted-on-read only), and ``okf_version`` lives on the bundle-root
+    ``index.md`` ONLY (per the OKF spec), never on a theme.
     """
     status = disp.status or "active"
+    summary = disp.summary or ""
     fm: dict[str, object] = {
         "title": disp.title or disp.basename or disp.candidate_id,
         "type": "theme",
@@ -312,8 +359,10 @@ def _theme_frontmatter(
         "tags": list(disp.tags),
         "created": run_date,
         "updated": run_date,
+        "timestamp": _okf_timestamp(run_date),
         "status": status,
-        "summary": disp.summary or "",
+        "summary": summary,
+        "description": summary,
         "sources": list(sources),
         "related": [f"[[{link}]]" for link in disp.links],
     }
@@ -332,7 +381,14 @@ def _daily_frontmatter(
     run_date: str,
     sources: list[str],
 ) -> dict[str, object]:
-    """Build the ADR-0010 C2 daily frontmatter (``date``/``run_id`` from the injected run, §3.1)."""
+    """Build the ADR-0010 C2 daily frontmatter (``date``/``run_id`` from the injected run, §3.1).
+
+    OKF v0.1 conformance (ADR-0014 D2) is ADDITIVE: ``description`` mirrors ``summary`` (ratified
+    decision #2) and ``timestamp`` is the deterministic ``<updated>T00:00:00Z`` (ratified
+    decision #5 / ADR-0010 D1) — placed after ``summary`` and ``updated`` respectively.
+    ``okf_version`` is NOT emitted on a daily (it is bundle-root-``index.md``-only, per OKF).
+    """
+    summary = disp.summary or ""
     fm: dict[str, object] = {
         "title": disp.title or f"Daily {run_date}",
         "type": "daily",
@@ -340,8 +396,10 @@ def _daily_frontmatter(
         "tags": list(disp.tags),
         "created": run_date,
         "updated": run_date,
+        "timestamp": _okf_timestamp(run_date),
         "status": disp.status or "active",
-        "summary": disp.summary or "",
+        "summary": summary,
+        "description": summary,
         "date": run_date,
         "run_id": run_id,
         "sources": list(sources),
@@ -572,7 +630,7 @@ def _apply_append_daily(
             if s not in merged_sources:
                 merged_sources.append(s)
         fm["sources"] = merged_sources
-        fm["updated"] = run_date
+        _set_updated(fm, run_date)
         if disp.needs_prose:
             fm["body_status"] = "pending"
         body = f"{prior_body}\n\n{section}" if prior_body else section
@@ -635,7 +693,7 @@ def _apply_merge(
         if s not in merged:
             merged.append(s)
     fm["sources"] = merged
-    fm["updated"] = run_date
+    _set_updated(fm, run_date)
 
     # MERGE_INTO_THEME is the ONLY op a gated/harvested candidate may use to ADD content (§6), so it
     # is the primary loop-prevention site: a kept-via-merge harvested region tags the target
@@ -707,7 +765,7 @@ def _apply_contested(
             contested_by.append(link)
     fm["contested_by"] = contested_by
     fm["contested_at"] = run_date
-    fm["updated"] = run_date
+    _set_updated(fm, run_date)
 
     # A harvested contradicting claim folded into the target tags it origin: harvest:<agent> for
     # loop-prevention (same rule as MERGE; §2 / §6 / DATA-MODEL §7). Set-union; never overwrite.
@@ -742,10 +800,14 @@ def _update_moc(
         fm, _ = frontmatter.parse(moc_path.read_text(encoding="utf-8"))
         _canonicalize_dates(fm)
         fm["children"] = [f"[[{b}]]" for b in children]
-        fm["updated"] = run_date
+        _set_updated(fm, run_date)
         body = "\n".join(f"- [[{b}]]" for b in children)
         moc_path.write_text(frontmatter.render(fm, body), encoding="utf-8")
     else:
+        # OKF v0.1 (ADR-0014 D2): ``description`` mirrors ``summary`` and ``timestamp`` is the
+        # deterministic ``<updated>T00:00:00Z`` (no wall clock, ADR-0010 D1). ``okf_version`` is NOT
+        # emitted here — a MOC is not the bundle root, so it stays index.md-only (per the OKF spec).
+        summary = f"Map of content for the {domain} domain."
         fm = {
             "title": f"{domain} MOC",
             "type": "moc",
@@ -753,8 +815,10 @@ def _update_moc(
             "tags": [],
             "created": run_date,
             "updated": run_date,
+            "timestamp": _okf_timestamp(run_date),
             "status": "active",
-            "summary": f"Map of content for the {domain} domain.",
+            "summary": summary,
+            "description": summary,
             "children": [f"[[{b}]]" for b in children],
         }
         body = "\n".join(f"- [[{b}]]" for b in children)
@@ -785,19 +849,27 @@ def _update_index(
         fm, _ = frontmatter.parse(index_path.read_text(encoding="utf-8"))
         _canonicalize_dates(fm)
         fm["children"] = [f"[[{b}]]" for b in moc_children]
-        fm["updated"] = run_date
+        _set_updated(fm, run_date)
         body = "\n".join(f"- [[{b}]]" for b in moc_children)
         index_path.write_text(frontmatter.render(fm, body), encoding="utf-8")
     else:
+        # The root index.md is the OKF BUNDLE ROOT (ADR-0014 D2): it ALONE carries ``okf_version``
+        # (placed immediately after ``type``, per the OKF spec — never on themes/dailies/mocs).
+        # ``description`` mirrors ``summary`` and ``timestamp`` is the deterministic
+        # ``<updated>T00:00:00Z`` (no wall clock, ADR-0010 D1 / ADR-0014 ratified decision #5).
+        summary = "Top map of content; links every domain MOC."
         fm = {
             "title": "Knowledge base index",
             "type": "index",
+            "okf_version": _OKF_VERSION,
             "aliases": [],
             "tags": [],
             "created": run_date,
             "updated": run_date,
+            "timestamp": _okf_timestamp(run_date),
             "status": "active",
-            "summary": "Top map of content; links every domain MOC.",
+            "summary": summary,
+            "description": summary,
             "children": [f"[[{b}]]" for b in moc_children],
         }
         body = "\n".join(f"- [[{b}]]" for b in moc_children)
