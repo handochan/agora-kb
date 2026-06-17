@@ -352,20 +352,58 @@ def test_off_layout_note_moved_to_first_domain_theme_and_warned(tmp_path: Path) 
     _parses(dest, "wiki/ai-tech/themes/loose-idea.md")
 
 
-# --- report-only: theme with no sources (L1-7) -------------------------------------------------
+# --- v2 change B: theme with no sources is GROUNDED in a synth raw/ snapshot (L1-7/L1-8) --------
 
 
-def test_theme_without_sources_is_reported_not_autofixed(tmp_path: Path) -> None:
-    """A theme with no raw/ sources is REPORTED (needs sources or status: stub), not auto-fixed."""
+def test_theme_with_body_gets_synth_raw_source(tmp_path: Path) -> None:
+    """A theme with a body but no sources is GROUNDED: its body is snapshotted to
+    raw/<domain>/<slug> and cited as the only source (ADR-0014 D5 v2 change B / ADR-0010 D3)."""
     src = tmp_path / "vault"
     dest = tmp_path / "out"
-    _write(src, "wiki/general/themes/sourceless.md", "# Sourceless\n\nNo sources cited.\n")
+    _write(
+        src,
+        "wiki/general/themes/sourceless.md",
+        "# Sourceless\n\nNo sources cited but it has real prose content.\n",
+    )
 
     report = import_vault(src, dest, domains=["general"], import_date=_IMPORT_DATE)
 
     rec = _record(report, "wiki/general/themes/sourceless.md")
-    assert any("needs sources" in w for w in rec.warnings)
-    assert report.summary["themes_without_sources"] >= 1
+    # The synth raw/ snapshot is the theme's basename under its domain (a POSIX raw/ path).
+    assert rec.synth_raw_source == "raw/general/sourceless.md"
+    assert rec.stubbed_empty_theme is False
+    # Frontmatter cites EXACTLY the synth source; no foreign / empty sources remain.
+    fm = _parses(dest, "wiki/general/themes/sourceless.md")
+    assert fm["sources"] == ["raw/general/sourceless.md"]
+    assert fm["status"] == "active"  # NOT stubbed — it has a body
+    # The raw/ file EXISTS on disk and carries the (verbatim) body content (L1-8 satisfiable).
+    raw = (dest / "raw/general/sourceless.md").read_text(encoding="utf-8")
+    assert "No sources cited but it has real prose content." in raw
+    assert report.summary["synth_raw_sources"] >= 1
+    # And the whole repo lints CLEAN — the theme satisfies L1-7 + L1-8 by construction.
+    assert report.lint.ok is True
+
+
+def test_empty_body_theme_becomes_stub(tmp_path: Path) -> None:
+    """An EMPTY-body theme cannot be honestly grounded, so it becomes status: stub (L1-7-exempt)
+    with empty sources + an 'imported empty theme -> stub' note (ADR-0014 D5 v2 change B)."""
+    src = tmp_path / "vault"
+    dest = tmp_path / "out"
+    # A note that is frontmatter-only (or empty body) — nothing to snapshot into raw/.
+    _write(src, "wiki/general/themes/empty.md", "---\ntitle: Empty Theme\n---\n")
+
+    report = import_vault(src, dest, domains=["general"], import_date=_IMPORT_DATE)
+
+    rec = _record(report, "wiki/general/themes/empty.md")
+    assert rec.stubbed_empty_theme is True
+    assert rec.synth_raw_source is None
+    assert any("imported empty theme -> stub" in w for w in rec.warnings)
+    fm = _parses(dest, "wiki/general/themes/empty.md")
+    assert fm["status"] == "stub"
+    assert fm["sources"] == []
+    assert report.summary["stubbed_empty_themes"] >= 1
+    # A stub is L1-7-exempt, so the repo still lints clean.
+    assert report.lint.ok is True
 
 
 # --- robustness: a previously-crashing vault now imports + dest is git-inited -------------------
@@ -440,3 +478,216 @@ def test_determinism_same_inputs_same_output(tmp_path: Path) -> None:
     a = (dest1 / "wiki/general/themes/topic.md").read_bytes()
     b = (dest2 / "wiki/general/themes/topic.md").read_bytes()
     assert a == b
+
+
+# --- v2 change A: structural / non-knowledge files are NOT imported as themes -------------------
+
+
+def test_structural_files_are_not_imported_as_themes(tmp_path: Path) -> None:
+    """The schema doc + a CLAUDE.md symlink + log.md + _templates/* are NOT imported as notes —
+    the dest emits its OWN schema, so importing them would only make junk themes (v2 change A)."""
+    src = tmp_path / "vault"
+    dest = tmp_path / "out"
+    # The schema doc and its agent-tool symlink (CLAUDE.md -> AGENTS.md), the run log, a template,
+    # and one REAL knowledge theme that MUST survive.
+    agents = _write(src, "AGENTS.md", "# Schema\n\nThe KB schema doc.\n")
+    (src / "CLAUDE.md").symlink_to(agents.name)  # a symlink, never imported
+    _write(src, "log.md", "# Log\n\n2026-06-17 ran curate.\n")
+    _write(src, "_templates/theme.md", "---\ntype: theme\n---\n\n# {{title}}\n")
+    _write(src, "wiki/general/themes/real.md", "# Real Note\n\nActual knowledge content.\n")
+
+    report = import_vault(src, dest, domains=["general"], import_date=_IMPORT_DATE)
+
+    imported = {n.rel_path for n in report.notes}
+    # Only the real knowledge note is imported.
+    assert imported == {"wiki/general/themes/real.md"}
+    # None of the structural junk themes from v1 exist.
+    for junk in ("agents", "claude", "schema", "log", "theme"):
+        assert not (dest / f"wiki/general/themes/{junk}.md").exists(), f"{junk} leaked as a theme"
+    # The four structural files (AGENTS.md, CLAUDE.md symlink, log.md, _templates/theme.md) counted.
+    assert report.summary["excluded_structural_files"] == 4
+    assert report.summary["notes"] == 1
+
+
+def test_meta_and_kb_subtrees_are_excluded(tmp_path: Path) -> None:
+    """Files under _meta/ and _kb/ (any depth) are structural and never imported (v2 change A)."""
+    src = tmp_path / "vault"
+    dest = tmp_path / "out"
+    _write(src, "_meta/taxonomy.md", "# taxonomy\n")
+    _write(src, "_kb/inbox/event.md", "# spool\n")
+    _write(src, "wiki/general/themes/keep.md", "# Keep\n\nKnowledge.\n")
+
+    report = import_vault(src, dest, domains=["general"], import_date=_IMPORT_DATE)
+
+    assert {n.rel_path for n in report.notes} == {"wiki/general/themes/keep.md"}
+    assert report.summary["excluded_structural_files"] == 2
+
+
+# --- v2 change C: MOC children synced to resolvable child-bullet set ----------------------------
+
+
+def test_moc_children_synced_to_resolvable_set_obsidian_bullets(tmp_path: Path) -> None:
+    """A MOC whose Obsidian child bullets target a resolvable AND an unresolvable note ends with
+    children: == the resolvable set; the unresolvable one is reported (v2 change C / L1-6)."""
+    src = tmp_path / "vault"
+    dest = tmp_path / "out"
+    # Obsidian child bullets; present-theme exists, ghost-theme does not. The resolvable bullet is
+    # converted to a markdown link (a child bullet); the unresolvable one stays a bare [[ ]] (NOT a
+    # child bullet, never a graph edge), so children: ends up exactly the resolvable set.
+    _write(
+        src,
+        "wiki/general/general-moc.md",
+        "---\ntitle: General MOC\n---\n\n# General MOC\n\n"
+        "## Themes\n"
+        "- [[present-theme]] — a real theme\n"
+        "- [[ghost-theme]] — a theme that was never written\n",
+    )
+    _write(src, "wiki/general/themes/present-theme.md", "# Present\n\nReal content.\n")
+
+    report = import_vault(src, dest, domains=["general"], import_date=_IMPORT_DATE)
+
+    fm = _parses(dest, "wiki/general/general-moc.md")
+    assert fm["children"] == ["[[present-theme]]"]  # EXACTLY the resolvable child-bullet set
+    rec = _record(report, "wiki/general/general-moc.md")
+    assert "ghost-theme" in rec.unresolved_links  # reported, never silently lost (D4)
+    body = (dest / "wiki/general/general-moc.md").read_text(encoding="utf-8")
+    # The resolvable bullet is now a markdown-link child bullet; the unresolvable target is NOT a
+    # children entry and was never a graph edge (L1-2 / L1-6 both clean).
+    assert "[present-theme](themes/present-theme.md)" in body
+    assert report.lint.ok is True
+
+
+def test_moc_unresolvable_markdown_child_bullet_line_dropped(tmp_path: Path) -> None:
+    """A MOC whose body already has a STANDARD-markdown child bullet to a non-existent note has that
+    bullet LINE dropped (it would fail L1-2 / break L1-6) + reported (v2 change C line-drop)."""
+    src = tmp_path / "vault"
+    dest = tmp_path / "out"
+    # A markdown-vault MOC: child bullets are already standard markdown links. ghost.md was never
+    # written, so its child-bullet line must be dropped to keep L1-6 / L1-2 clean.
+    _write(
+        src,
+        "wiki/general/general-moc.md",
+        "---\ntitle: General MOC\n---\n\n# General MOC\n\n"
+        "- [Alpha](themes/alpha.md) — a real theme\n"
+        "- [Ghost](themes/ghost.md) — never written\n",
+    )
+    _write(src, "wiki/general/themes/alpha.md", "# Alpha\n\nReal content.\n")
+
+    report = import_vault(src, dest, domains=["general"], import_date=_IMPORT_DATE)
+
+    assert _parses(dest, "wiki/general/general-moc.md")["children"] == ["[[alpha]]"]
+    rec = _record(report, "wiki/general/general-moc.md")
+    assert "ghost" in rec.unresolved_links
+    _, body = frontmatter.parse((dest / "wiki/general/general-moc.md").read_text(encoding="utf-8"))
+    # The whole unresolvable child-bullet LINE is gone from the BODY; the resolvable one survives.
+    assert "themes/ghost.md" not in body
+    assert "[Alpha](themes/alpha.md)" in body
+    assert report.lint.ok is True
+
+
+# --- v2 change D: non-raw/ source entries stripped + reported -----------------------------------
+
+
+def test_non_raw_source_path_is_stripped_and_reported(tmp_path: Path) -> None:
+    """A pre-existing sources: entry that is NOT a raw/ path is removed + recorded; the synth raw/
+    snapshot becomes the authoritative source (v2 change D / L1-8)."""
+    src = tmp_path / "vault"
+    dest = tmp_path / "out"
+    _write(
+        src,
+        "wiki/general/themes/coded.md",
+        "---\ntitle: Coded\n"
+        'sources: ["~/dev/analytics/psa @ 705f4a4 (2026-06-12)"]\n'
+        "---\n\n# Coded\n\nA project analysis with a foreign locator source.\n",
+    )
+
+    report = import_vault(src, dest, domains=["general"], import_date=_IMPORT_DATE)
+
+    rec = _record(report, "wiki/general/themes/coded.md")
+    assert "~/dev/analytics/psa @ 705f4a4 (2026-06-12)" in rec.stripped_sources
+    assert any("stripped non-raw source" in w for w in rec.warnings)
+    assert report.summary["stripped_sources"] >= 1
+    fm = _parses(dest, "wiki/general/themes/coded.md")
+    # The foreign locator is gone; the synth raw/ snapshot is the sole authoritative source.
+    assert fm["sources"] == ["raw/general/coded.md"]
+    assert rec.synth_raw_source == "raw/general/coded.md"
+    assert report.lint.ok is True
+
+
+def test_existing_valid_raw_source_is_kept_and_copied(tmp_path: Path) -> None:
+    """A theme already citing a raw/ artifact that EXISTS in the vault keeps it (no synth) and the
+    artifact is copied into dest so L1-8 passes (v2 change B/D pre-existing-source branch)."""
+    src = tmp_path / "vault"
+    dest = tmp_path / "out"
+    _write(src, "raw/general/kept-source.md", "the immutable captured source body\n")
+    _write(
+        src,
+        "wiki/general/themes/has-raw.md",
+        "---\ntitle: Has Raw\nsources: [raw/general/kept-source.md]\n---\n\n# Has Raw\n\nProse.\n",
+    )
+
+    report = import_vault(src, dest, domains=["general"], import_date=_IMPORT_DATE)
+
+    rec = _record(report, "wiki/general/themes/has-raw.md")
+    assert rec.synth_raw_source is None  # the pre-existing artifact wins; no synth
+    fm = _parses(dest, "wiki/general/themes/has-raw.md")
+    assert fm["sources"] == ["raw/general/kept-source.md"]
+    # The artifact was copied into dest verbatim (L1-8 satisfiable).
+    assert (dest / "raw/general/kept-source.md").read_text(encoding="utf-8") == (
+        "the immutable captured source body\n"
+    )
+    assert report.lint.ok is True
+
+
+# --- v2 end-to-end: a small multi-note vault imports LINT-CLEAN ---------------------------------
+
+
+def test_end_to_end_small_vault_imports_lint_clean(tmp_path: Path) -> None:
+    """A small but representative vault (index + a domain MOC + 2 themes + a structural file)
+    imports to a LINT-CLEAN repo — the v2 acceptance bar (ADR-0014 D5)."""
+    src = tmp_path / "vault"
+    dest = tmp_path / "out"
+    # An index (Obsidian-style type) with a domain MOC link in the body.
+    _write(
+        src,
+        "index.md",
+        "---\ntitle: Home\ntype: theme\n---\n\n# Home\n\n"
+        "## Domains\n- [[general-moc]] — the general domain\n",
+    )
+    # A domain MOC whose body lists its two themes as Obsidian child bullets.
+    _write(
+        src,
+        "wiki/general/general-moc.md",
+        "---\ntitle: General MOC\ntype: theme\n---\n\n# General\n\n"
+        "## Themes\n"
+        "- [[alpha]] — the first theme\n"
+        "- [[beta]] — the second theme, see [[alpha]]\n",
+    )
+    _write(src, "wiki/general/themes/alpha.md", "# Alpha\n\nThe first concept, real prose.\n")
+    _write(
+        src,
+        "wiki/general/themes/beta.md",
+        "# Beta\n\nThe second concept; it relates to [[alpha]] for context.\n",
+    )
+    # A structural file that must NOT become a note.
+    _write(src, "log.md", "# Log\n\n2026-06-17 import.\n")
+
+    report = import_vault(src, dest, domains=["general"], import_date=_IMPORT_DATE)
+
+    # The hard acceptance bar: the imported repo lints CLEAN (zero findings).
+    assert report.lint.ok is True, [(f.code, f.path, f.message) for f in report.lint.findings]
+    assert len(report.lint.findings) == 0
+    # log.md was excluded; the four real notes were imported.
+    assert report.summary["excluded_structural_files"] == 1
+    assert {n.rel_path for n in report.notes} == {
+        "index.md",
+        "wiki/general/general-moc.md",
+        "wiki/general/themes/alpha.md",
+        "wiki/general/themes/beta.md",
+    }
+    # Both themes are grounded in synth raw/ snapshots; the MOC children == both themes.
+    assert report.summary["synth_raw_sources"] == 2
+    moc_fm = _parses(dest, "wiki/general/general-moc.md")
+    assert moc_fm["children"] == ["[[alpha]]", "[[beta]]"]
+    index_fm = _parses(dest, "index.md")
+    assert index_fm["children"] == ["[[general-moc]]"]

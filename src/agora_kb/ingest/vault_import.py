@@ -44,13 +44,43 @@ from agora_kb.core.layout import RepoLayout
 from agora_kb.core.repo import GitError, Repo
 from agora_kb.schema import Taxonomy, emit_schema, lint
 from agora_kb.schema.lint import LintResult
-from agora_kb.schema.notes import note_basename, wikilinks
+from agora_kb.schema.notes import (
+    PARSE_EXEMPT_BASENAMES,
+    child_bullets,
+    note_basename,
+    wikilinks,
+)
 
 __all__ = ["ImportReport", "NoteRecord", "import_vault"]
 
 # OKF v0.1 bundle-root version (ADR-0014 D2) — mirrors the curator's ``apply._OKF_VERSION`` and the
 # seed index emitted by ``Repo.init``. Emitted on the bundle-root ``index.md`` ONLY.
 _OKF_VERSION = "0.1"
+
+# STRUCTURAL / non-knowledge files that the DEST emits its OWN copy of, so importing them AS notes
+# only produces junk themes (ADR-0014 D5 v2 change A). They are NOT knowledge content:
+#
+# * the schema doc + its agent-tool symlinks — skipped by exact STEM (the union ``schema.notes``
+#   uses to keep them parse-exempt, ADR-0010 §1): ``AGENTS`` / ``SCHEMA`` / ``CLAUDE`` / ``QWEN`` /
+#   ``GEMINI``;
+# * ``log.md`` — the append-only curator run log (ADR-0010 §1; the dest writes its own);
+# * anything under a ``_templates/`` / ``_meta/`` / ``_kb/`` directory at ANY depth (the per-type
+#   note templates, the taxonomy, and the git-ignored engine spool — ADR-0010 §1 layout);
+# * any SYMLINK (the only allowed symlinks are the schema-doc ones, already covered by stem — a
+#   symlink is never imported as a note, mirroring ``schema.notes._iter_note_paths``).
+#
+# ``log`` is added to the exempt-STEM set (``log.md`` -> stem ``log``) alongside the parse-exempt
+# schema basenames so a single stem check covers the schema doc, its symlinks, AND the run log.
+_EXEMPT_STEMS = PARSE_EXEMPT_BASENAMES | frozenset({"log"})
+
+# Directory names whose subtree (at any depth) is structural, never knowledge (ADR-0010 §1).
+_STRUCTURAL_DIRS = frozenset({"_templates", "_meta", "_kb"})
+
+# An indent-0 MOC child bullet, used by change C to DROP a child-bullet line whose target does not
+# resolve to a written note. Mirrors :data:`agora_kb.schema.notes._CHILD_BULLET_RE` (the FROZEN §3.2
+# grammar) so the line this importer strips is EXACTLY the one ``child_bullets`` would have counted
+# guaranteeing L1-6 (``children:``-set == child-bullet-set) holds by construction after the strip.
+_CHILD_BULLET_LINE_RE = re.compile(r"^- \[(?P<text>[^\]\r\n]*)\]\((?P<path>[^)\r\n]+)\)(?:\s.*)?$")
 
 # The ADR-0010 §2.6 status vocabulary. An existing frontmatter ``status:`` is preserved only if it
 # is one of these; anything else (or absent) is replaced with the ``active`` default.
@@ -103,6 +133,15 @@ class NoteRecord:
     ``unresolved_links`` are body wikilinks left verbatim because their basename matched no note in
     the vault (tolerated, not dropped; ADR-0014 D4). ``warnings`` are the report-only items the
     operator/curator must resolve (a moved note, a theme with no sources, an unparseable block).
+
+    The v2 grounding fields (ADR-0014 D5 v2 — what makes the imported repo LINT-CLEAN + curatable):
+    ``synth_raw_source`` is the POSIX ``raw/<domain>/<slug>.md`` path the importer SYNTHESIZED as
+    this theme's immutable import-snapshot source (decision (a): every claim traces to ``raw/``,
+    ADR-0010 D3) — set only when the theme had a non-empty body and no pre-existing valid ``raw/``
+    source; ``None`` otherwise. ``stubbed_empty_theme`` is True when an EMPTY-body theme was given
+    ``status: stub`` (L1-7-exempt) instead of a synth source. ``stripped_sources`` are pre-existing
+    ``sources:`` entries that were NOT ``raw/...`` paths and so were removed + recorded (change D —
+    the synth ``raw/`` becomes the authoritative source, never a foreign ``~/dev/...`` locator).
     """
 
     rel_path: str
@@ -113,6 +152,9 @@ class NoteRecord:
     converted_links: int = 0
     unresolved_links: tuple[str, ...] = ()
     warnings: tuple[str, ...] = ()
+    synth_raw_source: str | None = None
+    stubbed_empty_theme: bool = False
+    stripped_sources: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -121,13 +163,15 @@ class ImportReport:
 
     ``notes`` is one :class:`NoteRecord` per imported source note, in destination-path order.
     ``summary`` is a counts mapping (e.g. ``notes``, ``repaired_frontmatter``, ``moved``,
-    ``converted_links``, ``unresolved_links``, ``stripped_tags``, ``themes_without_sources``) so a
-    caller can print a one-line digest without re-walking ``notes``. ``warnings`` are run-level
-    findings not tied to a single note (e.g. a non-``.md`` file that was ignored is NOT a warning —
-    it is silently skipped per D4 — but a structural surprise would land here). ``lint`` is the
-    post-import :class:`~agora_kb.schema.lint.LintResult` over ``dest``: v1 does NOT promise it is
-    clean, so the report carries it verbatim for the operator to act on (this is the honest
-    "what still needs hands" surface, ADR-0014 D5).
+    ``converted_links``, ``unresolved_links``, ``stripped_tags``, ``themes_without_sources`` plus
+    the v2 grounding counts ``synth_raw_sources`` / ``stubbed_empty_themes`` / ``stripped_sources``
+    / ``excluded_structural_files``) so a caller can print a one-line digest without re-walking
+    ``notes``. ``warnings`` are run-level findings not tied to a single note (e.g. a non-``.md``
+    file that was ignored is NOT a warning — it is silently skipped per D4 — but a structural
+    surprise would land here). ``lint`` is the post-import
+    :class:`~agora_kb.schema.lint.LintResult` over
+    ``dest``: with the v2 grounding a real vault imports lint-clean, and the report carries the lint
+    verbatim for the operator to act on (the honest "what still needs hands" surface, ADR-0014 D5).
 
     The dataclass is frozen and uses tuples throughout so a report is an immutable, deterministic
     value object (the same discipline as :class:`~agora_kb.schema.lint.LintResult`).
@@ -157,6 +201,9 @@ class _NoteBuild:
     warnings: list[str] = field(default_factory=list)
     fm: dict[str, object] = field(default_factory=dict)
     body: str = ""
+    synth_raw_source: str | None = None
+    stubbed_empty_theme: bool = False
+    stripped_sources: list[str] = field(default_factory=list)
 
     def finalize(self) -> NoteRecord:
         return NoteRecord(
@@ -168,6 +215,9 @@ class _NoteBuild:
             converted_links=self.converted_links,
             unresolved_links=tuple(self.unresolved_links),
             warnings=tuple(self.warnings),
+            synth_raw_source=self.synth_raw_source,
+            stubbed_empty_theme=self.stubbed_empty_theme,
+            stripped_sources=tuple(self.stripped_sources),
         )
 
 
@@ -551,6 +601,157 @@ def _normalize_fm_link_arrays(build: _NoteBuild, known_basenames: set[str]) -> N
         build.fm[key] = kept
 
 
+# --- v2 grounding: raw/ provenance · MOC child sync · non-raw source strip (ADR-0014 D5) -------
+
+
+def _note_domain_of(rel_path: str) -> str | None:
+    """Return a note's domain — the first component under ``wiki/`` — or ``None`` (ADR-0010 §1).
+
+    ``wiki/<domain>/...`` ⇒ ``<domain>``. Mirrors :func:`agora_kb.schema.lint._note_domain`; the
+    root ``index.md`` and any non-``wiki/`` note have no domain (and so never carry a synth ``raw/``
+    source — only themes do, and a theme always lives under ``wiki/<domain>/themes/``).
+    """
+    parts = rel_path.split("/")
+    if len(parts) >= 2 and parts[0] == "wiki":
+        return parts[1]
+    return None
+
+
+def _strip_non_raw_sources(build: _NoteBuild) -> None:
+    """Remove every pre-existing ``sources:`` entry that is not a ``raw/...`` path (change D).
+
+    ADR-0014 D5 v2 change D: a real vault theme may cite a FOREIGN locator (e.g.
+    ``'~/dev/analytics/psa @ 705f4a4 (2026-06-12)'``) that is not an immutable ``raw/`` artifact —
+    L1-8 hard-rejects it ("sources path does not exist"). The Karpathy invariant is that every claim
+    traces to ``raw/`` (ADR-0010 D3), so such an entry is STRIPPED + recorded (a warning); the synth
+    ``raw/`` snapshot from change B then becomes the authoritative source. A non-list ``sources:``
+    is normalized to ``[]`` (tolerant). A valid ``raw/<...>`` entry is KEPT (change B then skips the
+    synth, deferring to the pre-existing artifact if it exists in the vault).
+    """
+    raw = build.fm.get("sources")
+    if not isinstance(raw, list):
+        build.fm["sources"] = []
+        return
+    kept: list[str] = []
+    for entry in raw:
+        if isinstance(entry, str) and entry.startswith("raw/"):
+            kept.append(entry)
+        else:
+            build.stripped_sources.append(str(entry))
+            build.warnings.append(f"stripped non-raw source {entry!r} (not under raw/)")
+    build.fm["sources"] = kept
+
+
+def _synth_raw_source(build: _NoteBuild, *, src: Path, dest: Path) -> None:
+    """Ground a THEME in ``raw/`` provenance, or STUB an empty-body theme (change B / decision (a)).
+
+    ADR-0014 D5 v2 change B + ADR-0010 D3 (the Karpathy "every claim traces to ``raw/``" invariant):
+
+    * a theme that ALREADY carries a valid ``raw/<...>`` source whose file EXISTS in the SOURCE
+      vault is left untouched — the pre-existing immutable artifact is authoritative (change D kept
+      the ref); its bytes are COPIED into ``dest`` so L1-8 ("sources path exists") passes;
+    * a theme with a NON-EMPTY body gets its body written VERBATIM to
+      ``raw/<domain>/<basename>.md`` (an immutable import snapshot; dirs created) and its
+      ``sources:`` set to ``['raw/<domain>/<basename>.md']`` (POSIX). The basename (globally unique,
+      ADR-0010 D5) is the slug. This satisfies L1-7 (non-empty sources) AND L1-8 (the path exists);
+    * a theme with an EMPTY body instead gets ``status: stub`` (L1-7-exempt, ADR-0010 §3.4.1) + a
+      recorded note — there is no content to snapshot, so forcing a source would be dishonest.
+
+    Mirrors the curator's ``apply._materialize_raw_source``: the DETERMINISTIC engine (never a
+    model) writes ``raw/`` from an immutable body, the path is POSIX, and the write is idempotent (a
+    re-import over an existing snapshot rewrites the same bytes). Only ``theme`` notes are grounded;
+    index/moc/daily carry no ``sources:`` requirement.
+    """
+    if build.type_inferred != "theme":
+        return
+
+    domain = _note_domain_of(build.rel_path)
+    slug = note_basename(Path(build.rel_path))
+
+    # A valid pre-existing raw/ source whose file exists in the SOURCE vault wins — copy it into the
+    # dest (non-destructively: src stays read-only) and defer to that immutable artifact.
+    current = build.fm.get("sources")
+    if isinstance(current, list):
+        for entry in current:
+            if isinstance(entry, str) and entry.startswith("raw/") and (src / entry).is_file():
+                out = dest / entry
+                out.parent.mkdir(parents=True, exist_ok=True)
+                out.write_bytes((src / entry).read_bytes())
+                return
+
+    if build.body.strip():
+        ref = f"raw/{domain}/{slug}.md" if domain else f"raw/{slug}.md"
+        out = dest / ref
+        out.parent.mkdir(parents=True, exist_ok=True)
+        # Immutable import snapshot: the theme's (normalized) body verbatim. Deterministic — a pure
+        # function of the source bytes + the injected import_date, no wall clock.
+        out.write_text(build.body if build.body.endswith("\n") else build.body + "\n", "utf-8")
+        build.fm["sources"] = [ref]
+        build.synth_raw_source = ref
+    else:
+        # No body to snapshot: an honest stub (exempt from L1-7) rather than a fabricated source.
+        build.fm["status"] = "stub"
+        build.fm["sources"] = []
+        build.stubbed_empty_theme = True
+        build.warnings.append("imported empty theme -> stub")
+
+
+def _sync_moc_children(build: _NoteBuild, written_basenames: set[str]) -> None:
+    """Make a moc/index's ``children:`` EXACTLY its resolvable child-bullet set (change C / L1-6).
+
+    ADR-0014 D5 v2 change C: ADR-0010 L1-6 requires ``children:`` (resolved via ``wikilinks``) to
+    equal the body child-bullet basename set (the FROZEN §3.2 grammar, :func:`child_bullets`). The
+    importer makes this hold BY CONSTRUCTION on the NORMALIZED body (after
+    :func:`_convert_body_links` has rewritten resolvable ``[[wikilink]]`` bullets to the standard
+    markdown-link form the grammar matches):
+
+    1. compute ``child_bullets`` over the normalized body;
+    2. DROP any indent-0 child-bullet line whose basename does NOT resolve to a WRITTEN note (record
+       it in ``unresolved_links``) — so the body never carries a child bullet L1-2 would reject;
+    3. set ``children:`` to the canonical ``[[basename]]`` strings of the RESOLVABLE set, sorted.
+
+    Runs on ``moc`` / ``index`` notes only (index children = domain MOCs; moc children = themes). A
+    non-child-bullet body link (inline prose, an indented sub-bullet) is untouched — only the L1-6
+    child set is synchronized.
+    """
+    if build.type_inferred not in ("moc", "index"):
+        return
+
+    # The FROZEN §3.2 grammar (the SAME function L1-6 evaluates) yields the child-bullet basename
+    # set on the normalized body — never reimplemented here, so importer and linter can't drift.
+    all_children = child_bullets(build.body)
+    resolvable = {b for b in all_children if b in written_basenames}
+    unresolvable = all_children - resolvable
+
+    if unresolvable:
+        # Drop each unresolvable indent-0 child-bullet LINE (it would fail L1-2 + break L1-6) and
+        # record its basename; a resolvable bullet and any non-child-bullet line are kept verbatim.
+        kept_lines: list[str] = []
+        for line in build.body.split("\n"):
+            m = _CHILD_BULLET_LINE_RE.match(line)
+            if m is not None:
+                base = _basename_from_child_path(m.group("path"))
+                if base in unresolvable:
+                    build.unresolved_links.append(base)
+                    continue
+            kept_lines.append(line)
+        build.body = "\n".join(kept_lines)
+
+    build.fm["children"] = [f"[[{b}]]" for b in sorted(resolvable)]
+
+
+def _basename_from_child_path(path: str) -> str:
+    """Return the child basename from a markdown-link target path (mirrors notes._basename..).
+
+    The basename is the link-target filename minus directory + ``.md`` (the internal globally-unique
+    identity, ADR-0010 D5) — kept LOCAL (a one-liner) to avoid importing a private name from
+    ``schema.notes``; it must agree with that module's ``_basename_from_link_path`` byte-for-byte so
+    the line this importer strips matches exactly what ``child_bullets`` counts.
+    """
+    last = path.strip(" \t\r\n\f\v").rsplit("/", 1)[-1]
+    return last[: -len(".md")] if last.endswith(".md") else last
+
+
 # --- the public entry point --------------------------------------------------------------------
 
 
@@ -586,13 +787,30 @@ def import_vault(
        (:func:`_convert_body_links`); an unresolvable link is left verbatim and reported;
     6. tags outside the destination taxonomy are STRIPPED + recorded (:func:`_filter_tags`).
 
-    REPORT-ONLY (v1 does NOT auto-fix; recorded as warnings for the operator/curator): a theme with
-    no ``sources:`` (L1-7 — "needs sources or status: stub"); a note that was MOVED to fit the
-    layout; stripped unknown tags; unresolved links; a note whose frontmatter could not be parsed at
-    all. After writing ``dest`` the schema + taxonomy are emitted, the repo is git-initialized, and
-    :func:`agora_kb.schema.lint.lint` is run — its result is ATTACHED to the report. ``dest`` is a
-    best-effort conformant repo PLUS a report of what still needs hands; a fully lint-clean ``dest``
-    is NOT promised in v1.
+    v2 GROUNDING auto-fixes — what makes a real vault like ``~/knowledge`` import LINT-CLEAN and
+    curate-able (ADR-0014 D5 v2), applied per note after the link conversion:
+
+    A. STRUCTURAL / non-knowledge files are EXCLUDED from import-as-notes in pass 0 — the schema doc
+       + its symlinks + ``log.md`` (:data:`_EXEMPT_STEMS`), the ``_templates/`` / ``_meta/`` /
+       ``_kb/`` subtrees (:data:`_STRUCTURAL_DIRS`), and any symlink — so they never become junk
+       themes (the dest emits its OWN schema);
+    D. pre-existing non-``raw/`` ``sources:`` entries are STRIPPED + recorded
+       (:func:`_strip_non_raw_sources`) so an L1-8 foreign locator (``~/dev/...``) is removed;
+    B. each THEME is grounded in ``raw/`` provenance (:func:`_synth_raw_source`, decision (a)): a
+       non-empty body is snapshotted VERBATIM to ``raw/<domain>/<slug>.md`` and cited as the theme's
+       ``sources:`` (satisfies L1-7 + L1-8 + the Karpathy "every claim traces to ``raw/``"
+       invariant, ADR-0010 D3); an EMPTY-body theme becomes ``status: stub`` (L1-7-exempt) instead;
+    C. each ``moc`` / ``index`` has its ``children:`` SYNCED to exactly the resolvable child-bullet
+       basename set of its normalized body (:func:`_sync_moc_children`), dropping unresolvable child
+       bullets — so L1-6 (``children:``-set == child-bullet-set) holds by construction.
+
+    REPORT-ONLY (recorded as warnings for the operator/curator, not blocking): a note that was MOVED
+    to fit the layout; stripped unknown tags; stripped non-raw sources; unresolved links; an empty
+    theme stubbed; a note whose frontmatter could not be parsed at all. After writing ``dest`` the
+    schema + taxonomy are emitted, the repo is git-initialized, and
+    :func:`agora_kb.schema.lint.lint` is run — its result is ATTACHED to the report. With the v2
+    grounding, a real vault imports to a LINT-CLEAN (``lint(dest).ok``) repo; the attached lint
+    remains the honest surface for any residue.
 
     Raises ``FileNotFoundError`` / ``NotADirectoryError`` if ``src`` is missing or not a directory
     (a hard error). ``domains`` must be non-empty (the first domain is the move target).
@@ -612,13 +830,31 @@ def import_vault(
     # --- pass 0: discover every source .md note (tolerant: ignore non-.md and hidden dirs) -------
     # ADR-0014 D4: non-``.md`` files (``.canvas``, images) and the ``.obsidian/`` config dir are
     # IGNORED, not errors. Hidden directories (leading ``.``) and the dest (if nested) are skipped.
+    #
+    # v2 change A (ADR-0014 D5): STRUCTURAL / non-knowledge files are also skipped — the DEST emits
+    # its OWN schema doc + symlinks + log + templates, so importing them as notes only yields junk
+    # themes (the v1 ``agents``/``claude``/``qwen``/``gemini``/``schema``/``log``/``theme`` themes).
+    # Skipped: an exempt STEM (the schema doc + its symlinks + ``log.md``, :data:`_EXEMPT_STEMS`),
+    # anything under a ``_templates/`` / ``_meta/`` / ``_kb/`` dir at any depth
+    # (:data:`_STRUCTURAL_DIRS`), and any SYMLINK (never import a symlink as a note). These are
+    # counted (``excluded_structural_files``) but otherwise simply not imported.
     src_md: list[Path] = []
+    excluded_structural = 0
     for p in sorted(src.rglob("*.md")):
-        if not p.is_file():
-            continue
         rel_parts = p.relative_to(src).parts
         if any(part.startswith(".") for part in rel_parts):
             continue  # skip .obsidian/, .git/, dotfiles
+        if p.is_symlink():
+            excluded_structural += 1  # a symlink is never a note (e.g. CLAUDE.md -> AGENTS.md)
+            continue
+        if not p.is_file():
+            continue
+        if note_basename(p) in _EXEMPT_STEMS:
+            excluded_structural += 1  # the schema doc / its symlinks / the run log
+            continue
+        if any(part in _STRUCTURAL_DIRS for part in rel_parts[:-1]):
+            excluded_structural += 1  # _templates/ · _meta/ · _kb/ subtree (at any depth)
+            continue
         src_md.append(p)
 
     # --- pass 1: parse + decide type/layout for every note, building the basename map ------------
@@ -681,15 +917,30 @@ def import_vault(
     dest.mkdir(parents=True, exist_ok=True)
 
     # --- pass 2: normalize frontmatter + links for every note ------------------------------------
+    # Order matters for the v2 grounding (ADR-0014 D5): D (strip foreign sources) THEN B (synth the
+    # authoritative raw/ snapshot or stub) THEN C (sync MOC children on the NORMALIZED body, after
+    # link conversion has rewritten resolvable [[wikilink]] bullets to the markdown-link form the
+    # frozen child-bullet grammar matches). ``known_basenames`` is exactly the WRITTEN-note set
+    # (structural files were excluded in pass 0), so it is the resolvable target set for change C.
     for build in builds:
         _infer_required_frontmatter(build, import_date)
         _filter_tags(build, allowed_tags)
         _normalize_fm_link_arrays(build, known_basenames)
         _convert_body_links(build, basename_to_relpath)
-        if build.type_inferred == "theme" and not _has_sources(build.fm):
-            build.warnings.append("theme has no raw/ sources (L1-7): needs sources or status: stub")
+        _strip_non_raw_sources(build)  # change D — remove non-raw/ source entries (+ record)
+        _synth_raw_source(build, src=src, dest=dest)  # change B — synth raw/ provenance or stub
+        _sync_moc_children(build, known_basenames)  # change C — children == resolvable child set
+        if build.type_inferred == "theme" and build.fm.get("status") != "stub":
+            # After change B every non-stub theme has a synth (or kept) raw/ source; a residual
+            # empty-sources theme (none — defensive) is still reported for the operator (L1-7).
+            if not _has_sources(build.fm):
+                build.warnings.append(
+                    "theme has no raw/ sources (L1-7): needs sources or status: stub"
+                )
 
     # --- write the normalized notes under dest ---------------------------------------------------
+    # Change B already wrote the immutable ``raw/<domain>/<slug>.md`` snapshots; here the normalized
+    # wiki notes themselves are emitted (raw/ is outside the wiki tree and never overwritten here).
     for build in builds:
         out_path = dest / build.rel_path
         out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -723,6 +974,14 @@ def import_vault(
         "themes_without_sources": sum(
             1 for r in records if any("needs sources" in w for w in r.warnings)
         ),
+        # v2 grounding counts (ADR-0014 D5): how many themes got a synth raw/ source, how many empty
+        # themes became stubs, how many non-raw source entries were stripped, and how many
+        # structural / non-knowledge files (schema doc, symlinks, log, _templates/_meta/_kb) were
+        # excluded from import-as-notes (change A).
+        "synth_raw_sources": sum(1 for r in records if r.synth_raw_source is not None),
+        "stubbed_empty_themes": sum(1 for r in records if r.stubbed_empty_theme),
+        "stripped_sources": sum(len(r.stripped_sources) for r in records),
+        "excluded_structural_files": excluded_structural,
         "lint_findings": len(lint_result.findings),
     }
     return ImportReport(notes=records, summary=summary, warnings=(), lint=lint_result)
