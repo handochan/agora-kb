@@ -1,6 +1,6 @@
 # ADR-0014 — OKF + Obsidian interoperability (amends ADR-0010)
 
-**Status:** Proposed · 2026-06-17 · _amends, does not repeal, ADR-0010_
+**Status:** Accepted · 2026-06-17 · _amends, does not repeal, ADR-0010_
 
 ## Context
 
@@ -155,22 +155,22 @@ evolve independently: an internal schema bump need not change OKF conformance an
 - **−** Our `index.md` carries frontmatter, which OKF reserves as a no-frontmatter listing; tolerated
   by conformant consumers but technically non-ideal (see open questions).
 
-## Open questions (to ratify before implementation)
+## Resolved decisions (ratified 2026-06-17)
 
-1. **Linking (D3) ratification:** adopt standard-markdown-body-links as the single tri-native form
-   (recommended — one repo, natively git+Obsidian+OKF, no export step), or keep `[[basename]]`
-   canonical with a pure OKF export (lower one-time effort, but the committed graph is not natively
-   OKF-traversable)?
-2. **`summary` vs `description`:** emit both (redundant value), make `description` canonical with
-   `summary` a read-accepted alias, or keep `summary` and only add `description` on the OKF export?
-3. **`index.md`:** accept the frontmatter superset (tolerant consumers won't reject), or emit a
-   separate OKF-plain listing on export?
-4. **Defaults:** emit the OKF fields at `repo init` by default, or behind a `--okf` flag /
-   `repo.yaml` switch?
-5. **Timestamp fidelity:** is the deterministic `<updated>T00:00:00Z` acceptable, or does any consumer
-   need true sub-day datetimes (which would break D1 replay determinism)?
-6. **`log.md`:** reshape to OKF's date-grouped-newest-first format, or keep the curator-run log and
-   rely on OKF's tolerance?
+1. **Linking (D3): standard-markdown-body-links** — the single form native to git + Obsidian + OKF;
+   no export/dual-emit. Internal basename identity (ADR-0010 D5) retained. (The wikilink-canonical +
+   export fallback is recorded but NOT chosen.)
+2. **`summary` + `description`:** keep `summary` as the internal canonical one-line field (no rename
+   now — avoids churning every fixture/lint rule) AND emit `description` carrying the same value for
+   OKF conformance. They MAY converge in a later `schema_version` bump.
+3. **`index.md`:** accept the frontmatter superset — conformant OKF consumers MUST NOT reject for it;
+   no separate OKF-plain listing.
+4. **Defaults:** OKF fields are emitted BY DEFAULT at `repo init` and during curation — OKF
+   conformance is the default posture, not an opt-in flag.
+5. **Timestamp:** the deterministic `<updated>T00:00:00Z` is accepted (preserves ADR-0010 D1 replay
+   determinism); no wall-clock datetime is introduced.
+6. **`log.md`:** keep the curator-run log format for now (OKF tolerates it); reshaping to OKF's
+   date-grouped-newest-first is deferred to a later increment.
 
 ## Implementation phasing (Phase-2; sequenced, each independently shippable)
 
