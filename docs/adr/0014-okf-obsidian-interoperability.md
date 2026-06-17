@@ -64,6 +64,11 @@ The strict internal schema (ADR-0010) continues to govern everything the curator
 explicitly-tolerant **boundary** governs everything Agora **reads, harvests, or imports**. The
 curator's deterministic integrity gate is never weakened.
 
+The concrete target is a **single committed repo that is natively all three at once** — a valid git
+repo, a working Obsidian vault, AND a conformant, graph-traversable OKF bundle — with **no build or
+export step** (achieved by the link representation in D3). There is no hard incompatibility between
+the three; the only design choice with real cost is the graph-link form.
+
 **D1 — Producer/consumer split (the load-bearing decision).** ADR-0010's strict lint applies to
 curator-produced notes ONLY. A separate "external read" posture (D4) applies to foreign input and is
 deliberately tolerant. The two never mix: tolerated foreign content is never published into the
@@ -83,16 +88,21 @@ curator produce frontmatter that satisfies OKF while remaining ADR-0010-valid:
 - `tags` stay the CLOSED taxonomy for produced notes (ADR-0010 D6 intact); OKF's free tags apply only
   to foreign bundles on read.
 
-**D3 — Linking: wikilink-canonical + deterministic OKF export (recommended).** The curator keeps
-authoring `[[basename]]`; ADR-0010 D5's frozen resolver and the L1-2/L1-6 grammars are UNCHANGED
-(lowest risk). Because `[[basename]] → path` is already a total function, a pure, deterministic
-**OKF link export** renders a conformant view with standard markdown links
-(`[Title](/wiki/<domain>/themes/<slug>.md)`). Since OKF consumers MUST tolerate "broken" links, the
-raw repo is already a non-rejected OKF bundle; the export upgrades it to graph-traversable. An opt-in
-`repo.yaml` switch enables **dual-emit** (both `[[basename]]` and the resolved markdown link inline)
-for repos that want a natively-graph-traversable OKF bundle with no export step. _(Standard markdown
-links also resolve in Obsidian, so switching the canonical form to OKF links remains a future option;
-it is rejected NOW only because it would rewrite the integrity-critical curator/lint grammar.)_
+**D3 — Linking: one representation native to all three (recommended).** The one link form that is
+simultaneously native to git, Obsidian, AND OKF is the **standard markdown link in the note BODY**
+(`[Title](<relative-path>.md)`): git/GitHub renders it, Obsidian resolves it as a first-class graph
+edge (backlinks + graph view), and OKF treats it as a conformant relationship edge. So the curator
+emits **markdown links in bodies**, and frontmatter `related:`/`children:` stay `"[[basename]]"`
+strings — the Obsidian "Properties" native form, which OKF preserves as extra keys. Agora's internal
+globally-unique **basename identity (ADR-0010 D5) is retained**; the resolver maps basename↔path and
+the curator emits the resolved relative path. The cost is a CONTAINED, one-time change to the
+integrity-critical link grammar — L1-2 link resolution and the L1-6 MOC child-bullet grammar move
+from `[[ ]]` to markdown-link targets, and the curator emits markdown links — accepted because it
+buys PERMANENT native tri-compatibility with NO export/dual-representation to keep in sync. The exact
+relative path form that resolves in BOTH Obsidian and OKF (relative `./` vs bundle-absolute `/`) is
+pinned during implementation. _(Lower-effort fallback: keep `[[basename]]` canonical and add a pure
+`[[basename]] → /path.md` OKF export — viable because OKF consumers MUST tolerate the un-exported
+wikilinks as "broken" — chosen only if we decide to defer the grammar change.)_
 
 **D4 — Tolerant consumer/read boundary.** The READ / harvest / import path MUST NOT crash on foreign
 input. Concretely it MUST tolerate, surfacing a finding or a skip rather than an error: malformed YAML
@@ -134,8 +144,9 @@ evolve independently: an internal schema bump need not change OKF conformance an
   is unchanged; this adds fields, a pure export, and a separate read boundary.
 - **−** A strict-producer/tolerant-consumer boundary must be policed: tolerated foreign content must
   never reach the curated tree except through the strict producer lint.
-- **−** Linking carries a dual representation (`[[]]` canonical + derived markdown links); a resolver
-  bug could desynchronize the two. Mitigated by making the markdown form a pure one-way derivation.
+- **−** Adopting standard-markdown-body-links (D3) is a one-time change to the integrity-critical
+  link grammar (L1-2/L1-6) and curator emission; accepted because it yields permanent native
+  tri-compatibility with no ongoing export or dual-representation to keep in sync.
 - **−** OKF v0.1 is five days old and explicitly "a starting point"; it may evolve (possibly
   breaking). Mitigated by adopting only the stable core (frontmatter fields + bundle shape), which is
   good markdown hygiene regardless, and by OKF's backward-compatible-growth pledge.
@@ -146,8 +157,10 @@ evolve independently: an internal schema bump need not change OKF conformance an
 
 ## Open questions (to ratify before implementation)
 
-1. **Linking (D3) ratification:** wikilink-canonical + OKF export (recommended), dual-emit by default,
-   or eventually switch the canonical graph to standard markdown links?
+1. **Linking (D3) ratification:** adopt standard-markdown-body-links as the single tri-native form
+   (recommended — one repo, natively git+Obsidian+OKF, no export step), or keep `[[basename]]`
+   canonical with a pure OKF export (lower one-time effort, but the committed graph is not natively
+   OKF-traversable)?
 2. **`summary` vs `description`:** emit both (redundant value), make `description` canonical with
    `summary` a read-accepted alias, or keep `summary` and only add `description` on the OKF export?
 3. **`index.md`:** accept the frontmatter superset (tolerant consumers won't reject), or emit a
