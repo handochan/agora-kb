@@ -28,6 +28,7 @@ from agora_kb.curator.apply import (
 from agora_kb.curator.plan import Disposition, Plan
 from agora_kb.schema.emit import Taxonomy, emit_schema
 from agora_kb.schema.lint import lint
+from agora_kb.schema.notes import body_link_basenames, child_bullets
 
 RUN_ID = "2026-06-13T03-00-00.000Z--7f31ab"
 RUN_DATE = "2026-06-13"
@@ -235,21 +236,61 @@ def test_create_theme_updates_moc_and_index(tmp_path: Path) -> None:
     assert moc.is_file()
     mfm, mbody = frontmatter.parse(moc.read_text(encoding="utf-8"))
     assert mfm["type"] == "moc"
+    # `children:` frontmatter STAYS [[basename]] (ADR-0014 D3 / Obsidian Properties native).
     assert mfm["children"] == ["[[curator-concurrency]]"]
-    assert "- [[curator-concurrency]]" in mbody
+    # The BODY child bullet is a STANDARD MARKDOWN LINK `- [Title](themes/<base>.md)` (ADR-0014 D3):
+    # link TEXT == the theme's title; relative path from the MOC's dir == `themes/<base>.md`.
+    assert "- [Curator concurrency model](themes/curator-concurrency.md)" in mbody
+    # No bare wikilink survives in the MOC body — the body graph link is markdown-only now.
+    assert "[[curator-concurrency]]" not in mbody
 
     index = wt / "index.md"
     assert index.is_file()
     ifm, ibody = frontmatter.parse(index.read_text(encoding="utf-8"))
     assert ifm["type"] == "index"
     assert ifm["children"] == ["[[ai-tech-moc]]"]
-    assert "- [[ai-tech-moc]]" in ibody
+    # The index→MOC bullet path is `wiki/<domain>/<domain>-moc.md` (relative from the repo root).
+    assert "- [ai-tech MOC](wiki/ai-tech/ai-tech-moc.md)" in ibody
+    assert "[[ai-tech-moc]]" not in ibody
 
 
 def test_create_theme_result_passes_lint(tmp_path: Path) -> None:
     wt = _worktree(tmp_path)
     plan = _plan(_create_theme())
     apply_plan(plan, worktree=wt, run_date=RUN_DATE, provenance=_provenance("c1", E1))
+    result = lint(RepoLayout(wt), taxonomy=TAXONOMY, run_date=RUN_DATE, run_id=RUN_ID)
+    assert result.ok, [f for f in result.findings]
+
+
+@pytest.mark.parametrize(
+    "title",
+    [
+        "Edge ] case",  # a bracket terminates _CHILD_BULLET_RE's link-text group early
+        "line1\nline2",  # a newline is forbidden in the frozen link-text class
+        "[fully] ]bracketed[",  # every bracket char must be sanitized out of the TEXT
+    ],
+)
+def test_create_theme_with_breaking_title_still_round_trips_and_lints(
+    tmp_path: Path, title: str
+) -> None:
+    # REGRESSION (ADR-0014 D3 / ADR-0010 D5 round-trip): a model-decided theme `title` may legally
+    # contain `]`, `[` or a newline (all valid YAML scalars), but the FROZEN `_CHILD_BULLET_RE`
+    # link-text class `[^\]\r\n]*` forbids them. Emitting such a title RAW into the MOC body bullet
+    # would produce a `- [..](themes/<base>.md)` line the curator's OWN L1-6/L1-2 lint can no longer
+    # parse, silently dropping the child from `child_bullets` / `body_link_basenames`. `_link_text`
+    # sanitizes the TEXT (never the slug-constrained PATH), so emit->parse still recovers the
+    # basename and the post-APPLY tree the curator just wrote lints clean.
+    wt = _worktree(tmp_path)
+    plan = _plan(_create_theme(title=title))
+    apply_plan(plan, worktree=wt, run_date=RUN_DATE, provenance=_provenance("c1", E1))
+
+    # The MOC body bullet round-trips: emit->parse recovers the theme's basename despite the title.
+    moc = wt / "wiki" / "ai-tech" / "ai-tech-moc.md"
+    _, mbody = frontmatter.parse(moc.read_text(encoding="utf-8"))
+    assert child_bullets(mbody) == {"curator-concurrency"}
+    assert body_link_basenames(mbody) == ["curator-concurrency"]
+
+    # And the whole post-APPLY tree lints clean (L1-6 declared==body-bullets, L1-2 no broken links).
     result = lint(RepoLayout(wt), taxonomy=TAXONOMY, run_date=RUN_DATE, run_id=RUN_ID)
     assert result.ok, [f for f in result.findings]
 

@@ -6,6 +6,7 @@ from .emit import Taxonomy, emit_schema
 from .lint import LintFinding, LintResult, lint
 from .notes import (
     Note,
+    body_link_basenames,
     child_bullets,
     heading_slug,
     note_basename,
@@ -18,6 +19,7 @@ __all__ = [
     "parse_all_notes",
     "wikilinks",
     "child_bullets",
+    "body_link_basenames",
     "heading_slug",
     "note_basename",
     "Taxonomy",

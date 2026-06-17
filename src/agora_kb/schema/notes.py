@@ -10,9 +10,12 @@ provides the deterministic, model-free reading layer the linter (ADR-0010 §6) a
   SKIPPING the parse-exempt schema doc (``AGENTS.md`` / ``SCHEMA.md``) by exact basename and its
   symlinks (``CLAUDE.md`` / ``QWEN.md`` / ``GEMINI.md``) by symlink identity (ADR-0010 §1).
 * the FROZEN grammars that two independent implementations MUST agree on byte-for-byte (ADR-0010
-  D5): :func:`wikilinks` (the ``[[basename]]`` resolver normalization, §3.1),
-  :func:`child_bullets` (the MOC child-bullet regex at indent 0, §3.2), and :func:`heading_slug`
-  (the heading-anchor slugger with ``-1`` / ``-2`` duplicate disambiguation, §4.1).
+  D5, as amended by ADR-0014 D3): :func:`wikilinks` (the ``[[basename]]`` resolver normalization,
+  §3.1 — still used for the frontmatter ``related:`` / ``children:`` arrays), :func:`child_bullets`
+  (the MOC child-bullet regex at indent 0, §3.2 — now a STANDARD MARKDOWN LINK
+  ``[Title](relative.md)`` body bullet per ADR-0014 D3, with the basename parsed from the link
+  path), and :func:`heading_slug` (the heading-anchor slugger with ``-1`` / ``-2`` duplicate
+  disambiguation, §4.1).
 
 These grammars are intentionally rigid: rigidity is the price of a reproducible hard-reject gate and
 a deterministic, testable retrieval path (ADR-0010 "Consequences").
@@ -33,6 +36,7 @@ __all__ = [
     "parse_all_notes",
     "wikilinks",
     "child_bullets",
+    "body_link_basenames",
     "heading_slug",
     "note_basename",
     "PARSE_EXEMPT_BASENAMES",
@@ -47,17 +51,36 @@ PARSE_EXEMPT_BASENAMES = frozenset({"AGENTS", "SCHEMA", "CLAUDE", "QWEN", "GEMIN
 
 # --- FROZEN grammars (ADR-0010 D5) ------------------------------------------------------------
 
-# §3.2 MOC child-bullet grammar — EXACT, at indent level 0 (no leading whitespace). Marker is
-# ``- `` (hyphen-space) only; exactly one ``[[ ]]`` and it is the first token; ``base`` is the
-# child. A ``[[ ]]`` in prose, in a nested (indented) bullet, in ``related:``, or as a second link
-# on the line is NOT a child bullet.
-_CHILD_BULLET_RE = re.compile(r"^- \[\[(?P<base>[a-z0-9][a-z0-9-]*)(\|[^\]\r\n]+)?\]\](?:\s.*)?$")
+# §3.2 MOC child-bullet grammar — EXACT, at indent level 0 (no leading whitespace). ADR-0014 D3
+# moves the BODY graph link from a ``[[basename]]`` wikilink to a STANDARD MARKDOWN LINK
+# ``[Title](relative-path.md)`` — the single form native to git + Obsidian + OKF (no export step).
+# Marker is ``- `` (hyphen-space) only; exactly one markdown link and it is the first token; the
+# child BASENAME is the link-target filename minus its directory and ``.md`` suffix (extracted by
+# :func:`_basename_from_link_path`). A markdown link in prose, in a nested (indented) bullet, or as
+# a second link on the line is NOT a child bullet. Internal IDENTITY remains the globally-unique
+# basename (ADR-0010 D5); the path is derived from it and the resolver maps basename↔path.
+#
+# ``text`` is the link TEXT (the child's title; ``[^\]\r\n]*`` keeps it on one line, no nested
+# brackets). ``path`` is the relative target — ``themes/<base>.md`` from a MOC, or
+# ``wiki/<domain>/<domain>-moc.md`` from the root index — captured up to the closing ``)`` with no
+# newline. The optional trailing group ``(?:\s.*)?$`` permits whitespace-led prose after the link.
+_CHILD_BULLET_RE = re.compile(r"^- \[(?P<text>[^\]\r\n]*)\]\((?P<path>[^)\r\n]+)\)(?:\s.*)?$")
 
 # §3.1 Wikilink token — ``[[basename]]`` or ``[[basename|display]]``. The link key is the substring
 # left of ``|`` (or the whole), with leading/trailing ASCII whitespace stripped; NO case folding, NO
 # unicode normalization, NO slugging. ``[^\[\]\r\n]`` keeps a token on one line and free of nested
-# brackets so ``[[a]] [[b]]`` yields two links, not one.
+# brackets so ``[[a]] [[b]]`` yields two links, not one. STILL used for the frontmatter ``related:``
+# / ``children:`` ``[[ ]]`` arrays (Obsidian-Properties-native; ADR-0014 D3 keeps them as wikis).
 _WIKILINK_RE = re.compile(r"\[\[(?P<inner>[^\[\]\r\n]*)\]\]")
+
+# A STANDARD MARKDOWN LINK in a note BODY — ``[text](target)`` — used as a graph edge by ADR-0014 D3
+# (the MOC/index child bullets). The visible ``text`` carries no nested brackets/newline; ``target``
+# is captured up to the closing ``)`` with no newline. This is the body-graph counterpart to
+# :data:`_WIKILINK_RE`: :func:`body_link_basenames` resolves each target path to its basename for
+# the L1-2 broken-link check and the read-path graph seed (ADR-0012). An IMAGE link ``![alt](...)``
+# is excluded (preceding ``!`` asserted absent) so an ``assets/`` image is never a graph edge
+# (ADR-0010 §3.5 — assets live outside the link graph).
+_BODY_MDLINK_RE = re.compile(r"(?<!\!)\[(?P<text>[^\]\r\n]*)\]\((?P<target>[^)\r\n]+)\)")
 
 # Inline-markdown strippers for the heading-slug algorithm (§4.1 step 2), applied in order:
 #   1. wikilink with display [[x|y]] -> y;  bare wikilink [[x]] -> x;
@@ -191,21 +214,74 @@ def wikilinks(text: str) -> list[str]:
     return keys
 
 
-def child_bullets(body: str) -> set[str]:
-    """Return the set of MOC child basenames in ``body`` (frozen grammar, §3.2).
+def _basename_from_link_path(path: str) -> str:
+    """Return the child BASENAME from a markdown-link target path (ADR-0014 D3 / ADR-0010 D5).
 
-    A child bullet is a line matching EXACTLY the ADR-0010 §3.2 regex at indent level 0: marker
-    ``- `` (hyphen-space) only, exactly one ``[[ ]]`` as the first token, optional trailing text.
-    The captured ``base`` (left of any ``|``) is the child. Any ``[[ ]]`` in prose, in a nested
-    (indented) bullet, in ``related:``, or as a second link on the line is IGNORED. Duplicates
-    collapse (set semantics) — L1-6 compares this set against the ``children:`` basename set.
+    The basename is the link-target filename minus its directory and ``.md`` suffix — the internal
+    globally-unique identity (ADR-0010 D5) the resolver keys off, independent of the relative path
+    the curator emitted. Robust to either body-link shape:
+
+    * a MOC's theme child  ``themes/curator-concurrency.md`` → ``curator-concurrency``;
+    * the root index's MOC child ``wiki/ai-tech/ai-tech-moc.md`` → ``ai-tech-moc``.
+
+    The path is split on ``/`` (POSIX-style, the only form APPLY emits — no leading ``/`` or
+    ``./``); the last segment's trailing ``.md`` (if any) is stripped. ASCII whitespace around the
+    captured path is trimmed so a stray space inside ``](  path.md )`` still resolves. A path empty
+    after trimming yields the empty string (the caller drops it — it can never match a basename).
+    """
+    last = path.strip(" \t\r\n\f\v").rsplit("/", 1)[-1]
+    if last.endswith(".md"):
+        last = last[: -len(".md")]
+    return last
+
+
+def child_bullets(body: str) -> set[str]:
+    """Return the set of MOC child basenames in ``body`` (frozen grammar, §3.2 / ADR-0014 D3).
+
+    A child bullet is a line matching EXACTLY the §3.2 regex at indent level 0: marker ``- ``
+    (hyphen-space) only, exactly one STANDARD MARKDOWN LINK ``[Title](relative-path.md)`` as the
+    first token, optional whitespace-led trailing text. The child basename is parsed from the link
+    PATH (filename minus directory minus ``.md``, via :func:`_basename_from_link_path`) — the
+    internal globally-unique identity regardless of the relative path emitted (ADR-0010 D5). A
+    markdown link in prose, in a nested (indented) bullet, or as a second link on the line is
+    IGNORED. Duplicates collapse (set semantics) — L1-6 compares this set against the ``children:``
+    basename set (still ``[[basename]]`` wikilink tokens; see :func:`wikilinks`).
     """
     children: set[str] = set()
     for line in body.splitlines():
         m = _CHILD_BULLET_RE.match(line)
         if m is not None:
-            children.add(m.group("base"))
+            base = _basename_from_link_path(m.group("path"))
+            if base:
+                children.add(base)
     return children
+
+
+def body_link_basenames(body: str) -> list[str]:
+    """Return the resolved child basenames of every BODY markdown graph link (ADR-0014 D3).
+
+    Scans ``body`` for standard markdown links ``[text](target.md)`` (the ADR-0014 D3 body-graph
+    edge form), resolving each ``.md`` target PATH to its basename via
+    :func:`_basename_from_link_path` (filename minus directory minus ``.md``, the internal
+    globally-unique identity, ADR-0010 D5). Order is document order; duplicates are preserved (a
+    caller wanting a set applies ``set()``).
+
+    ONLY ``.md`` targets are graph edges: an external URL ``[GCP](https://…)`` or an asset image
+    ``![alt](assets/foo.png)`` is NOT a note link, so a non-``.md`` target (and any image link, via
+    the regex's ``(?<!\\!)`` guard) is skipped — it is a citation/asset, not a basename edge
+    (ADR-0010 §3.5). This is the body counterpart of :func:`wikilinks`, which now resolves ONLY the
+    frontmatter ``related:`` / ``children:`` ``[[ ]]`` arrays (ADR-0014 D3 keeps those as wikis);
+    the two together are the complete link surface L1-2 resolves and the read path seeds on.
+    """
+    keys: list[str] = []
+    for m in _BODY_MDLINK_RE.finditer(body):
+        target = m.group("target").strip(" \t\r\n\f\v")
+        if not target.endswith(".md"):
+            continue  # external URL or non-note target — not a basename graph edge
+        base = _basename_from_link_path(target)
+        if base:
+            keys.append(base)
+    return keys
 
 
 def _strip_inline_markdown(text: str) -> str:

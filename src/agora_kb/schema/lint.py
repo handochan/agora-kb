@@ -3,8 +3,10 @@
 This is the model-free, wall-clock-free integrity gate that ADR-0011 §4.4 runs after APPLY +
 AUTHOR (before commit) and that the dashboard / ``kb_status`` reuse verbatim — the SAME code path,
 so the curator and the dashboard can never disagree. It builds on the FROZEN reading layer in
-:mod:`agora_kb.schema.notes` (the four grammars: :func:`~agora_kb.schema.notes.parse_all_notes`,
-:func:`~agora_kb.schema.notes.wikilinks`, :func:`~agora_kb.schema.notes.child_bullets`) and the
+:mod:`agora_kb.schema.notes` (:func:`~agora_kb.schema.notes.parse_all_notes`,
+:func:`~agora_kb.schema.notes.wikilinks` for the frontmatter ``related:`` / ``children:`` ``[[ ]]``
+arrays, :func:`~agora_kb.schema.notes.body_link_basenames` for the ADR-0014 D3 standard-markdown
+BODY graph links, and :func:`~agora_kb.schema.notes.child_bullets` for the MOC child set) and the
 :class:`~agora_kb.schema.emit.Taxonomy` model.
 
 Purity contract (ADR-0010 D1, "reads no wall clock"):
@@ -52,6 +54,7 @@ from agora_kb.schema.emit import Taxonomy
 from agora_kb.schema.notes import (
     PARSE_EXEMPT_BASENAMES,
     Note,
+    body_link_basenames,
     child_bullets,
     note_basename,
     parse_all_notes,
@@ -574,13 +577,23 @@ def lint(
         path = n.rel_path
         fm = n.frontmatter
 
-        # L1-2 broken/dangling wikilink — in the BODY and in the related:/children: frontmatter
-        # arrays (every [[ ]] entry must resolve to a known basename/alias, ADR-0010 §6 L1-2).
-        link_keys = list(wikilinks(n.body))
+        # L1-2 broken/dangling link — resolved against the known basename/alias set. Two link
+        # surfaces, per ADR-0014 D3: (1) the note BODY now carries STANDARD MARKDOWN graph links
+        # ``[Title](relative.md)`` (the MOC/index child bullets), resolved path→basename via
+        # body_link_basenames; (2) the frontmatter related:/children: arrays STAY ``[[basename]]``
+        # wikilinks, resolved via wikilinks(). A body markdown link whose resolved basename is
+        # unknown is a broken link — the SAME hard reject as before (the strict producer, ADR-0014
+        # D1). The two key kinds are reported with their native syntax for a precise message.
+        for key in body_link_basenames(n.body):
+            if key not in known:
+                findings.append(
+                    LintFinding("L1-2", "error", path, f"broken link [{key}](…) (no such note)")
+                )
+        fm_link_keys: list[str] = []
         for key in ("related", "children"):
             for entry in _str_items(fm.get(key)):
-                link_keys.extend(wikilinks(entry))
-        for key in link_keys:
+                fm_link_keys.extend(wikilinks(entry))
+        for key in fm_link_keys:
             if key not in known:
                 findings.append(
                     LintFinding("L1-2", "error", path, f"broken wikilink [[{key}]] (no such note)")

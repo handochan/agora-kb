@@ -147,9 +147,11 @@ body_status: pending | absent  # present-as `pending` ONLY while the dated secti
 ### 2.4 `moc` and `index` add
 
 ```yaml
-children: []       # array of "[[basename]]" — explicit enumeration of mapped notes.
-                   # MUST exactly equal the set of child-bullet basenames in the prose body (L1-6, grammar §3.2).
-                   # For index: the domain MOCs. For a domain moc: that domain's THEMES ONLY (never dailies, §3.6).
+children: []       # array of "[[basename]]" (frontmatter STAYS wikilinks, ADR-0014 D3) — explicit
+                   #   enumeration of mapped notes. MUST exactly equal the set of child-bullet
+                   #   BASENAMES in the prose body, where the body bullets are markdown links
+                   #   `- [Title](relative.md)` (L1-6, grammar §3.2). For index: the domain MOCs.
+                   #   For a domain moc: that domain's THEMES ONLY (never dailies, §3.6).
 ```
 
 ### 2.5 Worked examples
@@ -185,11 +187,16 @@ created: 2026-06-01
 updated: 2026-06-13
 status: active
 summary: Top map-of-content; navigation root for every domain MOC.
-children: ["[[ai-tech-moc]]", "[[economy-moc]]"]
+children: ["[[ai-tech-moc]]", "[[economy-moc]]"]   # frontmatter STAYS [[basename]] (ADR-0014 D3)
 ---
-- [[ai-tech-moc]] — models, tooling, architecture notes
-- [[economy-moc]] — macro and markets
+- [AI/Tech MOC](wiki/ai-tech/ai-tech-moc.md) — models, tooling, architecture notes
+- [Economy MOC](wiki/economy/economy-moc.md) — macro and markets
 ```
+
+> **Body links are markdown links, frontmatter links are wikilinks (ADR-0014 D3).** The body child
+> bullets use `[Title](relative.md)` (git + Obsidian + OKF native); `children:` / `related:` stay
+> `"[[basename]]"`. Both encode the same globally-unique basenames — the basename is parsed back from
+> the body link's path, so the deterministic L1-6 / L1-2 / read-path graph all stay total.
 
 ### 2.6 `status` vocabulary (lifecycle states — who sets them)
 
@@ -241,11 +248,17 @@ MUST NOT reject a bundle for the extra keys, so emitting them is safe for both f
 
 ## 3. Link, MOC & citation conventions
 
-### 3.1 Wikilinks (frozen resolver)
+### 3.1 Wikilinks (frozen resolver) — frontmatter `related:` / `children:` arrays
 
-- Use **`[[basename]]` only** — no path, no extension, no `[[path/note]]`. This is safe because basenames
-  are globally unique within the repo (DATA-MODEL §10), so `[[basename]]` is a *total function* from
-  link-text → file, computable in pure Python. This is the substrate for `match_reason: linked-theme`.
+> **Scope (ADR-0014 D3):** `[[basename]]` is the link form for the FRONTMATTER `related:` /
+> `children:` arrays (the Obsidian "Properties" native form). The BODY graph links (MOC/index child
+> bullets) are STANDARD MARKDOWN LINKS `[Title](relative.md)` — see §3.2. Both encode the same
+> globally-unique basenames; this section's resolver/normalization rules govern the `[[ ]]` form.
+
+- In `related:` / `children:` use **`[[basename]]` only** — no path, no extension, no `[[path/note]]`.
+  This is safe because basenames are globally unique within the repo (DATA-MODEL §10), so
+  `[[basename]]` is a *total function* from link-text → file, computable in pure Python. Together with
+  the body markdown links it is the substrate for `match_reason: linked-theme`.
 - `[[basename|display text]]` is allowed for display only; resolution keys off `basename` (left of `|`).
 - **Normalization (frozen):** the link key is the substring left of `|` (or the whole, if no `|`), with
   leading / trailing ASCII whitespace stripped. **NO case folding, NO unicode normalization, NO slugging.**
@@ -259,19 +272,36 @@ MUST NOT reject a bundle for the extra keys, so emitting them is safe for both f
 
 ### 3.2 MOC child enumeration (frozen grammar for the deterministic cross-check)
 
-A MOC lists children as a top-level bullet list AND mirrors that exact set in `children:` frontmatter.
+A MOC lists children as a top-level bullet list AND mirrors that exact basename set in `children:`
+frontmatter.
+
+**BODY graph links are STANDARD MARKDOWN LINKS (ADR-0014 D3).** The MOC/index child bullets are
+`- [Title](relative-path.md)` — the single link form native to **git** (GitHub renders it),
+**Obsidian** (a first-class graph edge — backlinks + graph view), AND **OKF** (a conformant
+relationship edge). This makes a committed Agora repo natively all three at once with **no export
+step**. The `children:` / `related:` FRONTMATTER arrays STAY `"[[basename]]"` wikilink strings (the
+Obsidian "Properties" native form, which OKF preserves as extra keys). Internal **basename identity
+is retained** (ADR-0010 D5): the basename is parsed back from the link path, and the curator emits
+the resolved relative path.
 
 A **child bullet** is a body line matching EXACTLY this regex at indent level 0 (no leading whitespace):
 
 ```
-^- \[\[(?P<base>[a-z0-9][a-z0-9-]*)(\|[^\]\r\n]+)?\]\](?:\s.*)?$
+^- \[(?P<text>[^\]\r\n]*)\]\((?P<path>[^)\r\n]+)\)(?:\s.*)?$
 ```
 
-Rules (frozen): the bullet marker is `- ` (hyphen-space) only — not `*` / `+`; exactly **one** `[[ ]]`
-link, and it is the first token of the bullet; the captured `base` is the child. Any `[[ ]]` appearing in
-non-bullet prose, in nested (indented) bullets, in `related:`, or as a second link on a bullet line is
-**ignored** for L1-6. The child set is the set of captured `base` values. L1-6 fails the commit iff this
-set ≠ the `children:` basename set (set equality; duplicates collapse).
+Rules (frozen): the bullet marker is `- ` (hyphen-space) only — not `*` / `+`; exactly **one**
+markdown link, and it is the first token of the bullet; the child **basename** is the link `path`'s
+filename minus its directory and `.md` suffix. The **relative path** is taken from the linking note's
+directory, with no leading `/` or `./`:
+
+- a domain MOC at `wiki/<domain>/<domain>-moc.md` links a theme as `themes/<base>.md`;
+- the root `index.md` links a domain MOC as `wiki/<domain>/<domain>-moc.md`.
+
+Any markdown link appearing in non-bullet prose, in nested (indented) bullets, or as a second link on
+a bullet line is **ignored** for L1-6 (and image links `![alt](assets/…)` are never graph edges,
+§3.5). The child set is the set of basenames parsed from the link paths. L1-6 fails the commit iff
+this set ≠ the `children:` basename set (set equality; duplicates collapse).
 
 ### 3.3 Backlinks, orphan, stale — derived, never stored
 
@@ -394,7 +424,9 @@ Naming rules:
 - **AVOID for cross-tool portability** (do not round-trip across Obsidian / Logseq / Foam / Quartz):
   Obsidian block-refs `^id`, transclusions `![[..]]`, `cssclass` / `cssclasses`, Logseq triple-underscore
   namespacing `A___B___C.md`, Logseq outliner bullets as structure, Basic-Memory `- [category]`
-  observation grammar. The body is **plain markdown prose + YAML frontmatter + `[[basename]]`** only.
+  observation grammar. The body is **plain markdown prose + YAML frontmatter + standard markdown
+  graph links `[Title](relative.md)`** (ADR-0014 D3); frontmatter `related:` / `children:` carry
+  `"[[basename]]"`.
 
 ### 4.1 Encoding, size & anchors (determinism hygiene)
 
@@ -484,7 +516,7 @@ doc + its symlinks (§1). Two tiers.
 | # | Rule | Detection |
 |---|---|---|
 | L1-1 | Duplicate basename anywhere in repo | basename → path map has a collision |
-| L1-2 | Broken / dangling wikilink | `[[X]]` where no note has basename `X` (after alias resolution §3.1) — checked in note bodies AND in every `[[basename]]` entry of `related:` and `children:` frontmatter. A forward-declared stub must already exist as a file (§3.7) |
+| L1-2 | Broken / dangling link | a link whose resolved basename names no note (after alias resolution §3.1) — checked in note BODIES (the ADR-0014 D3 markdown links `[Title](relative.md)`, resolved path→basename) AND in every `[[basename]]` entry of `related:` and `children:` frontmatter. A forward-declared stub must already exist as a file (§3.7). Broken links stay a **hard reject** for produced notes (the strict producer, ADR-0014 D1) |
 | L1-3 | Ambiguous wikilink | only fires if L1-1 / L1-15 already broke uniqueness (belt-and-suspenders) |
 | L1-4 | Missing required frontmatter for `type` | per the §2 required-field table |
 | L1-5 | Undeclared tag | a `tags:` value not a key in `_meta/taxonomy.yaml: allowed_tags` (declared-before-use only; see §5.2) |
@@ -546,8 +578,9 @@ def lint_l1(worktree: Path, taxonomy: Taxonomy, run_date: str, run_id: str,
     new_tags = set(taxonomy.allowed_tags) - set(base_taxonomy.allowed_tags)       # for L1-18 (evolution path only)
     for n in notes:
         if not is_utf8_lf_no_bom(n.path): errors.append(BadEncoding(n.path))      # L1-16
-        # L1-2/L1-3 — body links AND related:/children: frontmatter [[basename]] entries
-        for link in resolve_links(n.body, known) + resolve_fm_links(n.fm.related, n.fm.children, known):
+        # L1-2/L1-3 — body markdown links (ADR-0014 D3, path→basename) AND related:/children:
+        # frontmatter [[basename]] entries
+        for link in resolve_body_md_links(n.body, known) + resolve_fm_links(n.fm.related, n.fm.children, known):
             if link.unresolved: errors.append(BrokenLink(n.path, link))           # §3.2/§3.1 normalization
         errors += check_required_frontmatter(n)             # L1-4, L1-11 (incl. summary, body_status ∈ {pending, absent})
         errors += check_dates(n, run_date)                  # L1-12 (no future dates vs run_date)
@@ -651,8 +684,10 @@ worktree re-scan, path / allowlist, link resolvability, provenance, the candidat
 **ALL** structure and **ALL** frontmatter from the plan: file creation, globally-unique basenames,
 frontmatter (`title`, `summary`, `tags`, `sources` = unioned provenance, `created` / `updated` =
 `run_date`, `status`, `aliases`, `origin` iff a provenance source is `harvest:<agent>`, the contested
-fields §3.8, and `body_status: pending` for notes needing prose), `[[basename]]` wikilinks, MOC and
-`index.md` entries (`children:` kept equal to the child-bullet set, themes only), the templated
+fields §3.8, and `body_status: pending` for notes needing prose), the frontmatter `related:` /
+`children:` `[[basename]]` arrays, the MOC and `index.md` BODY child bullets as standard markdown
+links `- [Title](relative.md)` (ADR-0014 D3; `children:` kept equal to the child-bullet basename set,
+themes only), the templated
 `> [!contested]` callout, dated daily sections, and the body sentinels. You never write any of these.
 The worker writes to the **C4 INGEST allowlist ONLY** — `{ wiki/** , index.md , <domain>-moc.md , log.md
 , assets/** }` — and rejects any write to `_meta/`, `_templates/`, `raw/`, `_kb/`, git config, hooks, or
@@ -696,8 +731,10 @@ keep PASS-2 output to prose only (no frontmatter, no new links).
 `core.read` is deterministic (ADR-0009) and testable without a model. The way you write notes is what
 makes that deterministic retrieval succeed. Author with these guarantees in mind:
 
-- **Globally-unique basenames + the frozen resolver (§3.1)** make `[[basename]]` a total function, so the
-  link graph is traversable in pure Python — that traversal IS `match_reason: linked-theme`.
+- **Globally-unique basenames + the frozen resolver (§3.1)** make every graph link a total function
+  (body markdown links resolve path→basename, §3.2 / ADR-0014 D3; frontmatter `related:` / `children:`
+  resolve the `[[basename]]`), so the link graph is traversable in pure Python — that traversal IS
+  `match_reason: linked-theme`.
 - **`index.md` + MOCs** give every page a navigational entry point. No page should be reachable only by
   full-text. (Retrieval is a UNION of the navigation frontier and lexical matches, so an unlinked page is
   still reachable lexically — but a well-linked page ranks higher and is found `linked-theme`-first.)

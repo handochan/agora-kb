@@ -123,13 +123,16 @@ def _init_curatable_repo(tmp_path: Path) -> Repo:
 
 def _write_wiki_notes(tmp_path: Path) -> None:
     """Place a small navigable corpus on disk (index + MOC + two themes) under ``wiki/``."""
-    (tmp_path / "index.md").write_text("# personal\n\n- [[ai-tech-moc]]\n", encoding="utf-8")
+    # ADR-0014 D3: the produced MOC/index BODY child bullets are standard markdown links.
+    (tmp_path / "index.md").write_text(
+        "# personal\n\n- [AI Tech MOC](wiki/ai-tech/ai-tech-moc.md)\n", encoding="utf-8"
+    )
     domain = tmp_path / "wiki" / "ai-tech"
     domain.mkdir(parents=True, exist_ok=True)
     (domain / "ai-tech-moc.md").write_text(
         "---\nstatus: active\n---\n# AI Tech\n\n"
-        "- [[curator-concurrency]] — single-writer curator\n"
-        "- [[inbox-design]] — append-only inbox\n",
+        "- [Curator concurrency](themes/curator-concurrency.md) — single-writer curator\n"
+        "- [Inbox design](themes/inbox-design.md) — append-only inbox\n",
         encoding="utf-8",
     )
     (domain / "curator-concurrency.md").write_text(

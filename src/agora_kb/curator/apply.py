@@ -47,6 +47,7 @@ import re
 from pathlib import Path
 
 from agora_kb.core import frontmatter
+from agora_kb.core.frontmatter import FrontmatterError
 from agora_kb.curator.plan import Disposition, Plan
 from agora_kb.schema.notes import wikilinks
 
@@ -442,11 +443,84 @@ def _contested_callout(disp: Disposition, *, run_date: str, sources: list[str]) 
     )
 
 
-# --- MOC / index maintenance (ADR-0010 §2 children + §3.2 child-bullet grammar) ----------------
+# --- MOC / index maintenance (ADR-0010 §2 children + §3.2 grammar, ADR-0014 D3 body md-links) --
 
 
 def _moc_basename(domain: str) -> str:
     return f"{domain}-moc"
+
+
+# --- ADR-0014 D3: standard-markdown BODY graph links -------------------------------------------
+
+
+def _note_title(path: Path, fallback: str) -> str:
+    """Return a note's frontmatter ``title`` for use as markdown-link TEXT, else ``fallback``.
+
+    ADR-0014 D3 emits the MOC/index BODY child bullets as standard markdown links
+    ``[Title](relative.md)`` — the link TEXT is the CHILD note's ``title`` (read from its
+    frontmatter), so the rendered link is human/Obsidian/git-friendly while the basename remains the
+    internal identity (parsed back from the link path, ADR-0010 D5). DEFENSIVELY falls back to
+    ``fallback`` (the child basename) when the note is absent, unreadable, has no frontmatter, or
+    its ``title`` is missing/non-string — the link still resolves by basename, only the display text
+    degrades. This read is a pure function of the worktree at APPLY time (deterministic).
+    """
+    if not path.is_file():
+        return fallback
+    try:
+        fm, _ = frontmatter.parse(path.read_text(encoding="utf-8"))
+    except (FrontmatterError, OSError):
+        return fallback
+    title = fm.get("title")
+    return title if isinstance(title, str) and title else fallback
+
+
+def _link_text(title: str, *, fallback: str) -> str:
+    """Sanitize a note ``title`` for safe use as markdown-link TEXT (ADR-0014 D3 / ADR-0010 D5).
+
+    The MOC/index body child bullet is emitted as ``[<text>](<path>.md)`` and MUST round-trip
+    through the FROZEN ``_CHILD_BULLET_RE`` (``schema/notes.py``) whose link-text class
+    ``[^\\]\\r\\n]*`` forbids ``]`` and any newline. A note ``title`` is model-decided
+    (``disp.title``) and so may legally contain ``]``, ``[``, ``\\r`` or ``\\n`` (all valid YAML
+    scalars) — interpolating it raw would emit a bullet the curator's own L1-6/L1-2 lint can no
+    longer parse, dropping the child from ``child_bullets`` / ``body_link_basenames`` and the
+    read-path graph seed (ADR-0012). We therefore DROP the bracket characters that would terminate
+    the text group early and COLLAPSE any ``\\r``/``\\n`` to a single space, falling back to the
+    child basename if nothing survives. Only the human-readable TEXT is touched; the basename in the
+    PATH (slug-constrained) is never at risk, so emit->parse still recovers the same basename and
+    the round-trip identity is preserved.
+    """
+    text = title.replace("]", "").replace("[", "").replace("\r", " ").replace("\n", " ").strip()
+    return text if text else fallback
+
+
+def _theme_child_link(base: str, *, domain: str, worktree: Path) -> str:
+    """Render one MOC body child bullet for a theme as ``- [Title](themes/<base>.md)`` (D3).
+
+    A domain MOC lives at ``wiki/<domain>/<domain>-moc.md`` and a theme child at
+    ``wiki/<domain>/themes/<base>.md``, so the RELATIVE path from the MOC's directory to the theme
+    is ``themes/<base>.md`` — no leading ``/`` or ``./`` (the form that resolves in BOTH Obsidian
+    and an OKF bundle, ADR-0014 D3). The link TEXT is the theme's ``title`` (basename fallback). The
+    child basename is recoverable from the path (``_basename_from_link_path``), keeping L1-6 / L1-2
+    / read-path graph seeding total.
+    """
+    theme_path = worktree / "wiki" / domain / "themes" / f"{base}.md"
+    title = _link_text(_note_title(theme_path, base), fallback=base)
+    return f"- [{title}](themes/{base}.md)"
+
+
+def _moc_child_link(moc_base: str, *, worktree: Path) -> str:
+    """Render one root-index body child bullet for a domain MOC as a markdown link (D3).
+
+    The root ``index.md`` lives at the repo root and a domain MOC at
+    ``wiki/<domain>/<domain>-moc.md`` (``moc_base == "<domain>-moc"``), so the RELATIVE path from
+    the index's directory (the root) to the MOC is ``wiki/<domain>/<domain>-moc.md`` — no leading
+    ``/`` or ``./`` (ADR-0014 D3). The link TEXT is the MOC's ``title`` (basename fallback).
+    ``<domain>`` is recovered as ``moc_base`` minus the ``-moc`` suffix.
+    """
+    domain = moc_base[: -len("-moc")] if moc_base.endswith("-moc") else moc_base
+    moc_path = worktree / "wiki" / domain / f"{moc_base}.md"
+    title = _link_text(_note_title(moc_path, moc_base), fallback=moc_base)
+    return f"- [{title}](wiki/{domain}/{moc_base}.md)"
 
 
 # --- the deterministic APPLY (ADR-0011 §3) -----------------------------------------------------
@@ -787,7 +861,14 @@ def _update_moc(
 
     The children set is the UNION of the themes already living in ``wiki/<domain>/themes/`` and the
     ones created this run. ``children:`` frontmatter is kept exactly equal to the body child-bullet
-    set (L1-6) and both are sorted, so the MOC is a deterministic function of its child set.
+    BASENAME set (L1-6) and both are sorted, so the MOC is a deterministic function of its children.
+
+    ADR-0014 D3 — the BODY child bullets are STANDARD MARKDOWN LINKS ``- [Title](themes/<base>.md)``
+    (git + Obsidian + OKF native, no export step), rendered by :func:`_theme_child_link`: the link
+    TEXT is the theme's ``title`` and the relative path from the MOC's dir to the theme is
+    ``themes/<base>.md``. The ``children:`` FRONTMATTER STAYS ``"[[basename]]"`` wikilink strings
+    (Obsidian-Properties-native; OKF preserves them). Both sides derive from the same sorted
+    basename set, so L1-6 (children == child-bullet basename set) holds by construction.
     """
     themes_dir = worktree / "wiki" / domain / "themes"
     existing = (
@@ -796,12 +877,12 @@ def _update_moc(
     children = sorted(existing | new_basenames)
 
     moc_path = worktree / "wiki" / domain / f"{_moc_basename(domain)}.md"
+    body = "\n".join(_theme_child_link(b, domain=domain, worktree=worktree) for b in children)
     if moc_path.is_file():
         fm, _ = frontmatter.parse(moc_path.read_text(encoding="utf-8"))
         _canonicalize_dates(fm)
         fm["children"] = [f"[[{b}]]" for b in children]
         _set_updated(fm, run_date)
-        body = "\n".join(f"- [[{b}]]" for b in children)
         moc_path.write_text(frontmatter.render(fm, body), encoding="utf-8")
     else:
         # OKF v0.1 (ADR-0014 D2): ``description`` mirrors ``summary`` and ``timestamp`` is the
@@ -821,7 +902,6 @@ def _update_moc(
             "description": summary,
             "children": [f"[[{b}]]" for b in children],
         }
-        body = "\n".join(f"- [[{b}]]" for b in children)
         moc_path.parent.mkdir(parents=True, exist_ok=True)
         moc_path.write_text(frontmatter.render(fm, body), encoding="utf-8")
 
@@ -835,8 +915,15 @@ def _update_index(
     """Create-or-update root ``index.md`` so its children list every domain MOC (ADR-0010 §1).
 
     The index's children are the domain MOC basenames (``<domain>-moc``) — the UNION of every MOC
-    already present in the worktree and the ones touched this run. ``children:`` == the body
-    child-bullet set (L1-6); both sorted, deterministic.
+    already present in the worktree and the ones touched this run. ``children:`` frontmatter == the
+    body child-bullet BASENAME set (L1-6); both sorted, deterministic.
+
+    ADR-0014 D3 — the BODY child bullets are STANDARD MARKDOWN LINKS
+    ``- [Title](wiki/<domain>/<domain>-moc.md)`` (git + Obsidian + OKF native), rendered by
+    :func:`_moc_child_link`: the link TEXT is the MOC's ``title`` and the relative path from the
+    index's dir (the repo root) to the MOC is ``wiki/<domain>/<domain>-moc.md``. The ``children:``
+    FRONTMATTER STAYS ``"[[basename]]"`` wikilink strings (Obsidian-Properties-native; OKF
+    preserves). Both derive from the same sorted MOC-basename set, so L1-6 holds by construction.
     """
     wiki = worktree / "wiki"
     existing_mocs = (
@@ -845,12 +932,12 @@ def _update_index(
     moc_children = sorted(existing_mocs | {_moc_basename(d) for d in domains})
 
     index_path = worktree / "index.md"
+    body = "\n".join(_moc_child_link(b, worktree=worktree) for b in moc_children)
     if index_path.is_file():
         fm, _ = frontmatter.parse(index_path.read_text(encoding="utf-8"))
         _canonicalize_dates(fm)
         fm["children"] = [f"[[{b}]]" for b in moc_children]
         _set_updated(fm, run_date)
-        body = "\n".join(f"- [[{b}]]" for b in moc_children)
         index_path.write_text(frontmatter.render(fm, body), encoding="utf-8")
     else:
         # The root index.md is the OKF BUNDLE ROOT (ADR-0014 D2): it ALONE carries ``okf_version``
@@ -872,7 +959,6 @@ def _update_index(
             "description": summary,
             "children": [f"[[{b}]]" for b in moc_children],
         }
-        body = "\n".join(f"- [[{b}]]" for b in moc_children)
         index_path.write_text(frontmatter.render(fm, body), encoding="utf-8")
 
 

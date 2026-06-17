@@ -101,7 +101,8 @@ def _valid_repo(tmp_path: Path) -> RepoLayout:
             "summary": "root",
             "children": ["[[ai-tech-moc]]"],
         },
-        "- [[ai-tech-moc]] — models",
+        # ADR-0014 D3: BODY child bullets are markdown links; `children:` frontmatter stays [[ ]].
+        "- [AI/Tech MOC](wiki/ai-tech/ai-tech-moc.md) — models",
     )
     _write(
         layout,
@@ -117,7 +118,7 @@ def _valid_repo(tmp_path: Path) -> RepoLayout:
             "summary": "domain hub",
             "children": ["[[curator-concurrency]]"],
         },
-        "- [[curator-concurrency]] — the curator",
+        "- [Curator concurrency](themes/curator-concurrency.md) — the curator",
     )
     _write(
         layout,
@@ -185,16 +186,18 @@ def test_l1_1_duplicate_basename_fails(tmp_path: Path) -> None:
     assert not result.ok
 
 
-# --- L1-2 broken wikilink (body + related:/children:) ---------------------------------------------
+# --- L1-2 broken link (body markdown link + related:/children: [[ ]]) -----------------------------
 
 
-def test_l1_2_broken_link_in_body_fails(tmp_path: Path) -> None:
+def test_l1_2_broken_markdown_link_in_body_fails(tmp_path: Path) -> None:
+    # ADR-0014 D3: a BODY graph link is a markdown link; one whose resolved basename names no note
+    # is a broken link — the SAME hard reject as the old `[[ ]]` body link (strict producer, D1).
     layout = _valid_repo(tmp_path)
     _write(
         layout,
         "wiki/ai-tech/themes/curator-concurrency.md",
         _theme_fm(related=["[[single-writer-stub]]"]),
-        "See [[does-not-exist]].",
+        "See [the missing page](themes/does-not-exist.md).",
     )
     result = lint(layout, taxonomy=_TAXONOMY, run_date=RUN_DATE)
     assert "L1-2" in _codes(result.findings)
@@ -293,7 +296,7 @@ def test_l1_5_bad_tag_on_index_fails_type_agnostic(tmp_path: Path) -> None:
             "summary": "root",
             "children": ["[[ai-tech-moc]]"],
         },
-        "- [[ai-tech-moc]] — models",
+        "- [AI/Tech MOC](wiki/ai-tech/ai-tech-moc.md) — models",
     )
     result = lint(layout, taxonomy=_TAXONOMY, run_date=RUN_DATE)
     assert "L1-5" in _codes(result.findings)
@@ -327,7 +330,9 @@ def test_l1_6_children_mismatch_fails(tmp_path: Path) -> None:
             "summary": "domain hub",
             "children": ["[[curator-concurrency]]"],
         },
-        "- [[single-writer-stub]] — wrong",
+        # ADR-0014 D3 markdown body bullet pointing at the WRONG child (single-writer-stub), so the
+        # child-bullet basename set {single-writer-stub} != children: {curator-concurrency}.
+        "- [Single writer](themes/single-writer-stub.md) — wrong",
     )
     result = lint(layout, taxonomy=_TAXONOMY, run_date=RUN_DATE)
     assert "L1-6" in _codes(result.findings)
@@ -351,11 +356,14 @@ def test_l1_2_broken_link_in_children_array_fails(tmp_path: Path) -> None:
             "summary": "domain hub",
             "children": ["[[curator-concurrency]]", "[[ghost]]"],
         },
-        "- [[curator-concurrency]] — the curator\n- [[ghost]] — missing target",
+        # The body markdown bullets mirror BOTH children basenames (so L1-6 passes); the broken
+        # link is the `[[ghost]]` entry in the children: array (still [[ ]], ADR-0014 D3).
+        "- [Curator concurrency](themes/curator-concurrency.md) — the curator\n"
+        "- [Ghost](themes/ghost.md) — missing target",
     )
     result = lint(layout, taxonomy=_TAXONOMY, run_date=RUN_DATE)
     assert "L1-2" in _codes(result.findings)
-    # The matching bullet keeps L1-6 satisfied, so the failure is L1-2 (broken link), not L1-6.
+    # The matching bullets keep L1-6 satisfied, so the failure is L1-2 (broken link), not L1-6.
     assert "L1-6" not in _codes(result.findings)
 
 

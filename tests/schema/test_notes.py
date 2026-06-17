@@ -14,6 +14,7 @@ import pytest
 from agora_kb.core.frontmatter import FrontmatterError, render
 from agora_kb.core.layout import RepoLayout
 from agora_kb.schema.notes import (
+    body_link_basenames,
     child_bullets,
     heading_slug,
     note_basename,
@@ -36,13 +37,14 @@ def _seed_repo(layout: RepoLayout) -> None:
         layout,
         "index.md",
         {"title": "KB index", "type": "index", "status": "active", "summary": "root"},
-        "- [[ai-tech-moc]] — models",
+        # ADR-0014 D3: BODY child bullets are markdown links (the produced form).
+        "- [AI/Tech MOC](wiki/ai-tech/ai-tech-moc.md) — models",
     )
     _write_note(
         layout,
         "wiki/ai-tech/ai-tech-moc.md",
         {"title": "AI/Tech", "type": "moc", "status": "active", "summary": "domain hub"},
-        "- [[curator-concurrency]] — the curator",
+        "- [Curator concurrency](themes/curator-concurrency.md) — the curator",
     )
     _write_note(
         layout,
@@ -174,60 +176,129 @@ def test_wikilinks_order_and_duplicates_preserved() -> None:
     assert wikilinks("[[a]] then [[b]] then [[a]]") == ["a", "b", "a"]
 
 
-# --- child_bullets (§3.2 frozen MOC child-bullet grammar) -----------------------------------------
+# --- child_bullets (§3.2 frozen MOC child-bullet grammar — ADR-0014 D3 markdown links) -----------
+# Since ADR-0014 D3 the BODY child bullet is a STANDARD MARKDOWN LINK `- [Title](relative.md)`; the
+# child basename is parsed from the link PATH (filename minus dir minus `.md`). The `children:`
+# FRONTMATTER stays `[[basename]]` (exercised by wikilinks() above). Identity is still the basename.
 
 
-def test_child_bullets_matches_adr_index_example() -> None:
-    # ADR-0010 §2.5 index.md body — children are ai-tech-moc and economy-moc.
-    body = "- [[ai-tech-moc]] — models, tooling, architecture notes\n- [[economy-moc]] — macro"
+def test_child_bullets_matches_adr_index_example_markdown_links() -> None:
+    # index.md body — children are the domain MOCs, linked as `[Title](wiki/<dom>/<dom>-moc.md)`
+    # (ADR-0014 D3). The basename is parsed from the path → the child set is the two MOC basenames.
+    body = (
+        "- [AI/Tech MOC](wiki/ai-tech/ai-tech-moc.md) — models, tooling, architecture\n"
+        "- [Economy MOC](wiki/economy/economy-moc.md) — macro"
+    )
     assert child_bullets(body) == {"ai-tech-moc", "economy-moc"}
 
 
-def test_child_bullets_with_display_text_captures_base() -> None:
-    assert child_bullets("- [[cqrs|the CQRS page]] some trailing prose") == {"cqrs"}
+def test_child_bullets_theme_child_path_yields_basename() -> None:
+    # A MOC links a theme child as `themes/<base>.md`; the basename is parsed from that path
+    # (ADR-0014 D3 relative path form: from the MOC's dir, no leading `/` or `./`).
+    assert child_bullets("- [Curator concurrency](themes/curator-concurrency.md)") == {
+        "curator-concurrency"
+    }
+
+
+def test_child_bullets_index_to_moc_path_yields_basename() -> None:
+    # The root index links a domain MOC as `wiki/<domain>/<domain>-moc.md`; basename == `<dom>-moc`.
+    assert child_bullets("- [AI/Tech MOC](wiki/ai-tech/ai-tech-moc.md)") == {"ai-tech-moc"}
+
+
+def test_child_bullets_link_text_is_ignored_for_identity() -> None:
+    # The link TEXT (the title) is display-only; identity is the path's basename. A title with
+    # spaces/punctuation does not change the parsed basename.
+    assert child_bullets("- [Some Fancy Title!](themes/cqrs.md) some trailing prose") == {"cqrs"}
+
+
+@pytest.mark.parametrize(
+    "raw_text",
+    [
+        "Edge ] case",  # a `]` terminates the link-text group before the real `](`
+        "[bracketed]",  # any bracket char breaks the frozen `[^\]\r\n]*` text class
+    ],
+)
+def test_child_bullets_raw_bracket_in_text_does_not_round_trip(raw_text: str) -> None:
+    # The FROZEN `_CHILD_BULLET_RE` link-text class `[^\]\r\n]*` CANNOT contain `]` or a newline.
+    # A bullet whose TEXT carries a raw `]` therefore FAILS to parse — silently dropping the child.
+    # This is exactly why the curator emitter must sanitize a model-decided title before emit
+    # (ADR-0014 D3 / ADR-0010 D5 round-trip): the emitter-driven emit->parse round-trip is asserted
+    # in tests/curator/test_apply.py (test_create_theme_with_breaking_title_still_round_trips...).
+    assert child_bullets(f"- [{raw_text}](themes/edge-case.md)") != {"edge-case"}
+    # The sanitized TEXT (brackets removed) round-trips back to the same basename.
+    sanitized = raw_text.replace("]", "").replace("[", "")
+    assert child_bullets(f"- [{sanitized}](themes/edge-case.md)") == {"edge-case"}
 
 
 @pytest.mark.parametrize(
     "line",
     [
-        "  - [[indented]]",  # indented (not at indent 0)
-        "* [[star-marker]]",  # wrong marker
-        "+ [[plus-marker]]",  # wrong marker
-        "-[[no-space]]",  # missing the required hyphen-space
-        "- prose then [[late-link]]",  # link is not the first token
-        "- [[A]]",  # base must start [a-z0-9]; uppercase is not a valid child base
-        "- [[a]] and [[b]]",  # second link on the line is ignored, only base 'a' would count…
-        "text [[inline]] not a bullet",  # prose, not a bullet
-        "> [[in-callout]]",  # blockquote, not a child bullet
-        "- [[child]]xyz",  # trailing text must be whitespace-led (`(?:\\s.*)?$`), not glued to ]]
+        "  - [Indented](themes/indented.md)",  # indented (not at indent 0)
+        "* [Star](themes/star-marker.md)",  # wrong marker
+        "+ [Plus](themes/plus-marker.md)",  # wrong marker
+        "-[NoSpace](themes/no-space.md)",  # missing the required hyphen-space
+        "- prose then [Late](themes/late-link.md)",  # link is not the first token
+        "text [Inline](themes/inline.md) not a bullet",  # prose, not a bullet
+        "> [InCallout](themes/in-callout.md)",  # blockquote, not a child bullet
+        "- [Child](themes/child.md)xyz",  # trailing text must be whitespace-led, not glued to )
+        "- [[wikilink-in-body]]",  # a bare wikilink is NO LONGER a child bullet (ADR-0014 D3)
     ],
 )
 def test_child_bullets_non_matches(line: str) -> None:
-    got = child_bullets(line)
-    if line == "- [[a]] and [[b]]":
-        # Exactly one link is captured (the first token); the second is ignored (§3.2).
-        assert got == {"a"}
-    else:
-        assert got == set()
+    assert child_bullets(line) == set()
+
+
+def test_child_bullets_second_link_on_line_ignored() -> None:
+    # Exactly one markdown link is captured (the first token); a second link on the line is ignored.
+    assert child_bullets("- [A](themes/a.md) and [B](themes/b.md)") == {"a"}
 
 
 def test_child_bullets_bare_no_trailing_matches() -> None:
-    # The trailing `(?:\s.*)?$` group is OPTIONAL: a bare `- [[base]]` (no trailing space) matches.
-    assert child_bullets("- [[bare]]") == {"bare"}
+    # The trailing `(?:\s.*)?$` group is OPTIONAL: a bare `- [T](themes/base.md)` (no trailing
+    # text) matches.
+    assert child_bullets("- [Bare](themes/bare.md)") == {"bare"}
 
 
 def test_child_bullets_dedup_collapses() -> None:
-    assert child_bullets("- [[x]]\n- [[x]]\n- [[y]]") == {"x", "y"}
+    body = "- [X](themes/x.md)\n- [X again](themes/x.md)\n- [Y](themes/y.md)"
+    assert child_bullets(body) == {"x", "y"}
 
 
-def test_child_bullets_ignores_related_and_prose_links() -> None:
+def test_child_bullets_ignores_wikilinks_prose_and_nested_links() -> None:
     body = (
-        "- [[real-child]]\n"
-        "Some prose mentioning [[other-theme]].\n"
-        "  - [[nested-not-child]]\n"
-        "Recent: [[ai-tech-2026-06-13]], [[ai-tech-2026-06-12]]\n"
+        "- [Real child](themes/real-child.md)\n"
+        "Some prose mentioning [Other](themes/other-theme.md).\n"  # not a bullet (prose)
+        "  - [Nested](themes/nested-not-child.md)\n"  # indented (not at indent 0)
+        "Recent: [[ai-tech-2026-06-13]], [[ai-tech-2026-06-12]]\n"  # wikilinks, not graph bullets
     )
     assert child_bullets(body) == {"real-child"}
+
+
+# --- body_link_basenames (ADR-0014 D3 BODY markdown graph edges, for L1-2 + read-path seeding) ----
+
+
+def test_body_link_basenames_resolves_theme_and_moc_paths() -> None:
+    # Resolves every body markdown `.md` link to its basename (path → file minus dir minus `.md`).
+    body = (
+        "- [Curator concurrency](themes/curator-concurrency.md)\n"
+        "- [AI/Tech MOC](wiki/ai-tech/ai-tech-moc.md)\n"
+    )
+    assert body_link_basenames(body) == ["curator-concurrency", "ai-tech-moc"]
+
+
+def test_body_link_basenames_skips_external_urls_and_images() -> None:
+    # An external URL (non-`.md`) is a citation, an `![alt](assets/…)` is an asset — neither is a
+    # note graph edge (ADR-0010 §3.5 / ADR-0014 D3), so both are skipped; only the `.md` link wins.
+    body = (
+        "See [the OKF spec](https://example.com/okf) and the diagram "
+        "![arch](assets/arch.png) plus [a theme](themes/single-writer.md)."
+    )
+    assert body_link_basenames(body) == ["single-writer"]
+
+
+def test_body_link_basenames_preserves_order_and_duplicates() -> None:
+    body = "[a](themes/a.md) [b](themes/b.md) [a again](themes/a.md)"
+    assert body_link_basenames(body) == ["a", "b", "a"]
 
 
 # --- heading_slug (§4.1 frozen anchor algorithm) --------------------------------------------------
