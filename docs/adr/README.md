@@ -20,3 +20,4 @@ Format: lightweight [MADR](https://adr.github.io/madr/)-style.
 | [0011](0011-curator-ingest-contract.md) | Curator INGEST contract (plan-apply-author) | Accepted |
 | [0012](0012-deterministic-query-ranking.md) | Deterministic query ranking for core.wiki | Accepted |
 | [0013](0013-curator-sandbox-mechanism.md) | Curator sandbox mechanism (macOS Seatbelt + cross-platform) | Accepted |
+| [0014](0014-okf-obsidian-interoperability.md) | OKF + Obsidian interoperability (strict producer / tolerant consumer) | Proposed |
