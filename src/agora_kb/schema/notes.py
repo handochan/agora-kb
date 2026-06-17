@@ -175,7 +175,12 @@ def parse_all_notes(layout: RepoLayout) -> list[Note]:
     """
     notes: list[Note] = []
     for path in _iter_note_paths(layout):
-        text = path.read_text(encoding="utf-8")
+        # Decode LOSSILY (errors="replace") so a non-UTF8 note in a foreign/not-yet-normalized
+        # vault never crashes the consumer lint/read path with UnicodeDecodeError (ADR-0014 D4
+        # tolerant consumer). The authoritative UTF-8/LF/no-BOM gate is the producer lint's
+        # byte-level L1-16 scan, which still flags it; a curated worktree is UTF-8, so this is a
+        # no-op there.
+        text = path.read_text(encoding="utf-8", errors="replace")
         try:
             fm, body = frontmatter.parse(text)
         except FrontmatterError as exc:  # surface which file is malformed

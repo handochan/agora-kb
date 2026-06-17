@@ -237,6 +237,18 @@ class _Note:
     indeg: int = 0
 
 
+def _read_tolerant(path: Path) -> str:
+    """Read a wiki file for the QUERY path, tolerating non-UTF8 bytes (ADR-0014 D4).
+
+    The read/query boundary must NEVER crash on foreign or imperfect content: a single non-UTF8
+    note in a vault (e.g. a not-yet-normalized Obsidian vault) is decoded LOSSILY
+    (``errors="replace"``) so it stays queryable instead of raising ``UnicodeDecodeError`` out of
+    ``kb_query``. The strict UTF-8 / LF / no-BOM requirement stays the PRODUCER lint's job (L1-16),
+    not the reader's — the tolerant-consumer / strict-producer split (ADR-0014 D1).
+    """
+    return path.read_text(encoding="utf-8", errors="replace")
+
+
 def _parse_note(path: str, basename: str, is_index: bool, raw_text: str) -> _Note:
     """Parse one note's markdown into a :class:`_Note` (frontmatter via core.frontmatter)."""
     try:
@@ -512,7 +524,7 @@ class Wiki:
                     path="index.md",
                     basename="index",
                     is_index=True,
-                    raw_text=index_path.read_text(encoding="utf-8"),
+                    raw_text=_read_tolerant(index_path),
                 )
             )
         wiki_dir = self.layout.wiki_dir
@@ -528,7 +540,7 @@ class Wiki:
                         path=rel,
                         basename=Path(rel).stem,
                         is_index=False,
-                        raw_text=p.read_text(encoding="utf-8"),
+                        raw_text=_read_tolerant(p),
                     )
                 )
         return notes

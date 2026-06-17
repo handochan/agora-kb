@@ -174,11 +174,15 @@ evolve independently: an internal schema bump need not change OKF conformance an
 
 ## Implementation phasing (Phase-2; sequenced, each independently shippable)
 
-1. **Tolerant consumer read boundary (D4)** — STARTED: the `frontmatter.parse` robustness fix shipped
-   in the Phase-1 completion work makes read/lint/query total on malformed frontmatter. Extend to
-   foreign links, unknown keys, and non-`.md` files; cover with tests over real-vault fixtures.
-2. **OKF producer fields (D2)** — emit `description`/`resource`/`timestamp`/`okf_version`; update the
-   schema doc + emit + lint (additive rules only).
-3. **OKF link export (D3)** — the pure `[[basename]] → /path.md` renderer; optional dual-emit switch.
-4. **Obsidian import/normalizer (D5)** — the opt-in admin op that makes a real vault (`~/knowledge`)
-   curate-able by choice.
+1. **Tolerant consumer read boundary (D4)** — DONE. The `frontmatter.parse` robustness fix (Phase-1)
+   wraps malformed YAML in the typed `FrontmatterError`; `core.Wiki` and `schema.notes.parse_all_notes`
+   now decode non-UTF8 notes LOSSILY (`errors="replace"`) so `kb_query`/lint never crash on a foreign
+   vault (the byte-level L1-16 scan stays the producer's encoding gate); broken links, unknown
+   frontmatter keys, and non-`.md` sidecars (`.canvas`/`.obsidian`) were already tolerated. Locked in
+   by `tests/core/test_wiki_tolerant.py` over an adversarial vault.
+2. **OKF producer fields (D2)** — DONE (emit `description`/`timestamp`/`okf_version`; `resource`
+   documented as accepted-on-read).
+3. **Standard-markdown body links (D3)** — DONE (MOC/index body bullets are markdown links; frontmatter
+   `related:`/`children:` stay `[[basename]]`; read path + lint resolve both).
+4. **Obsidian import/normalizer (D5)** — DONE (the opt-in `agora import` admin op; verified to make a
+   `~/knowledge` clone lint-clean + curate-able, non-destructively).
