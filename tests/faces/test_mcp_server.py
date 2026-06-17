@@ -348,9 +348,7 @@ def test_mcp_client_roundtrip_capture_curate_query(tmp_path: Path) -> None:
             )
             status_before = await client.call_tool("kb_status", {})
             curated = await client.call_tool("kb_curate", {})
-            queried = await client.call_tool(
-                "kb_query", {"question": "curator concurrency"}
-            )
+            queried = await client.call_tool("kb_query", {"question": "curator concurrency"})
             return {
                 "remembered": remembered.data,
                 "status_before": status_before.data,
