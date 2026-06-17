@@ -23,6 +23,7 @@ import argparse
 import importlib
 import shutil
 import sys
+import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -34,6 +35,7 @@ from .config import (
 )
 from .core import Inbox, Repo, RepoLayout, StateStore
 from .curator import evaluate
+from .curator.isolation import SandboxUnavailable, select_backend_isolation
 from .curator.subprocess_backend import SubprocessBackend
 from .curator.worker import recover, run
 from .schema import Taxonomy, emit_schema, lint
@@ -246,7 +248,9 @@ def _cmd_curate(args: argparse.Namespace) -> int:
         print("note: no consolidation run was due; nothing was changed")
         return 0
 
-    backend = _build_backend(layout, cfg.default_backend)
+    backend = _build_backend(
+        layout, cfg.default_backend, allow_reduced_isolation=cfg.allow_reduced_isolation
+    )
     if backend is None:
         return 1
 
@@ -265,13 +269,23 @@ def _cmd_curate(args: argparse.Namespace) -> int:
     return 0
 
 
-def _build_backend(layout: RepoLayout, backend_name: str) -> SubprocessBackend | None:
+def _build_backend(
+    layout: RepoLayout, backend_name: str, *, allow_reduced_isolation: bool = False
+) -> SubprocessBackend | None:
     """Resolve the configured WRITE-adapter into a :class:`SubprocessBackend`, or print why not.
 
     Loads ``adapters.yaml`` (DATA-MODEL §8) from the repo root. Returns ``None`` (after printing a
     clear stderr message) when the file is absent (no brain configured) or the configured
     ``default_backend`` is not among its ``backends`` — so the caller exits non-zero instead of
     crashing. The actual missing-executable case surfaces later, at invocation, as a clear error.
+
+    ADR-0013: an :class:`~agora_kb.curator.isolation.BackendIsolation` adapter is selected and
+    injected ONLY for a ``network: 'none'`` backend (the file-writing PASS-2 step is then confined).
+    Selection is LAZY/conditional on purpose — the default loopback Ollama brain does inference
+    OUTSIDE the sandbox (``network: 'loopback'``), so it never needs a kernel sandbox and curate
+    keeps working on a host without one. A ``network: 'none'`` backend with no usable sandbox and
+    ``allow_reduced_isolation=False`` fails closed here (clear message, ``None``) rather than
+    running unconfined.
     """
     adapters_path = layout.root / "adapters.yaml"
     registry = load_backend_registry(adapters_path)
@@ -287,7 +301,18 @@ def _build_backend(layout: RepoLayout, backend_name: str) -> SubprocessBackend |
     except KeyError as exc:
         print(f"{_PROG} curate: {exc}", file=sys.stderr)
         return None
-    return SubprocessBackend(spec)
+    isolation = None
+    if spec.network == "none":
+        try:
+            isolation = select_backend_isolation(allow_reduced_isolation=allow_reduced_isolation)
+        except SandboxUnavailable as exc:
+            print(
+                f"{_PROG} curate: backend {backend_name!r} is sandboxed (network: none) but no "
+                f"usable OS sandbox is available: {exc}",
+                file=sys.stderr,
+            )
+            return None
+    return SubprocessBackend(spec, isolation=isolation)
 
 
 def _cmd_serve(args: argparse.Namespace) -> int:
@@ -346,8 +371,67 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
     else:
         print(f"  repo {layout.root}: not initialized (run 'agora repo init')")
 
+    # ADR-0013: PROVE the curator's OS-sandbox confinement on this host (mechanism + the four
+    # assertions), rather than assume it. A sandbox that is present but does NOT actually confine is
+    # a real health failure; a platform with no kernel sandbox is reported (fail-closed only bites a
+    # network: none backend at curate time) without flagging the whole host unhealthy.
+    ok = _doctor_sandbox(load_repo_config(layout).allow_reduced_isolation) and ok
+
     print(f"status: {'healthy' if ok else 'unhealthy'}")
     return 0 if ok else 1
+
+
+def _doctor_sandbox(allow_reduced_isolation: bool) -> bool:
+    """Run the ADR-0013 sandbox self-test and print its report; return whether the host is healthy.
+
+    Selects the OS-appropriate :class:`~agora_kb.curator.isolation.BackendIsolation` and runs the
+    hardened self-test against a throwaway worktree + a SEPARATE throwaway tmp (the ADR's
+    EPERM-specific probes: write-inside OK, write-outside denied, network denied to a reachable
+    target, Apple-shimmed binary runs). Returns ``False`` ONLY when a sandbox is present but its
+    self-test FAILS (a confinement that lies is worse than none). A platform with no kernel sandbox
+    (``SandboxUnavailable``) prints a fail-closed note and returns ``True`` — the default loopback
+    Ollama brain does inference outside the sandbox and never needs one; the fail-closed guard bites
+    only a ``network: none`` backend at curate time. Never raises: any unexpected error is reported.
+    """
+    from .curator.isolation.selftest import ollama_reachable, self_test
+
+    try:
+        isolation = select_backend_isolation(allow_reduced_isolation=allow_reduced_isolation)
+    except SandboxUnavailable as exc:
+        print(f"  sandbox: unavailable — fail-closed for network:none backends ({exc})")
+        return True
+
+    wt = Path(tempfile.mkdtemp(prefix="agora-doctor-wt-"))
+    tmp = Path(tempfile.mkdtemp(prefix="agora-doctor-tmp-"))
+    try:
+        report = self_test(isolation, wt, tmp, [])
+    except Exception as exc:  # noqa: BLE001 — doctor must never crash; report and move on.
+        print(f"  sandbox ({isolation.name}): self-test ERROR — {exc}")
+        return False
+    finally:
+        shutil.rmtree(wt, ignore_errors=True)
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    # The network-deny leg is only PROVABLE against a reachable target (the ADR uses host Ollama at
+    # 127.0.0.1:11434): with nothing listening the probe gets ECONNREFUSED, not EPERM, so the
+    # self-test cannot prove the deny. Treat that as "unproven", NOT a failure — health is the other
+    # three legs plus a network deny only when a target was actually reachable.
+    reachable = ollama_reachable()
+    healthy = (
+        report.write_inside_ok
+        and report.write_outside_denied
+        and report.apple_shim_ok
+        and (report.network_denied or not reachable)
+    )
+    print(f"  sandbox: {report.mechanism} ({'ok' if healthy else 'FAILED'})")
+    print(
+        f"    write-inside={report.write_inside_ok} "
+        f"write-outside-denied={report.write_outside_denied} "
+        f"apple-shim={report.apple_shim_ok}"
+    )
+    net_note = "" if reachable else " (no reachable target — unproven, not a failure)"
+    print(f"    network-denied={report.network_denied}{net_note}")
+    return healthy
 
 
 # --- helpers ------------------------------------------------------------------------------------

@@ -35,12 +35,17 @@ plan.json / fills the sentinels) with no real model in the loop. A region missin
 
 from __future__ import annotations
 
+import os
 import re
+import shutil
+import sys
+import tempfile
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from .apply import body_sentinels
 from .backends import BackendResult, BackendSpec, run_backend
+from .isolation import BackendIsolation, build_sandbox_spec, scrub_env
 
 if TYPE_CHECKING:
     # Typing-only import to avoid the runtime cycle: worker imports BackendUnavailableError from
@@ -185,10 +190,21 @@ class SubprocessBackend:
     """
 
     def __init__(
-        self, spec: BackendSpec, *, body_byte_bound: int = _DEFAULT_BODY_BYTE_BOUND
+        self,
+        spec: BackendSpec,
+        *,
+        body_byte_bound: int = _DEFAULT_BODY_BYTE_BOUND,
+        isolation: BackendIsolation | None = None,
     ) -> None:
         self._spec = spec
         self._body_byte_bound = body_byte_bound
+        # ADR-0013 confinement adapter (None → unconfined). The worker/CLI injects this ONLY for a
+        # ``network: 'none'`` backend (the file-writing PASS-2 step is then run inside the sandbox);
+        # for the default loopback Ollama brain it stays None and inference happens OUTSIDE the
+        # sandbox per the ADR (the shim couples inference + file-writing and needs loopback). PASS 1
+        # is NEVER confined (it writes no wiki files; its plan.json is re-validated), so confinement
+        # is requested only by :meth:`author` and only honored when ``spec.network == 'none'``.
+        self._isolation = isolation
 
     @property
     def spec(self) -> BackendSpec:
@@ -203,7 +219,7 @@ class SubprocessBackend:
         returned STDOUT is handed verbatim to :func:`agora_kb.curator.plan.Plan.from_json` by the
         worker; a non-zero exit or missing executable becomes a clear error so PLAN parse fails.
         """
-        result = self._invoke(worktree=bundle_dir, prompt=_PASS1_PROMPT)
+        result = self._invoke(worktree=bundle_dir, prompt=_PASS1_PROMPT, confine=False)
         if result.returncode != 0:
             raise BackendUnavailableError(
                 f"PLAN backend {self._spec.name!r} exited {result.returncode}: "
@@ -233,9 +249,12 @@ class SubprocessBackend:
             for sid in sids:
                 prompt = self._pass2_prompt(rel_path, sid, context.get(sid))
                 # cwd = worktree (the only writable mount); the backend edits this region's
-                # sentinels there. A non-zero exit is intentionally NOT raised — the §4.2 gate
-                # degrades that note.
-                self._invoke(worktree=worktree, prompt=prompt)
+                # sentinels there. ``confine=True`` runs this file-writing step INSIDE the ADR-0013
+                # sandbox when an isolation adapter is injected AND ``spec.network == 'none'`` (a
+                # malicious backend then cannot write outside the worktree nor reach the network); a
+                # loopback Ollama brain stays unconfined (inference outside). A non-zero exit is
+                # intentionally NOT raised — the §4.2 gate degrades that note.
+                self._invoke(worktree=worktree, prompt=prompt, confine=True)
 
     def _pass2_prompt(self, rel_path: str, sentinel_id: str, region: AuthorRegion | None) -> str:
         """Build the per-region PASS-2 prompt: the §8.2 grounded template, else the minimal one.
@@ -263,22 +282,99 @@ class SubprocessBackend:
             n_bytes=self._body_byte_bound,
         )
 
-    def _invoke(self, *, worktree: Path, prompt: str) -> BackendResult:
-        """Spawn the backend via :func:`run_backend`, mapping a missing executable to a clear error.
+    def _invoke(self, *, worktree: Path, prompt: str, confine: bool) -> BackendResult:
+        """Spawn the backend; confine it inside the ADR-0013 sandbox when ``confine`` applies.
 
-        ``run_backend`` runs ``argv`` with ``shell=False`` (no interpolation) and feeds ``prompt``
-        on stdin. A ``FileNotFoundError`` (the configured program is not on PATH / not executable)
-        or a ``PermissionError`` becomes :class:`BackendUnavailableError` so the operator sees an
-        actionable message naming the backend, not a raw OS traceback.
+        ``confine`` is honored (runs inside :meth:`BackendIsolation.run`) ONLY when an isolation
+        adapter was injected AND ``spec.network == 'none'`` — the file-writing PASS-2 step of a
+        no-network backend. Otherwise the bare ``argv`` is spawned via :func:`run_backend` with
+        ``shell=False`` and a credential-scrubbed env (ADR-0013 §"Env scrubbing" applies to EVERY
+        mechanism, even the unconfined inference-outside path, so a git/cloud token never enters
+        the backend). A ``FileNotFoundError`` / ``PermissionError`` (not on PATH / not
+        executable) becomes :class:`BackendUnavailableError` so the operator sees an actionable
+        message naming the backend, not a raw OS traceback.
         """
+        if confine and self._isolation is not None and self._spec.network == "none":
+            return self._invoke_sandboxed(worktree=worktree, prompt=prompt)
         timeout = float(self._spec.timeout_s) if self._spec.timeout_s else float(_DEFAULT_TIMEOUT_S)
         try:
-            return run_backend(self._spec, worktree=worktree, prompt=prompt, timeout=timeout)
+            return run_backend(
+                self._spec,
+                worktree=worktree,
+                prompt=prompt,
+                timeout=timeout,
+                env=scrub_env(os.environ),
+            )
         except (FileNotFoundError, PermissionError) as exc:
             raise BackendUnavailableError(
                 f"backend {self._spec.name!r} ({self._spec.argv[0]!r}) could not be executed: "
                 f"{exc}; check adapters.yaml and that the program is installed and on PATH"
             ) from exc
+
+    def _invoke_sandboxed(self, *, worktree: Path, prompt: str) -> BackendResult:
+        """Run ONE backend invocation confined to ``worktree`` via the ADR-0013 isolation adapter.
+
+        Builds a :class:`SandboxSpec` (every path realpath-resolved + env credential-scrubbed by
+        :func:`build_sandbox_spec`) over the ``{worktree}``-substituted argv, with a FRESH throwaway
+        ``tmp_dir`` created OUTSIDE the worktree (``HOME`` / ``TMPDIR`` point there so backend
+        dotfiles/caches never pollute the ADR-0008 worktree diff). The prompt rides on stdin.
+        ``main_git`` / ``main_kb`` are left ``None`` so the seatbelt adapter derives the MAIN repo's
+        ``.git`` / ``_kb`` realpaths to deny (G4/G5); the worktree is structurally non-nested
+        (``repo.create_worktree`` uses ``tempfile.mkdtemp``). Translates the raw
+        :class:`SandboxResult` (bytes) into a text :class:`BackendResult`. A non-zero exit is
+        returned as-is (PASS 2 leaves it for the worker's §4.2 degrade); a timeout
+        propagates as :class:`subprocess.TimeoutExpired` (the worker maps it to a clean failed run).
+        """
+        assert self._isolation is not None  # guarded by the caller's confinement predicate
+        worktree_str = str(worktree)
+        argv = [arg.replace("{worktree}", worktree_str) for arg in self._spec.argv]
+        timeout_s = int(self._spec.timeout_s) if self._spec.timeout_s else _DEFAULT_TIMEOUT_S
+        # Anchor the throwaway scratch as a SIBLING of the worktree (under its private holder dir),
+        # so it is deterministically OUTSIDE the writable mount regardless of ``$TMPDIR`` — a
+        # TMPDIR pointing inside the worktree could otherwise land scratch in the ADR-0008 diff.
+        # ``build_sandbox_spec`` still asserts ``tmp`` ⊄ ``worktree`` as the hard downstream guard.
+        tmp_dir = Path(tempfile.mkdtemp(prefix="agora-sbx-", dir=str(worktree.parent)))
+        try:
+            spec = build_sandbox_spec(
+                argv=argv,
+                worktree=worktree,
+                tmp_dir=tmp_dir,
+                read_roots=self._resolve_read_roots(worktree),
+                stdin_data=prompt.encode("utf-8"),
+                env=os.environ,
+                timeout_s=timeout_s,
+                network="none",
+            )
+            result = self._isolation.run(spec)
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        return BackendResult(
+            returncode=result.returncode,
+            stdout=result.stdout.decode("utf-8", "replace"),
+            stderr=result.stderr.decode("utf-8", "replace"),
+        )
+
+    def _resolve_read_roots(self, worktree: Path) -> list[str | os.PathLike[str]]:
+        """Resolve the spec's ``read_roots`` placeholders into existing read-only paths (ADR-0013).
+
+        Substitutes ``{venv}`` → ``sys.prefix``, ``{interpreter}`` → its directory, and
+        ``{worktree}`` → ``worktree`` in each configured read root, keeping only paths that exist
+        (``build_sandbox_spec`` resolves them ``strict=True``, so a missing root would otherwise
+        crash). Phase-1 ships a broad ``(allow file-read*)`` in the profile, so these are
+        belt-and-suspenders today; the load-bearing grants once the read posture is tightened.
+        """
+        interp_dir = str(Path(sys.executable).resolve().parent)
+        roots: list[str | os.PathLike[str]] = []
+        for raw in self._spec.read_roots:
+            resolved = (
+                raw.replace("{venv}", sys.prefix)
+                .replace("{interpreter}", interp_dir)
+                .replace("{worktree}", str(worktree))
+            )
+            path = Path(resolved)
+            if path.exists():
+                roots.append(path)
+        return roots
 
 
 def present_sentinel_ids(text: str) -> set[str]:
