@@ -39,7 +39,12 @@ def parse(text: str) -> tuple[dict[str, object], str]:
 
     The opening and closing fences must each be a line that is exactly ``---`` (trailing spaces/tabs
     allowed); a ``----`` or ``---foo`` line is not a fence and will not split the document. Raises
-    :class:`FrontmatterError` if the document does not open with a ``---`` fence closed by another.
+    :class:`FrontmatterError` if the document does not open with a ``---`` fence closed by another,
+    OR if the fenced block is not parseable as a YAML mapping — including syntactically MALFORMED
+    YAML (e.g. an Obsidian ``links: [[a]], [[b]]`` line). The underlying :class:`yaml.YAMLError` is
+    WRAPPED in :class:`FrontmatterError` so the deterministic read/lint path stays TOTAL: a single
+    malformed note in a real-world KB surfaces as a typed, catchable error (a lint finding / a
+    skipped note), never an uncaught third-party traceback out of ``kb_query`` / the curator bundle.
     """
     nl = text.find("\n")
     first = text if nl == -1 else text[:nl]
@@ -51,7 +56,13 @@ def parse(text: str) -> tuple[dict[str, object], str]:
         raise FrontmatterError("frontmatter block is not closed by a '---' line")
     yaml_text = rest[: closing.start()]
     body = rest[closing.end() :].lstrip("\n").rstrip("\n")
-    loaded = yaml.safe_load(yaml_text) if yaml_text.strip() else {}
+    try:
+        loaded = yaml.safe_load(yaml_text) if yaml_text.strip() else {}
+    except yaml.YAMLError as exc:
+        # Malformed YAML in a hand-/Obsidian-authored note must not crash the curator or the read
+        # path: wrap it as the same typed error a missing fence raises, so every consumer's existing
+        # FrontmatterError handling (lint finding / Wiki skip / parse_all_notes surface) applies.
+        raise FrontmatterError(f"frontmatter is not valid YAML: {exc}") from exc
     if not isinstance(loaded, dict):
         raise FrontmatterError("frontmatter is not a YAML mapping")
     return loaded, body
