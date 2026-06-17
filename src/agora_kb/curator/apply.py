@@ -47,6 +47,7 @@ import re
 from pathlib import Path
 
 from agora_kb.core import frontmatter
+from agora_kb.core.frontmatter import FrontmatterError
 from agora_kb.curator.plan import Disposition, Plan
 from agora_kb.schema.notes import wikilinks
 
@@ -283,6 +284,41 @@ def _stamp_harvest_origin(fm: dict[str, object], provenance: list[dict[str, obje
         fm["origin"] = origin
 
 
+# --- OKF v0.1 producer fields (ADR-0014 D2) ----------------------------------------------------
+
+# The OKF v0.1 bundle-root version string, emitted on the root ``index.md`` ONLY (per the OKF spec;
+# ADR-0014 D2 / D6). It is the EXTERNAL conformance axis, orthogonal to the internal
+# ``schema_version`` (ADR-0010 D6 / L1-17) — the two evolve independently. Never on theme/daily/moc.
+_OKF_VERSION = "0.1"
+
+
+def _okf_timestamp(updated: str) -> str:
+    """Return OKF's ``timestamp`` for a note, derived DETERMINISTICALLY from ``updated`` (D2).
+
+    OKF v0.1 expects an ISO-8601 datetime for "last meaningful change"; Agora's canonical clock is a
+    DATE (``updated`` == ``run_date``, ADR-0010 D1) read from the injected run manifest, never the
+    wall clock. So the OKF datetime is the run date pinned to midnight UTC — ``<updated>T00:00:00Z``
+    — which satisfies OKF WITHOUT reintroducing a system clock (ADR-0014 ratified decision #5 / D1
+    replay determinism). ``updated`` is the same ``YYYY-MM-DD`` string APPLY already materializes,
+    so ``timestamp`` is a pure function of it and the run stays byte-reproducible.
+    """
+    return f"{updated}T00:00:00Z"
+
+
+def _set_updated(fm: dict[str, object], run_date: str) -> None:
+    """Bump ``updated`` AND re-derive the OKF ``timestamp`` together, in lock-step (D2).
+
+    The OKF invariant ``timestamp == <updated>T00:00:00Z`` must hold on EVERY note after EVERY
+    curator edit (ADR-0014 D2 / kb_schema.md §2.7), not just at CREATE. Every UPDATE branch that
+    advances ``updated`` to ``run_date`` (append-daily re-touch, MERGE, MARK_CONTESTED, MOC /
+    index re-render) MUST go through this helper so ``timestamp`` can never drift stale behind
+    ``updated``. The CREATE branches pair the two keys inline at note-build time (key order matters
+    there); this helper is the single update-path equivalent.
+    """
+    fm["updated"] = run_date
+    fm["timestamp"] = _okf_timestamp(run_date)
+
+
 # --- theme frontmatter (ADR-0010 C2 / §2) -----------------------------------------------------
 
 
@@ -303,8 +339,20 @@ def _theme_frontmatter(
     by the model, ADR-0011 §2, so the backend can never inflate it), and ``body_status: pending``
     when the note needs prose. Key order matches the ADR-0010 §2 documented shape so the rendered
     YAML is stable.
+
+    OKF v0.1 conformance (ADR-0014 D2) is ADDITIVE — the WORKER (never the model) also materializes
+    ``description`` (the OKF one-line field, carrying the SAME value as ``summary`` so an OKF-aware
+    reader sees the precis under its standard key; ratified decision #2) and ``timestamp`` (OKF's
+    "last meaningful change", derived DETERMINISTICALLY as ``<updated>T00:00:00Z`` so no wall clock
+    is reintroduced — ADR-0014 ratified decision #5 / ADR-0010 D1 replay determinism).
+    ``description`` is placed immediately after ``summary`` and ``timestamp`` immediately after
+    ``updated`` so the key order stays a stable superset of the ADR-0010 §2 shape. The OPTIONAL OKF
+    ``resource`` URI is NOT emitted (the curator has no canonical URI for a theme it distils;
+    ADR-0014 D2 documents it as accepted-on-read only), and ``okf_version`` lives on the bundle-root
+    ``index.md`` ONLY (per the OKF spec), never on a theme.
     """
     status = disp.status or "active"
+    summary = disp.summary or ""
     fm: dict[str, object] = {
         "title": disp.title or disp.basename or disp.candidate_id,
         "type": "theme",
@@ -312,8 +360,10 @@ def _theme_frontmatter(
         "tags": list(disp.tags),
         "created": run_date,
         "updated": run_date,
+        "timestamp": _okf_timestamp(run_date),
         "status": status,
-        "summary": disp.summary or "",
+        "summary": summary,
+        "description": summary,
         "sources": list(sources),
         "related": [f"[[{link}]]" for link in disp.links],
     }
@@ -332,7 +382,14 @@ def _daily_frontmatter(
     run_date: str,
     sources: list[str],
 ) -> dict[str, object]:
-    """Build the ADR-0010 C2 daily frontmatter (``date``/``run_id`` from the injected run, §3.1)."""
+    """Build the ADR-0010 C2 daily frontmatter (``date``/``run_id`` from the injected run, §3.1).
+
+    OKF v0.1 conformance (ADR-0014 D2) is ADDITIVE: ``description`` mirrors ``summary`` (ratified
+    decision #2) and ``timestamp`` is the deterministic ``<updated>T00:00:00Z`` (ratified
+    decision #5 / ADR-0010 D1) — placed after ``summary`` and ``updated`` respectively.
+    ``okf_version`` is NOT emitted on a daily (it is bundle-root-``index.md``-only, per OKF).
+    """
+    summary = disp.summary or ""
     fm: dict[str, object] = {
         "title": disp.title or f"Daily {run_date}",
         "type": "daily",
@@ -340,8 +397,10 @@ def _daily_frontmatter(
         "tags": list(disp.tags),
         "created": run_date,
         "updated": run_date,
+        "timestamp": _okf_timestamp(run_date),
         "status": disp.status or "active",
-        "summary": disp.summary or "",
+        "summary": summary,
+        "description": summary,
         "date": run_date,
         "run_id": run_id,
         "sources": list(sources),
@@ -384,11 +443,84 @@ def _contested_callout(disp: Disposition, *, run_date: str, sources: list[str]) 
     )
 
 
-# --- MOC / index maintenance (ADR-0010 §2 children + §3.2 child-bullet grammar) ----------------
+# --- MOC / index maintenance (ADR-0010 §2 children + §3.2 grammar, ADR-0014 D3 body md-links) --
 
 
 def _moc_basename(domain: str) -> str:
     return f"{domain}-moc"
+
+
+# --- ADR-0014 D3: standard-markdown BODY graph links -------------------------------------------
+
+
+def _note_title(path: Path, fallback: str) -> str:
+    """Return a note's frontmatter ``title`` for use as markdown-link TEXT, else ``fallback``.
+
+    ADR-0014 D3 emits the MOC/index BODY child bullets as standard markdown links
+    ``[Title](relative.md)`` — the link TEXT is the CHILD note's ``title`` (read from its
+    frontmatter), so the rendered link is human/Obsidian/git-friendly while the basename remains the
+    internal identity (parsed back from the link path, ADR-0010 D5). DEFENSIVELY falls back to
+    ``fallback`` (the child basename) when the note is absent, unreadable, has no frontmatter, or
+    its ``title`` is missing/non-string — the link still resolves by basename, only the display text
+    degrades. This read is a pure function of the worktree at APPLY time (deterministic).
+    """
+    if not path.is_file():
+        return fallback
+    try:
+        fm, _ = frontmatter.parse(path.read_text(encoding="utf-8"))
+    except (FrontmatterError, OSError):
+        return fallback
+    title = fm.get("title")
+    return title if isinstance(title, str) and title else fallback
+
+
+def _link_text(title: str, *, fallback: str) -> str:
+    """Sanitize a note ``title`` for safe use as markdown-link TEXT (ADR-0014 D3 / ADR-0010 D5).
+
+    The MOC/index body child bullet is emitted as ``[<text>](<path>.md)`` and MUST round-trip
+    through the FROZEN ``_CHILD_BULLET_RE`` (``schema/notes.py``) whose link-text class
+    ``[^\\]\\r\\n]*`` forbids ``]`` and any newline. A note ``title`` is model-decided
+    (``disp.title``) and so may legally contain ``]``, ``[``, ``\\r`` or ``\\n`` (all valid YAML
+    scalars) — interpolating it raw would emit a bullet the curator's own L1-6/L1-2 lint can no
+    longer parse, dropping the child from ``child_bullets`` / ``body_link_basenames`` and the
+    read-path graph seed (ADR-0012). We therefore DROP the bracket characters that would terminate
+    the text group early and COLLAPSE any ``\\r``/``\\n`` to a single space, falling back to the
+    child basename if nothing survives. Only the human-readable TEXT is touched; the basename in the
+    PATH (slug-constrained) is never at risk, so emit->parse still recovers the same basename and
+    the round-trip identity is preserved.
+    """
+    text = title.replace("]", "").replace("[", "").replace("\r", " ").replace("\n", " ").strip()
+    return text if text else fallback
+
+
+def _theme_child_link(base: str, *, domain: str, worktree: Path) -> str:
+    """Render one MOC body child bullet for a theme as ``- [Title](themes/<base>.md)`` (D3).
+
+    A domain MOC lives at ``wiki/<domain>/<domain>-moc.md`` and a theme child at
+    ``wiki/<domain>/themes/<base>.md``, so the RELATIVE path from the MOC's directory to the theme
+    is ``themes/<base>.md`` — no leading ``/`` or ``./`` (the form that resolves in BOTH Obsidian
+    and an OKF bundle, ADR-0014 D3). The link TEXT is the theme's ``title`` (basename fallback). The
+    child basename is recoverable from the path (``_basename_from_link_path``), keeping L1-6 / L1-2
+    / read-path graph seeding total.
+    """
+    theme_path = worktree / "wiki" / domain / "themes" / f"{base}.md"
+    title = _link_text(_note_title(theme_path, base), fallback=base)
+    return f"- [{title}](themes/{base}.md)"
+
+
+def _moc_child_link(moc_base: str, *, worktree: Path) -> str:
+    """Render one root-index body child bullet for a domain MOC as a markdown link (D3).
+
+    The root ``index.md`` lives at the repo root and a domain MOC at
+    ``wiki/<domain>/<domain>-moc.md`` (``moc_base == "<domain>-moc"``), so the RELATIVE path from
+    the index's directory (the root) to the MOC is ``wiki/<domain>/<domain>-moc.md`` — no leading
+    ``/`` or ``./`` (ADR-0014 D3). The link TEXT is the MOC's ``title`` (basename fallback).
+    ``<domain>`` is recovered as ``moc_base`` minus the ``-moc`` suffix.
+    """
+    domain = moc_base[: -len("-moc")] if moc_base.endswith("-moc") else moc_base
+    moc_path = worktree / "wiki" / domain / f"{moc_base}.md"
+    title = _link_text(_note_title(moc_path, moc_base), fallback=moc_base)
+    return f"- [{title}](wiki/{domain}/{moc_base}.md)"
 
 
 # --- the deterministic APPLY (ADR-0011 §3) -----------------------------------------------------
@@ -572,7 +704,7 @@ def _apply_append_daily(
             if s not in merged_sources:
                 merged_sources.append(s)
         fm["sources"] = merged_sources
-        fm["updated"] = run_date
+        _set_updated(fm, run_date)
         if disp.needs_prose:
             fm["body_status"] = "pending"
         body = f"{prior_body}\n\n{section}" if prior_body else section
@@ -635,7 +767,7 @@ def _apply_merge(
         if s not in merged:
             merged.append(s)
     fm["sources"] = merged
-    fm["updated"] = run_date
+    _set_updated(fm, run_date)
 
     # MERGE_INTO_THEME is the ONLY op a gated/harvested candidate may use to ADD content (§6), so it
     # is the primary loop-prevention site: a kept-via-merge harvested region tags the target
@@ -707,7 +839,7 @@ def _apply_contested(
             contested_by.append(link)
     fm["contested_by"] = contested_by
     fm["contested_at"] = run_date
-    fm["updated"] = run_date
+    _set_updated(fm, run_date)
 
     # A harvested contradicting claim folded into the target tags it origin: harvest:<agent> for
     # loop-prevention (same rule as MERGE; §2 / §6 / DATA-MODEL §7). Set-union; never overwrite.
@@ -729,7 +861,14 @@ def _update_moc(
 
     The children set is the UNION of the themes already living in ``wiki/<domain>/themes/`` and the
     ones created this run. ``children:`` frontmatter is kept exactly equal to the body child-bullet
-    set (L1-6) and both are sorted, so the MOC is a deterministic function of its child set.
+    BASENAME set (L1-6) and both are sorted, so the MOC is a deterministic function of its children.
+
+    ADR-0014 D3 — the BODY child bullets are STANDARD MARKDOWN LINKS ``- [Title](themes/<base>.md)``
+    (git + Obsidian + OKF native, no export step), rendered by :func:`_theme_child_link`: the link
+    TEXT is the theme's ``title`` and the relative path from the MOC's dir to the theme is
+    ``themes/<base>.md``. The ``children:`` FRONTMATTER STAYS ``"[[basename]]"`` wikilink strings
+    (Obsidian-Properties-native; OKF preserves them). Both sides derive from the same sorted
+    basename set, so L1-6 (children == child-bullet basename set) holds by construction.
     """
     themes_dir = worktree / "wiki" / domain / "themes"
     existing = (
@@ -738,14 +877,18 @@ def _update_moc(
     children = sorted(existing | new_basenames)
 
     moc_path = worktree / "wiki" / domain / f"{_moc_basename(domain)}.md"
+    body = "\n".join(_theme_child_link(b, domain=domain, worktree=worktree) for b in children)
     if moc_path.is_file():
         fm, _ = frontmatter.parse(moc_path.read_text(encoding="utf-8"))
         _canonicalize_dates(fm)
         fm["children"] = [f"[[{b}]]" for b in children]
-        fm["updated"] = run_date
-        body = "\n".join(f"- [[{b}]]" for b in children)
+        _set_updated(fm, run_date)
         moc_path.write_text(frontmatter.render(fm, body), encoding="utf-8")
     else:
+        # OKF v0.1 (ADR-0014 D2): ``description`` mirrors ``summary`` and ``timestamp`` is the
+        # deterministic ``<updated>T00:00:00Z`` (no wall clock, ADR-0010 D1). ``okf_version`` is NOT
+        # emitted here — a MOC is not the bundle root, so it stays index.md-only (per the OKF spec).
+        summary = f"Map of content for the {domain} domain."
         fm = {
             "title": f"{domain} MOC",
             "type": "moc",
@@ -753,11 +896,12 @@ def _update_moc(
             "tags": [],
             "created": run_date,
             "updated": run_date,
+            "timestamp": _okf_timestamp(run_date),
             "status": "active",
-            "summary": f"Map of content for the {domain} domain.",
+            "summary": summary,
+            "description": summary,
             "children": [f"[[{b}]]" for b in children],
         }
-        body = "\n".join(f"- [[{b}]]" for b in children)
         moc_path.parent.mkdir(parents=True, exist_ok=True)
         moc_path.write_text(frontmatter.render(fm, body), encoding="utf-8")
 
@@ -771,8 +915,15 @@ def _update_index(
     """Create-or-update root ``index.md`` so its children list every domain MOC (ADR-0010 §1).
 
     The index's children are the domain MOC basenames (``<domain>-moc``) — the UNION of every MOC
-    already present in the worktree and the ones touched this run. ``children:`` == the body
-    child-bullet set (L1-6); both sorted, deterministic.
+    already present in the worktree and the ones touched this run. ``children:`` frontmatter == the
+    body child-bullet BASENAME set (L1-6); both sorted, deterministic.
+
+    ADR-0014 D3 — the BODY child bullets are STANDARD MARKDOWN LINKS
+    ``- [Title](wiki/<domain>/<domain>-moc.md)`` (git + Obsidian + OKF native), rendered by
+    :func:`_moc_child_link`: the link TEXT is the MOC's ``title`` and the relative path from the
+    index's dir (the repo root) to the MOC is ``wiki/<domain>/<domain>-moc.md``. The ``children:``
+    FRONTMATTER STAYS ``"[[basename]]"`` wikilink strings (Obsidian-Properties-native; OKF
+    preserves). Both derive from the same sorted MOC-basename set, so L1-6 holds by construction.
     """
     wiki = worktree / "wiki"
     existing_mocs = (
@@ -781,26 +932,33 @@ def _update_index(
     moc_children = sorted(existing_mocs | {_moc_basename(d) for d in domains})
 
     index_path = worktree / "index.md"
+    body = "\n".join(_moc_child_link(b, worktree=worktree) for b in moc_children)
     if index_path.is_file():
         fm, _ = frontmatter.parse(index_path.read_text(encoding="utf-8"))
         _canonicalize_dates(fm)
         fm["children"] = [f"[[{b}]]" for b in moc_children]
-        fm["updated"] = run_date
-        body = "\n".join(f"- [[{b}]]" for b in moc_children)
+        _set_updated(fm, run_date)
         index_path.write_text(frontmatter.render(fm, body), encoding="utf-8")
     else:
+        # The root index.md is the OKF BUNDLE ROOT (ADR-0014 D2): it ALONE carries ``okf_version``
+        # (placed immediately after ``type``, per the OKF spec — never on themes/dailies/mocs).
+        # ``description`` mirrors ``summary`` and ``timestamp`` is the deterministic
+        # ``<updated>T00:00:00Z`` (no wall clock, ADR-0010 D1 / ADR-0014 ratified decision #5).
+        summary = "Top map of content; links every domain MOC."
         fm = {
             "title": "Knowledge base index",
             "type": "index",
+            "okf_version": _OKF_VERSION,
             "aliases": [],
             "tags": [],
             "created": run_date,
             "updated": run_date,
+            "timestamp": _okf_timestamp(run_date),
             "status": "active",
-            "summary": "Top map of content; links every domain MOC.",
+            "summary": summary,
+            "description": summary,
             "children": [f"[[{b}]]" for b in moc_children],
         }
-        body = "\n".join(f"- [[{b}]]" for b in moc_children)
         index_path.write_text(frontmatter.render(fm, body), encoding="utf-8")
 
 

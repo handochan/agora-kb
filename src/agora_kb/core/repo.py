@@ -50,16 +50,26 @@ _GITIGNORE = (
 # A schema-compliant root index.md (the ADR-0010 `index` note frontmatter) so a freshly-initialized
 # repo lints clean (schema.lint L1-4); the curator's APPLY later fills children/updated, preserving
 # these keys. {date} is the init date (YYYY-MM-DD).
+#
+# The seed index is also the OKF v0.1 BUNDLE ROOT (ADR-0014 D2): OKF conformance is the DEFAULT
+# posture at `repo init` (ratified decision #4), so the seed carries `okf_version: '0.1'` (bundle
+# root ONLY, placed after `type` per the OKF spec), `description` mirroring `summary` (after
+# `summary`; ratified decision #2), and a DETERMINISTIC `timestamp` == `<date>T00:00:00Z` (after
+# `updated`; the run reads no wall clock — ADR-0010 D1 / ADR-0014 ratified decision #5). A fresh
+# repo is therefore a conformant OKF bundle the moment it is initialized.
 _SEED_INDEX = (
     "---\n"
     "title: Index\n"
     "type: index\n"
+    "okf_version: '0.1'\n"
     "aliases: []\n"
     "tags: []\n"
     "created: '{date}'\n"
     "updated: '{date}'\n"
+    "timestamp: '{date}T00:00:00Z'\n"
     "status: active\n"
     "summary: Knowledge base index.\n"
+    "description: Knowledge base index.\n"
     "children: []\n"
     "---\n\n# Knowledge base\n"
 )

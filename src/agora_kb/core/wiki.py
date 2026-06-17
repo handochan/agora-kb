@@ -9,7 +9,10 @@ implementation does not wire them, and a full pure-Python scan is always the sou
 The algorithm is the LEXICAL-UNION FRONTIER with a single pure-Python scorer (ADR-0012 §4-§7):
 
 1. **SEED** navigation roots from ``index.md`` + every in-scope ``<domain>-moc.md``.
-2. **FRONTIER** = BFS over the ``[[wikilink]]`` graph (``max_hops=2``) UNION lexical candidates.
+2. **FRONTIER** = BFS over the note link graph (``max_hops=2``) UNION lexical candidates. Edges are
+   the ADR-0014 D3 BODY markdown links ``[Title](relative.md)`` (resolved path→basename), the
+   frontmatter ``related:`` / ``children:`` ``"[[basename]]"`` arrays, and any tolerated stray body
+   ``[[ ]]`` wikilink. The traversal stays deterministic + reproducible (ADR-0009).
 3. **TOKENIZE** the question; an all-stopword question yields ``not_found`` immediately.
 4. **LEXICAL** BM25F over {title, tags, headings, body} with repo-wide IDF.
 5. **STRUCTURAL** degree surrogate ``alpha/(1+d_moc) + beta*indeg_norm`` (no iterative PageRank).
@@ -93,10 +96,18 @@ _REASON_RANK: dict[str, int] = {"linked-theme": 0, "heading": 1, "lexical": 2}
 _HEADING_RE = re.compile(r"^(#{1,6})[ \t]+(.*?)[ \t]*#*[ \t]*$")
 # A fenced code block delimiter (``` or ~~~), allowing an info string after.
 _FENCE_RE = re.compile(r"^[ \t]*(```+|~~~+)")
-# [[target|label]] or [[target#anchor]] or [[target]] wikilink.
+# [[target|label]] or [[target#anchor]] or [[target]] wikilink. STILL used for the frontmatter
+# related:/children: arrays (ADR-0014 D3 keeps those as "[[basename]]" strings) and for any stray
+# body wikilink (a foreign/Obsidian vault may carry them; tolerated on read, ADR-0014 D4).
 _WIKILINK_RE = re.compile(r"\[\[([^\]]+)\]\]")
-# [label](url) markdown link.
+# [label](url) markdown link — used both to strip link punctuation to its label AND (since
+# ADR-0014 D3) to read the BODY graph edges: a MOC/index child bullet is now ``[Title](path.md)``.
+# An IMAGE link ``![alt](assets/foo.png)`` is excluded from graph edges via the ``(?<!\!)`` guard in
+# _MDLINK_TARGET_RE (assets live outside the link graph, ADR-0010 §3.5).
 _MDLINK_RE = re.compile(r"\[([^\]]*)\]\([^)]*\)")
+# A non-image markdown link with its TARGET captured — the ADR-0014 D3 body graph-edge form. The
+# target is resolved to a basename (filename minus dir minus ``.md``) by _mdlink_target_basename.
+_MDLINK_TARGET_RE = re.compile(r"(?<!\!)\[(?P<text>[^\]\r\n]*)\]\((?P<target>[^)\r\n]+)\)")
 # A token of the §3 tokenizer alphabet.
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
 
@@ -156,6 +167,46 @@ def _link_target(inner: str) -> str:
     target = inner.split("|", 1)[0]  # drop alias
     target = target.split("#", 1)[0]  # drop anchor
     return target.strip()
+
+
+def _mdlink_target_basename(target: str) -> str:
+    """Resolve a markdown-link TARGET path to its note basename, or ``""`` (ADR-0014 D3).
+
+    The body graph edge ``[Title](relative.md)`` (ADR-0014 D3) carries a relative path; its basename
+    is the filename minus directory minus ``.md`` — the internal identity the read-path graph seeds
+    on (ADR-0010 D5), matching :func:`agora_kb.schema.notes._basename_from_link_path`. An anchor
+    fragment (``path.md#heading``) is dropped. A NON-``.md`` target (an external URL, an ``assets/``
+    image) is NOT a note edge and yields ``""`` so the caller skips it. Determinism: a pure function
+    of the link text, so the seeded graph is reproducible (ADR-0009).
+    """
+    cleaned = target.strip()
+    cleaned = cleaned.split("#", 1)[0]  # drop any #anchor fragment
+    if not cleaned.endswith(".md"):
+        return ""
+    last = cleaned.rsplit("/", 1)[-1]
+    return last[: -len(".md")]
+
+
+def _fm_wikilink_basenames(value: object) -> list[str]:
+    """Resolve a frontmatter ``related:`` / ``children:`` array of ``"[[basename]]"`` strings.
+
+    ADR-0014 D3 keeps the frontmatter graph arrays as Obsidian-Properties ``"[[basename]]"`` tokens
+    (only the BODY child bullets became markdown links). Each list entry is scanned for ``[[ ]]``
+    tokens and resolved to its target basename via :func:`_link_target`, so these structured edges
+    seed the read-path graph alongside the body markdown links — keeping ``linked-theme`` BFS total.
+    A non-list / non-string value contributes nothing.
+    """
+    out: list[str] = []
+    if not isinstance(value, list):
+        return out
+    for entry in value:
+        if not isinstance(entry, str):
+            continue
+        for m in _WIKILINK_RE.finditer(entry):
+            target = _link_target(m.group(1))
+            if target:
+                out.append(target)
+    return out
 
 
 @dataclass
@@ -241,12 +292,30 @@ def _parse_note(path: str, basename: str, is_index: bool, raw_text: str) -> _Not
                     slug_counts[base_slug] = n + 1
                     slug = base_slug if n == 0 else f"{base_slug}-{n}"
                     headings.append(_Heading(level=level, text=text, slug=slug, line=idx))
-        # outlinks are collected from the FULL body (links inside fences are rare; the ADR walks
-        # the wikilink graph over the note's links — we collect from non-fence lines to match the
-        # body-text model, but wikilinks are content, so scan every line for link targets).
+        # Body graph edges (ADR-0012 §2 walks the note's link graph). Since ADR-0014 D3 the BODY
+        # graph link is a STANDARD MARKDOWN LINK ``[Title](relative.md)`` (the MOC/index child
+        # bullets), so collect non-image markdown ``.md`` targets resolved to basenames. ALSO
+        # collect any stray body ``[[ ]]`` wikilink: a foreign/Obsidian vault may still carry them
+        # and they are tolerated on read (ADR-0014 D4) — a produced Agora note has none in its body.
+        # Image links / external URLs resolve to "" and are skipped.
+        for m in _MDLINK_TARGET_RE.finditer(line):
+            target = _mdlink_target_basename(m.group("target"))
+            if target and target not in seen_targets:
+                seen_targets.add(target)
+                outlinks.append(target)
         for m in _WIKILINK_RE.finditer(line):
             target = _link_target(m.group(1))
             if target and target not in seen_targets:
+                seen_targets.add(target)
+                outlinks.append(target)
+
+    # Frontmatter structured graph edges: related: / children: STAY ``"[[basename]]"`` arrays
+    # (ADR-0014 D3) — seed them into the graph alongside the body markdown links so a theme's
+    # ``related`` and a MOC/index's ``children`` keep contributing ``linked-theme`` BFS edges and
+    # in-degree, exactly as the body ``[[ ]]`` did before the D3 grammar change.
+    for key in ("related", "children"):
+        for target in _fm_wikilink_basenames(fm.get(key)):
+            if target not in seen_targets:
                 seen_targets.add(target)
                 outlinks.append(target)
 
@@ -543,14 +612,23 @@ class Wiki:
 
     @staticmethod
     def _moc_link_labels(note: _Note) -> list[tuple[str, set[str]]]:
-        """Extract ``[[basename]]`` targets of a MOC/index with their link-label tokens.
+        """Extract a MOC/index's child link targets with their link-label tokens (ADR-0014 D3).
 
-        The label is the visible ``[[basename|label]]`` text if present, else the surrounding
-        list-item / line text (with link punctuation stripped). Returns target-basename →
-        token-set pairs in document order.
+        Since ADR-0014 D3 a MOC/index BODY child bullet is a STANDARD MARKDOWN LINK
+        ``[Title](relative.md)``, so the target basename is parsed from the link PATH
+        (:func:`_mdlink_target_basename`) and the label is the visible ``Title`` text — this is what
+        powers ``match_reason: linked-theme`` (the child's title tokens seed the d_moc==0
+        theme-token set). A stray ``[[basename]]`` wikilink in a MOC body is ALSO honored (tolerant
+        read, ADR-0014 D4): its label is the ``|display`` text or the surrounding line. Returns
+        target-basename → token-set pairs in document order; image / external links are skipped.
         """
         out: list[tuple[str, set[str]]] = []
         for raw_line in note.raw_lines:
+            for m in _MDLINK_TARGET_RE.finditer(raw_line):
+                target = _mdlink_target_basename(m.group("target"))
+                if not target:
+                    continue
+                out.append((target, set(_tokenize(m.group("text")))))
             for m in _WIKILINK_RE.finditer(raw_line):
                 inner = m.group(1)
                 target = _link_target(inner)

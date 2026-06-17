@@ -290,3 +290,23 @@ def test_depth_glob_is_two_levels(inbox: Inbox) -> None:
     deep.mkdir(parents=True, exist_ok=True)
     deep.joinpath("e.md").write_text("x", encoding="utf-8")
     assert inbox.depth() == 1
+
+
+def test_last_write_none_on_empty(tmp_path: Path) -> None:
+    assert Inbox(RepoLayout(tmp_path)).last_write() is None
+
+
+def test_last_write_returns_newest_event_timestamp(inbox: Inbox) -> None:
+    early = datetime(2026, 6, 13, 2, 0, 0, tzinfo=UTC)
+    late = datetime(2026, 6, 13, 5, 30, 0, tzinfo=UTC)
+    inbox.write(text="a", writer="dochan", source="manual", now=early)
+    inbox.write(text="b", writer="alice", source="manual", now=late)  # across writer namespaces
+    # The newest event id (time-sortable) wins, regardless of which writer wrote it.
+    assert inbox.last_write() == late
+
+
+def test_last_write_ignores_foreign_filenames(inbox: Inbox) -> None:
+    ts = datetime(2026, 6, 13, 2, 0, 0, tzinfo=UTC)
+    inbox.write(text="a", writer="dochan", source="manual", now=ts)
+    inbox.layout.inbox_dir.joinpath("dochan", "not-an-event.md").write_text("x", encoding="utf-8")
+    assert inbox.last_write() == ts

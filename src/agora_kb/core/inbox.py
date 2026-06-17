@@ -28,7 +28,7 @@ from pathlib import Path
 from . import frontmatter
 from .atomicio import atomic_write_text
 from .hashing import content_sha256
-from .ids import new_event_id
+from .ids import event_id_timestamp, is_valid_event_id, new_event_id
 from .layout import RepoLayout, validate_writer
 from .models import Confidence, InboxItem, Kind
 
@@ -120,6 +120,25 @@ class Inbox:
         if not inbox.exists():
             return 0
         return sum(1 for _ in inbox.glob("*/*.md"))
+
+    def last_write(self) -> datetime | None:
+        """Timestamp of the most recent pending inbox event, or ``None`` when the inbox is empty.
+
+        Derived from the NEWEST event id, not file mtime: ids are time-sortable (lexicographic order
+        == chronological, :mod:`agora_kb.core.ids`), so the largest pending id carries the latest
+        write instant — stable across filesystems and clock-skew-free. Feeds the curator's *idle*
+        trigger (no writes for ``idle_minutes`` while a backlog exists, DESIGN §4). Foreign or
+        malformed filenames under ``inbox/`` are ignored; only valid event ids are considered.
+        """
+        inbox = self._layout.inbox_dir
+        if not inbox.exists():
+            return None
+        newest: str | None = None
+        for path in inbox.glob("*/*.md"):
+            stem = path.stem
+            if is_valid_event_id(stem) and (newest is None or stem > newest):
+                newest = stem
+        return event_id_timestamp(newest) if newest is not None else None
 
     # --- internals ------------------------------------------------------------------------------
     def _append(self, item: InboxItem) -> None:

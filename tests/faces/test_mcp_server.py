@@ -14,6 +14,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
+from fastmcp import Client
 
 from agora_kb.core import Inbox, Repo
 from agora_kb.core.wiki import Wiki
@@ -122,13 +123,16 @@ def _init_curatable_repo(tmp_path: Path) -> Repo:
 
 def _write_wiki_notes(tmp_path: Path) -> None:
     """Place a small navigable corpus on disk (index + MOC + two themes) under ``wiki/``."""
-    (tmp_path / "index.md").write_text("# personal\n\n- [[ai-tech-moc]]\n", encoding="utf-8")
+    # ADR-0014 D3: the produced MOC/index BODY child bullets are standard markdown links.
+    (tmp_path / "index.md").write_text(
+        "# personal\n\n- [AI Tech MOC](wiki/ai-tech/ai-tech-moc.md)\n", encoding="utf-8"
+    )
     domain = tmp_path / "wiki" / "ai-tech"
     domain.mkdir(parents=True, exist_ok=True)
     (domain / "ai-tech-moc.md").write_text(
         "---\nstatus: active\n---\n# AI Tech\n\n"
-        "- [[curator-concurrency]] — single-writer curator\n"
-        "- [[inbox-design]] — append-only inbox\n",
+        "- [Curator concurrency](themes/curator-concurrency.md) — single-writer curator\n"
+        "- [Inbox design](themes/inbox-design.md) — append-only inbox\n",
         encoding="utf-8",
     )
     (domain / "curator-concurrency.md").write_text(
@@ -326,6 +330,45 @@ def test_curate_empty_inbox_with_backend_is_noop(tmp_path: Path) -> None:
 
     assert result["status"] == "noop"
     assert result["published_commit"] is None
+
+
+# --- live MCP client round-trip (the Exit clause) -----------------------------------------------
+@requires_git
+def test_mcp_client_roundtrip_capture_curate_query(tmp_path: Path) -> None:
+    """A REAL MCP client (``fastmcp.Client``) drives the server over the protocol: capture → curate
+    → query returns it with a path citation. This is the ROADMAP Phase-1 Exit clause — "capture from
+    any MCP client → curator atomically files it → deterministic query returns it" — proven end to
+    end through tool dispatch + serialization, not by calling the handlers directly.
+    """
+    repo = _init_curatable_repo(tmp_path)
+    server = build_server(repo_path=repo.layout.root, writer="agent-1")
+
+    async def _run() -> dict[str, object]:
+        async with Client(server) as client:
+            remembered = await client.call_tool(
+                "kb_remember",
+                {"text": "One curator advances the branch under a lock.", "domain": "ai-tech"},
+            )
+            status_before = await client.call_tool("kb_status", {})
+            curated = await client.call_tool("kb_curate", {})
+            queried = await client.call_tool("kb_query", {"question": "curator concurrency"})
+            return {
+                "remembered": remembered.data,
+                "status_before": status_before.data,
+                "curated": curated.data,
+                "queried": queried.data,
+            }
+
+    out = asyncio.run(_run())
+
+    assert out["remembered"]["queued"] is True
+    assert out["status_before"]["inbox_depth"] == 1
+    # The curator atomically filed the capture and published a commit (CQRS write→curate→read).
+    assert out["curated"]["status"] == "published"
+    assert out["curated"]["published_commit"]
+    # The deterministic query now resolves the freshly-curated theme with a path citation.
+    assert out["queried"]["status"] == "ok"
+    assert any("curator-concurrency" in hit["path"] for hit in out["queried"]["hits"])
 
 
 # --- build_server wiring smoke test -------------------------------------------------------------

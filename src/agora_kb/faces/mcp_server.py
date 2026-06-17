@@ -31,6 +31,7 @@ from typing import TYPE_CHECKING
 
 from agora_kb.config import load_backend_registry, load_repo_config
 from agora_kb.core import Inbox, Repo, StateStore, Wiki
+from agora_kb.curator.isolation import SandboxUnavailable, select_backend_isolation
 from agora_kb.curator.subprocess_backend import SubprocessBackend
 from agora_kb.curator.worker import recover, run
 
@@ -187,7 +188,9 @@ class AgoraHandlers:
         ``noop``. ``target`` defaults to ``"personal"`` (the only repo until multi-tenancy lands).
         """
         cfg = load_repo_config(self._repo.layout)
-        backend = self._build_backend(cfg.default_backend)
+        backend = self._build_backend(
+            cfg.default_backend, allow_reduced_isolation=cfg.allow_reduced_isolation
+        )
         if backend is None:
             return {
                 "status": "no_backend",
@@ -220,21 +223,38 @@ class AgoraHandlers:
             "recovered": recovered,
         }
 
-    def _build_backend(self, backend_name: str) -> SubprocessBackend | None:
+    def _build_backend(
+        self, backend_name: str, *, allow_reduced_isolation: bool = False
+    ) -> SubprocessBackend | None:
         """Resolve the configured WRITE-adapter into a :class:`SubprocessBackend`, or ``None``.
 
         Loads ``adapters.yaml`` (DATA-MODEL §8) from the repo root. ``None`` (an absent file or an
         unknown configured brain) is the caller's "no backend configured" signal; a missing
         executable surfaces later at invocation as a clear error from the backend itself.
+
+        ADR-0013: an OS-sandbox adapter is selected and injected ONLY for a ``network: 'none'``
+        backend (its file-writing PASS-2 step is then confined). The default loopback Ollama brain
+        does inference OUTSIDE the sandbox, so it needs none. A ``network: 'none'`` backend with no
+        usable sandbox and ``allow_reduced_isolation=False`` fails closed (``None``), matching the
+        CLI ``curate`` path, rather than running unconfined.
         """
         adapters_path = self._repo.layout.root / "adapters.yaml"
         registry = load_backend_registry(adapters_path)
         if registry is None:
             return None
         try:
-            return SubprocessBackend(registry.get(backend_name))
+            spec = registry.get(backend_name)
         except KeyError:
             return None
+        isolation = None
+        if spec.network == "none":
+            try:
+                isolation = select_backend_isolation(
+                    allow_reduced_isolation=allow_reduced_isolation
+                )
+            except SandboxUnavailable:
+                return None
+        return SubprocessBackend(spec, isolation=isolation)
 
 
 def _now() -> datetime:

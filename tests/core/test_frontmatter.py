@@ -7,6 +7,18 @@ import pytest
 from agora_kb.core.frontmatter import FrontmatterError, parse, render
 
 
+def test_parse_wraps_malformed_yaml_in_frontmatter_error() -> None:
+    """Malformed YAML frontmatter raises the TYPED FrontmatterError, not a raw yaml.YAMLError.
+
+    Real-world (Obsidian) notes carry ``links: [[a]], [[b]]`` in frontmatter — invalid YAML. The
+    deterministic read/lint path must stay TOTAL: the parser wraps the yaml error so each consumer's
+    existing FrontmatterError handling (lint finding / Wiki skip) applies instead of crashing.
+    """
+    obsidian = "---\ntitle: T\nlinks: [[economy-moc]], [[ai-tech-moc]]\n---\n\nbody\n"
+    with pytest.raises(FrontmatterError, match="not valid YAML"):
+        parse(obsidian)
+
+
 def test_render_basic_shape() -> None:
     text = render({"id": "x", "n": 1}, "hello body")
     assert text.startswith("---\n")

@@ -1,7 +1,10 @@
 """Tests for the deterministic, model-free read path (core.wiki, ADR-0012).
 
 The fixture corpus mirrors ADR-0012 §10 (the `personal` repo: index.md, an ai-tech MOC linking two
-themes, two theme notes with frontmatter + headings + [[links]], and a deprecated roadmap note). The
+themes via the ADR-0014 D3 standard-markdown BODY links `[Title](relative.md)`, two theme notes with
+frontmatter + headings, and a deprecated roadmap note). The read path seeds the `linked-theme` graph
+from those markdown body links (path→basename), so retrieval-as-navigation works on a produced repo.
+The
 SCORING FORMULA is normative; the exact float numbers are not byte-pinned cross-machine, so we
 assert ordering, field correctness, the lexical-evidence gate, the not_found floor, determinism,
 tie-break, and limit — not magic score constants.
@@ -16,10 +19,13 @@ from agora_kb.core.wiki import QueryResult, SearchHit, Wiki
 
 # --- fixture corpus (ADR-0012 §10) --------------------------------------------------------------
 
+# ADR-0014 D3: the produced MOC/index BODY child bullets are STANDARD MARKDOWN LINKS
+# `[Title](relative.md)`. The read path seeds the `linked-theme` graph from these markdown links
+# (path→basename) exactly as it did from `[[ ]]`, and the link TEXT supplies the MOC-label tokens.
 INDEX_MD = """\
 # personal
 
-- [[ai-tech-moc]]
+- [AI Tech MOC](wiki/ai-tech/ai-tech-moc.md)
 """
 
 AI_TECH_MOC = """\
@@ -28,8 +34,8 @@ status: active
 ---
 # AI Tech
 
-- [[curator-concurrency]] — how the single-writer curator serializes writes
-- [[inbox-design]] — append-only per-writer inbox
+- [Curator concurrency](themes/curator-concurrency.md) — single-writer curator serializes writes
+- [Inbox design](themes/inbox-design.md) — append-only per-writer inbox
 """
 
 CURATOR_CONCURRENCY = """\
@@ -104,6 +110,20 @@ def test_query_returns_expected_hit(tmp_path: Path) -> None:
     assert top.line == 1
     assert 0.0 <= top.score <= 1.0
     assert "Curator Concurrency" in top.excerpt
+
+
+def test_linked_theme_traverses_markdown_body_link(tmp_path: Path) -> None:
+    # ADR-0014 D3 explicit: the MOC seeds its theme child via a STANDARD MARKDOWN BODY LINK
+    # `- [Curator concurrency](themes/curator-concurrency.md)` (NOT a `[[ ]]` wikilink). The read
+    # path must resolve that link path→basename, seed the theme at d_moc==0, and return
+    # match_reason == linked-theme — proving the D3 grammar drives the nav graph (ADR-0012 §5).
+    layout = _build_repo(tmp_path / "personal")
+    moc_body = (layout.root / "wiki" / "ai-tech" / "ai-tech-moc.md").read_text(encoding="utf-8")
+    assert "](themes/curator-concurrency.md)" in moc_body  # the produced D3 body-link form
+    assert "[[curator-concurrency]]" not in moc_body  # no wikilink body edge
+    result = Wiki(layout).query("curator concurrency control")
+    top = next(h for h in result.hits if h.path.endswith("curator-concurrency.md"))
+    assert top.match_reason == "linked-theme"
 
 
 def test_lexical_evidence_gate_drops_inbox_design(tmp_path: Path) -> None:
@@ -186,9 +206,12 @@ def test_top_idf_body_term_beats_weak_heading_term(tmp_path: Path) -> None:
     root = tmp_path / "personal"
     wikidir = root / "wiki" / "general"
     wikidir.mkdir(parents=True)
-    (root / "index.md").write_text("# personal\n\n- [[general-moc]]\n", encoding="utf-8")
+    (root / "index.md").write_text(
+        "# personal\n\n- [General MOC](wiki/general/general-moc.md)\n", encoding="utf-8"
+    )
     (root / "wiki" / "general" / "general-moc.md").write_text(
-        "# General\n\n- [[note-a]]\n- [[design-note]]\n", encoding="utf-8"
+        "# General\n\n- [Note A](themes/note-a.md)\n- [Design note](themes/design-note.md)\n",
+        encoding="utf-8",
     )
     # note-a: high-idf "zephyrumquux" in the BODY under a low-idf "Design notes" heading.
     (wikidir / "note-a.md").write_text(
@@ -237,16 +260,18 @@ def test_hyphenated_domain_focus_restricts_moc_seeding(tmp_path: Path) -> None:
     (root / "wiki" / "ai-tech").mkdir(parents=True)
     (root / "wiki" / "cooking").mkdir(parents=True)
     (root / "index.md").write_text(
-        "# personal\n\n- [[ai-tech-moc]]\n- [[cooking-moc]]\n", encoding="utf-8"
+        "# personal\n\n- [AI Tech MOC](wiki/ai-tech/ai-tech-moc.md)\n"
+        "- [Cooking MOC](wiki/cooking/cooking-moc.md)\n",
+        encoding="utf-8",
     )
     (root / "wiki" / "ai-tech" / "ai-tech-moc.md").write_text(
-        "# AI Tech\n\n- [[agents]]\n", encoding="utf-8"
+        "# AI Tech\n\n- [Agents](themes/agents.md)\n", encoding="utf-8"
     )
     (root / "wiki" / "ai-tech" / "agents.md").write_text(
         "---\ntags: [agents]\n---\n# Agents\n\nAgents and tooling.\n", encoding="utf-8"
     )
     (root / "wiki" / "cooking" / "cooking-moc.md").write_text(
-        "# Cooking\n\n- [[recipes]]\n", encoding="utf-8"
+        "# Cooking\n\n- [Recipes](themes/recipes.md)\n", encoding="utf-8"
     )
     (root / "wiki" / "cooking" / "recipes.md").write_text(
         "---\ntags: [recipes]\n---\n# Recipes\n\nRecipes about cooking.\n", encoding="utf-8"
@@ -314,9 +339,12 @@ def test_tie_break_by_path(tmp_path: Path) -> None:
     wikidir = root / "wiki" / "general"
     wikidir.mkdir(parents=True)
     root.mkdir(parents=True, exist_ok=True)
-    (root / "index.md").write_text("# personal\n\n- [[general-moc]]\n", encoding="utf-8")
+    (root / "index.md").write_text(
+        "# personal\n\n- [General MOC](wiki/general/general-moc.md)\n", encoding="utf-8"
+    )
     (root / "wiki" / "general" / "general-moc.md").write_text(
-        "# General\n\n- [[zeta-note]]\n- [[alpha-note]]\n", encoding="utf-8"
+        "# General\n\n- [Zeta note](themes/zeta-note.md)\n- [Alpha note](themes/alpha-note.md)\n",
+        encoding="utf-8",
     )
     same_body = "# Title\n\nWidget calibration tolerance specification details here.\n"
     (wikidir / "alpha-note.md").write_text(

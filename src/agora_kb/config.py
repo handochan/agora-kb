@@ -91,6 +91,11 @@ class RepoConfig(BaseModel):
     triggers: TriggerConfig = Field(default_factory=TriggerConfig)
     default_backend: str = _DEFAULT_BACKEND
     max_attempts: int = Field(default=_DEFAULT_MAX_ATTEMPTS, ge=1)
+    # ADR-0013 fail-closed opt-in: when False (default) a ``sandbox: strict`` backend with no usable
+    # kernel sandbox raises SandboxUnavailable rather than running unconfined; True opts into the
+    # restricted fallback (network egress + out-of-worktree writes are NOT prevented, forced
+    # review-mode). Read from ``curator.allow_reduced_isolation`` (DATA-MODEL §3 curator policy).
+    allow_reduced_isolation: bool = False
 
 
 def repo_config_path(layout: RepoLayout) -> Path:
@@ -121,6 +126,9 @@ def load_repo_config(layout: RepoLayout) -> RepoConfig:
     max_attempts = _opt_int(
         curator.get("max_attempts"), _DEFAULT_MAX_ATTEMPTS, key="curator.max_attempts"
     )
+    allow_reduced_isolation = _opt_bool(
+        curator.get("allow_reduced_isolation"), False, key="curator.allow_reduced_isolation"
+    )
     triggers = _build_triggers(curator.get("triggers"))
 
     taxonomy = _load_taxonomy(
@@ -136,6 +144,7 @@ def load_repo_config(layout: RepoLayout) -> RepoConfig:
         triggers=triggers,
         default_backend=default_backend,
         max_attempts=max_attempts,
+        allow_reduced_isolation=allow_reduced_isolation,
     )
 
 
@@ -165,6 +174,7 @@ def write_default_repo_config(
         "curator": {
             "backend": _DEFAULT_BACKEND,
             "max_attempts": _DEFAULT_MAX_ATTEMPTS,
+            "allow_reduced_isolation": False,
             "triggers": {
                 "cron": triggers.cron,
                 "threshold": triggers.threshold,
@@ -350,6 +360,21 @@ def _opt_int(value: object, default: int, *, key: str = "value") -> int:
     if isinstance(value, float) and value.is_integer():
         return int(value)
     raise ConfigError(f"{key} must be an integer, got {value!r}")
+
+
+def _opt_bool(value: object, default: bool, *, key: str = "value") -> bool:
+    """Coerce an operator-supplied boolean, or fall back to ``default`` when absent.
+
+    An absent value (``None``) takes ``default``. A genuine ``bool`` is honored. Any other type (a
+    string like ``"true"``, an int, …) raises a clear :class:`ConfigError` so a fail-closed security
+    flag (``curator.allow_reduced_isolation``) is never silently misread — an operator who typed a
+    non-boolean must see it, not have it default to the safe value and mask a typo.
+    """
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    raise ConfigError(f"{key} must be a boolean, got {value!r}")
 
 
 def _str_list(value: object) -> list[str]:
