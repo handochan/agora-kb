@@ -456,6 +456,83 @@ def test_watch_once_runs_on_cron_due(tmp_path: Path, capsys: pytest.CaptureFixtu
     assert "status=published" in out
 
 
+# --- import (the opt-in Obsidian/markdown vault normalizer, ADR-0014 D5) ------------------------
+@requires_git
+def test_import_happy_path_creates_dest_and_prints_digest(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`agora import` on a tiny vault exits 0, git-inits dest, and prints the imported count."""
+    src = tmp_path / "vault"
+    dest = tmp_path / "out"
+    note = src / "wiki" / "general" / "themes" / "topic.md"
+    note.parent.mkdir(parents=True)
+    note.write_text("# Topic\n\nA body paragraph about the topic.\n", encoding="utf-8")
+
+    rc = main(["import", str(src), str(dest)])
+
+    assert rc == 0  # a best-effort import is a success even with lint findings
+    out = capsys.readouterr().out
+    assert "imported 1 note(s)" in out
+    # dest is a real, git-inited Agora repo with the schema emitted.
+    assert (dest / ".git").exists()
+    assert (dest / "AGENTS.md").is_file()
+
+
+@requires_git
+def test_import_defaults_to_general_domain(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """With --domain omitted, an off-layout note lands under wiki/general/themes/ (the default)."""
+    src = tmp_path / "vault"
+    dest = tmp_path / "out"
+    note = src / "Loose Idea.md"
+    note.parent.mkdir(parents=True, exist_ok=True)
+    note.write_text("# Loose Idea\n\nA stray note.\n", encoding="utf-8")
+
+    rc = main(["import", str(src), str(dest)])
+
+    assert rc == 0
+    capsys.readouterr()
+    assert (dest / "wiki" / "general" / "themes" / "loose-idea.md").is_file()
+
+
+@requires_git
+def test_import_missing_src_exits_1_with_stderr(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A missing source vault is a HARD error: exit 1 + an error on stderr (ADR-0014 D5)."""
+    dest = tmp_path / "out"
+
+    rc = main(["import", str(tmp_path / "nope"), str(dest)])
+
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "import:" in err
+
+
+@requires_git
+def test_import_with_warnings_still_exits_0_and_prints_them(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A vault with findings (off-layout move + stripped tag) exits 0 and prints the warnings."""
+    src = tmp_path / "vault"
+    dest = tmp_path / "out"
+    note = src / "Loose Idea.md"
+    note.parent.mkdir(parents=True, exist_ok=True)
+    # Off-layout (forces a move warning) + a tag outside the declared taxonomy (forces a strip).
+    note.write_text(
+        "---\ntitle: Loose\ntags: [unknown-tag]\n---\n\n# Loose Idea\n\nA stray note.\n",
+        encoding="utf-8",
+    )
+
+    rc = main(["import", str(src), str(dest), "--tag", "architecture"])
+
+    assert rc == 0  # warnings are NOT a failure
+    out = capsys.readouterr().out
+    assert "moved to fit" in out
+    assert "stripped tags: unknown-tag" in out
+
+
 # --- no / unknown command -----------------------------------------------------------------------
 def test_no_command_returns_2(capsys: pytest.CaptureFixture[str]) -> None:
     rc = main([])

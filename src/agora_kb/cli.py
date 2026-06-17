@@ -89,6 +89,30 @@ def build_parser() -> argparse.ArgumentParser:
     p_repo_init.set_defaults(func=_cmd_repo_init)
     p_repo.set_defaults(func=_cmd_repo_missing)
 
+    # import — the opt-in Obsidian/markdown vault normalizer (ADR-0014 D5).
+    p_import = sub.add_parser(
+        "import", help="normalize an external Obsidian/markdown vault into a new Agora repo"
+    )
+    p_import.add_argument("src", help="source vault to read (NEVER modified)")
+    p_import.add_argument("dest", help="destination repo to write (created)")
+    p_import.add_argument(
+        "--domain",
+        action="append",
+        default=None,
+        metavar="DOMAIN",
+        help="a destination taxonomy domain (repeatable; the FIRST is the move target; "
+        "default: general)",
+    )
+    p_import.add_argument(
+        "--tag",
+        action="append",
+        default=None,
+        metavar="TAG",
+        help="an allowed destination taxonomy tag (repeatable; source tags outside this set are "
+        "stripped + reported; default: none)",
+    )
+    p_import.set_defaults(func=_cmd_import)
+
     # status
     p_status = sub.add_parser("status", help="show inbox depth + curator state")
     p_status.add_argument("--repo", default=".", help="repo root (default: .)")
@@ -210,6 +234,63 @@ def _cmd_repo_missing(args: argparse.Namespace) -> int:
     # `agora repo` with no subcommand: usage to stderr, exit 2 (mirrors the no-command path).
     print(f"{_PROG} repo: missing subcommand (try 'repo init <path>')", file=sys.stderr)
     return 2
+
+
+def _cmd_import(args: argparse.Namespace) -> int:
+    """``agora import <src> <dest>``: normalize an external vault into a new Agora repo (ADR-0014).
+
+    The opt-in Obsidian/markdown vault NORMALIZER. ``src`` is read NON-DESTRUCTIVELY; a normalized,
+    closer-to-ADR-0010-conformant repo is written to ``dest`` plus a human report. ``import_date``
+    is derived HERE from ``datetime.now(UTC)`` (the CLI boundary owns the wall clock) and injected
+    into :func:`~agora_kb.ingest.vault_import.import_vault`, which stays a pure function of its
+    inputs (ADR-0010 D1). Domains default to ``general`` (the first is the move target for
+    off-layout notes); tags default to none. Prints a concise digest — the counts, each note's
+    warnings, and the final lint summary — and exits non-zero ONLY on a HARD error (e.g. ``src``
+    missing), never on report warnings (a best-effort import with findings is a success; ADR-0014).
+    """
+    from .ingest.vault_import import import_vault
+
+    import_date = datetime.now(UTC).strftime("%Y-%m-%d")
+    domains = list(args.domain) if args.domain else ["general"]
+    tags = list(args.tag) if args.tag else []
+
+    try:
+        report = import_vault(
+            Path(args.src),
+            Path(args.dest),
+            domains=domains,
+            import_date=import_date,
+            tags=tags,
+        )
+    except (FileNotFoundError, NotADirectoryError, ValueError) as exc:
+        print(f"{_PROG} import: {exc}", file=sys.stderr)
+        return 1
+
+    s = report.summary
+    print(f"imported {s['notes']} note(s) from {args.src} -> {args.dest}")
+    print(
+        f"repaired_frontmatter={s['repaired_frontmatter']} moved={s['moved']} "
+        f"converted_links={s['converted_links']} unresolved_links={s['unresolved_links']} "
+        f"stripped_tags={s['stripped_tags']} themes_without_sources={s['themes_without_sources']}"
+    )
+    for note in report.notes:
+        if note.warnings or note.stripped_tags or note.unresolved_links:
+            print(f"  {note.rel_path} ({note.type_inferred}):")
+            for w in note.warnings:
+                print(f"    - {w}")
+            if note.stripped_tags:
+                print(f"    - stripped tags: {', '.join(note.stripped_tags)}")
+            if note.unresolved_links:
+                print(f"    - unresolved links: {', '.join(note.unresolved_links)}")
+
+    lr = report.lint
+    if lr.ok:
+        print("lint: clean")
+    else:
+        print(f"lint: {len(lr.findings)} finding(s) still need hands:")
+        for finding in lr.findings:
+            print(f"  {finding.code} {finding.path}: {finding.message}")
+    return 0
 
 
 def _cmd_status(args: argparse.Namespace) -> int:
