@@ -40,17 +40,24 @@ edits the shared wiki. Repo = tenant boundary. See [`docs/ARCHITECTURE.md`](docs
 ```
 src/agora_kb/
   core/        single internal API: inbox(write) · wiki(read) · repo/tenant · state
-  curator/     sleep-time consolidation worker + pluggable agent backends + triggers
-  harvester/   read adapters: pull from other agents' memory systems → candidates
-  ingest/      input adapters: upload extractors (url, pdf, docx → markdown)
-  faces/       mcp_server.py (agents) · web/ (people: upload, search, dashboard)
-  auth/        authn/authz (tokens, OpenFGA/Forgejo delegation)
-  schema/      the KB wiki schema (AGENTS.md template emitted into each knowledge repo)
-docs/          DESIGN, ARCHITECTURE, DATA-MODEL, ROADMAP, adr/
+  curator/     sleep-time consolidation worker + backends + triggers + isolation/ (OS sandbox)
+  ingest/      input adapters: vault_import.py (Obsidian/markdown vault normalizer)
+  faces/       mcp_server.py (the MCP face — agents)
+  schema/      the KB wiki schema (AGENTS.md template emitted into each knowledge repo) + lint
+  config.py    load config (adapters.yaml, repo.yaml, triggers)
+  cli.py       `agora` entry point (repo init · import · status · curate · watch · serve · doctor)
+  # --- not yet implemented (later phases) ---
+  harvester/   (Phase 2+ — stub) read adapters: pull from other agents' memory → candidates
+  faces/web/   (Phase 3+ — stub) FastAPI app: upload, search, dashboard
+  auth/        (Phase 4+ — stub) authn/authz (tokens, OpenFGA/Forgejo delegation)
+docs/          DESIGN, ARCHITECTURE, DATA-MODEL, ROADMAP, INGEST-CONTRACT, adr/
 ```
 
 ## Where to start (current phase)
-The repo is in **design phase** — docs exist, implementation does not. The first milestone is the
-personal MVP (see [`docs/ROADMAP.md`](docs/ROADMAP.md) Phase 1): `kb_remember` / `kb_query` /
-`kb_curate` over a local markdown repo with a local-model curator. Build the **core API** and the
-**MCP face** first; defer auth, web, harvester, multi-tenancy.
+The repo has **shipped Phase 1** (Personal MVP): the **core API**, the `agora` CLI, the **MCP face**
+(four tools — `kb_remember` / `kb_query` / `kb_status` / `kb_curate`), the local-model curator
+(Qwen via Ollama) with the ADR-0013 OS sandbox, `ingest/vault_import.py`, and the wiki schema are all
+implemented, tested, and dogfooded on a real `~/knowledge` Obsidian vault (see
+[`docs/ROADMAP.md`](docs/ROADMAP.md) Phase 1). Current work is **Phase 2** — a pluggable-brains
+registry from `adapters.yaml` plus the harvester. Auth, web, and multi-tenancy remain deferred to
+Phases 3–5.

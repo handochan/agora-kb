@@ -213,6 +213,9 @@ consume this result but may not replace or hide the underlying evidence.
 - **Inbox id:** `YYYY-MM-DDTHH-MM-SS.mmmZ--<6 hex>` — sortable + unique; safe as a filename.
 - **Note basenames are globally unique** within a repo (only the root `index.md` is named `index`),
   so `[[basename]]` resolves unambiguously in Obsidian/Logseq. Domain MOCs are `<domain>-moc.md`.
+  Note: plan `links[]` carry basenames, but APPLY resolves each to a standard markdown body link
+  `[Title](relative.md)` (the git+Obsidian+OKF-native form; ADR-0014 D3); only frontmatter
+  `related:`/`children:` remain `[[basename]]`.
 - **Tags** are kebab-case and must exist in the repo schema's taxonomy before use (prevents sprawl).
 
 ## 11. Curator plan & content hash (PLAN-APPLY-AUTHOR)
@@ -263,14 +266,21 @@ materializes ALL structure and ALL frontmatter from it (C7): the model DECIDES, 
 }
 ```
 
-Disposition fields the model DECIDES: `candidate_id`, `event_ids[]`, `op` (closed vocabulary; ADR-0011 §2),
-`domain`, `basename` (the target note's basename; **null for `DROP`/`NOOP`**), `title`, `summary`,
+Disposition fields the model DECIDES: `candidate_id`, `event_ids[]`, `op` ∈ {CREATE_THEME, APPEND_DAILY, MERGE_INTO_THEME, MARK_CONTESTED, DROP, NOOP} (closed vocabulary; ADR-0011 §2),
+`domain`, `basename` (the NEW note's basename for `CREATE_THEME`/`APPEND_DAILY`; null otherwise),
+`target_basename` (the EXISTING theme note targeted by `MERGE_INTO_THEME`/`MARK_CONTESTED`; null otherwise)
+— both null for `DROP`/`NOOP`, `title`, `summary`,
 `status` (the C1 enum: `active | stub | contested | deprecated`), `aliases[]`, `tags[]` (each must already
-exist in `_meta/taxonomy.yaml`, C5), `links[]` (wikilink basenames), `needs_prose` (whether PASS 2 authors a
+exist in `_meta/taxonomy.yaml`, C5), `links[]` (wikilink basenames; APPLY resolves each to a standard
+markdown body link `[Title](relative.md)` — the git+Obsidian+OKF-native form; only frontmatter `related:`/`children:`
+remain `[[basename]]` — see ADR-0014 D3), `needs_prose` (whether PASS 2 authors a
 body), and `reason`. EXACTLY one disposition per candidate; the union of all `event_ids` equals the manifest
-set, each exactly once (the manifest is the sole coverage universe). Contested judgments are expressed via
-`status: contested` plus the worker-materialized `contested_by`/`contested_at` and `> [!contested]` callout
-(C3); the model never writes frontmatter or callouts itself.
+set, each exactly once (the manifest is the sole coverage universe). Contested judgments are NOT expressed by
+setting `status: contested` on a normal disposition. They use the dedicated `MARK_CONTESTED` op against an
+existing `target_basename`; deterministic APPLY then materializes the `status: contested` frontmatter plus
+non-empty `contested_by`/`contested_at` (== run_date) and the templated `> [!contested]` callout (ADR-0011
+§2.1, constraint C3). A plain `CREATE_THEME`/`MERGE_INTO_THEME` disposition declaring `status: contested` is
+rejected by the STATUS validator (plan.py) — the model never writes frontmatter or callouts itself.
 
 ### 11.2 `content_sha256` canonical normalization (tier-2 dedup, §1)
 

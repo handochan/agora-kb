@@ -1,6 +1,6 @@
 # ADR-0010 — KB wiki schema v1 (the `AGENTS.md`/`SCHEMA.md` emitted into every repo)
 
-**Status:** Accepted · 2026-06-13
+**Status:** Accepted · 2026-06-13 · _amended by ADR-0014 (2026-06-17): body graph links are now standard markdown links `[Title](relative.md)`, not `[[ ]]`; the L1-2 resolution and L1-6 MOC child-bullet rule are updated accordingly. Frontmatter `related:`/`children:` stay `[[basename]]`; basename identity is retained._
 
 ## Context
 The curator brain edits `wiki/` but the integrity gate that protects the repo is deterministic code
@@ -129,6 +129,11 @@ summary: <one-line precis>           # REQUIRED; single-line gist used by QUERY/
 ---
 ```
 
+> **Additive (ADR-0014 D2, 2026-06-17):** the curator also emits OKF-conformance frontmatter fields
+> as an additive superset (no existing field changed): `description` (mirrors `summary`), a
+> deterministic `timestamp` (`<updated>T00:00:00Z`), and `okf_version: "0.1"` on the bundle-root
+> `index.md` only. See ADR-0014 and `kb_schema.md` §2.7.
+
 `theme` adds:
 
 ```yaml
@@ -189,8 +194,21 @@ slugging**; match byte-for-byte against a basename or an `aliases:` entry. Resol
 The union of all basenames + all `aliases:` must be globally unique (L1-15), so `[[X]]` is
 single-valued. Basename uniqueness is scoped to wiki notes (raw/ is outside the wikilink graph).
 
+> **Scope note (ADR-0014 D3, 2026-06-17):** `[[basename]]` is now the form for FRONTMATTER
+> `related:`/`children:` arrays only. BODY graph links (note bodies, MOC/index child bullets) use
+> standard markdown links `[Title](relative.md)`; the unique-basename resolver maps the link
+> target path (filename minus directory minus `.md`) to the same basename identity. See ADR-0014
+> and the "MOC child grammar" section below.
+
 **MOC child grammar (frozen).** A child bullet is a body line matching EXACTLY this regex at indent
 0:
+
+> **Amended by ADR-0014 D3 (2026-06-17):** the BODY child-bullet grammar is now the STANDARD
+> MARKDOWN LINK form, not the `[[ ]]` wikilink shown below. The shipped grammar is
+> `^- \[(?P<text>[^\]\r\n]*)\]\((?P<path>[^)\r\n]+)\)(?:\s.*)?$`, with the child basename parsed
+> from the link target path (filename minus directory minus `.md`). Frontmatter `related:`/`children:`
+> arrays STAY `[[basename]]`. See `kb_schema.md` §3.2/L1-2 and `src/agora_kb/schema/notes.py`
+> `_CHILD_BULLET_RE`/`_basename_from_link_path`.
 
 ```
 ^- \[\[(?P<base>[a-z0-9][a-z0-9-]*)(\|[^\]\r\n]+)?\]\](?:\s.*)?$

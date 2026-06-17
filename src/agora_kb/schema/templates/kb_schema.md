@@ -119,7 +119,7 @@ origin: claude-code | codex | qwen | gemini | opencode | hermes | web:<user> | h
                    # PRESENT IFF any provenance source is harvest:<agent>; EXACT copy of the inbox
                    #   `source` enum (DATA-MODEL §1); loop-prevention (DATA-MODEL §7). Worker-set, §7.
 confidence: high | medium | low                        # mirrors inbox-item confidence (DATA-MODEL §1)
-body_status: pending | absent  # present-as `pending` ONLY while prose is not yet authored;
+body_status: pending  # present (== `pending`) ONLY while prose is not yet authored;
                    #   the key is ABSENT once the body is authored (§2.6, §7)
 
 # WHEN status == contested, the theme ADDITIONALLY carries (the §3.8 frozen convention):
@@ -140,7 +140,7 @@ date: 2026-06-13   # REQUIRED, YYYY-MM-DD == run_date == the date in the basenam
 run_id: 2026-06-13T03-00-00.000Z--7f31ab   # REQUIRED == the injected run_id; back-link to the curator run
 sources: []        # raw/ paths consolidated that day (MAY be empty: a daily is not durable provenance)
 summary: <one-line precis>   # REQUIRED, string — one-line summary of the day's consolidation
-body_status: pending | absent  # present-as `pending` ONLY while the dated section's prose is not yet
+body_status: pending  # present (== `pending`) ONLY while the dated section's prose is not yet
                    #   authored; ABSENT once authored (§2.6, §7)
 ```
 
@@ -582,7 +582,7 @@ def lint_l1(worktree: Path, taxonomy: Taxonomy, run_date: str, run_id: str,
         # frontmatter [[basename]] entries
         for link in resolve_body_md_links(n.body, known) + resolve_fm_links(n.fm.related, n.fm.children, known):
             if link.unresolved: errors.append(BrokenLink(n.path, link))           # §3.2/§3.1 normalization
-        errors += check_required_frontmatter(n)             # L1-4, L1-11 (incl. summary, body_status ∈ {pending, absent})
+        errors += check_required_frontmatter(n)             # L1-4, L1-11 (incl. summary; body_status, when present, must equal `pending`)
         errors += check_dates(n, run_date)                  # L1-12 (no future dates vs run_date)
         for tag in n.fm.tags:                                # L1-5
             if tag not in taxonomy.allowed_tags: errors.append(UndeclaredTag(n.path, tag))

@@ -15,6 +15,8 @@ Each curator run is a transaction owned by deterministic orchestration:
    `_kb/processing/<run-id>/` and write a run manifest.
 2. Create a temporary git worktree at the current curated revision. The backend runs only there,
    inside an OS sandbox with no network by default and with the repo as its only writable mount.
+   The concrete sandbox mechanism is specified and implemented in ADR-0013 (macOS `sandbox-exec`/SBPL
+   default, Linux `bwrap`, fail-closed restricted-subprocess fallback; self-tested by `agora doctor`).
 3. Pass prompts and item paths as structured process arguments/input, never by shell interpolation.
 4. After the backend exits, deterministic validation rejects symlinks/path escapes and changes outside
    the allowlist (`wiki/`, `index.md`, `log.md`, and schema-approved content paths).

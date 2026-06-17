@@ -2,7 +2,7 @@
 
 **Status:** Accepted · 2026-06-13
 
-Refines ADR-0009 (does not supersede); depends on ADR-0001, ADR-0002, ADR-0006, ADR-0008.
+Refines ADR-0009 (does not supersede); depends on ADR-0001, ADR-0002, ADR-0006, ADR-0008. Amended by ADR-0014 D3 (body graph edges are now standard markdown links `[Title](relative.md)`; frontmatter `related:`/`children:` stay `[[basename]]`).
 **Amends DATA-MODEL §9** (see §12).
 
 ## Context
@@ -140,7 +140,7 @@ For each `*.md` under `wiki/` plus root `index.md`, the pure-Python parser build
 | **tags** | frontmatter `tags:` (kebab-case, schema-validated upstream) |
 | **body** | all prose with frontmatter, code fences, and `[[...]]`/`[](...)` link *punctuation* stripped to the visible label |
 | `status` | frontmatter `status:` normalized to the §8 enum (default `neutral`-for-ranking if absent/unknown) |
-| `outlinks` | ordered, de-duplicated `[[basename]]` targets (anchor `#...` and alias `|...` stripped), resolved via the unique-basename map; unresolved targets recorded but contribute no edge |
+| `outlinks` | ordered, de-duplicated basename targets resolved via the unique-basename map; unresolved targets recorded but contribute no edge. Per ADR-0014 D3, body graph edges are standard markdown links `[Title](relative.md)` (`.md` target path → basename via the unique-basename map; image `![]()` and non-`.md` links excluded); frontmatter `related:`/`children:` remain `[[basename]]`. The shipped resolver is `src/agora_kb/schema/notes.py` `body_link_basenames`/`child_bullets`/`wikilinks`. |
 | `indeg` | in-degree over resolved `outlinks`, after all notes parsed |
 | `heading_lines` | ordered `(level, text, slug, line)` for anchor resolution |
 | `field_tokens` | the §3 `tokenize()` output per field — THIS feeds BM25F and (if used) the FTS5 prefilter index |
@@ -201,20 +201,25 @@ the scorer and the FTS5-indexed token stream change together — parity preserve
 ### 4. Pipeline (7 deterministic stages — all scoring by the pure-Python oracle)
 
 #### Stage 1 — SEED (navigation roots; Karpathy LLM-wiki model)
-Parse root `index.md` and EVERY in-scope `<domain>-moc.md`. Each `[[basename]]` they link is a frontier
-seed:
+Parse root `index.md` and EVERY in-scope `<domain>-moc.md`. Each link they contain to a note basename is a
+frontier seed:
 - targets of a `<domain>-moc.md` → `d_moc = 0`;
 - targets of root `index.md` → `d_moc = 1`;
 - the MOC notes themselves → `d_moc = 0`; `index.md` itself → `d_moc = 1`.
 
-Record the MOC link label (visible `[[basename|label]]` text, else surrounding list-item text) for
-linked-theme detection (§6). `[[basename]]` resolves unambiguously (DATA-MODEL §10); unresolvable targets
-are logged and skipped. Domain in-scope filter: a `<domain>-moc.md` is seeded iff its `<domain>` is in
-`repo.yaml domains:` and the repo is in `scope`. If the question contains a token exactly matching a
-`<domain>` kebab name, seed only that domain's MOC; otherwise seed ALL in-scope MOCs.
+Record the MOC link label (visible link text, else surrounding list-item text) for linked-theme detection
+(§6). Basename resolves unambiguously (DATA-MODEL §10); unresolvable targets are logged and skipped.
+Domain in-scope filter: a `<domain>-moc.md` is seeded iff its `<domain>` is in `repo.yaml domains:` and
+the repo is in `scope`. If the question contains a token exactly matching a `<domain>` kebab name, seed
+only that domain's MOC; otherwise seed ALL in-scope MOCs.
+
+> Note (ADR-0014 D3): MOC and index body graph edges are standard markdown links `[Title](relative.md)`
+> (basename recovered from the `.md` target path via the unique-basename map; image `![]()` and non-`.md`
+> links excluded). Frontmatter `related:`/`children:` remain `[[basename]]`. The shipped resolver is
+> `src/agora_kb/schema/notes.py` `body_link_basenames`/`child_bullets`/`wikilinks`.
 
 #### Stage 2 — FRONTIER (graph walk ∪ lexical candidates)
-BFS-expand the `[[wikilink]]` graph from all seeds, following resolved `outlinks`, up to `max_hops = 2`,
+BFS-expand the body link graph from all seeds, following resolved `outlinks`, up to `max_hops = 2`,
 recording each note's **MIN** hop distance as `d_moc`. `d_moc` is a property of minimum distance and is
 therefore INDEPENDENT of BFS expansion order.
 
