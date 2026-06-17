@@ -5,19 +5,31 @@ conceptual model; this doc maps it to modules and runtime processes.
 
 ## 1. Module map (`src/agora_kb/`)
 
+> **Phase 1 ships:** `core/`, `curator/` (incl. `isolation/`), `ingest/vault_import.py`,
+> `faces/mcp_server.py`, `schema/`, `cli.py`, `config.py`. The `harvester/`, `faces/web/`, and
+> `auth/` packages below are later-phase (Phase 2–5) stubs, shown here for the full target map.
+
 ```
 core/                 The single internal API. Everything else is a face or adapter over this.
   inbox.py            append-only write path: write(target, item) → _kb/inbox/<writer>/<id>.md
   wiki.py             deterministic retrieval: QueryResult with ordered SearchHit citations
   repo.py             Repo/tenant model: resolve repo, git ops (commit, push, PR), layout
   state.py            curator state (_kb/state.json): counters, event keys, published runs
-  schema.py           emit/validate a repo's KB schema (AGENTS.md + symlinks, templates)
 
 curator/              Sleep-time consolidation (one worker per repo).
-  worker.py           claim → sandboxed worktree → validate → publish → finalize
+  worker.py           claim → sandboxed worktree → validate → publish → finalize (run loop)
+  claim.py            atomic FIFO claim of inbox items → _kb/processing/<run-id>/ + manifest
+  manifest.py         per-run manifest (unpublished/published/finalized state for recovery)
+  plan.py             candidate gate + consolidation plan (keep/merge/drop, schema-validated)
+  apply.py            apply the validated plan to the worktree; allowlisted-diff enforcement
+  bundle.py           assemble the curated change set for publish
   backends.py         WRITE adapters: registry of agent "brains" from adapters.yaml (headless CLIs)
+  subprocess_backend.py  default headless-CLI brain runner (Qwen/Ollama, temp=0 deterministic)
+  isolation/          OS sandbox for the backend (ADR-0013): seatbelt (macOS) · bwrap (Linux)
+                      · restricted (fallback) · selftest (`agora doctor`); profiles/
   triggers.py         cron / threshold / idle trigger logic
-  review.py           candidate gate + direct-commit vs PR (team/review mode)
+  cron.py             deterministic cron matcher for `agora watch`
+  # Phase 5 (planned, not yet shipped): PR-review mode — curator opens PRs vs direct commit
 
 harvester/            READ adapters: pull from other agents' memory systems → candidates.
   base.py             Connector protocol (scan since cursor → list[Candidate])
@@ -41,8 +53,14 @@ auth/                 AuthN/AuthZ.
   identity.py         token / OIDC (Keycloak) verification
   policy.py           AuthZ: Forgejo delegation or OpenFGA; resolve token → repos+roles+domains
 
-cli.py                `agora` entry point: serve, curate, repo init, harvest, doctor
-config.py             load config (adapters.yaml, repos, triggers)
+schema/               KB wiki schema emitted into each knowledge repo.
+  emit.py             emit AGENTS.md + symlinks/templates into a repo
+  lint.py             validate a repo's KB schema / notes (deterministic L1 rules)
+  notes.py            note-type helpers (index/moc/theme/daily) + link resolution
+  templates/kb_schema.md   the AGENTS.md schema template
+
+cli.py                `agora` entry point: repo init · import · status · curate · watch · serve · doctor
+config.py             load config (adapters.yaml, repo.yaml, triggers)
 ```
 
 Dependency rule: **faces and adapters depend on `core`; `core` depends on nothing above it.**
@@ -99,8 +117,10 @@ trigger (cron/threshold/idle) → curator.worker.run(repo)
   ├─ flock curator.lock (else exit)
   ├─ atomically claim FIFO items → _kb/processing/<run-id>/ + manifest
   ├─ event_key idempotency; content hash equivalence retains/merges provenance
-  ├─ candidate gate: harvested/low-confidence items require keep/merge/drop decision (curator/review)
-  ├─ create temporary git worktree; run backend in sandbox with no network/credentials
+  ├─ candidate gate: harvested/low-confidence items require keep/merge/drop decision (curator/plan)
+  ├─ create temp git worktree; run backend in OS sandbox (macOS seatbelt / Linux bwrap / restricted
+  │   fallback — ADR-0013) with no network/credentials (default Ollama brain: inference runs OUTSIDE
+  │   the sandbox, env-scrubbed; the file-writing step is confined when network:none)
   ├─ validate allowlisted diff + schema; discard invalid/partial changes
   ├─ commit and compare-and-swap curated branch ref (or publish validated commit as PR)
   └─ finalize processed/failed; update state; remove worktree; release lock
@@ -163,6 +183,9 @@ web/dashboard → core.meta(scope)   reads: inbox count, state.json, log.md, git
 - **Distribution conflicts:** one repo owner advances the curated branch. Human edits arrive as inbox
   events or reviewed PRs; gateways do not push competing working-copy commits.
 - **Backend isolation:** the temporary worktree is the only writable mount; network, credentials,
-  `_kb/`, git configuration, and hooks are unavailable to the backend (ADR-0008).
+  `_kb/`, git configuration, and hooks are unavailable to the backend (ADR-0008 transaction;
+  ADR-0013 OS-sandbox mechanism — macOS seatbelt / Linux bwrap / restricted fallback, self-tested by
+  `agora doctor`). The default Qwen-via-Ollama brain runs model inference outside the sandbox
+  (env-scrubbed); the confined PASS-2 step applies when `network: none`.
 - **Rebuildable metadata:** any SQLite/PG index must be reconstructable from the markdown — markdown is
   the source of truth (ADR-0001).

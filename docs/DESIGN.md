@@ -138,7 +138,7 @@ A background worker, one per repo, triggered by **cron** + **threshold** (inbox 
 
 The orchestration (lock, queue, dedup, git) is **deterministic code**; only the *cognitive* INGEST
 step is delegated to a swappable agent. Transactional worktrees, validation, and sandboxing keep the
-backend outside the integrity boundary. (ADR-0004, ADR-0008.) Routing is supported: bulk/simple →
+backend outside the integrity boundary. (ADR-0004, ADR-0008, ADR-0013.) Routing is supported: bulk/simple →
 local open-weight model (free); hard merges /
 contradiction resolution → a stronger (optional, possibly proprietary) backend.
 

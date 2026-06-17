@@ -1,7 +1,7 @@
 # Curator INGEST Contract — Plan-Apply-Author
 
 The operational contract between the **deterministic curator worker** (`src/agora_kb/curator/worker.py`)
-and the **swappable backend brain** (`curator/backends/*`; default: local Qwen via Ollama, zero API cost).
+and the **swappable backend brain** (`curator/backends.py` registry + `curator/subprocess_backend.py` default subprocess brain; default: local Qwen via Ollama, zero API cost).
 It expands DESIGN §4 steps 5–6 and [ADR-0008](adr/0008-transactional-sandboxed-curation.md) step 4 into
 **PLAN → apply → AUTHOR → validate**. The backend-facing half (§2, §2.1, §6, §8) is emitted into each
 repo's `AGENTS.md`/`SCHEMA.md` under an `INGEST` section.
@@ -29,6 +29,13 @@ repo's `AGENTS.md`/`SCHEMA.md` under an `INGEST` section.
   [ADR-0009](adr/0009-deterministic-query-contract.md) (deterministic `core.read`); and DATA-MODEL §1
   (inbox item), §4 (state.json), §5 (run.json — phase enum amended, see §10), §6 (harvester cursor), §7
   (provenance), §8 (adapters), §9 (QueryResult), §10 (naming).
+- [ADR-0013 — Curator sandbox mechanism](adr/0013-curator-sandbox-mechanism.md): the accepted OS-level
+  sandbox (macOS seatbelt sandbox-exec / Linux bwrap / restricted fallback, `agora doctor` self-test)
+  that realizes the ADR-0008 §2 sandbox this contract depends on.
+- [ADR-0014 — OKF + Obsidian interoperability](adr/0014-okf-obsidian-interoperability.md): amends the
+  body/MOC/index graph-link grammar this contract specifies — D3 moves those links from `[[basename]]`
+  to standard markdown links `[Title](relative.md)` (refining ADR-0010 L1-2/L1-6); frontmatter
+  `related:`/`children:` stay `[[basename]]`.
 
 ---
 ## 0. Where INGEST sits in the transactional loop (ADR-0008 step 5, expanded)
@@ -154,7 +161,7 @@ CREATE/MERGE/CONTEST (so every disposition maps to ≥1 event and coverage stays
 
 | op | meaning | structural effect (applied by deterministic code, §3) | needs prose? | allowed for gated candidate? |
 |---|---|---|---|---|
-| `CREATE_THEME` | new atomic concept page | create `wiki/<domain>/themes/<basename>.md` w/ frontmatter (title, status, summary, tags, aliases, sources, related, created, updated, origin?, confidence?); add `[[basename]]` to `<domain>-moc.md` + root index; insert plan `links[]` | yes (body) | **NO** (may never originate) |
+| `CREATE_THEME` | new atomic concept page | create `wiki/<domain>/themes/<basename>.md` w/ frontmatter (title, status, summary, tags, aliases, sources, related, created, updated, origin?, confidence?); add `[[basename]]` to `<domain>-moc.md` + root index (per ADR-0014 D3, the MOC child bullet is a standard markdown link `[Title](themes/<basename>.md)` and the root index child bullet is `[Title](wiki/<domain>/<domain>-moc.md)`; frontmatter `related:`/`children:` stay `[[basename]]`); insert plan `links[]` | yes (body) | **NO** (may never originate) |
 | `APPEND_DAILY` | dated capture/briefing | create-or-append `wiki/<domain>/daily/<domain>-<YYYY-MM-DD>.md`; add a dated `## ` section (one per disposition, §3.1) + `sources:` line | yes (the appended section only) | **NO** (originates content) |
 | `MERGE_INTO_THEME` | fold claim into existing theme | edit target theme: UNION this run's `event_ids` into `sources:` (never drop prior); insert plan `links[]`; place an augmentation sentinel sub-region | yes (only the augmented sub-region) | **YES** — corroborate only |
 | `MARK_CONTESTED` | contradiction | annotate target with the templated `> [!contested]` callout + `[[competing-note]]`; set frontmatter `status: contested` + `contested_by` + `contested_at`; record new claim's provenance; keep BOTH | no (callout is templated, §2.1) | **YES** — on contradiction |
@@ -252,7 +259,10 @@ mutation itself, so correctness is by construction, not by post-hoc rejection:
   for notes needing prose;
 - insert `[[basename]]` wikilinks and verify each resolves to a real (live-tree) or same-plan basename (else
   the plan is rejected at §4.1 check 7);
-- add MOC entries (`<domain>-moc.md`) and root `index.md` entries;
+- add MOC entries (`<domain>-moc.md`) and root `index.md` entries (per ADR-0014 D3, the child bullets in
+  MOC bodies are standard markdown links `[Title](themes/<basename>.md)` and in the root `index.md` body
+  are `[Title](wiki/<domain>/<domain>-moc.md)`; basename is recovered from the link path; frontmatter
+  `related:`/`children:` arrays remain `[[basename]]`);
 - render the templated `MARK_CONTESTED` callout + frontmatter (§2.1) byte-for-byte; create dated daily
   sections (§3.1);
 - place body sentinels for notes flagged `needs_prose`:
@@ -386,8 +396,14 @@ checks:
    regions. `orphan`/`stale` are DERIVED at read/dashboard time (link graph + `run_date`) and are NEVER
    persisted in frontmatter.
 2. **Taxonomy** — every note's `tags ⊆ _meta/taxonomy.yaml allowed_tags`; its domain ∈ `_meta/taxonomy.yaml domains`.
-3. **Wikilink resolution** — every `[[basename]]` in note bodies/MOCs/index resolves to a real basename in
-   the tree (no dangling links).
+3. **Link resolution (L1-2)** — every graph edge resolves to a real basename (or alias) in the tree, across
+   two forms: (a) **standard-markdown BODY links** `[Title](relative.md)` in note bodies, MOCs, and the
+   index (the MOC/index child bullets), resolved path→basename via `body_link_basenames` (a body link whose
+   resolved basename is unknown fails with `broken link [{basename}](…)`); and (b) frontmatter
+   **`related:`/`children:` `[[basename]]`** arrays, resolved via `wikilinks` (an unresolved entry fails
+   with `broken wikilink [[{basename}]]`). Both must resolve or the run is discarded. Per ADR-0014 D3,
+   body/MOC/index graph edges are standard markdown links, NOT `[[basename]]`; only frontmatter
+   `related:`/`children:` remain `[[basename]]`.
 4. **Orphans** — count notes not referenced by any MOC/index/other note; FAIL only if orphan count exceeds
    `repo.yaml curator.lint.max_orphans` (default 0 for theme notes; daily exempt). A signal, not a per-note
    hard error, so legitimate roots don't fail.

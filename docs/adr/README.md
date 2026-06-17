@@ -16,7 +16,7 @@ Format: lightweight [MADR](https://adr.github.io/madr/)-style.
 | [0007](0007-memory-harvester-safety.md) | Memory harvester with provenance/gate/scope safety | Accepted |
 | [0008](0008-transactional-sandboxed-curation.md) | Transactional, sandboxed curator runs | Accepted |
 | [0009](0009-deterministic-query-contract.md) | Deterministic query contract; synthesis is optional | Accepted |
-| [0010](0010-kb-wiki-schema.md) | KB wiki schema v1 (emitted AGENTS.md/SCHEMA.md) | Accepted |
+| [0010](0010-kb-wiki-schema.md) | KB wiki schema v1 (emitted AGENTS.md/SCHEMA.md) | Accepted · amended by 0014 |
 | [0011](0011-curator-ingest-contract.md) | Curator INGEST contract (plan-apply-author) | Accepted |
 | [0012](0012-deterministic-query-ranking.md) | Deterministic query ranking for core.wiki | Accepted |
 | [0013](0013-curator-sandbox-mechanism.md) | Curator sandbox mechanism (macOS Seatbelt + cross-platform) | Accepted |

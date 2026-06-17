@@ -158,7 +158,7 @@ CREATE/MERGE/CONTEST (so every disposition maps to ≥1 event and coverage stays
 
 | op | meaning | structural effect (applied by deterministic code, §3) | needs prose? | gated candidate? |
 |---|---|---|---|---|
-| `CREATE_THEME` | new atomic concept page | create `wiki/<domain>/themes/<basename>.md` w/ frontmatter (title, summary, tags, status, created, updated, aliases, sources, related, confidence, origin?) per ADR-0010; add `[[basename]]` to `<domain>-moc.md` + root index; insert plan `links[]` | yes (body) | **NO** (may never originate) |
+| `CREATE_THEME` | new atomic concept page | create `wiki/<domain>/themes/<basename>.md` w/ frontmatter (title, summary, tags, status, created, updated, aliases, sources, related, confidence, origin?) per ADR-0010; add `[[basename]]` to `<domain>-moc.md` + root index (per ADR-0014 D3, these MOC/index entries are emitted as standard markdown links `[Title](relative.md)`, not `[[basename]]`); insert plan `links[]` | yes (body) | **NO** (may never originate) |
 | `APPEND_DAILY` | dated capture/briefing | create-or-append `wiki/<domain>/daily/<domain>-<YYYY-MM-DD>.md`; add a dated `## ` section (one per disposition, §3.1) + `sources:` line | yes (the appended section only) | **NO** (originates content) |
 | `MERGE_INTO_THEME` | fold claim into existing theme | edit target theme: UNION this run's `event_ids` into `sources:` (never drop prior); insert plan `links[]`; place an augmentation sentinel sub-region | yes (only the augmented sub-region) | **YES** — corroborate only |
 | `MARK_CONTESTED` | contradiction | annotate target with the templated `> [!contested]` callout + `[[competing-note]]`; set frontmatter `status: contested` + `contested_by` + `contested_at`; record the new claim's provenance; keep BOTH | no (callout is templated, §2.1) | **YES** — on contradiction |
@@ -257,8 +257,14 @@ construction, not by post-hoc rejection:
   every curator edit), `confidence` (theme; mirrored from the candidate), `origin?` (harvest), and when
   `status == contested` also `contested_by`/`contested_at` (§2.1); plus `body_status: pending` for notes
   needing prose;
-- insert `[[basename]]` wikilinks and verify each resolves to a real (live-tree) or same-plan basename
+- insert graph links and verify each resolves to a real (live-tree) or same-plan basename
   (else the plan is rejected at §4.1 check 7);
+
+> Note (ADR-0014 D3): MOC entries, root index entries, and body graph edges are emitted as standard
+> markdown links `[Title](relative.md)` (basename recovered from the link path), NOT `[[basename]]`
+> wikilinks. Only frontmatter `related:`/`children:` arrays remain `"[[basename]]"` strings. The read
+> path and lint resolve BOTH forms; body `[[basename]]` wikilinks placed by PASS 2 prose are stripped
+> per §4.6.
 - add MOC entries (`<domain>-moc.md`) and root `index.md` entries;
 - render the templated `MARK_CONTESTED` callout + frontmatter (§2.1) byte-for-byte; create dated daily
   sections (§3.1);
@@ -382,8 +388,10 @@ dashboard lint signals and `kb_status`. On the post-APPLY/post-AUTHOR tree it ch
    `confidence` (`high|medium|low`) on themes; `body_status` ∈ {`pending`, absent}; `origin` (str) iff any
    provenance source is `harvest:<agent>`.
 2. **Taxonomy** — every note's `tags ⊆ _meta/taxonomy.yaml.allowed_tags`; its domain ∈ `_meta/taxonomy.yaml.domains`.
-3. **Wikilink resolution** — every `[[basename]]` in bodies/MOCs/index resolves to a real basename (no
-   dangling links).
+3. **Link resolution** — every graph link in bodies/MOCs/index resolves to a real basename (no
+   dangling links). Per ADR-0014 D3, body/MOC/index graph edges are standard markdown links
+   `[Title](relative.md)` (basename from path); frontmatter `related:`/`children:` remain
+   `[[basename]]`; the lint resolves BOTH forms.
 4. **Orphans** — count notes not referenced by any MOC/index/other note; FAIL only if orphan count exceeds
    `repo.yaml curator.lint.max_orphans` (default 0 for theme notes; daily exempt). A signal, not a per-note
    hard error, so legitimate roots don't fail.
