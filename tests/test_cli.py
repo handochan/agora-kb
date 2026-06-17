@@ -355,6 +355,107 @@ def test_serve_forwards_explicit_writer(tmp_path: Path, monkeypatch: pytest.Monk
     assert captured["ran"] is True
 
 
+# --- watch (scheduler loop) ---------------------------------------------------------------------
+def _init_stub_repo(target: Path) -> RepoLayout:
+    """Init a repo with the stub brain wired (domain/tags matching the stub plan) → its layout."""
+    assert (
+        main(
+            [
+                "repo",
+                "init",
+                str(target),
+                "--domain",
+                "ai-tech",
+                "--tag",
+                "curator",
+                "--tag",
+                "concurrency",
+            ]
+        )
+        == 0
+    )
+    _write_stub_adapters(target)
+    layout = RepoLayout(target)
+    repo_yaml = layout.kb_dir / "repo.yaml"
+    repo_yaml.write_text(
+        repo_yaml.read_text(encoding="utf-8").replace("backend: qwen", "backend: stub"),
+        encoding="utf-8",
+    )
+    return layout
+
+
+@requires_git
+def test_watch_once_is_idle_on_empty_repo(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`watch --once` on an empty repo evaluates the triggers, finds nothing due, and exits 0."""
+    target = tmp_path / "kb"
+    assert main(["repo", "init", str(target)]) == 0
+    capsys.readouterr()
+
+    assert main(["watch", "--repo", str(target), "--once"]) == 0
+
+    out = capsys.readouterr().out
+    assert "idle: depth=0" in out
+    assert "reason=none" in out
+
+
+@requires_git
+def test_watch_once_runs_when_threshold_met(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A backlog at/above ``threshold`` makes `watch --once` consolidate (reason=threshold)."""
+    target = tmp_path / "kb"
+    layout = _init_stub_repo(target)
+    repo_yaml = layout.kb_dir / "repo.yaml"
+    repo_yaml.write_text(
+        repo_yaml.read_text(encoding="utf-8").replace("threshold: 10", "threshold: 1"),
+        encoding="utf-8",
+    )
+    capsys.readouterr()
+    Inbox(layout).write(
+        text="One curator advances the branch under a lock.",
+        writer="dochan",
+        source="claude-code",
+        domain="ai-tech",
+        now=datetime(2026, 6, 13, 2, 40, 10, tzinfo=UTC),
+    )
+
+    assert main(["watch", "--repo", str(target), "--once"]) == 0
+
+    out = capsys.readouterr().out
+    assert "ran (threshold)" in out
+    assert "status=published" in out
+
+
+@requires_git
+def test_watch_once_runs_on_cron_due(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """A cron matching every minute fires `watch --once` (reason=cron) with a backlog present."""
+    target = tmp_path / "kb"
+    layout = _init_stub_repo(target)
+    repo_yaml = layout.kb_dir / "repo.yaml"
+    # cron "* * * * *" is due every minute; threshold stays 10 so ONLY the cron signal can fire.
+    repo_yaml.write_text(
+        repo_yaml.read_text(encoding="utf-8").replace("cron: 0 3 * * *", "cron: '* * * * *'"),
+        encoding="utf-8",
+    )
+    capsys.readouterr()
+    # Current-timestamp event so the 30-min idle trigger cannot pre-empt the cron reason.
+    Inbox(layout).write(
+        text="One curator advances the branch under a lock.",
+        writer="dochan",
+        source="claude-code",
+        domain="ai-tech",
+        now=datetime.now(UTC),
+    )
+
+    assert main(["watch", "--repo", str(target), "--once"]) == 0
+
+    out = capsys.readouterr().out
+    assert "ran (cron)" in out
+    assert "status=published" in out
+
+
 # --- no / unknown command -----------------------------------------------------------------------
 def test_no_command_returns_2(capsys: pytest.CaptureFixture[str]) -> None:
     rc = main([])
