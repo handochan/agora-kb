@@ -5,19 +5,23 @@ the core (capture → consolidate → query) on a single local repo before addin
 
 ## Phase 0 — Design (current)
 - [x] Design docs (DESIGN, ARCHITECTURE, DATA-MODEL), ADRs, project scaffold.
-- [ ] Validate the wiki schema against a real existing KB (`~/knowledge`) for compatibility.
+- [x] Validate the wiki schema against a real existing KB (`~/knowledge`) for compatibility
+      (validated via `agora import` on a `~/knowledge` clone → lint-clean; ADR-0014 D5).
 
 ## Phase 1 — Personal MVP (core + MCP face)
 Goal: a single local markdown repo with capture, scheduled consolidation, and query — zero infra.
-- [ ] `core.inbox` (immutable events + event-key idempotency), deterministic `core.wiki`
+- [x] `core.inbox` (immutable events + event-key idempotency), deterministic `core.wiki`
       (`QueryResult`/`SearchHit`), `core.repo` (layout, git), `core.state`.
-- [ ] `curator.worker` transactional run loop (claim manifest → sandboxed worktree → validate → publish
+- [x] `curator.worker` transactional run loop (claim manifest → sandboxed worktree → validate → publish
       → finalize) with the **local-model**
-      write-adapter (Qwen via Ollama) as default brain.
-- [ ] `curator.triggers`: cron + threshold + idle.
-- [ ] MCP face: `kb_remember`, `kb_query`, `kb_status`, `kb_curate` (FastMCP, stdio).
-- [ ] `agora` CLI: `serve`, `curate`, `repo init`, `doctor`.
-- [ ] Register with Claude Code + Hermes; dogfood on `~/knowledge`.
+      write-adapter (Qwen via Ollama) as default brain. OS sandbox per ADR-0013 (`agora doctor`
+      self-test); the default Ollama brain does inference OUTSIDE the sandbox (env-scrubbed) by design.
+- [x] `curator.triggers`: cron + threshold + idle (deterministic cron matcher + `agora watch`).
+- [x] MCP face: `kb_remember`, `kb_query`, `kb_status`, `kb_curate` (FastMCP, stdio).
+- [x] `agora` CLI: `serve`, `curate`, `repo init`, `doctor` (+ `watch`, `import`).
+- [x] Register with Claude Code + Hermes; dogfood on `~/knowledge` (both clients ✔ connect to
+      `agora serve`; the real `~/knowledge` is imported non-destructively to a curate-able KB and a
+      live capture → curate → query loop runs on it).
 **Exit:** capture from any MCP client → curator atomically files it → deterministic query returns it
 with path/anchor citations; injected or failed backend output cannot modify the live wiki.
 
