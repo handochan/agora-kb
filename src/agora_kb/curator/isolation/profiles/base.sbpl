@@ -1,0 +1,59 @@
+(version 1)
+
+;; ── deny everything by default: this makes the profile an ALLOWLIST.
+;;    A later (deny ...) ALWAYS wins over any (allow ...), regardless of order. [V: deny-wins]
+(deny default)
+
+;; ── process model: the backend is CPython and/or a CLI agent spawning children
+(allow process-exec)
+(allow process-fork)
+(allow signal     (target same-sandbox))
+(allow process-info* (target same-sandbox))
+
+;; ── reads: Phase-1 broad read (tightened later). Runtime/model/interpreter.
+(allow file-read*)
+
+;; ── writes: DENY-DEFAULT. Only /dev/null + the worktree + the separate scratch are writable.
+;;    /dev/null write is REQUIRED so Apple-shimmed CLIs (git via xcrun) don't fatally die. [V]
+(allow file-write*
+  (require-all (path "/dev/null") (vnode-type CHARACTER-DEVICE)))
+(allow file-write* (subpath (param "WORKTREE")))
+(allow file-write* (subpath (param "TMP")))      ;; scratch lives OUTSIDE the worktree
+
+;; ── G4: lock the worktree's OWN .git POINTER FILE (a linked worktree's .git is a 64-byte
+;;    "gitdir:" pointer file, NOT a directory). Without this the backend could repoint it
+;;    at the main repo's objects/hooks. [V: write to this path returns EPERM]
+(deny file-write* (path (string-append (param "WORKTREE") "/.git")))
+
+;; ── G4/G5: deny the MAIN repo's operational paths by their REALPATH. The real hooks/config,
+;;    .git/worktrees/<id>, and _kb/ live in the MAIN repo OUTSIDE {WORKTREE}; deny them
+;;    explicitly so protection does not silently depend on sibling placement luck.
+(deny file-write* (subpath (param "MAIN_GIT")))   ;; main/.git (objects, hooks, config, worktrees/*)
+(deny file-write* (subpath (param "MAIN_KB")))    ;; main/_kb (inbox/processing/processed/state/lock)
+
+;; ── CPython / PyTorch / libomp need POSIX sem + shm
+(allow ipc-posix-sem)
+(allow ipc-posix-shm)
+
+;; ── safe sysctl reads only (Codex allowlist) — NOT a blanket sysctl-read
+(allow sysctl-read
+  (sysctl-name-prefix "hw.")
+  (sysctl-name-prefix "kern.")
+  (sysctl-name "net.routetable.0")   ;; route lookup; harmless with explicit network deny below
+  (sysctl-name-prefix "kern.os"))
+
+;; ── pseudo-tty so CLI backends that expect a tty don't crash
+(allow file-read* file-write* (regex #"^/dev/ttys[0-9]+$"))
+(allow file-read* file-write* (path "/dev/ptmx"))
+(allow pseudo-tty)
+
+;; ── minimal name lookups some runtimes do at startup. Each enumerated; none proxies egress:
+;;    opendirectoryd.libinfo = local user/group (getpwuid) lookups, NOT a network resolver path.
+(allow mach-lookup (global-name "com.apple.system.opendirectoryd.libinfo"))
+(allow user-preference-read)   ;; cfprefs reads (no write); read-only, cannot egress
+
+;; ── NETWORK: belt-and-suspenders. Default-deny already blocks egress, but add EXPLICIT denies
+;;    that a future stray (allow ...) cannot accidentally override (deny-wins). DNS via
+;;    mDNSResponder is also denied: with no network-outbound, getaddrinfo cannot reach the resolver.
+(deny network*)        ;; [V: outbound TCP -> PermissionError EPERM with this in place]
+(deny system-socket)   ;; [V]
