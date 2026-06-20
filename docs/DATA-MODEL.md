@@ -199,6 +199,20 @@ config error. Routing only chooses *which* brain runs an act, never how its outp
 the deterministic integrity boundary is unchanged (`plan` and `author` may use different brains, even
 with different `network` postures).
 
+A backend's `argv` may shell a **brain shim** rather than a raw model: `agora-ollama-brain` drives a
+local Ollama model, and `agora-cli-brain` (ADR-0016) drives ANY headless CLI agent as a pure text
+generator — the CLI argv follows a `--` separator. Both shims read the bundle and normalize the
+output; the agent only generates text (no file tools, no elevated permissions):
+
+```yaml
+backends:
+  qwen:   { argv: [agora-ollama-brain, --model, "qwen3.6:35b-a3b"], network: loopback }
+  claude: { argv: [agora-cli-brain, --, claude, -p],                 network: loopback }
+  codex:  { argv: [agora-cli-brain, --, codex, exec, --skip-git-repo-check, --sandbox, read-only], network: loopback }
+  gemini: { argv: [agora-cli-brain, --, gemini, -p, ""],             network: loopback }
+default_backend: qwen
+```
+
 ## 9. Query result
 
 ```yaml
