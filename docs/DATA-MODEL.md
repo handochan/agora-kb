@@ -191,11 +191,16 @@ extractors:
 
 # READ adapters — memory harvester connectors.
 connectors:
-  file:claude-code: { path: "~/.claude/**/MEMORY.md", scope: personal }
+  file:claude-code: { path: "~/.claude/**/MEMORY.md", scope: personal, follow_links: true }
   file:hermes:      { path: "~/.hermes/MEMORY.md",    scope: personal }
   # letta:   { api: "...", scope: personal }
   # mem0:    { api: "...", scope: personal }
 ```
+
+`scope` is the source's privacy class (enforced by the harvester's scope gate, ADR-0007/0017).
+`follow_links` (optional, default `false`; ADR-0018) makes a `file:` connector follow a bullet's
+`[Title](sibling.md)` link and harvest the sibling's content (frontmatter stripped) instead of the
+thin one-line summary — opt-in, one hop, confined to the source file's own directory subtree.
 
 The exact argv is backend/version-specific and validated by the adapter. The registry stores an argv
 array rather than a shell command, and prompt data travels over stdin or a read-only file. Backend

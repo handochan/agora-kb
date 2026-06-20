@@ -351,3 +351,50 @@ def test_cursor_last_scan_serialized_as_z_form(tmp_path: Path) -> None:
     store.save(HarvestCursor(connector="file:a", last_scan=when))
     raw = RepoLayout(tmp_path).harvest_cursor_path("file:a").read_text(encoding="utf-8")
     assert '"last_scan": "2026-06-20T09:30:05Z"' in raw
+
+
+# --- link-following through the orchestrator (ADR-0018) ------------------------------------------
+
+
+def _follow_repo(tmp_path: Path) -> Path:
+    src = tmp_path / "mem"
+    src.mkdir()
+    return src
+
+
+def test_followed_fact_is_a_gated_candidate(tmp_path: Path) -> None:
+    # A SIBLING-derived (followed) fact must still hit the candidate gate (kind/confidence/source).
+    src = _follow_repo(tmp_path)
+    (src / "MEMORY.md").write_text("# I\n\n- [Curator](curator.md) — note\n", encoding="utf-8")
+    (src / "curator.md").write_text("# Curator\n\nOne curator holds a lock.\n", encoding="utf-8")
+    layout = RepoLayout(tmp_path)
+    policy = HarvestPolicy(enabled=True, scope_lock="personal", repo_kind="personal")
+    conn = FileConnector(
+        name="file:demo", path=str(src / "MEMORY.md"), scope=Scope.personal, follow_links=True
+    )
+    Harvester(layout).run([conn], policy=policy, now=FIXED)
+    items = _read_inbox(layout)
+    assert len(items) == 1
+    fm, body = items[0]
+    assert fm["kind"] == "candidate"
+    assert fm["confidence"] == "low"
+    assert fm["source"] == "harvest:demo"
+    assert "One curator holds a lock." in body
+
+
+def test_followed_same_sibling_dedupes_through_inbox(tmp_path: Path) -> None:
+    # Two bullets to one sibling → body-only event_key collapses them at the inbox (ADR-0018 D5).
+    src = _follow_repo(tmp_path)
+    (src / "MEMORY.md").write_text(
+        "# I\n\n- [One](s.md) — a\n- [Two](s.md) — b\n", encoding="utf-8"
+    )
+    (src / "s.md").write_text("# S\n\nshared body\n", encoding="utf-8")
+    layout = RepoLayout(tmp_path)
+    policy = HarvestPolicy(enabled=True, scope_lock="personal", repo_kind="personal")
+    conn = FileConnector(
+        name="file:demo", path=str(src / "MEMORY.md"), scope=Scope.personal, follow_links=True
+    )
+    report = Harvester(layout).run([conn], policy=policy, now=FIXED)
+    cr = report.connectors[0]
+    assert cr.written == 1 and cr.deduped == 1
+    assert len(_read_inbox(layout)) == 1

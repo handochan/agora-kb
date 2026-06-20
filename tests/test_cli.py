@@ -743,3 +743,28 @@ def test_doctor_prints_the_connectors_line(
     assert "harvest: enabled (scope_lock=personal)" in out
     assert "file:demo (scope=personal)" in out
     assert "proposed=0" in out
+
+
+@requires_git
+def test_harvest_follow_links_harvests_sibling_content(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    target, mem = _setup_harvest_repo(tmp_path)
+    # Reshape the memory as a pointer index + a same-dir sibling, and turn follow_links on.
+    mem.write_text("# Index\n\n- [Curator](curator.md) — how it works\n", encoding="utf-8")
+    (mem.parent / "curator.md").write_text(
+        "# Curator\n\nOne curator holds a per-repo lock.\n", encoding="utf-8"
+    )
+    ap = target / "adapters.yaml"
+    a = yaml.safe_load(ap.read_text(encoding="utf-8"))
+    a["connectors"]["file:demo"]["follow_links"] = True
+    ap.write_text(yaml.safe_dump(a, sort_keys=False), encoding="utf-8")
+    capsys.readouterr()
+
+    rc = main(["harvest", "--repo", str(target)])
+    assert rc == 0
+    items = sorted((target / "_kb" / "inbox").glob("*/*.md"))
+    assert len(items) == 1
+    body = items[0].read_text(encoding="utf-8")
+    assert "One curator holds a per-repo lock." in body  # the SIBLING content was harvested
+    assert "[Curator](curator.md)" not in body  # the thin pointer markup was replaced

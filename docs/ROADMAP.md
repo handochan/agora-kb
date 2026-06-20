@@ -41,9 +41,12 @@ Goal: tool-agnostic curator and autonomous accumulation, still single-user.
       gate keyed on repo `kind` (personal source → personal repo only); a DATA-MODEL §6 cursor with a
       whole-source fast no-op. Opt-in (`harvest.enabled`, default off); `connectors:` in `adapters.yaml`;
       `agora doctor` shows the connectors line. **Live-verified** on a real `MEMORY.md` shape
-      (dry-run + real write + unchanged no-op + a team-repo scope refusal). The realistic *reworded*
-      KB→memory→KB loop and team/multi-tenant harvesting are documented residual risks deferred to
-      later phases (ADR-0017); Letta/mem0 API connectors remain Phase-4/5.
+      (dry-run + real write + unchanged no-op + a team-repo scope refusal). Opt-in **link-following**
+      (ADR-0018) then shipped: a `follow_links` connector follows a pointer bullet's
+      `[Title](sibling.md)` and harvests the sibling's content (frontmatter stripped, source-dir-confined,
+      symlink-rejected, fan-out-capped, one hop) instead of the thin one-liner. The realistic
+      *reworded* KB→memory→KB loop and team/multi-tenant harvesting are documented residual risks
+      deferred to later phases (ADR-0017); Letta/mem0 API connectors remain Phase-4/5.
 **Exit:** swap the curator brain via config with no data risk; harvested candidates flow safely.
 
 ## Phase 3 — Web face: upload + dashboard
