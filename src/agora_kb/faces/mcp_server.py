@@ -31,8 +31,11 @@ from typing import TYPE_CHECKING
 
 from agora_kb.config import load_backend_registry, load_repo_config
 from agora_kb.core import Inbox, Repo, StateStore, Wiki
-from agora_kb.curator.isolation import SandboxUnavailable, select_backend_isolation
-from agora_kb.curator.subprocess_backend import SubprocessBackend
+from agora_kb.curator.subprocess_backend import (
+    RoutedBackend,
+    SubprocessBackend,
+    build_routed_backend,
+)
 from agora_kb.curator.worker import recover, run
 
 if TYPE_CHECKING:
@@ -189,7 +192,8 @@ class AgoraHandlers:
         """
         cfg = load_repo_config(self._repo.layout)
         backend = self._build_backend(
-            cfg.default_backend, allow_reduced_isolation=cfg.allow_reduced_isolation
+            default_backend=cfg.default_backend,
+            allow_reduced_isolation=cfg.allow_reduced_isolation,
         )
         if backend is None:
             return {
@@ -224,37 +228,33 @@ class AgoraHandlers:
         }
 
     def _build_backend(
-        self, backend_name: str, *, allow_reduced_isolation: bool = False
-    ) -> SubprocessBackend | None:
-        """Resolve the configured WRITE-adapter into a :class:`SubprocessBackend`, or ``None``.
+        self, *, default_backend: str | None = None, allow_reduced_isolation: bool = False
+    ) -> RoutedBackend | SubprocessBackend | None:
+        """Resolve the configured WRITE-adapter(s) into a worker backend, or ``None``.
 
-        Loads ``adapters.yaml`` (DATA-MODEL §8) from the repo root. ``None`` (an absent file or an
-        unknown configured brain) is the caller's "no backend configured" signal; a missing
-        executable surfaces later at invocation as a clear error from the backend itself.
-
-        ADR-0013: an OS-sandbox adapter is selected and injected ONLY for a ``network: 'none'``
-        backend (its file-writing PASS-2 step is then confined). The default loopback Ollama brain
-        does inference OUTSIDE the sandbox, so it needs none. A ``network: 'none'`` backend with no
-        usable sandbox and ``allow_reduced_isolation=False`` fails closed (``None``), matching the
-        CLI ``curate`` path, rather than running unconfined.
+        Loads ``adapters.yaml`` (DATA-MODEL §8) and delegates to the shared
+        :func:`~agora_kb.curator.subprocess_backend.build_routed_backend`, honoring the optional
+        per-act ``routing`` table (ADR-0015): ``plan`` and ``author`` may run on different brains.
+        ``None`` (an absent file, or a ``network: 'none'`` act with no usable OS sandbox under
+        ``allow_reduced_isolation=False``) is the caller's "no backend configured" signal — the face
+        stays SILENT (``report=None``), unlike the CLI which prints to stderr. A missing executable
+        surfaces later at invocation as a clear error from the backend itself.
         """
         adapters_path = self._repo.layout.root / "adapters.yaml"
-        registry = load_backend_registry(adapters_path)
+        try:
+            registry = load_backend_registry(adapters_path)
+        except ValueError:
+            # A malformed adapters.yaml (incl. an invalid ADR-0015 ``routing:`` block) is unusable;
+            # the silent face reports it as "no_backend" rather than raising to the MCP client.
+            return None
         if registry is None:
             return None
-        try:
-            spec = registry.get(backend_name)
-        except KeyError:
-            return None
-        isolation = None
-        if spec.network == "none":
-            try:
-                isolation = select_backend_isolation(
-                    allow_reduced_isolation=allow_reduced_isolation
-                )
-            except SandboxUnavailable:
-                return None
-        return SubprocessBackend(spec, isolation=isolation)
+        return build_routed_backend(
+            registry,
+            allow_reduced_isolation=allow_reduced_isolation,
+            default_backend=default_backend,
+            report=None,
+        )
 
 
 def _now() -> datetime:

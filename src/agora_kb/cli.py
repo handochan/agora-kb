@@ -41,7 +41,7 @@ from .core import Inbox, Repo, RepoLayout, StateStore
 from .curator import evaluate
 from .curator.cron import is_cron_due
 from .curator.isolation import SandboxUnavailable, select_backend_isolation
-from .curator.subprocess_backend import SubprocessBackend
+from .curator.subprocess_backend import RoutedBackend, SubprocessBackend, build_routed_backend
 from .curator.worker import recover, run
 from .schema import Taxonomy, emit_schema, lint
 
@@ -123,6 +123,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_curate.add_argument("--repo", default=".", help="repo root (default: .)")
     p_curate.add_argument(
         "--force", action="store_true", help="treat the run as due regardless of triggers"
+    )
+    p_curate.add_argument(
+        "--backend",
+        default=None,
+        metavar="NAME",
+        help="pin BOTH cognitive acts to this adapters.yaml backend, bypassing routing (ADR-0015)",
     )
     p_curate.set_defaults(func=_cmd_curate)
 
@@ -355,7 +361,10 @@ def _cmd_curate(args: argparse.Namespace) -> int:
         return 0
 
     backend = _build_backend(
-        layout, cfg.default_backend, allow_reduced_isolation=cfg.allow_reduced_isolation
+        layout,
+        default_backend=cfg.default_backend,
+        override=args.backend,
+        allow_reduced_isolation=cfg.allow_reduced_isolation,
     )
     if backend is None:
         return 1
@@ -376,25 +385,36 @@ def _cmd_curate(args: argparse.Namespace) -> int:
 
 
 def _build_backend(
-    layout: RepoLayout, backend_name: str, *, allow_reduced_isolation: bool = False
-) -> SubprocessBackend | None:
-    """Resolve the configured WRITE-adapter into a :class:`SubprocessBackend`, or print why not.
+    layout: RepoLayout,
+    *,
+    default_backend: str | None = None,
+    override: str | None = None,
+    allow_reduced_isolation: bool = False,
+) -> RoutedBackend | SubprocessBackend | None:
+    """Resolve the configured WRITE-adapter(s) into a worker backend, or print why not.
 
-    Loads ``adapters.yaml`` (DATA-MODEL §8) from the repo root. Returns ``None`` (after printing a
-    clear stderr message) when the file is absent (no brain configured) or the configured
-    ``default_backend`` is not among its ``backends`` — so the caller exits non-zero instead of
-    crashing. The actual missing-executable case surfaces later, at invocation, as a clear error.
+    Loads ``adapters.yaml`` (DATA-MODEL §8) from the repo root and delegates to
+    :func:`~agora_kb.curator.subprocess_backend.build_routed_backend`, which honors the optional
+    per-act ``routing`` table (ADR-0015): ``plan`` (PASS-1) and ``author`` (PASS-2) may run on
+    different brains. Returns a plain :class:`SubprocessBackend` when both acts use one brain,
+    else a :class:`RoutedBackend`. ``override`` (``agora curate --backend NAME``) pins BOTH acts
+    to one brain, bypassing routing.
 
-    ADR-0013: an :class:`~agora_kb.curator.isolation.BackendIsolation` adapter is selected and
-    injected ONLY for a ``network: 'none'`` backend (the file-writing PASS-2 step is then confined).
-    Selection is LAZY/conditional on purpose — the default loopback Ollama brain does inference
-    OUTSIDE the sandbox (``network: 'loopback'``), so it never needs a kernel sandbox and curate
-    keeps working on a host without one. A ``network: 'none'`` backend with no usable sandbox and
-    ``allow_reduced_isolation=False`` fails closed here (clear message, ``None``) rather than
-    running unconfined.
+    Returns ``None`` (after a clear stderr message) when the file is absent (no brain configured),
+    an ``override`` names an unknown brain, or a ``network: 'none'`` act has no usable OS sandbox
+    and ``allow_reduced_isolation=False`` (fail-closed — ADR-0013; the default loopback Ollama
+    brain does inference OUTSIDE the sandbox and never needs one). The missing-executable case
+    surfaces later,
+    at invocation, as a clear error.
     """
     adapters_path = layout.root / "adapters.yaml"
-    registry = load_backend_registry(adapters_path)
+    try:
+        registry = load_backend_registry(adapters_path)
+    except ValueError as exc:
+        # Fail-loud but CLEAN (no traceback): a malformed adapters.yaml — including an invalid
+        # ADR-0015 ``routing:`` block (unknown act key or a value naming an undefined backend).
+        print(f"{_PROG} curate: invalid adapters.yaml — {exc}", file=sys.stderr)
+        return None
     if registry is None:
         print(
             f"{_PROG} curate: no backend configured — create {adapters_path} with a 'backends:' "
@@ -402,23 +422,13 @@ def _build_backend(
             file=sys.stderr,
         )
         return None
-    try:
-        spec = registry.get(backend_name)
-    except KeyError as exc:
-        print(f"{_PROG} curate: {exc}", file=sys.stderr)
-        return None
-    isolation = None
-    if spec.network == "none":
-        try:
-            isolation = select_backend_isolation(allow_reduced_isolation=allow_reduced_isolation)
-        except SandboxUnavailable as exc:
-            print(
-                f"{_PROG} curate: backend {backend_name!r} is sandboxed (network: none) but no "
-                f"usable OS sandbox is available: {exc}",
-                file=sys.stderr,
-            )
-            return None
-    return SubprocessBackend(spec, isolation=isolation)
+    return build_routed_backend(
+        registry,
+        allow_reduced_isolation=allow_reduced_isolation,
+        default_backend=default_backend,
+        override=override,
+        report=lambda msg: print(f"{_PROG} curate: {msg}", file=sys.stderr),
+    )
 
 
 def _cmd_watch(args: argparse.Namespace) -> int:
@@ -481,7 +491,9 @@ def _watch_tick(repo: Repo) -> None:
         return
 
     backend = _build_backend(
-        layout, cfg.default_backend, allow_reduced_isolation=cfg.allow_reduced_isolation
+        layout,
+        default_backend=cfg.default_backend,
+        allow_reduced_isolation=cfg.allow_reduced_isolation,
     )
     if backend is None:
         print(f"{stamp} due ({decision.reason}) but no usable backend — skipping this tick")
@@ -564,8 +576,42 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
     # network: none backend at curate time) without flagging the whole host unhealthy.
     ok = _doctor_sandbox(load_repo_config(layout).allow_reduced_isolation) and ok
 
+    # ADR-0015: observability — which brain runs each cognitive act (default or routed). Reporting
+    # only; never affects the health verdict.
+    _doctor_routing(layout, load_repo_config(layout).default_backend)
+
     print(f"status: {'healthy' if ok else 'unhealthy'}")
     return 0 if ok else 1
+
+
+def _doctor_routing(layout: RepoLayout, default_backend: str | None = None) -> None:
+    """Print the ADR-0015 per-act routing table (which brain runs ``plan`` / ``author``).
+
+    Observability only — never affects the health verdict and never crashes: an absent
+    ``adapters.yaml`` is noted and a malformed one is skipped (``agora curate`` surfaces the real
+    config error loudly). ``default_backend`` (the repo's ``curator.backend``) is threaded so the
+    table reflects the SAME precedence a real run uses. Showing each act's ``network`` posture lets
+    an operator see BEFORE a run that e.g. routing an act to a ``network: 'none'`` brain on a
+    sandbox-less host will fail closed (ADR-0013), or that routing ``author`` to a metered API
+    multiplies cost (PASS-2 runs per region).
+    """
+    adapters_path = layout.root / "adapters.yaml"
+    try:
+        registry = load_backend_registry(adapters_path)
+    except Exception as exc:  # noqa: BLE001 — doctor must never crash on a malformed adapters.yaml.
+        print(f"  routing: adapters.yaml present but unreadable ({exc})")
+        return
+    if registry is None:
+        print("  routing: no adapters.yaml (no backend configured)")
+        return
+    parts = []
+    for act, name in registry.routed_backends(default=default_backend).items():
+        try:
+            parts.append(f"{act}={name} (network: {registry.get(name).network})")
+        except KeyError:
+            # repo.yaml curator.backend names no defined brain — surface it, don't crash.
+            parts.append(f"{act}={name} (UNKNOWN backend)")
+    print(f"  routing: {'  '.join(parts)}")
 
 
 def _doctor_sandbox(allow_reduced_isolation: bool) -> bool:

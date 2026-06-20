@@ -95,15 +95,28 @@ class BackendResult(BaseModel):
     stderr: str
 
 
+# ADR-0015: the CLOSED set of routable cognitive acts — exactly the two methods of the worker's
+# ``Backend`` Protocol (``plan`` = PASS-1, ``author`` = PASS-2), the only two points a brain is
+# invoked. Per-op / per-tier routing is intentionally OUT OF SCOPE for v1 (PASS-1 plans the whole
+# batch in one ``plan()`` call), so the key-space cannot promise sub-act routing it can't deliver.
+_ROUTABLE_ACTS: tuple[str, ...] = ("plan", "author")
+
+
 class BackendRegistry:
     """The pluggable write-adapter registry parsed from ``adapters.yaml`` (DATA-MODEL §8).
 
-    Holds the named ``backends`` plus the ``default_backend`` pointer. This is the single place the
-    curator resolves "which brain" — swapping the brain is a config edit, not a code change
-    (ADR-0004). Construct via :meth:`from_yaml` / :meth:`from_file`.
+    Holds the named ``backends`` plus the ``default_backend`` pointer and an optional per-act
+    ``routing`` table (ADR-0015). This is the single place the curator resolves "which brain" —
+    swapping the brain, or pinning a different brain per cognitive act, is a config edit, not a code
+    change (ADR-0004). Construct via :meth:`from_yaml` / :meth:`from_file`.
     """
 
-    def __init__(self, backends: dict[str, BackendSpec], default_backend: str) -> None:
+    def __init__(
+        self,
+        backends: dict[str, BackendSpec],
+        default_backend: str,
+        routing: dict[str, str] | None = None,
+    ) -> None:
         if not backends:
             raise ValueError("adapters.yaml defines no backends")
         if default_backend not in backends:
@@ -111,6 +124,22 @@ class BackendRegistry:
                 f"default_backend {default_backend!r} is not among the defined "
                 f"backends {sorted(backends)}"
             )
+        # ADR-0015: validate the optional per-act routing HERE so every construction path (including
+        # a direct test build) is guarded fail-loud, mirroring the ``default_backend`` invariant. An
+        # unknown act key or a value naming an undefined backend is a hard config error, never a
+        # silent fallback.
+        self._routing: dict[str, str] = dict(routing or {})
+        for act, name in self._routing.items():
+            if act not in _ROUTABLE_ACTS:
+                raise ValueError(
+                    f"routing key {act!r} is not a routable act; routable acts are "
+                    f"{list(_ROUTABLE_ACTS)} (per-op / per-tier routing is not supported in v1)"
+                )
+            if name not in backends:
+                raise ValueError(
+                    f"routing[{act!r}] → {name!r} is not among the defined backends "
+                    f"{sorted(backends)}"
+                )
         self._backends = dict(backends)
         self._default = default_backend
 
@@ -121,7 +150,12 @@ class BackendRegistry:
         top-level ``default_backend``. Other top-level adapter families (``extractors``,
         ``connectors``) are ignored here — this registry owns only the WRITE family.
         """
-        data = yaml.safe_load(text) or {}
+        try:
+            data = yaml.safe_load(text) or {}
+        except yaml.YAMLError as exc:
+            # A YAML syntax error is a yaml.YAMLError (NOT a ValueError); normalize it so the faces'
+            # ``except ValueError`` surfaces it cleanly instead of crashing with a traceback.
+            raise ValueError(f"adapters.yaml is not valid YAML: {exc}") from exc
         if not isinstance(data, dict):
             raise ValueError("adapters.yaml must be a mapping at the top level")
 
@@ -145,12 +179,32 @@ class BackendRegistry:
         if not isinstance(default_backend, str):
             raise ValueError("'default_backend' must be a string naming a defined backend")
 
-        return cls(backends=backends, default_backend=default_backend)
+        # ADR-0015: optional per-act ``routing`` block (sibling of ``backends``/``default_backend``;
+        # NOT a backend field, so ``BackendSpec`` stays frozen/extra='forbid'). Absent or empty →
+        # no routing (the default brain handles every act). Key/value validity is enforced in
+        # ``__init__`` so this parse stays thin and direct construction is guarded identically.
+        raw_routing = data.get("routing")
+        routing: dict[str, str] = {}
+        if raw_routing is not None:
+            if not isinstance(raw_routing, dict):
+                raise ValueError("'routing' must be a mapping of act → backend name")
+            for act, name in raw_routing.items():
+                if not isinstance(name, str):
+                    raise ValueError(f"routing[{str(act)!r}] must name a backend (a string)")
+                routing[str(act)] = name
+
+        return cls(backends=backends, default_backend=default_backend, routing=routing)
 
     @classmethod
     def from_file(cls, path: str | Path) -> BackendRegistry:
         """Load and parse an ``adapters.yaml`` file from disk (UTF-8)."""
-        return cls.from_yaml(Path(path).read_text(encoding="utf-8"))
+        try:
+            text = Path(path).read_text(encoding="utf-8")
+        except OSError as exc:
+            # A present-but-unreadable file raises OSError (not ValueError); normalize it so the
+            # faces' ``except ValueError`` reports it cleanly rather than crashing.
+            raise ValueError(f"adapters.yaml could not be read: {exc}") from exc
+        return cls.from_yaml(text)
 
     def get(self, name: str) -> BackendSpec:
         """Return the named backend spec. Raise ``KeyError`` for an unknown name."""
@@ -168,6 +222,34 @@ class BackendRegistry:
     def names(self) -> list[str]:
         """Return the defined backend names, sorted for stable output."""
         return sorted(self._backends)
+
+    def resolve(self, act: str, *, default: str | None = None) -> BackendSpec:
+        """Return the backend spec for a routable cognitive act (``'plan'`` | ``'author'``).
+
+        Precedence (ADR-0015): a ``routing:`` entry for the act wins; else the caller-supplied
+        ``default`` (the repo's default brain — ``repo.yaml`` ``curator.backend``, which the faces
+        thread through so an UNROUTED act keeps honoring it); else the registry's own
+        ``default_backend``. Pure and deterministic — same config → same brain per act. Raises
+        ``ValueError`` for a non-routable act, and ``KeyError`` when the resolved name (e.g. a
+        ``default`` from ``repo.yaml`` that names no defined backend) is unknown.
+        """
+        if act not in _ROUTABLE_ACTS:
+            raise ValueError(
+                f"unknown routable act {act!r}; routable acts are {list(_ROUTABLE_ACTS)}"
+            )
+        name = self._routing.get(act) or default or self._default
+        if name not in self._backends:
+            raise KeyError(f"unknown backend {name!r}; known backends: {sorted(self._backends)}")
+        return self._backends[name]
+
+    def routed_backends(self, *, default: str | None = None) -> dict[str, str]:
+        """Return the resolved ``{act: backend_name}`` table for every routable act.
+
+        Observability for ``agora doctor`` (ADR-0015): shows which brain each act will use under the
+        same precedence as :meth:`resolve` (``routing`` → ``default`` → registry default), so an
+        operator sees the wiring before a run.
+        """
+        return {act: (self._routing.get(act) or default or self._default) for act in _ROUTABLE_ACTS}
 
 
 def _substitute_worktree(value: str, worktree: str) -> str:

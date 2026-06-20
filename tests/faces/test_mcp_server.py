@@ -292,6 +292,21 @@ def test_curate_no_backend_returns_clear_note(tmp_path: Path) -> None:
     assert "no backend configured" in result["note"]
 
 
+def test_curate_with_invalid_routing_returns_no_backend(tmp_path: Path) -> None:
+    """ADR-0015: a malformed ``routing:`` block makes the SILENT MCP face report ``no_backend``
+    rather than raising the config ``ValueError`` to the client."""
+    repo = _init_repo(tmp_path)
+    (repo.layout.root / "adapters.yaml").write_text(
+        "backends:\n  qwen: { argv: [agora-ollama-brain], network: loopback }\n"
+        "default_backend: qwen\nrouting:\n  plan: ghost\n",
+        encoding="utf-8",
+    )
+    handlers = AgoraHandlers(repo, writer="local")
+    handlers.remember("a single capture")
+
+    assert handlers.curate()["status"] == "no_backend"
+
+
 @requires_git
 def test_curate_with_stub_backend_publishes(tmp_path: Path) -> None:
     """`kb_curate` runs curator.worker against a STUB backend and PUBLISHES a theme.

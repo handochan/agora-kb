@@ -207,6 +207,75 @@ def test_curate_force_without_backend_reports_no_backend(
 
 
 @requires_git
+def test_doctor_prints_the_routing_table(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """ADR-0015: `agora doctor` reports which brain runs each act + its network posture. A fresh
+    repo emits one `qwen` brain with no routing, so both acts resolve to it."""
+    target = tmp_path / "kb"
+    assert main(["repo", "init", str(target), "--domain", "ai-tech"]) == 0
+    capsys.readouterr()
+
+    main(["doctor", "--repo", str(target)])
+    out = capsys.readouterr().out
+    assert "routing:" in out
+    assert "plan=qwen" in out
+    assert "author=qwen" in out
+
+
+@requires_git
+def test_curate_unknown_backend_override_is_a_clean_error(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`agora curate --backend NAME` with an undefined NAME exits non-zero with a clear message
+    (the override escape hatch is fail-loud), not a traceback."""
+    target = tmp_path / "kb"
+    assert main(["repo", "init", str(target), "--domain", "ai-tech"]) == 0
+    capsys.readouterr()
+
+    rc = main(["curate", "--repo", str(target), "--force", "--backend", "nonesuch"])
+    assert rc == 1
+    assert "unknown backend" in capsys.readouterr().err
+
+
+@requires_git
+def test_curate_invalid_routing_block_is_a_clean_error(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A malformed ADR-0015 `routing:` block (an undefined target) makes `agora curate` exit
+    non-zero with a clean 'invalid adapters.yaml' message, not an uncaught ValueError."""
+    target = tmp_path / "kb"
+    assert main(["repo", "init", str(target), "--domain", "ai-tech"]) == 0
+    capsys.readouterr()
+    adapters = target / "adapters.yaml"
+    adapters.write_text(
+        adapters.read_text(encoding="utf-8") + "routing:\n  plan: ghost\n", encoding="utf-8"
+    )
+
+    rc = main(["curate", "--repo", str(target), "--force"])
+    assert rc == 1
+    assert "invalid adapters.yaml" in capsys.readouterr().err
+
+
+@requires_git
+def test_doctor_tolerates_a_malformed_adapters_yaml(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`agora doctor` never crashes on a malformed adapters.yaml — it notes it on the routing line
+    and still reports a status."""
+    target = tmp_path / "kb"
+    assert main(["repo", "init", str(target), "--domain", "ai-tech"]) == 0
+    capsys.readouterr()
+    (target / "adapters.yaml").write_text('a: "unterminated', encoding="utf-8")
+
+    main(["doctor", "--repo", str(target)])
+    out = capsys.readouterr().out
+    assert "routing:" in out
+    assert "unreadable" in out
+    assert "status:" in out
+
+
+@requires_git
 def test_curate_with_stub_backend_publishes_and_query_reflects_it(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
