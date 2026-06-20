@@ -14,6 +14,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
+import yaml
 
 from agora_kb.cli import main
 from agora_kb.core import Inbox, Repo, RepoLayout
@@ -614,3 +615,131 @@ def test_unknown_command_exits_2() -> None:
     with pytest.raises(SystemExit) as excinfo:
         main(["definitely-not-a-command"])
     assert excinfo.value.code == 2
+
+
+# --- harvest (ADR-0007/0017) --------------------------------------------------------------------
+def _setup_harvest_repo(
+    tmp_path: Path,
+    *,
+    kind: str = "personal",
+    scope: str = "personal",
+    enabled: bool = True,
+    with_connector: bool = True,
+) -> tuple[Path, Path]:
+    """Init a repo, enable harvest in repo.yaml, and (optionally) wire a file: connector."""
+    target = tmp_path / "kb"
+    assert main(["repo", "init", str(target), "--kind", kind, "--domain", "general"]) == 0
+    mem = tmp_path / "mem" / "MEMORY.md"
+    mem.parent.mkdir(parents=True, exist_ok=True)
+    mem.write_text("# m\n\n- harvested fact one\n- harvested fact two\n", encoding="utf-8")
+
+    rp = target / "_kb" / "repo.yaml"
+    doc = yaml.safe_load(rp.read_text(encoding="utf-8"))
+    doc.setdefault("harvest", {})["enabled"] = enabled
+    rp.write_text(yaml.safe_dump(doc, sort_keys=False), encoding="utf-8")
+
+    if with_connector:
+        ap = target / "adapters.yaml"
+        a = yaml.safe_load(ap.read_text(encoding="utf-8"))
+        a["connectors"] = {"file:demo": {"path": str(mem), "scope": scope}}
+        ap.write_text(yaml.safe_dump(a, sort_keys=False), encoding="utf-8")
+    return target, mem
+
+
+@requires_git
+def test_harvest_disabled_is_noop(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    target, _ = _setup_harvest_repo(tmp_path, enabled=False)
+    capsys.readouterr()
+    rc = main(["harvest", "--repo", str(target)])
+    assert rc == 0
+    assert "disabled" in capsys.readouterr().out
+
+
+@requires_git
+def test_harvest_writes_gated_candidates(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    target, _ = _setup_harvest_repo(tmp_path)
+    capsys.readouterr()
+    rc = main(["harvest", "--repo", str(target)])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "total candidates written: 2" in out
+    items = sorted((target / "_kb" / "inbox").glob("*/*.md"))
+    assert len(items) == 2
+    for p in items:
+        text = p.read_text(encoding="utf-8")
+        assert "kind: candidate" in text
+        assert "confidence: low" in text
+        assert "source: harvest:demo" in text
+
+
+@requires_git
+def test_harvest_dry_run_writes_nothing(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    target, _ = _setup_harvest_repo(tmp_path)
+    capsys.readouterr()
+    rc = main(["harvest", "--repo", str(target), "--dry-run"])
+    assert rc == 0
+    assert "would harvest" in capsys.readouterr().out
+    assert list((target / "_kb" / "inbox").glob("*/*.md")) == []
+
+
+@requires_git
+def test_harvest_no_connectors_is_error(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    target, _ = _setup_harvest_repo(tmp_path, with_connector=False)
+    capsys.readouterr()
+    rc = main(["harvest", "--repo", str(target)])
+    assert rc == 1
+    assert "no connectors configured" in capsys.readouterr().err
+
+
+@requires_git
+def test_harvest_unknown_connector_is_error(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    target, _ = _setup_harvest_repo(tmp_path)
+    capsys.readouterr()
+    rc = main(["harvest", "--repo", str(target), "--connector", "file:bogus"])
+    assert rc == 1
+    assert "no connector named" in capsys.readouterr().out
+
+
+@requires_git
+def test_harvest_scope_refused_exits_zero_and_writes_nothing(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # A personal source into a team repo is refused (privacy); the run still completes (exit 0).
+    target, _ = _setup_harvest_repo(tmp_path, kind="team", scope="personal")
+    capsys.readouterr()
+    rc = main(["harvest", "--repo", str(target)])
+    assert rc == 0
+    assert "SCOPE REFUSED" in capsys.readouterr().out
+    assert list((target / "_kb" / "inbox").glob("*/*.md")) == []
+
+
+@requires_git
+def test_harvest_malformed_adapters_is_clean_error(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    target, _ = _setup_harvest_repo(tmp_path)
+    ap = target / "adapters.yaml"
+    a = yaml.safe_load(ap.read_text(encoding="utf-8"))
+    a["connectors"] = {"file:demo": {"path": "/tmp/x/MEMORY.md", "scope": "bogus-scope"}}
+    ap.write_text(yaml.safe_dump(a, sort_keys=False), encoding="utf-8")
+    capsys.readouterr()
+    rc = main(["harvest", "--repo", str(target)])
+    assert rc == 1
+    assert "invalid config" in capsys.readouterr().err
+
+
+@requires_git
+def test_doctor_prints_the_connectors_line(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    target, _ = _setup_harvest_repo(tmp_path)
+    capsys.readouterr()
+    main(["doctor", "--repo", str(target)])
+    out = capsys.readouterr().out
+    assert "harvest: enabled (scope_lock=personal)" in out
+    assert "file:demo (scope=personal)" in out
+    assert "proposed=0" in out
