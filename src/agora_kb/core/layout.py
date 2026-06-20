@@ -16,7 +16,12 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
-__all__ = ["RepoLayout", "InvalidWriterError", "validate_writer"]
+__all__ = [
+    "RepoLayout",
+    "InvalidWriterError",
+    "validate_writer",
+    "safe_path_component",
+]
 
 # A writer is a single path component: starts alphanumeric, then alphanumerics plus ._- . No
 # slashes, no leading dot, and ".."/"." are rejected by the leading-alphanumeric anchor. This is
@@ -41,6 +46,18 @@ def validate_writer(writer: str) -> str:
             f"be 1-{_WRITER_MAX} chars, with no path separators or '..'"
         )
     return writer
+
+
+def safe_path_component(value: str) -> str:
+    """Validate ``value`` as a safe single path component (same charset/guards as a writer).
+
+    Reused by the harvester to confine a connector's cursor file to ``_kb/harvest/`` (ADR-0007):
+    a DATA-MODEL §8 connector key like ``file:claude-code`` contains a ``:`` that is not a safe
+    filename, so the caller sanitizes it (``:`` → ``-``) and passes the *derived* stem here to
+    reject any residual path separator / ``..`` before it is interpolated into a path. Raises
+    :class:`InvalidWriterError` on an unsafe component (the same guard the inbox namespace uses).
+    """
+    return validate_writer(value)
 
 
 @dataclass(frozen=True)
@@ -100,6 +117,11 @@ class RepoLayout:
         return self.kb_dir / "failed"
 
     @property
+    def harvest_dir(self) -> Path:
+        """Per-connector harvester cursor directory ``_kb/harvest/`` (ADR-0007, DATA-MODEL §6)."""
+        return self.kb_dir / "harvest"
+
+    @property
     def state_file(self) -> Path:
         return self.kb_dir / "state.json"
 
@@ -115,3 +137,16 @@ class RepoLayout:
     def inbox_item_path(self, writer: str, event_id: str) -> Path:
         """Path of one inbox event ``_kb/inbox/<writer>/<event_id>.md`` (writer validated)."""
         return self.inbox_writer_dir(writer) / f"{event_id}.md"
+
+    # --- harvester cursor addressing ------------------------------------------------------------
+    def harvest_cursor_path(self, connector: str) -> Path:
+        """Path of one connector's cursor ``_kb/harvest/<stem>.json`` (DATA-MODEL §6, ADR-0007).
+
+        ``connector`` is the operator's ``adapters.yaml`` connector key (e.g. ``file:claude-code``),
+        which is NOT a safe filename — DATA-MODEL §8 keys contain a ``:``. The colon is sanitized to
+        ``-`` and the resulting stem is validated as a safe single path component
+        (:func:`safe_path_component`) so a malformed/hostile connector key can never escape
+        ``_kb/harvest/`` (the same path-traversal guard the inbox namespace uses, DESIGN §7).
+        """
+        stem = safe_path_component(connector.replace(":", "-"))
+        return self.harvest_dir / f"{stem}.json"

@@ -31,12 +31,10 @@ curator/              Sleep-time consolidation (one worker per repo).
   cron.py             deterministic cron matcher for `agora watch`
   # Phase 5 (planned, not yet shipped): PR-review mode — curator opens PRs vs direct commit
 
-harvester/            READ adapters: pull from other agents' memory systems → candidates.
-  base.py             Connector protocol (scan since cursor → list[Candidate])
-  connectors/
-    file_connector.py    diff a markdown memory file (Claude/Codex/Hermes) since last hash
-    letta_connector.py   Letta memory blocks via API
-    mem0_connector.py    mem0 store via API
+harvester/            READ adapters: pull from other agents' memory systems → gated candidates (ADR-0007/0017).
+  connectors.py       Connector protocol + FileConnector (segment a markdown memory file, scan since cursor)
+  harvester.py        orchestrator: scope gate (privacy) + §6 cursor + write kind=candidate/confidence=low
+  # Phase 4+ (planned, not yet shipped): letta/mem0 API connectors (DATA-MODEL §8)
 
 ingest/               INPUT adapters: uploads → markdown in raw/.
   base.py             Extractor protocol (bytes|url → markdown + metadata)

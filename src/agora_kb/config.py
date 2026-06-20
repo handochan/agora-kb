@@ -29,6 +29,7 @@ config never widens the closed vocabulary the curator validates against.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 
 import yaml
@@ -46,7 +47,16 @@ __all__ = [
     "write_default_repo_config",
     "write_default_adapters_yaml",
     "load_backend_registry",
+    "HarvestPolicy",
+    "load_harvest_policy",
+    "ConnectorSpec",
+    "load_connector_specs",
 ]
+
+# Harvest scope values (ADR-0007 mechanism 3). Kept as plain strings HERE (not the harvester's
+# Scope enum) so this config seam never imports the harvester package — the harvester imports
+# config, not the reverse, so the dependency stays acyclic. The harvester maps these to its enum.
+_SCOPE_VALUES = ("personal", "team")
 
 # DATA-MODEL §3: the per-repo config lives in the git-ignored operational spool at _kb/repo.yaml.
 _REPO_CONFIG_NAME = "repo.yaml"
@@ -181,6 +191,13 @@ def write_default_repo_config(
                 "idle_minutes": triggers.idle_minutes,
             },
         },
+        # ADR-0007: the memory harvester is OPT-IN and disabled by default. Set enabled: true (and
+        # configure connectors in adapters.yaml) to pull other agents' memory into gated candidates.
+        # scope_lock guards privacy: a personal source may feed ONLY a personal repo (§3).
+        "harvest": {
+            "enabled": False,
+            "scope_lock": "personal",
+        },
     }
     path = repo_config_path(layout)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -230,7 +247,20 @@ def write_default_adapters_yaml(layout: RepoLayout, *, model: str | None = None)
         "default_backend": _DEFAULT_BACKEND,
     }
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(yaml.safe_dump(doc, sort_keys=False, allow_unicode=True), encoding="utf-8")
+    text = yaml.safe_dump(doc, sort_keys=False, allow_unicode=True)
+    # READ adapters — memory harvester connectors (ADR-0007). Emitted COMMENTED-OUT: harvesting is
+    # opt-in (also gated by repo.yaml harvest.enabled), so a fresh repo wires no connector by
+    # default. The BackendRegistry ignores this block; the harvester's loader (load_connector_specs)
+    # reads it. Uncomment + point at a real memory file to start harvesting into gated candidates.
+    text += (
+        "\n# READ adapters — memory harvester connectors (ADR-0007; opt-in, also needs\n"
+        "# repo.yaml harvest.enabled: true). scope guards privacy (personal feeds only a personal\n"
+        "# repo). Uncomment + point at a real memory file to enable harvesting.\n"
+        "# connectors:\n"
+        '#   file:claude-code: { path: "~/.claude/**/MEMORY.md", scope: personal }\n'
+        '#   file:hermes:      { path: "~/.hermes/MEMORY.md",    scope: personal }\n'
+    )
+    path.write_text(text, encoding="utf-8")
     return path
 
 
@@ -247,6 +277,105 @@ def load_backend_registry(path: str | Path) -> BackendRegistry | None:
     if not p.is_file():
         return None
     return BackendRegistry.from_file(p)
+
+
+# --- harvester config (ADR-0007: read adapters) -------------------------------------------------
+
+
+class HarvestPolicy(BaseModel):
+    """The repo's harvest policy, read from ``_kb/repo.yaml`` ``harvest:`` (DATA-MODEL §3).
+
+    A SEPARATE model from :class:`RepoConfig` on purpose: ``RepoConfig`` is the integrity-neutral
+    curator/CLI input and is ``extra='forbid'``; folding harvest policy in would couple the
+    curator's config to an opt-in read-side feature. ``enabled`` defaults to ``False`` (ADR-0007:
+    harvesting is opt-in and disabled by default). ``scope_lock`` is the source-scope the repo
+    accepts (DATA-MODEL §3). ``repo_kind`` is the repo's EXPLICIT ``kind`` (``None`` when
+    absent/omitted) — the fail-closed input to the scope gate: a harvester treats an unknown kind as
+    ``team`` and refuses a personal feed (so a missing/edited ``repo.yaml`` can never silently let
+    personal memory into a team repo, ADR-0007 mechanism 3 / ADR-0017).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    scope_lock: str = "personal"
+    repo_kind: str | None = None
+
+
+def load_harvest_policy(layout: RepoLayout) -> HarvestPolicy:
+    """Load the ``harvest:`` policy from ``_kb/repo.yaml`` (DATA-MODEL §3); defaults when absent.
+
+    Read via the same raw-mapping ``.get()`` path :func:`load_repo_config` uses (NOT by constructing
+    ``RepoConfig`` from the raw dict, which is ``extra='forbid'`` and would reject a ``harvest:``
+    key). A missing file / ``harvest:`` block yields ``enabled=False`` (opt-in default), so harvest
+    fails SAFE — it simply does nothing until the operator explicitly enables it. An explicit but
+    invalid ``harvest.scope_lock`` or repo ``kind`` raises :class:`ConfigError` (a typo in a
+    privacy-relevant policy must surface, never silently take a default).
+    """
+    raw = _read_yaml_mapping(repo_config_path(layout))
+    harvest = _sub_mapping(raw.get("harvest"))
+    enabled = _opt_bool(harvest.get("enabled"), False, key="harvest.enabled")
+    scope_lock = _opt_str(harvest.get("scope_lock")) or "personal"
+    if scope_lock not in _SCOPE_VALUES:
+        raise ConfigError(
+            f"harvest.scope_lock must be one of {list(_SCOPE_VALUES)}, got {scope_lock!r}"
+        )
+    kind = _opt_str(raw.get("kind"))
+    if kind is not None and kind not in _SCOPE_VALUES:
+        raise ConfigError(f"repo kind must be one of {list(_SCOPE_VALUES)}, got {kind!r}")
+    return HarvestPolicy(enabled=enabled, scope_lock=scope_lock, repo_kind=kind)
+
+
+@dataclass(frozen=True)
+class ConnectorSpec:
+    """One READ-adapter entry parsed from ``adapters.yaml`` ``connectors:`` (DATA-MODEL §8).
+
+    A lightweight, behavior-free value (the harvester turns it into a live connector) so this
+    config seam stays free of any harvester import. ``name`` is the connector key (e.g.
+    ``file:claude-code`` — the ``<type>:<agent>`` form). ``scope`` is the validated source scope
+    (``personal`` | ``team``, a plain string here; the harvester maps it to its ``Scope`` enum).
+    ``path`` is the source locator (a glob for a file connector; ``None`` for deferred API
+    connectors).
+    """
+
+    name: str
+    scope: str
+    path: str | None
+
+
+def load_connector_specs(path: str | Path) -> list[ConnectorSpec] | None:
+    """Load the READ-adapter ``connectors:`` block from ``adapters.yaml`` (DATA-MODEL §8).
+
+    Returns ``None`` when the file or the ``connectors:`` block is absent (mirroring
+    :func:`load_backend_registry`'s None-on-absent contract, so the caller surfaces a clear "no
+    connectors configured" note rather than crashing). The existing :class:`BackendRegistry` IGNORES
+    the ``connectors:`` block, so this is the connector family's OWN parser and it owns all
+    validation: a non-mapping block, a non-mapping entry, or an unknown ``scope`` value raises
+    :class:`ConfigError` (FAIL LOUD — operator config is a trust boundary, ADR-0007). An absent
+    per-entry ``scope`` defaults to ``personal`` (the most restrictive scope; it may feed only a
+    personal repo). Commented-out ``letta:`` / ``mem0:`` examples are simply not present after YAML
+    parse and so are tolerated.
+    """
+    p = Path(path)
+    if not p.is_file():
+        return None
+    raw = _read_yaml_mapping(p)
+    conns = raw.get("connectors")
+    if conns is None:
+        return None
+    if not isinstance(conns, dict):
+        raise ConfigError("'connectors' must be a mapping of name → connector spec")
+    specs: list[ConnectorSpec] = []
+    for name, spec in conns.items():
+        if not isinstance(spec, dict):
+            raise ConfigError(f"connector {name!r} must be a mapping of fields")
+        scope = _opt_str(spec.get("scope")) or "personal"
+        if scope not in _SCOPE_VALUES:
+            raise ConfigError(
+                f"connector {name!r}: scope must be one of {list(_SCOPE_VALUES)}, got {scope!r}"
+            )
+        specs.append(ConnectorSpec(name=str(name), scope=scope, path=_opt_str(spec.get("path"))))
+    return specs
 
 
 # --- internals ----------------------------------------------------------------------------------

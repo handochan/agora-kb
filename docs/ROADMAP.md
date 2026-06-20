@@ -33,8 +33,17 @@ Goal: tool-agnostic curator and autonomous accumulation, still single-user.
       (qwen + hermes via Ollama, claude + codex via the CLI shim), all publishing lint-clean, plus
       per-task routing across two of them. (gemini failed cleanly on the test host — an account-tier
       limitation, not a shim defect.)
-- [ ] `harvester` with file connectors (Claude Code memory, Hermes `MEMORY.md`); candidate gate;
-      provenance + loop prevention; personal-repo scope lock.
+- [x] `harvester` with file connectors (Claude Code memory, Hermes `MEMORY.md`); candidate gate;
+      provenance + loop prevention; personal-repo scope lock. Shipped (ADR-0017): `agora harvest`
+      [+ `--dry-run`, `--connector`] over a `FileConnector` that segments a `MEMORY.md` into facts
+      and writes them as gated `kind=candidate`/`confidence=low` inbox items (`source=harvest:<agent>`)
+      for the curator's existing keep/merge/drop gate (the PRIMARY loop break); a fail-closed scope
+      gate keyed on repo `kind` (personal source → personal repo only); a DATA-MODEL §6 cursor with a
+      whole-source fast no-op. Opt-in (`harvest.enabled`, default off); `connectors:` in `adapters.yaml`;
+      `agora doctor` shows the connectors line. **Live-verified** on a real `MEMORY.md` shape
+      (dry-run + real write + unchanged no-op + a team-repo scope refusal). The realistic *reworded*
+      KB→memory→KB loop and team/multi-tenant harvesting are documented residual risks deferred to
+      later phases (ADR-0017); Letta/mem0 API connectors remain Phase-4/5.
 **Exit:** swap the curator brain via config with no data risk; harvested candidates flow safely.
 
 ## Phase 3 — Web face: upload + dashboard

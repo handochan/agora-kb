@@ -147,6 +147,16 @@ Per-connector position, so each scan only emits new/changed facts.
 }
 ```
 
+The cursor is a derived, git-ignored performance optimization (rebuildable from git + `processed/`),
+never an integrity control: a missing/corrupt cursor loads fresh and the scan re-reads from scratch
+(the candidate gate absorbs any re-flood). `last_content_sha256` is the whole-source fast no-op (an
+unchanged file emits nothing); pending-delivery idempotency reuses the inbox `event_key`
+(ADR-0017 §4). **Counter ownership (ADR-0017 §7):** the harvester writes `connector` / `source_path`
+/ `last_scan` / `last_content_sha256` / `proposed`; the curator owns `accepted` / `rejected` from
+plan dispositions at finalize (ADR-0011) — currently **deferred**, so those two stay `0` and
+round-trip untouched until that wiring lands. The connector name is sanitized to a safe filename
+(`file:claude-code` → `file-claude-code.json`, path-traversal-guarded).
+
 ## 7. Provenance & loop prevention
 
 Every wiki note records where its claims came from (`sources:` in note frontmatter, per the KB schema),

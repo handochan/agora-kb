@@ -32,7 +32,10 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from .config import (
+    ConfigError,
     load_backend_registry,
+    load_connector_specs,
+    load_harvest_policy,
     load_repo_config,
     write_default_adapters_yaml,
     write_default_repo_config,
@@ -131,6 +134,25 @@ def build_parser() -> argparse.ArgumentParser:
         help="pin BOTH cognitive acts to this adapters.yaml backend, bypassing routing (ADR-0015)",
     )
     p_curate.set_defaults(func=_cmd_curate)
+
+    # harvest — scan configured memory connectors into gated candidates (ADR-0007; opt-in).
+    p_harvest = sub.add_parser(
+        "harvest",
+        help="scan configured memory connectors into gated candidates (ADR-0007; opt-in)",
+    )
+    p_harvest.add_argument("--repo", default=".", help="repo root (default: .)")
+    p_harvest.add_argument(
+        "--connector",
+        default=None,
+        metavar="NAME",
+        help="scan only this connector (default: all configured connectors)",
+    )
+    p_harvest.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="report what WOULD be harvested without writing to the inbox or advancing any cursor",
+    )
+    p_harvest.set_defaults(func=_cmd_harvest)
 
     # watch — the in-process scheduler loop (cron + threshold + idle).
     p_watch = sub.add_parser(
@@ -431,6 +453,94 @@ def _build_backend(
     )
 
 
+def _cmd_harvest(args: argparse.Namespace) -> int:
+    """``agora harvest``: scan configured memory connectors into gated candidates (ADR-0007).
+
+    The read-side mirror of ``agora curate``. Loads the repo's ``harvest:`` policy (opt-in; a no-op
+    with a clear note when disabled) and the ``adapters.yaml`` ``connectors:`` block, builds the
+    connectors, and runs the :class:`~agora_kb.harvester.Harvester`: each connector is scope-gated
+    (privacy, fail-closed), scanned since its cursor, and its new facts appended to the inbox as
+    ``kind=candidate`` / ``confidence=low`` for the curator's keep/merge/drop gate. ``--dry-run``
+    reports what WOULD be harvested without writing anything (the noise-pollution preview);
+    ``--connector NAME`` restricts the run to one connector. A malformed config or an unsupported
+    connector type is a clean error (exit 1), as is any per-connector scan error.
+    """
+    from .harvester import Harvester, build_connectors
+    from .harvester.connectors import ConnectorError
+
+    layout = RepoLayout(Path(args.repo))
+    now = datetime.now(UTC)
+    try:
+        policy = load_harvest_policy(layout)
+        repo_name = load_repo_config(layout).name
+        specs = load_connector_specs(layout.root / "adapters.yaml")
+    except ConfigError as exc:
+        print(f"{_PROG} harvest: invalid config — {exc}", file=sys.stderr)
+        return 1
+
+    print(f"repo: {layout.root}")
+    if not policy.enabled:
+        print("harvest: disabled (set harvest.enabled: true in _kb/repo.yaml — ADR-0007)")
+        return 0
+    if not specs:
+        print(
+            f"harvest: no connectors configured — add a 'connectors:' block to "
+            f"{layout.root / 'adapters.yaml'} (DATA-MODEL §8).",
+            file=sys.stderr,
+        )
+        return 1
+
+    try:
+        connectors = build_connectors(specs)
+    except (ConnectorError, ValueError) as exc:
+        print(f"{_PROG} harvest: {exc}", file=sys.stderr)
+        return 1
+
+    report = Harvester(layout).run(
+        connectors,
+        policy=policy,
+        repo_name=repo_name,
+        now=now,
+        dry_run=args.dry_run,
+        only=args.connector,
+    )
+
+    if args.connector is not None and not report.connectors:
+        print(
+            f"harvest: no connector named {args.connector!r} (have: {[c.name for c in connectors]})"
+        )
+        return 1
+
+    mode = " [dry-run]" if args.dry_run else ""
+    print(f"harvest{mode}: scope_lock={policy.scope_lock} connectors={len(report.connectors)}")
+    had_error = False
+    for cr in report.connectors:
+        if cr.status == "scope-refused":
+            print(f"  {cr.name} (scope={cr.scope}): SCOPE REFUSED — {cr.message}")
+        elif cr.status == "error":
+            had_error = True
+            print(f"  {cr.name} (scope={cr.scope}): ERROR — {cr.message}")
+        elif cr.status == "unchanged":
+            print(f"  {cr.name} (scope={cr.scope}): unchanged (source hash matches last scan)")
+        elif args.dry_run:
+            print(f"  {cr.name} (scope={cr.scope}): would harvest {cr.facts_found} fact(s)")
+            for fact in cr.preview:
+                preview = " ".join(fact.text.split())
+                if len(preview) > 100:
+                    preview = preview[:100].rstrip() + "…"
+                print(f"      [{fact.fact_key[:12]}] {preview}")
+        else:
+            print(
+                f"  {cr.name} (scope={cr.scope}): found={cr.facts_found} "
+                f"written={cr.written} deduped={cr.deduped}"
+            )
+        for note in cr.notes:
+            print(f"      - {note}")
+    if not args.dry_run:
+        print(f"total candidates written: {report.total_written}")
+    return 1 if had_error else 0
+
+
 def _cmd_watch(args: argparse.Namespace) -> int:
     """``agora watch``: the in-process curator scheduler (DESIGN §4 — cron + threshold + idle).
 
@@ -580,8 +690,55 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
     # only; never affects the health verdict.
     _doctor_routing(layout, load_repo_config(layout).default_backend)
 
+    # ADR-0007: observability — the harvester policy + configured connectors with cursor state.
+    # Reporting only; never affects the health verdict and never crashes on malformed config.
+    _doctor_connectors(layout)
+
     print(f"status: {'healthy' if ok else 'unhealthy'}")
     return 0 if ok else 1
+
+
+def _doctor_connectors(layout: RepoLayout) -> None:
+    """Print the ADR-0007 harvest policy + configured connectors with per-connector cursor state.
+
+    Observability only — never affects the health verdict and never crashes: an unreadable
+    ``repo.yaml`` / ``adapters.yaml`` is noted (``agora harvest`` surfaces the real config error
+    loudly). Shows whether harvesting is enabled, the ``scope_lock``, and for each connector its
+    scope and cursor (last scan + the §6 ``proposed`` / ``accepted`` / ``rejected`` counters — the
+    latter two are curator-owned and remain 0 until that wiring lands, ADR-0017).
+    """
+    from .harvester import CursorStore
+
+    try:
+        policy = load_harvest_policy(layout)
+    except Exception as exc:  # noqa: BLE001 — doctor must never crash on a malformed repo.yaml.
+        print(f"  harvest: repo.yaml present but unreadable ({exc})")
+        return
+    print(
+        f"  harvest: {'enabled' if policy.enabled else 'disabled'} (scope_lock={policy.scope_lock})"
+    )
+
+    try:
+        specs = load_connector_specs(layout.root / "adapters.yaml")
+    except Exception as exc:  # noqa: BLE001 — doctor must never crash on a malformed adapters.yaml.
+        print(f"  connectors: adapters.yaml present but unreadable ({exc})")
+        return
+    if not specs:
+        print("  connectors: none configured")
+        return
+
+    store = CursorStore(layout)
+    for spec in specs:
+        try:
+            cursor = store.load(spec.name)
+            last = _fmt_dt(cursor.last_scan)
+            counters = (
+                f"last_scan={last} proposed={cursor.proposed} "
+                f"accepted={cursor.accepted} rejected={cursor.rejected}"
+            )
+        except Exception as exc:  # noqa: BLE001 — a bad connector name must not crash doctor.
+            counters = f"cursor unreadable ({exc})"
+        print(f"    {spec.name} (scope={spec.scope}): {counters}")
 
 
 def _doctor_routing(layout: RepoLayout, default_backend: str | None = None) -> None:
