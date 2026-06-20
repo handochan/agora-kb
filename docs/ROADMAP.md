@@ -39,7 +39,8 @@ Goal: tool-agnostic curator and autonomous accumulation, still single-user.
       and writes them as gated `kind=candidate`/`confidence=low` inbox items (`source=harvest:<agent>`)
       for the curator's existing keep/merge/drop gate (the PRIMARY loop break); a fail-closed scope
       gate keyed on repo `kind` (personal source → personal repo only); a DATA-MODEL §6 cursor with a
-      whole-source fast no-op. Opt-in (`harvest.enabled`, default off); `connectors:` in `adapters.yaml`;
+      whole-source fast no-op (the harvester writes `proposed`; the curator-owned `accepted`/`rejected`
+      counters are deferred — ADR-0017 §7). Opt-in (`harvest.enabled`, default off); `connectors:` in `adapters.yaml`;
       `agora doctor` shows the connectors line. **Live-verified** on a real `MEMORY.md` shape
       (dry-run + real write + unchanged no-op + a team-repo scope refusal). Opt-in **link-following**
       (ADR-0018) then shipped: a `follow_links` connector follows a pointer bullet's

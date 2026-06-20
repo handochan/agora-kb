@@ -62,34 +62,27 @@ git_remote: https://forgejo.internal/agora/engineering.git
 review_mode: direct | pr                    # curator commits directly, or opens PRs
 curator:
   backend: qwen                             # default write-adapter (see adapters.yaml)
-  routing:                                  # optional per-task brain routing + PRE-PLAN signals
-    bulk_daily: qwen
-    hard_merge: claude
-    ambiguity_band: { low: 0.35, high: 0.70 } # PRE-PLAN: route by related/ top-hit score band
-    top2_delta: 0.10                        # PRE-PLAN: route to a stronger brain when top-2 scores are close
-    contradiction_regex:                    # PRE-PLAN: signals that may indicate a contested merge
-      - "(?i)\\bbut\\b|\\bhowever\\b|\\bcontrary\\b"
-  limits:                                   # deterministic caps that bound the local context window (ADR-0011 §1.3)
-    body_byte_bound: 8192                   # max bytes a PASS-2 sentinel body region may write
-    related_k: 8                            # top-k existing notes pre-fetched per candidate
-    related_excerpt_bytes: 512              # per-hit excerpt budget (deterministic head-truncation)
-    max_candidates_per_run: 32              # FIFO claim cap so a run never overflows context
-    max_augmentation_regions: 4             # max MERGE_INTO_THEME augmentation sub-regions per run
-  lint:
-    max_orphans: 0                          # lint fails if derived orphan count exceeds this bound
   max_attempts: 3                           # per-event retry budget before move to failed/ (ADR-0011 §5.1)
+  allow_reduced_isolation: false            # ADR-0013 fail-closed opt-in (see below)
   triggers:
     cron: "0 3 * * *"                       # 03:00 daily
     threshold: 10                           # consolidate when inbox depth ≥ 10
     idle_minutes: 30                        # or after 30 min of no writes with backlog > 0
-health:                                     # derived-health thresholds (orphan/stale computed at read time, C1)
-  stale_days: 90                            # a note whose updated is older than this is DERIVED stale
-  stub_max_runs: 5                          # a stub un-promoted after this many runs is flagged
-  max_note_bytes: 262144                    # soft cap on a single note's size
-harvest:
+harvest:                                    # ADR-0007 — opt-in; disabled by default
   enabled: true
   scope_lock: personal                      # personal sources may only feed a personal repo
 ```
+
+**Per-task brain routing** is configured in `adapters.yaml` (`routing: {plan, author}`, ADR-0015 —
+see §8), NOT in `repo.yaml`. The earlier `curator.routing` PRE-PLAN-signal design
+(`ambiguity_band`/`top2_delta`/`contradiction_regex`) and per-op keys were **not adopted** in v1
+(per-op / per-tier routing reserved as future work).
+
+What `load_repo_config` actually parses today: `name`, `kind`, `domains`/`schema_version` (taxonomy),
+and under `curator:` only `backend`, `max_attempts`, `allow_reduced_isolation`, and `triggers`; plus
+the `harvest:` block (`enabled`, `scope_lock`). Any other keys (e.g. a forward-looking
+`curator.limits` / `curator.lint` / top-level `health` from the ADR-0011 design) are **silently
+ignored** — they are not yet wired, so they neither take effect nor break loading.
 
 ## 4. Curator state — `_kb/state.json`
 

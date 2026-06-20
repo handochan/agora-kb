@@ -36,6 +36,16 @@ repo's `AGENTS.md`/`SCHEMA.md` under an `INGEST` section.
   body/MOC/index graph-link grammar this contract specifies — D3 moves those links from `[[basename]]`
   to standard markdown links `[Title](relative.md)` (refining ADR-0010 L1-2/L1-6); frontmatter
   `related:`/`children:` stay `[[basename]]`.
+- [ADR-0015 — Per-task brain routing](adr/0015-per-task-brain-routing.md): **supersedes the §7.1
+  routing design.** The shipped routing is a static optional `routing: {plan, author}` map in
+  `adapters.yaml` resolved per cognitive act; the PRE-PLAN escalation heuristic below was NOT adopted.
+- [ADR-0016 — CLI agents as text-generator brains](adr/0016-cli-agent-brains-as-text-generators.md):
+  the generic `agora-cli-brain` shim — any headless CLI agent is a swappable backend.
+- [ADR-0017 — Harvester file-connector mechanics](adr/0017-harvester-file-connector-mechanics.md):
+  realizes the harvester cursor (DATA-MODEL §6) + candidate gating referenced in §0/§4.3/§5/§6, and
+  records that the curator-side `accepted`/`rejected` cursor counters are **deferred** (§7 below).
+- [ADR-0018 — Harvester link-following](adr/0018-harvester-link-following.md): opt-in following of a
+  candidate's `[Title](sibling.md)` pointer.
 
 ---
 ## 0. Where INGEST sits in the transactional loop (ADR-0008 step 5, expanded)
@@ -49,7 +59,7 @@ build BUNDLE (git-ignored) under processing/<run-id>/bundle/                    
   ─ regenerate wiki_index.json from worktree markdown @ base_commit (never cached) [§1] │
 create temp git worktree @ base_commit ; append `_agora_scratch/` to its .gitignore     │
   ─ sandbox: no network, no creds, worktree = only writable mount (ADR-0008 §2)         │
-route PLAN backend on PRE-PLAN signals per repo.yaml curator.routing               [§7] │
+resolve PLAN/AUTHOR backend per adapters.yaml routing:{plan,author} (ADR-0015)     [§7.1]│
                                                                                         ┘
   PASS 1 PLAN   : backend reads bundle, writes ONLY _agora_scratch/plan.json (no edits) ┐ DELEGATED
   validate PLAN  (closed vocab, coverage, taxonomy, basename, paths, gate, prov)   [§4.1]│ deterministic
@@ -63,7 +73,7 @@ append ONE structured entry to log.md (worker only; AFTER §4.2/§4.4 pass-or-de
 git commit worktree (one commit/run) ; compare-and-swap curated ref base→new            │
   (or open PR if review_mode=pr) ; record published_runs[run_id]=sha ; phase=published   │
 move events processing/ → processed/<date>/  (or failed/ + error record)                │
-update state.json counters + harvester cursors from plan dispositions ; phase=finalized │
+update state.json counters from dispositions (harvester cursor accepted/rejected DEFERRED) ; finalized │
 drop worktree ; release lock                                                            ┘
 ```
 
@@ -362,8 +372,10 @@ runs with an explicit atomicity boundary:
    CAS success is the single durable source of truth for "published".**
 3. record `published_runs[run_id]=sha` + rewrite `state.json` (atomic, under the lock); set
    `run.json.phase=published`;
-4. move events to `processed/<date>/`; update `state.json.counters` + harvester cursors
-   (`proposed/accepted/rejected`, DATA-MODEL §6) from plan dispositions; set `run.json.phase=finalized`;
+4. move events to `processed/<date>/`; update `state.json.counters` from plan dispositions (the
+   contracted harvester-cursor `accepted/rejected` update from dispositions, DATA-MODEL §6, is
+   **DEFERRED in Phase 2 — ADR-0017 §7;** the worker does not yet touch any cursor); set
+   `run.json.phase=finalized`;
 5. drop the worktree; release the lock.
 
 A crash between any two steps is recoverable from git: `published_runs` and `state.json` are rebuildable from
@@ -473,10 +485,15 @@ For any candidate with `is_gated == true` (`kind=candidate` OR `confidence=low`,
   check 9 rejects any plan that violates this — structural enforcement, not trust.
 - Kept-via-merge regions are tagged `origin: harvest:<agent>` by the worker (loop prevention); the candidate
   `confidence` is recorded so lint/dashboard surface low-confidence and contested regions for human review.
-- Harvester cursor counters (`proposed/accepted/rejected`) are updated DETERMINISTICALLY from the plan
-  dispositions, never self-reported by the backend.
-- Scope-lock (personal source → personal repo only, ADR-0007 §3) is enforced at the core WRITE boundary
-  BEFORE the inbox; the curator never re-checks tenancy.
+- Harvester cursor counters: the harvester writes `proposed`; the curator-owned `accepted`/`rejected`
+  counters are contracted to be updated DETERMINISTICALLY from the plan dispositions at finalize, but
+  are **DEFERRED in Phase 2 (ADR-0017 §7)** — the worker does not yet touch any cursor, so they
+  round-trip at 0 (rebuildable from git + `processed/`). Never self-reported by the backend.
+- Scope-lock (personal source → personal repo only, ADR-0007 §3) is enforced in Phase 2 as a
+  **fail-closed harvester pre-write gate** keyed on the repo's declared `kind` (`check_scope`, before
+  the inbox write), NOT yet at the core write boundary (a caller building a harvester/Inbox against the
+  wrong layout would bypass it); true core-boundary enforcement is deferred to Phase 4 (ADR-0017 §6).
+  The curator never re-checks tenancy.
 
 All captured AND harvested content is treated as untrusted (prompt-injection / memory-poisoning): the prompts
 harden against embedded instructions (§8) and the integrity boundary (validation) does not depend on the
@@ -496,8 +513,8 @@ capped:<N>`), keeping the taxonomy a fixed input to every run.
 **Deterministic code (worker) owns — never delegated:** trigger eval (cron/threshold/idle); `flock` acquire;
 FIFO claim → processing + manifest; tier-1 claim-time event_key dedup under the lock; tier-2 content_sha256
 dedup + provenance union (manifest universe); bundle build incl. core.read `related/` and the per-run rebuild
-of `wiki_index.json` from base_commit; sandbox/worktree setup + `_agora_scratch/` gitignore; PRE-PLAN routing
-heuristic (§7.1); backend invocation (argv/stdin, no shell); plan parse + ALL of §4.1; ALL structural APPLY
+of `wiki_index.json` from base_commit; sandbox/worktree setup + `_agora_scratch/` gitignore; per-act backend
+resolution (adapters.yaml `routing:{plan,author}`, §7.1); backend invocation (argv/stdin, no shell); plan parse + ALL of §4.1; ALL structural APPLY
 (§3: files, basenames via full-tree re-scan, frontmatter, `sources:` union, links, MOC, index, contested
 callout+frontmatter §2.1, daily sections §3.1, candidate_id-keyed sentinels, `origin` tags); AUTHOR diff
 validation (§4.2) + stray-link stripping (§4.6); deterministic LINT (§4.4); `log.md` append (after §4.2/§4.4
@@ -515,20 +532,20 @@ self-sandboxes (DATA-MODEL §8); `log.md` append-only + single-writer (ADR-0002)
 it (after validation) and the ref CAS; markdown+git remains source of truth; tenant isolation untouched
 (worktree is this repo only).
 
-### 7.1 ROUTING (`repo.yaml curator.routing`) — PRE-PLAN signals ONLY
-Per-RUN, decided BEFORE PASS 1 from deterministic signals available pre-PLAN (i.e. from `related/<cand-id>.json`
-and candidate text only — NO "chosen-vs-alternative" data, which does not yet exist). The run escalates the
-WHOLE PLAN pass to the stronger backend iff ANY candidate satisfies:
-- `max related score ∈ [ambiguity_band.low, ambiguity_band.high]` (merge-vs-create ambiguity); OR
-- `top-2 related scores within top2_delta` (ties); OR
-- candidate `text` matches the fixed `contradiction_regex` list (lexical negation/contradiction cues, e.g.
-  `\bnot\b`, `\bno longer\b`, `\binstead of\b`, `\bcontradicts\b`, `\bdeprecated\b`).
+### 7.1 ROUTING (`adapters.yaml routing: {plan, author}`) — static per-act, ADR-0015 (shipped)
+The shipped routing is a **static, optional per-act map** in `adapters.yaml` (a sibling of
+`backends:`/`default_backend:`), NOT a `repo.yaml` PRE-PLAN heuristic. The routable acts are the
+**closed set `{plan, author}`** — exactly the two methods a brain is invoked for (PASS 1 = `plan`,
+PASS 2 = `author`). `BackendRegistry.resolve(act)` picks the brain with precedence
+`--backend` override > `routing[act]` > `repo.yaml curator.backend` > `adapters.yaml default_backend`;
+`RoutedBackend` then delegates each act to its routed brain and `worker.run` is **unchanged**
+(routing chooses *which* brain runs an act, never how its output is validated — the integrity boundary
+is identical). An unknown act key or a value naming an undefined backend is a hard config error.
 
-Otherwise the bulk PLAN + all AUTHOR passes run on free local Qwen. These three are the ONLY routing inputs.
-`repo.yaml curator.routing` gains `ambiguity_band {low,high}`, `top2_delta`, and `contradiction_regex[]` keys
-alongside the existing `bulk_daily`/`hard_merge` backend names; defaults are pinned there and tuned during
-dogfooding. The contract/validator are identical for any backend; no escalation disposition is added (closed
-vocabulary preserved).
+> The earlier PRE-PLAN escalation design (`repo.yaml curator.routing` with
+> `ambiguity_band`/`top2_delta`/`contradiction_regex`, per-op `bulk_daily`/`hard_merge` keys) was
+> **NOT adopted** — per-op / per-tier routing is reserved as future work (ADR-0015). Those keys are
+> not parsed by `load_repo_config`.
 
 ---
 ## 8. QWEN PROMPT TEMPLATES (local, zero-cost; short, enumerated, example-anchored)
@@ -645,8 +662,10 @@ from `git log` + `processed/`.
   input = body text only (frontmatter excluded), UTF-8 NFC, LF newlines, trailing whitespace stripped per
   line, single trailing newline; hash = sha256 of those bytes. This makes tier-2 reproducible across
   writers/platforms.
-- **DATA-MODEL §3 (repo.yaml)**: add `curator.limits` (§1.3), `curator.routing` PRE-PLAN keys (§7.1),
-  `curator.lint.max_orphans` (§4.4), `curator.max_attempts` (§5.1).
+- **DATA-MODEL §3 (repo.yaml)**: `curator.max_attempts` (§5.1) is wired. `curator.limits` (§1.3) and
+  `curator.lint.max_orphans` (§4.4) remain forward-looking design — documented but NOT yet parsed by
+  `load_repo_config` (silently ignored if present). The `curator.routing` PRE-PLAN keys (§7.1) were
+  **superseded** by the shipped static `adapters.yaml routing: {plan, author}` (ADR-0015).
 - **ADR-0008 consequences (one line)**: assert NO amendment is needed — `_agora_scratch/` is inside the
   worktree mount (so "worktree is the only writable mount" holds verbatim) and is git-ignored in the
   worktree's own `.gitignore` written by the worker before invocation; symlink rejection is diff-scoped
@@ -675,5 +694,6 @@ from `git log` + `processed/`.
 | note body prose | **backend (PASS 2)** | `worktree/wiki/**` (candidate_id sentinel regions) | yes | the delegated prose; graded by §4.2 |
 | `log.md` append | worker (after §4.2/§4.4 only) | `worktree/log.md` | yes | append-only action log, single-writer |
 | commit + ref CAS | worker | git | — | atomic publish; CAS is the durable publish point (ADR-0002/0008) |
-| `state.json`, harvester cursors | worker | `_kb/` | no | counters/idempotency, rebuildable from git + processed/ |
+| `state.json` | worker | `_kb/` | no | counters/idempotency, rebuildable from git + processed/ |
+| harvester cursor (`proposed`) | harvester | `_kb/harvest/<connector>.json` | no | scan position; the worker-owned `accepted/rejected` update is DEFERRED (ADR-0017 §7) |
 | `lint` result | worker (§4.4) | in-memory | — | deterministic, same code path as dashboard (DESIGN §5.3) / ADR-0010 L1 |

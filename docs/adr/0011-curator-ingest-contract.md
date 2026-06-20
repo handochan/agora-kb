@@ -1,6 +1,6 @@
 # ADR-0011 — Curator INGEST contract (plan-apply-author)
 
-**Status:** Accepted · 2026-06-13
+**Status:** Accepted · 2026-06-13 · **§7.1 routing superseded by [ADR-0015](0015-per-task-brain-routing.md)**
 
 ## Context
 The transactional curator loop (ADR-0008) delegates exactly one cognitive step — INGEST — to a
@@ -494,6 +494,12 @@ model in the loop). Backend writes only the worktree (ADR-0008); validation is m
 backend self-sandboxes (DATA-MODEL §8); `log.md` stays append-only + single-writer (ADR-0002) since only
 the worker writes it (after validation) and the ref CAS; markdown+git remains source of truth; tenant
 isolation is untouched (worktree is this repo only).
+
+> **Superseded by [ADR-0015](0015-per-task-brain-routing.md) (2026-06-20).** The §7.1 PRE-PLAN
+> escalation heuristic below was NOT adopted; the shipped routing is a static optional
+> `routing: {plan, author}` map in `adapters.yaml` resolved per cognitive act. This section is kept
+> as the historical design record (append-only). See the living contract in
+> [INGEST-CONTRACT.md](../INGEST-CONTRACT.md) §7.1.
 
 **§7.1 Routing (`repo.yaml curator.routing`) — PRE-PLAN signals ONLY.** Decided per-RUN, BEFORE PASS 1,
 from deterministic signals available pre-PLAN (i.e. from `related/<cand-id>.json` and candidate text only —

@@ -17,11 +17,11 @@ Format: lightweight [MADR](https://adr.github.io/madr/)-style.
 | [0008](0008-transactional-sandboxed-curation.md) | Transactional, sandboxed curator runs | Accepted |
 | [0009](0009-deterministic-query-contract.md) | Deterministic query contract; synthesis is optional | Accepted |
 | [0010](0010-kb-wiki-schema.md) | KB wiki schema v1 (emitted AGENTS.md/SCHEMA.md) | Accepted · amended by 0014 |
-| [0011](0011-curator-ingest-contract.md) | Curator INGEST contract (plan-apply-author) | Accepted |
+| [0011](0011-curator-ingest-contract.md) | Curator INGEST contract (plan-apply-author) | Accepted · §7.1 routing superseded by 0015 |
 | [0012](0012-deterministic-query-ranking.md) | Deterministic query ranking for core.wiki | Accepted |
 | [0013](0013-curator-sandbox-mechanism.md) | Curator sandbox mechanism (macOS Seatbelt + cross-platform) | Accepted |
 | [0014](0014-okf-obsidian-interoperability.md) | OKF + Obsidian interoperability (strict producer / tolerant consumer) | Accepted |
 | [0015](0015-per-task-brain-routing.md) | Per-task curator brain routing (`plan`/`author` via `adapters.yaml`) | Accepted |
 | [0016](0016-cli-agent-brains-as-text-generators.md) | Headless CLI agents as curator brains (text-generator shim) | Accepted |
-| [0017](0017-harvester-file-connector-mechanics.md) | Harvester file-connector mechanics (segmentation / cursor / loop / scope) | Accepted · realizes 0007 |
+| [0017](0017-harvester-file-connector-mechanics.md) | Harvester file-connector mechanics (segmentation / cursor / loop / scope) | Accepted · realizes 0007 · §2 superseded by 0018 |
 | [0018](0018-harvester-link-following.md) | Harvester file-connector link-following (opt-in; follow `[Title](sibling.md)`) | Accepted · supersedes 0017 §2 |

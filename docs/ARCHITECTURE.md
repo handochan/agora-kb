@@ -5,9 +5,10 @@ conceptual model; this doc maps it to modules and runtime processes.
 
 ## 1. Module map (`src/agora_kb/`)
 
-> **Phase 1 ships:** `core/`, `curator/` (incl. `isolation/`), `ingest/vault_import.py`,
-> `faces/mcp_server.py`, `schema/`, `cli.py`, `config.py`. The `harvester/`, `faces/web/`, and
-> `auth/` packages below are later-phase (Phase 2–5) stubs, shown here for the full target map.
+> **Phases 1–2 ship:** `core/`, `curator/` (incl. `isolation/` + the `backends` registry with per-act
+> routing), `adapters/` (the curator-brain shims), `harvester/` (file connectors), `ingest/vault_import.py`,
+> `faces/mcp_server.py`, `schema/`, `cli.py`, `config.py`. The `ingest/extractors/`, `faces/web/`, and
+> `auth/` packages below are later-phase (Phase 3–5) stubs, shown here for the full target map.
 
 ```
 core/                 The single internal API. Everything else is a face or adapter over this.
@@ -23,18 +24,27 @@ curator/              Sleep-time consolidation (one worker per repo).
   plan.py             candidate gate + consolidation plan (keep/merge/drop, schema-validated)
   apply.py            apply the validated plan to the worktree; allowlisted-diff enforcement
   bundle.py           assemble the curated change set for publish
-  backends.py         WRITE adapters: registry of agent "brains" from adapters.yaml (headless CLIs)
-  subprocess_backend.py  default headless-CLI brain runner (Qwen/Ollama, temp=0 deterministic)
+  backends.py         WRITE-adapter registry: agent "brains" from adapters.yaml + per-act
+                      `plan`/`author` routing (ADR-0015), no-shell argv invocation primitive
+  subprocess_backend.py  generic no-shell brain runner (SubprocessBackend) — shells the configured
+                      adapters.yaml brain argv over stdin for PASS-1 plan + PASS-2 author; RoutedBackend
+                      dispatches each act to its routed brain (ADR-0015)
   isolation/          OS sandbox for the backend (ADR-0013): seatbelt (macOS) · bwrap (Linux)
                       · restricted (fallback) · selftest (`agora doctor`); profiles/
   triggers.py         cron / threshold / idle trigger logic
   cron.py             deterministic cron matcher for `agora watch`
   # Phase 5 (planned, not yet shipped): PR-review mode — curator opens PRs vs direct commit
 
-harvester/            READ adapters: pull from other agents' memory systems → gated candidates (ADR-0007/0017).
-  connectors.py       Connector protocol + FileConnector (segment a markdown memory file, scan since cursor)
-  harvester.py        orchestrator: scope gate (privacy) + §6 cursor + write kind=candidate/confidence=low
-  # Phase 4+ (planned, not yet shipped): letta/mem0 API connectors (DATA-MODEL §8)
+adapters/             WRITE-adapter brain shims invoked via the adapters.yaml argv.
+  ollama_brain.py     `agora-ollama-brain`: default local Qwen via Ollama (two-pass plan+author)
+  cli_agent_brain.py  `agora-cli-brain` (ADR-0016): drives ANY headless CLI agent (claude/codex/…)
+                      as a pure text generator; the CLI argv follows a `--` separator
+
+harvester/            READ adapters: pull from other agents' memory systems → gated candidates (ADR-0007/0017/0018).
+  connectors.py       Connector protocol + FileConnector (segment a markdown memory file, scan since
+                      cursor, opt-in link-following — ADR-0018)
+  harvester.py        orchestrator: fail-closed scope gate (privacy) + §6 cursor + write kind=candidate/confidence=low
+  # Phase 5 (planned, not yet shipped): letta/mem0 API connectors (DATA-MODEL §8)
 
 ingest/               INPUT adapters: uploads → markdown in raw/.
   base.py             Extractor protocol (bytes|url → markdown + metadata)
@@ -57,8 +67,8 @@ schema/               KB wiki schema emitted into each knowledge repo.
   notes.py            note-type helpers (index/moc/theme/daily) + link resolution
   templates/kb_schema.md   the AGENTS.md schema template
 
-cli.py                `agora` entry point: repo init · import · status · curate · watch · serve · doctor
-config.py             load config (adapters.yaml, repo.yaml, triggers)
+cli.py                `agora` entry point: repo init · import · status · curate · harvest · watch · serve · doctor
+config.py             load config (adapters.yaml backends/routing + connectors, repo.yaml, triggers, harvest policy)
 ```
 
 Dependency rule: **faces and adapters depend on `core`; `core` depends on nothing above it.**
@@ -104,8 +114,9 @@ web upload (file/url/text) → ingest extractor → markdown
 
 ### 3.3 Harvest — pull candidates
 ```
-harvester (scheduled) → connector.scan(since cursor)
-  └─ for each new/changed memory fact:
+harvester (agora harvest) → for each connector:
+  ├─ check_scope (HARD pre-write gate: personal source → personal repo only, fail-closed)
+  └─ connector.scan(since cursor) → for each new/changed memory fact:
        core.write(target=<scope-bound repo>, item{source=harvest:<agent>, kind=candidate, confidence=low})
 ```
 

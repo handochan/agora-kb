@@ -4,11 +4,13 @@
 > Plain-markdown knowledge that many agents and people write to, that **organizes itself**,
 > and that any MCP-speaking tool can read and contribute to.
 
-**Status:** **Phase 1 (Personal MVP) shipped** — a local markdown KB with capture (`kb_remember`),
-deterministic navigation query (`kb_query`), and a scheduled local-model curator (`kb_curate`),
-exposed over an MCP stdio face and the `agora` CLI. Phases 2–5 (pluggable-brains/harvester,
-web/upload, multi-tenant, governance) are still ahead; see [`docs/ROADMAP.md`](docs/ROADMAP.md).
-Package/distribution name: `agora-kb`.
+**Status:** **Phases 1–2 shipped** — a local markdown KB with capture (`kb_remember`), deterministic
+navigation query (`kb_query`), and a scheduled curator (`kb_curate`), exposed over an MCP stdio face
+and the `agora` CLI. The curator's brain is **pluggable/swappable via `adapters.yaml`** (a local
+Ollama model or any headless CLI agent) with per-act `plan`/`author` routing (ADR-0015/0016), and an
+opt-in **harvester** pulls other agents' on-disk memory into gated candidates (`agora harvest`,
+ADR-0007). Phases 3–5 (web/upload, multi-tenant, governance) are still ahead; see
+[`docs/ROADMAP.md`](docs/ROADMAP.md). Package/distribution name: `agora-kb`.
 
 ---
 
@@ -52,9 +54,9 @@ pluggable — any headless CLI agent + any model (default: a local open-weight m
 - **Repo = tenant boundary.** Team repos and personal repos are equal citizens, hard-isolated,
   with role- and (optionally) domain-level access control.
 
-## Quickstart (Phase 1 — local, no cloud, no auth)
+## Quickstart (local, no cloud, no auth)
 
-Phase 1 runs entirely on your machine: a local markdown repo, a local model (Qwen via Ollama by
+Runs entirely on your machine: a local markdown repo, a local model (Qwen via Ollama by
 default), zero cloud, zero auth. Requires **Python 3.12+** and [`uv`](https://docs.astral.sh/uv/).
 
 ```bash
@@ -88,6 +90,14 @@ The loop: an agent calls **`kb_remember`** to capture a fact (it lands in the ap
 get cited evidence back. You can drive the same loop from the CLI without an agent —
 `agora status` (inbox depth + curator state), `agora curate` (one consolidation run), and
 `agora watch` (scheduler loop: cron + threshold + idle triggers).
+
+**Phase 2 (pluggable brains + harvester).** To swap the curator's brain, add a `default_backend`
+(and optional `routing: {plan, author}`) to `adapters.yaml` and run `agora curate --backend NAME`
+(ADR-0015); any headless CLI agent can be a brain via `agora-cli-brain` (ADR-0016). To pull another
+agent's on-disk memory (e.g. `~/.claude/**/MEMORY.md`) into the inbox as gated low-confidence
+candidates, declare a `connectors:` block in `adapters.yaml`, enable `harvest.enabled` in
+`_kb/repo.yaml`, then preview with `agora harvest --dry-run` and run `agora harvest` (ADR-0007/0018).
+`agora doctor` prints the routing table and the configured connectors.
 
 ## Documentation
 
