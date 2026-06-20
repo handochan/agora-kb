@@ -22,3 +22,4 @@ Format: lightweight [MADR](https://adr.github.io/madr/)-style.
 | [0013](0013-curator-sandbox-mechanism.md) | Curator sandbox mechanism (macOS Seatbelt + cross-platform) | Accepted |
 | [0014](0014-okf-obsidian-interoperability.md) | OKF + Obsidian interoperability (strict producer / tolerant consumer) | Accepted |
 | [0015](0015-per-task-brain-routing.md) | Per-task curator brain routing (`plan`/`author` via `adapters.yaml`) | Accepted |
+| [0016](0016-cli-agent-brains-as-text-generators.md) | Headless CLI agents as curator brains (text-generator shim) | Accepted |

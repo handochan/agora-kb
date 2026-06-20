@@ -39,6 +39,7 @@ dev = [
 [project.scripts]
 agora = "agora_kb.cli:main"
 agora-ollama-brain = "agora_kb.adapters.ollama_brain:main"
+agora-cli-brain = "agora_kb.adapters.cli_agent_brain:main"
 
 [build-system]
 requires = ["hatchling"]
