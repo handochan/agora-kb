@@ -105,6 +105,8 @@ repo's own `AGENTS.md`/`SCHEMA.md`, tool-agnostic via symlinks `CLAUDE.md`/`QWEN
     processing/<run-id>/               atomically claimed immutable items + run manifest
     processed/<date>/                  consolidated items (audit trail)
     failed/                            terminal failures + separate error records
+    harvest/<connector>.json           per-connector harvester cursor (last scan, hash, proposed;
+                                       DATA-MODEL §6, ADR-0007)
     state.json                         curator state: counters, last_run, published runs
     curator.lock                       flock held during a consolidation run
 ```
@@ -183,21 +185,31 @@ Scope is filtered by access control — a viewer sees only their teams/personal 
 The mirror of the curator: **read adapters** that periodically scan other agents' memory systems and
 propose candidate knowledge.
 
+> **Status (Phase 2, shipped — ADR-0007/0017/0018).** Implemented and CLI-exposed via
+> `agora harvest [--dry-run] [--connector NAME]` over a `FileConnector` (the only Phase-2 connector).
+> Opt-in: disabled unless `harvest.enabled` is set in `_kb/repo.yaml`, with `connectors:` declared in
+> `adapters.yaml`; `agora doctor` lists the configured connectors. Opt-in **link-following** follows a
+> pointer bullet's `[Title](sibling.md)` to harvest the sibling's content (ADR-0018). The API
+> connectors (Letta, mem0) remain Phase 5.
+
 ```
 agent memory sources                          candidate flow
 ─────────────────────                          ──────────────
-Claude Code  ~/.claude/.../MEMORY.md  (file)   diff vs cursor → new/changed only
-Codex        ~/.codex                 (file)   → inbox item:
-Hermes       ~/.hermes/MEMORY.md      (file)      source=harvest:<agent>, kind=candidate,
+Claude Code  ~/.claude/**/MEMORY.md   (file)   diff vs cursor → new/changed only
+Hermes       ~/.hermes/MEMORY.md      (file)   → inbox item:
+(any MEMORY.md-shaped markdown glob)              source=harvest:<agent>, kind=candidate,
 Letta        memory blocks            (API)       confidence=low
 mem0         vector store             (API)   → curator review gate: keep / merge / drop
 ```
+
+The FileConnector accepts any `MEMORY.md`-shaped markdown path/glob; `file:claude-code` and
+`file:hermes` are the examples emitted in the default `adapters.yaml`. Letta/mem0 are Phase-5 stubs.
 
 Three safety mechanisms are mandatory (without them this feature poisons the base):
 
 | Risk | Mitigation |
 |---|---|
-| **Feedback loop** (KB → agent memory → harvest → KB …) | provenance tags (`harvest:<agent>`) + origin marking; never re-harvest KB-originated facts |
+| **Feedback loop** (KB → agent memory → harvest → KB …) | provenance tags (`harvest:<agent>`) + origin marking; a best-effort, verbatim-only origin-marker skip avoids re-harvesting unchanged KB-originated facts. The candidate gate (below) is the *primary* loop break; the reworded KB→memory→KB loop is a documented residual risk (ADR-0017) |
 | **Noise pollution** | harvested items are `kind=candidate` / `confidence=low` → must pass the curator review gate before promotion to `wiki/`; never written directly |
 | **Privacy leakage** | scope enforcement: a personal agent-memory source feeds **only** the personal repo, never a team repo; team harvest requires explicitly-designated team sources; consent-based |
 

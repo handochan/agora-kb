@@ -40,24 +40,39 @@ edits the shared wiki. Repo = tenant boundary. See [`docs/ARCHITECTURE.md`](docs
 ```
 src/agora_kb/
   core/        single internal API: inbox(write) · wiki(read) · repo/tenant · state
-  curator/     sleep-time consolidation worker + backends + triggers + isolation/ (OS sandbox)
+  curator/     sleep-time consolidation worker + backends (BackendRegistry, per-act plan/author
+               routing — ADR-0015) + triggers + isolation/ (OS sandbox)
+  adapters/    curator-brain shims invoked via adapters.yaml argv: ollama_brain.py
+               (agora-ollama-brain, local Qwen) + cli_agent_brain.py (agora-cli-brain — any
+               headless CLI agent as a pure text-gen brain, ADR-0016)
+  harvester/   read adapters: connectors.py (Connector Protocol + FileConnector, opt-in
+               link-following) + harvester.py (orchestrator, scope gate, cursor) — pull other
+               agents' memory → gated candidates (ADR-0007/0017/0018)
   ingest/      input adapters: vault_import.py (Obsidian/markdown vault normalizer)
   faces/       mcp_server.py (the MCP face — agents)
   schema/      the KB wiki schema (AGENTS.md template emitted into each knowledge repo) + lint
-  config.py    load config (adapters.yaml, repo.yaml, triggers)
-  cli.py       `agora` entry point (repo init · import · status · curate · watch · serve · doctor)
+  config.py    load config (adapters.yaml, repo.yaml, triggers + harvest policy + connector specs)
+  cli.py       `agora` entry point
+               (repo init · import · status · curate · harvest · watch · serve · doctor)
   # --- not yet implemented (later phases) ---
-  harvester/   (Phase 2+ — stub) read adapters: pull from other agents' memory → candidates
   faces/web/   (Phase 3+ — stub) FastAPI app: upload, search, dashboard
   auth/        (Phase 4+ — stub) authn/authz (tokens, OpenFGA/Forgejo delegation)
 docs/          DESIGN, ARCHITECTURE, DATA-MODEL, ROADMAP, INGEST-CONTRACT, adr/
 ```
 
 ## Where to start (current phase)
-The repo has **shipped Phase 1** (Personal MVP): the **core API**, the `agora` CLI, the **MCP face**
-(four tools — `kb_remember` / `kb_query` / `kb_status` / `kb_curate`), the local-model curator
-(Qwen via Ollama) with the ADR-0013 OS sandbox, `ingest/vault_import.py`, and the wiki schema are all
-implemented, tested, and dogfooded on a real `~/knowledge` Obsidian vault (see
-[`docs/ROADMAP.md`](docs/ROADMAP.md) Phase 1). Current work is **Phase 2** — a pluggable-brains
-registry from `adapters.yaml` plus the harvester. Auth, web, and multi-tenancy remain deferred to
-Phases 3–5.
+The repo has **shipped Phases 1 and 2**.
+
+**Phase 1** (Personal MVP): the **core API**, the `agora` CLI, the **MCP face** (four tools —
+`kb_remember` / `kb_query` / `kb_status` / `kb_curate`), the local-model curator (Qwen via Ollama)
+with the ADR-0013 OS sandbox, `ingest/vault_import.py`, and the wiki schema — all tested and
+dogfooded on a real `~/knowledge` Obsidian vault.
+
+**Phase 2** (pluggable brains + harvester): the `curator.backends` `BackendRegistry` from
+`adapters.yaml` with per-act `plan`/`author` routing (ADR-0015), the generic `agora-cli-brain`
+CLI-agent shim (ADR-0016), and the opt-in **harvester** with file connectors, the candidate gate,
+provenance, fail-closed scope lock, and link-following (ADR-0007/0017/0018) — surfaced via
+`agora harvest`, `agora curate --backend`, and the `agora doctor` routing/connectors tables.
+
+Next is **Phase 3** (ingest extractors + web/dashboard); see [`docs/ROADMAP.md`](docs/ROADMAP.md).
+Auth and multi-tenancy remain deferred to Phases 4–5.

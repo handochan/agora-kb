@@ -4,7 +4,8 @@
 
 Depends on ADR-0004 (pluggable adapters — the swappable write-adapter brain) and ADR-0008/ADR-0011
 (the deterministic transaction + INGEST contract that grade a brain's output); extends DATA-MODEL §8
-(`adapters.yaml`).
+(`adapters.yaml`). **Supersedes ADR-0011 §7.1** (the PRE-PLAN escalation routing heuristic, not
+adopted) with this static per-act `routing: {plan, author}` design.
 
 ## Context
 ADR-0004 makes the curator's brain a swappable write adapter and explicitly allows **per-task
