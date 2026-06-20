@@ -24,3 +24,4 @@ Format: lightweight [MADR](https://adr.github.io/madr/)-style.
 | [0015](0015-per-task-brain-routing.md) | Per-task curator brain routing (`plan`/`author` via `adapters.yaml`) | Accepted |
 | [0016](0016-cli-agent-brains-as-text-generators.md) | Headless CLI agents as curator brains (text-generator shim) | Accepted |
 | [0017](0017-harvester-file-connector-mechanics.md) | Harvester file-connector mechanics (segmentation / cursor / loop / scope) | Accepted · realizes 0007 |
+| [0018](0018-harvester-link-following.md) | Harvester file-connector link-following (opt-in; follow `[Title](sibling.md)`) | Accepted · supersedes 0017 §2 |

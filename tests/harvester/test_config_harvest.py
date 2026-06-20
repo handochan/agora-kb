@@ -160,3 +160,42 @@ def test_default_adapters_yaml_has_no_active_connectors(tmp_path: Path) -> None:
     assert load_connector_specs(path) is None
     # ...and the commented example is present for the operator to uncomment.
     assert "# connectors:" in path.read_text(encoding="utf-8")
+
+
+# --- follow_links (ADR-0018) --------------------------------------------------------------------
+
+
+def test_connector_specs_follow_links_default_false(tmp_path: Path) -> None:
+    lo = _layout(tmp_path)
+    p = _write_adapters(
+        lo,
+        "backends:\n  qwen: { argv: [x] }\ndefault_backend: qwen\n"
+        "connectors:\n  file:x: { path: /m/MEMORY.md, scope: personal }\n",
+    )
+    specs = load_connector_specs(p)
+    assert specs is not None
+    assert specs[0].follow_links is False
+
+
+def test_connector_specs_follow_links_true(tmp_path: Path) -> None:
+    lo = _layout(tmp_path)
+    p = _write_adapters(
+        lo,
+        "backends:\n  qwen: { argv: [x] }\ndefault_backend: qwen\n"
+        "connectors:\n  file:x: { path: /m/MEMORY.md, scope: personal, follow_links: true }\n",
+    )
+    specs = load_connector_specs(p)
+    assert specs is not None
+    assert specs[0].follow_links is True
+
+
+def test_connector_specs_follow_links_non_bool_raises(tmp_path: Path) -> None:
+    # A string "true" must FAIL LOUD, not truthy-coerce (a read-surface flag, ADR-0018).
+    lo = _layout(tmp_path)
+    p = _write_adapters(
+        lo,
+        "backends:\n  qwen: { argv: [x] }\ndefault_backend: qwen\n"
+        'connectors:\n  file:x: { path: /m/MEMORY.md, scope: personal, follow_links: "true" }\n',
+    )
+    with pytest.raises(ConfigError):
+        load_connector_specs(p)

@@ -204,7 +204,12 @@ def build_connectors(specs: list[ConnectorSpec]) -> list[Connector]:
     for spec in specs:
         if spec.name.startswith("file:"):
             connectors.append(
-                FileConnector(name=spec.name, path=spec.path or "", scope=Scope(spec.scope))
+                FileConnector(
+                    name=spec.name,
+                    path=spec.path or "",
+                    scope=Scope(spec.scope),
+                    follow_links=spec.follow_links,
+                )
             )
         else:
             raise ConnectorError(

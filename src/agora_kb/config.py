@@ -255,10 +255,12 @@ def write_default_adapters_yaml(layout: RepoLayout, *, model: str | None = None)
     text += (
         "\n# READ adapters — memory harvester connectors (ADR-0007; opt-in, also needs\n"
         "# repo.yaml harvest.enabled: true). scope guards privacy (personal feeds only a personal\n"
-        "# repo). Uncomment + point at a real memory file to enable harvesting.\n"
+        "# repo). follow_links (ADR-0018, default off) follows a bullet's [Title](sibling.md)\n"
+        "# and harvests the sibling's content instead of the thin one-line summary.\n"
+        "# Uncomment + point at a real memory file to enable harvesting.\n"
         "# connectors:\n"
         '#   file:claude-code: { path: "~/.claude/**/MEMORY.md", scope: personal }\n'
-        '#   file:hermes:      { path: "~/.hermes/MEMORY.md",    scope: personal }\n'
+        '#   file:hermes: { path: "~/.hermes/MEMORY.md", scope: personal, follow_links: true }\n'
     )
     path.write_text(text, encoding="utf-8")
     return path
@@ -341,6 +343,7 @@ class ConnectorSpec:
     name: str
     scope: str
     path: str | None
+    follow_links: bool = False
 
 
 def load_connector_specs(path: str | Path) -> list[ConnectorSpec] | None:
@@ -374,7 +377,19 @@ def load_connector_specs(path: str | Path) -> list[ConnectorSpec] | None:
             raise ConfigError(
                 f"connector {name!r}: scope must be one of {list(_SCOPE_VALUES)}, got {scope!r}"
             )
-        specs.append(ConnectorSpec(name=str(name), scope=scope, path=_opt_str(spec.get("path"))))
+        # follow_links (ADR-0018) is opt-in; fail LOUD on a non-bool (e.g. the string "true") rather
+        # than truthy-coercing it — a privacy/read-surface flag must never silently misread.
+        follow_links = _opt_bool(
+            spec.get("follow_links"), False, key=f"connector {name!r}: follow_links"
+        )
+        specs.append(
+            ConnectorSpec(
+                name=str(name),
+                scope=scope,
+                path=_opt_str(spec.get("path")),
+                follow_links=follow_links,
+            )
+        )
     return specs
 
 
