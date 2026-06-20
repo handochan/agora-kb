@@ -169,6 +169,9 @@ backends:
   codex:  { argv: ["codex", "exec"], cwd: "{worktree}", prompt: stdin, sandbox: strict }
   hermes: { argv: ["hermes", "chat"], cwd: "{worktree}", prompt: stdin, sandbox: strict }
 default_backend: qwen
+routing:                 # OPTIONAL per-act routing (ADR-0015); omit → default_backend everywhere
+  plan:   qwen           # PASS-1 plan() brain
+  author: claude         # PASS-2 author() brain
 
 # INPUT adapters — upload extractors by mime/scheme.
 extractors:
@@ -188,6 +191,13 @@ The exact argv is backend/version-specific and validated by the adapter. The reg
 array rather than a shell command, and prompt data travels over stdin or a read-only file. Backend
 adapters receive no shell, network, git credentials, or writable paths outside the temporary worktree.
 Deterministic validation remains mandatory even when the backend advertises its own sandbox.
+
+The optional `routing` map (ADR-0015) pins a brain per cognitive act — the closed set `plan`
+(PASS-1) and `author` (PASS-2), the only two points a brain is invoked. An omitted act or an absent
+block falls back to `default_backend`; routing to an unknown act or an undefined backend is a hard
+config error. Routing only chooses *which* brain runs an act, never how its output is validated, so
+the deterministic integrity boundary is unchanged (`plan` and `author` may use different brains, even
+with different `network` postures).
 
 ## 9. Query result
 

@@ -40,19 +40,31 @@ import re
 import shutil
 import sys
 import tempfile
+from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from .apply import body_sentinels
-from .backends import BackendResult, BackendSpec, run_backend
-from .isolation import BackendIsolation, build_sandbox_spec, scrub_env
+from .backends import BackendRegistry, BackendResult, BackendSpec, run_backend
+from .isolation import (
+    BackendIsolation,
+    SandboxUnavailable,
+    build_sandbox_spec,
+    scrub_env,
+    select_backend_isolation,
+)
 
 if TYPE_CHECKING:
     # Typing-only import to avoid the runtime cycle: worker imports BackendUnavailableError from
-    # this module, so AuthorRegion (defined in worker) is pulled in only for annotations.
-    from .worker import AuthorRegion
+    # this module, so AuthorRegion / Backend (defined in worker) are pulled in only for annotations.
+    from .worker import AuthorRegion, Backend
 
-__all__ = ["SubprocessBackend", "BackendUnavailableError"]
+__all__ = [
+    "SubprocessBackend",
+    "RoutedBackend",
+    "build_routed_backend",
+    "BackendUnavailableError",
+]
 
 # A generous default per-invocation wall clock for a local model (overridden by spec.timeout_s when
 # the adapter pins one). Kept here so a hung backend cannot wedge a run indefinitely.
@@ -406,3 +418,108 @@ def fill_sentinel_region(text: str, candidate_id: str, prose: str) -> str:
         return text
     region_start = si + len(start)
     return f"{text[:region_start]}\n{prose}\n{text[ei:]}"
+
+
+class RoutedBackend:
+    """A :class:`agora_kb.curator.worker.Backend` that dispatches each act to its own brain.
+
+    ADR-0015 per-act routing: PASS-1 :meth:`plan` delegates to the ``plan``-routed backend and
+    PASS-2 :meth:`author` to the ``author``-routed backend. Each delegate is an ordinary,
+    fully-formed :class:`SubprocessBackend` (its own ``adapters.yaml`` spec and its own injected
+    ADR-0013 isolation), so the worker's deterministic integrity gates (ADR-0011 §4) and per-spec
+    confinement are reused UNCHANGED per delegate. ``worker.run`` calls :meth:`plan`/:meth:`author`
+    exactly as for a single backend and never learns it is routing — routing only chooses WHICH
+    brain runs each act, never how that act's output is validated (the integrity boundary is
+    identical either way).
+    """
+
+    def __init__(self, *, plan_backend: Backend, author_backend: Backend) -> None:
+        self._plan = plan_backend
+        self._author = author_backend
+
+    def plan(self, bundle_dir: Path) -> str:
+        return self._plan.plan(bundle_dir)
+
+    def author(
+        self,
+        worktree: Path,
+        needs_prose: dict[str, list[str]],
+        context: dict[str, AuthorRegion],
+    ) -> None:
+        self._author.author(worktree, needs_prose, context)
+
+
+def build_routed_backend(
+    registry: BackendRegistry,
+    *,
+    allow_reduced_isolation: bool = False,
+    default_backend: str | None = None,
+    override: str | None = None,
+    report: Callable[[str], None] | None = None,
+) -> RoutedBackend | SubprocessBackend | None:
+    """Build the curator backend for a run, honoring ADR-0015 per-act ``routing``.
+
+    The single, face-agnostic constructor shared by the CLI (``agora curate`` / ``watch``) and the
+    MCP face so the two cannot drift (the historical duplication risk). It:
+
+    - resolves the ``plan`` and ``author`` acts to their :class:`BackendSpec` via
+      :meth:`BackendRegistry.resolve` with precedence ``routing[act]`` → ``default_backend`` (the
+      repo's default brain, ``repo.yaml`` ``curator.backend``, which the faces pass through so an
+      unrouted act keeps honoring it) → the registry's own default — or, when ``override`` is given,
+      pins BOTH acts to that named backend, bypassing ``routing`` and ``default_backend`` (the
+      deterministic operator escape hatch behind ``agora curate --backend NAME``);
+    - builds each distinct spec into a :class:`SubprocessBackend`, selecting an ADR-0013 isolation
+      adapter ONLY for a ``network: 'none'`` spec (per-act: ``plan`` and ``author`` may differ);
+    - returns a plain :class:`SubprocessBackend` when both acts resolve to the SAME spec (the
+      no-routing / single-brain path — byte-for-byte today's object), else a :class:`RoutedBackend`.
+
+    Returns ``None`` (after calling ``report`` with a clear message, if provided) when the override
+    names an unknown backend, or when a ``network: 'none'`` act has no usable OS sandbox and
+    ``allow_reduced_isolation`` is ``False`` (fail-closed rather than run unconfined). ``report``
+    is a sink the caller wires to its own channel (CLI → stderr; the MCP face passes ``None`` to
+    stay silent). The "no backend configured" (absent ``adapters.yaml``) case is handled by the
+    caller BEFORE this builder, which has no registry to pass.
+    """
+
+    def _emit(message: str) -> None:
+        if report is not None:
+            report(message)
+
+    def _build_one(spec: BackendSpec, act_label: str) -> SubprocessBackend | None:
+        isolation: BackendIsolation | None = None
+        if spec.network == "none":
+            try:
+                isolation = select_backend_isolation(
+                    allow_reduced_isolation=allow_reduced_isolation
+                )
+            except SandboxUnavailable as exc:
+                _emit(
+                    f"backend {spec.name!r} ({act_label}) is sandboxed (network: none) but no "
+                    f"usable OS sandbox is available: {exc}"
+                )
+                return None
+        return SubprocessBackend(spec, isolation=isolation)
+
+    try:
+        if override is not None:
+            # --backend NAME pins BOTH acts, bypassing routing and the repo default brain.
+            plan_spec = author_spec = registry.get(override)
+        else:
+            plan_spec = registry.resolve("plan", default=default_backend)
+            author_spec = registry.resolve("author", default=default_backend)
+    except KeyError as exc:
+        # An unknown --backend NAME, or a repo.yaml curator.backend naming no defined brain.
+        _emit(str(exc.args[0]) if exc.args else str(exc))
+        return None
+
+    if plan_spec is author_spec:
+        # No routing (or both acts on one brain): today's single-backend object, exactly.
+        return _build_one(plan_spec, "backend")
+
+    plan_backend = _build_one(plan_spec, "plan")
+    if plan_backend is None:
+        return None
+    author_backend = _build_one(author_spec, "author")
+    if author_backend is None:
+        return None
+    return RoutedBackend(plan_backend=plan_backend, author_backend=author_backend)

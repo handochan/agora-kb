@@ -30,6 +30,7 @@ from agora_kb.core.state import StateStore
 from agora_kb.curator.apply import body_sentinels, region_sentinel_id
 from agora_kb.curator.claim import curator_lock
 from agora_kb.curator.manifest import RunManifest, manifest_path, read_manifest, write_manifest
+from agora_kb.curator.subprocess_backend import RoutedBackend
 from agora_kb.curator.worker import (
     AuthorRegion,
     Backend,
@@ -230,6 +231,70 @@ def test_happy_path_publishes_theme_advances_ref_and_finalizes(tmp_path: Path) -
     manifest = read_manifest(manifest_path(layout, report.run_id))
     assert manifest.phase == "finalized"
     assert manifest.published_commit == new_tip
+
+
+def test_routed_backend_runs_plan_and_author_on_distinct_brains(tmp_path: Path) -> None:
+    """ADR-0015: a :class:`RoutedBackend` runs PASS-1 on the ``plan`` brain and PASS-2 on the
+    ``author`` brain, and the worker publishes EXACTLY as for a single backend — proving routing is
+    integrity-neutral (``worker.run`` never learns it is routing). The ``author`` brain carries a
+    POISON plan with no dispositions; that the theme is still published, with the author brain's
+    prose in its sentinel, proves ``plan()`` ran on the plan brain and ``author()`` on the author
+    brain (had the acts been swapped, the empty plan would create no theme / the prose would be
+    missing).
+    """
+    repo = _init_repo(tmp_path)
+    layout = repo.layout
+    inbox = Inbox(layout)
+
+    e1 = _write_capture(inbox, text="One curator advances the branch under a lock.", second=10)
+    e2 = _write_capture(inbox, text="The inbox is append-only and per-writer.", second=11)
+    _seed_raw(repo, e1, e2)
+
+    plan = json.dumps(
+        {
+            "schema_version": 1,
+            "run_id": "ignored",
+            "finished": True,
+            "dispositions": [
+                {
+                    "candidate_id": "c1",
+                    "event_ids": [e1],
+                    "op": "CREATE_THEME",
+                    "domain": "ai-tech",
+                    "basename": "curator-concurrency",
+                    "title": "Curator concurrency model",
+                    "summary": "One curator advances the curated branch under a per-repo lock.",
+                    "status": "active",
+                    "tags": ["curator", "concurrency"],
+                    "aliases": [],
+                    "links": [],
+                    "needs_prose": True,
+                    "reason": "New concept.",
+                },
+                {
+                    "candidate_id": "c2",
+                    "event_ids": [e2],
+                    "op": "DROP",
+                    "needs_prose": False,
+                    "reason": "Redundant for this run.",
+                },
+            ],
+        }
+    )
+    poison = json.dumps({"schema_version": 1, "run_id": "x", "finished": True, "dispositions": []})
+    sid = region_sentinel_id("ignored", "c1")
+    plan_brain = FakeBackend(plan, prose={})  # plans the theme; writes no prose
+    author_brain = FakeBackend(poison, prose={sid: "Prose authored by the dedicated author brain."})
+    backend = RoutedBackend(plan_backend=plan_brain, author_backend=author_brain)
+
+    report = _run(repo, backend)
+
+    assert report.status == "published"
+    with repo.worktree(at=report.published_commit) as published:
+        theme = published / "wiki" / "ai-tech" / "themes" / "curator-concurrency.md"
+        assert theme.is_file()  # the PLAN brain's plan created it
+        # the AUTHOR brain filled the sentinel (not the plan brain, whose prose dict is empty)
+        assert "Prose authored by the dedicated author brain." in theme.read_text(encoding="utf-8")
 
 
 # --- (1b) read-after-publish: the owner working copy is synced to the published tip -------------

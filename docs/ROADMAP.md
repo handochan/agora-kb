@@ -28,7 +28,8 @@ with path/anchor citations; injected or failed backend output cannot modify the 
 ## Phase 2 — Pluggable brains + harvester (current/next)
 Goal: tool-agnostic curator and autonomous accumulation, still single-user.
 - [ ] `curator.backends` registry from `adapters.yaml`; verify ≥3 brains (qwen, claude, hermes) +
-      per-task routing.
+      per-task routing. (Per-act `plan`/`author` routing **shipped** — ADR-0015; live ≥3-brain
+      verification still pending.)
 - [ ] `harvester` with file connectors (Claude Code memory, Hermes `MEMORY.md`); candidate gate;
       provenance + loop prevention; personal-repo scope lock.
 **Exit:** swap the curator brain via config with no data risk; harvested candidates flow safely.
