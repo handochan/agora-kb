@@ -520,9 +520,29 @@ def render_note_body(body: str, *, notes: list[dict[str, object]] | None = None)
     """
     from markdown_it import MarkdownIt
 
-    rewritten = _rewrite_wiki_links(body, notes=notes or [])
-    md = MarkdownIt("commonmark", {"html": False, "linkify": False})
+    # Strip the curator's internal body-region markers BEFORE rendering: with html=False markdown-it
+    # would otherwise escape them into VISIBLE text in the note (they are an AUTHOR-pass transaction
+    # mechanism, not content). breaks=True renders a single newline as <br> so the curator's prose
+    # (long unwrapped lines, one section/bullet per line) reads line-by-line instead of collapsing
+    # consecutive lines into one run-on paragraph (CommonMark's default soft-break-as-space).
+    rewritten = _rewrite_wiki_links(_strip_body_sentinels(body), notes=notes or [])
+    md = MarkdownIt("commonmark", {"html": False, "linkify": False, "breaks": True})
     return md.render(rewritten)
+
+
+# The curator's per-region body markers (INGEST contract): `<!-- agora:body:start id=<id> -->` …
+# `<!-- agora:body:end id=<id> -->`. Internal transaction mechanism — never shown to a reader.
+_BODY_SENTINEL_RE = re.compile(r"[ \t]*<!--\s*agora:body:(?:start|end)\b[^>]*-->[ \t]*")
+
+
+def _strip_body_sentinels(body: str) -> str:
+    """Remove the `<!-- agora:body:start/end id=… -->` region markers from a note body for display.
+
+    They are internal curator markers, not content; leaving them in would (under markdown-it
+    html=False) render as escaped, visible text. Removing them and trimming leaves the prose; any
+    resulting blank lines collapse to a single paragraph break in markdown.
+    """
+    return _BODY_SENTINEL_RE.sub("", body).strip()
 
 
 def _rewrite_wiki_links(body: str, *, notes: list[dict[str, object]]) -> str:
