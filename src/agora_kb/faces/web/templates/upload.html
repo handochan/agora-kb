@@ -1,0 +1,52 @@
+{% extends "base.html" %}
+{% block title %}Capture — Agora{% endblock %}
+{% block content %}
+<h1>Capture knowledge</h1>
+<p class="muted">
+  Upload a file (PDF / Office doc), point at a URL, or paste text. Agora extracts it to markdown,
+  appends it to the inbox, and the curator makes it searchable on its next run.
+</p>
+
+<form hx-post="/upload" hx-target="#capture-receipt" hx-encoding="multipart/form-data" hx-swap="innerHTML">
+  <div class="field">
+    <label for="file">File</label>
+    <input type="file" id="file" name="file">
+    <p class="hint">PDF, .docx, .xlsx, or .pptx — extracted to markdown (the original binary is not stored verbatim yet; ADR-0020).</p>
+  </div>
+
+  <div class="or-divider">— or —</div>
+
+  <div class="field">
+    <label for="url">URL</label>
+    <input type="url" id="url" name="url" placeholder="https://example.com/article" autocomplete="off">
+    <p class="hint">The page is fetched server-side and the readable content extracted.</p>
+  </div>
+
+  <div class="or-divider">— or —</div>
+
+  <div class="field">
+    <label for="text">Text</label>
+    <textarea id="text" name="text" placeholder="Paste a note, snippet, or finding…"></textarea>
+  </div>
+
+  <div class="field">
+    <label for="domain">Domain (optional)</label>
+    <select id="domain" name="domain">
+      <option value="">(let the curator decide)</option>
+      {% for domain in browse.domains %}
+        <option value="{{ domain }}">{{ domain }}</option>
+      {% endfor %}
+    </select>
+  </div>
+
+  <div class="field">
+    <label for="tags">Tags (optional)</label>
+    <input type="text" id="tags" name="tags" placeholder="kebab-case, comma-separated" autocomplete="off">
+    <p class="hint">e.g. <span class="mono">single-writer, inbox</span></p>
+  </div>
+
+  <button type="submit">Capture</button>
+</form>
+
+<div id="capture-receipt" aria-live="polite"></div>
+{% endblock %}

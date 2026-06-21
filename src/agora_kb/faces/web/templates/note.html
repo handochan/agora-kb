@@ -1,0 +1,30 @@
+{% extends "base.html" %}
+{% block title %}{% if note %}{{ note.title }}{% else %}Note not found{% endif %} — Agora{% endblock %}
+{% block content %}
+{% if note %}
+  <p class="muted"><a href="/">&larr; Browse</a></p>
+  <article class="note">
+    <header class="fm-header">
+      <h1>{{ note.title }}</h1>
+      <p class="muted mono">
+        {{ note.rel_path }}
+        {% if note.status %}<span class="badge-status">{{ note.status }}</span>{% endif %}
+        {% if note.domain %}· {{ note.domain }}{% endif %}
+      </p>
+      {% if note.tags %}
+        <div class="tags">
+          {% for tag in note.tags %}<span class="tag">{{ tag }}</span>{% endfor %}
+        </div>
+      {% endif %}
+    </header>
+    {# body_html is produced by markdown-it-py with html=False (raw HTML disabled), so embedded
+       <script>/<img onerror=…> in (untrusted) note content is ESCAPED, not executed. Marked safe
+       only because it was rendered by the XSS-safe renderer, never from raw frontmatter/body. #}
+    <div class="body">{{ body_html | safe }}</div>
+  </article>
+{% else %}
+  <h1>Note not found</h1>
+  <p class="empty">No tracked note at <span class="mono">{{ rel_path }}</span>.</p>
+  <p><a href="/">&larr; Back to browse</a></p>
+{% endif %}
+{% endblock %}

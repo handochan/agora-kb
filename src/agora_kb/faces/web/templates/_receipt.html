@@ -1,0 +1,18 @@
+{# Upload-receipt fragment (HTMX swap). Shows the queued receipt + the eventual-consistency note. #}
+{% if receipt %}
+  <div class="receipt" role="status">
+    <strong>Captured.</strong>
+    <span class="id">id {{ receipt.id }}</span>
+    {% if not receipt.queued %}<span class="muted">(already queued — idempotent re-delivery)</span>{% endif %}
+    <p class="eventual">
+      Queued to the inbox (depth now {{ receipt.inbox_depth }}). It will be searchable
+      <em>after the next curator run</em> — capture is fire-and-forget, the wiki is eventually
+      consistent (DESIGN §2.2).
+    </p>
+  </div>
+{% else %}
+  <div class="receipt error" role="alert">
+    <strong>Capture failed{% if status_code %} ({{ status_code }}){% endif %}.</strong>
+    <p class="eventual">{{ error }}</p>
+  </div>
+{% endif %}

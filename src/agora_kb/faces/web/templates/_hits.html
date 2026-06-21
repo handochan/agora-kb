@@ -1,0 +1,26 @@
+{# Search-results fragment (HTMX target swap). Autoescaped: hit fields are untrusted content. #}
+{% if result.status == "ok" and result.hits %}
+  <p class="muted">{{ result.hits | length }} result(s) for “{{ result.query }}”.</p>
+  <ul class="hits">
+    {% for hit in result.hits %}
+      <li class="hit">
+        <div class="head">
+          <a href="/note/{{ hit.path }}{% if hit.anchor %}#{{ hit.anchor }}{% endif %}" class="path">
+            {{ hit.path }}{% if hit.anchor %}#{{ hit.anchor }}{% endif %}
+          </a>
+          <span class="score">score {{ "%.3f"|format(hit.score) }}</span>
+        </div>
+        <p class="excerpt">{{ hit.excerpt }}</p>
+        <span class="reason">{{ hit.match_reason }}</span>
+      </li>
+    {% endfor %}
+  </ul>
+{% else %}
+  <p class="empty">
+    {% if result.query and result.query.strip() %}
+      No evidence found for “{{ result.query }}”. Try different terms — search is lexical, not semantic.
+    {% else %}
+      Enter a query to search the wiki.
+    {% endif %}
+  </p>
+{% endif %}

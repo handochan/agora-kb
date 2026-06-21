@@ -330,7 +330,10 @@ def _run_locked(
         # Parse the live tree ONCE and derive BOTH registries: the all-basenames set (CREATE
         # uniqueness + LINK resolvability grade against this) and the THEME-only subset (MERGE/
         # CONTEST targets grade against this, mirroring apply._resolve_target_path theme_only).
-        notes = parse_all_notes(wt_layout)
+        # strict=True: a malformed note in the live tree is integrity-critical here (the basename /
+        # theme registries grade the model's plan), so surface it loudly rather than silently
+        # building an incomplete registry. The browse read path uses the tolerant default instead.
+        notes = parse_all_notes(wt_layout, strict=True)
         live_basenames = {n.basename for n in notes}
         theme_basenames = {n.basename for n in notes if _is_theme_note(n)}
 

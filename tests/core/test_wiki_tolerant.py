@@ -76,17 +76,23 @@ def test_lint_does_not_crash_on_adversarial_vault(tmp_path: Path) -> None:
 
 
 def test_parse_all_notes_does_not_crash_on_adversarial_vault(tmp_path: Path) -> None:
-    """``parse_all_notes`` (the bundle/lint substrate) raises only the typed FrontmatterError.
+    """``parse_all_notes`` is a TOLERANT consumer by default and raises only the typed error strict.
 
-    It is fail-fast by design (it raises on the FIRST malformed note), but the error is the typed
-    ``FrontmatterError`` its callers already handle — never an uncaught ``UnicodeDecodeError`` /
-    ``yaml.YAMLError`` leaking out of the consumer path.
+    Default (the browse/read substrate): NEVER raises — a fenceless / malformed note degrades to
+    empty frontmatter + full body, so the read path stays up (ADR-0014 D1). ``strict=True`` (the
+    producer lint / curator grading substrate): raises only the typed ``FrontmatterError`` its
+    callers already handle — never an uncaught ``UnicodeDecodeError`` / ``yaml.YAMLError`` leaking
+    out of the consumer path.
     """
     from agora_kb.core.frontmatter import FrontmatterError
 
     root = _adversarial_vault(tmp_path)
+    # Tolerant default: every note (incl. the no-closing-fence c.md) parses without raising.
+    notes = parse_all_notes(RepoLayout(root))
+    assert any(n.rel_path.endswith("c.md") for n in notes)
+    # strict=True: fail-fast, but only the typed, caller-handled FrontmatterError.
     try:
-        parse_all_notes(RepoLayout(root))
+        parse_all_notes(RepoLayout(root), strict=True)
     except FrontmatterError:
         pass  # acceptable: the typed, caller-handled error
 

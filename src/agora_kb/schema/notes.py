@@ -164,14 +164,19 @@ def _iter_note_paths(layout: RepoLayout) -> list[Path]:
     return sorted(kept, key=lambda p: p.relative_to(root).as_posix())
 
 
-def parse_all_notes(layout: RepoLayout) -> list[Note]:
+def parse_all_notes(layout: RepoLayout, *, strict: bool = False) -> list[Note]:
     """Parse every wiki note in ``layout`` into :class:`Note` objects, in deterministic path order.
 
     Scans ``index.md`` and ``wiki/**/*.md`` (the schema doc ``AGENTS.md`` / ``SCHEMA.md`` and its
     ``CLAUDE.md`` / ``QWEN.md`` / ``GEMINI.md`` symlinks are EXCLUDED — they are parse-exempt,
-    ADR-0010 §1). Files that do not open with a well-formed frontmatter fence raise
-    :class:`agora_kb.core.frontmatter.FrontmatterError`, surfacing a malformed note rather than
-    silently dropping it. The returned list is sorted by POSIX relative path.
+    ADR-0010 §1). The returned list is sorted by POSIX relative path.
+
+    By default this is a **tolerant** read (ADR-0014 D1 tolerant-consumer / strict-producer): a note
+    that does not open with a well-formed frontmatter fence is parsed with empty frontmatter and its
+    full text as ``body`` — mirroring :func:`agora_kb.core.wiki._parse_note`, so one fenceless /
+    foreign note can never crash a read path (the browse face, ADR-0019). Pass ``strict=True`` to
+    re-raise :class:`agora_kb.core.frontmatter.FrontmatterError` (with the offending relative path)
+    for callers that must surface a malformed note rather than degrade it (e.g. the producer lint).
     """
     notes: list[Note] = []
     for path in _iter_note_paths(layout):
@@ -183,9 +188,13 @@ def parse_all_notes(layout: RepoLayout) -> list[Note]:
         text = path.read_text(encoding="utf-8", errors="replace")
         try:
             fm, body = frontmatter.parse(text)
-        except FrontmatterError as exc:  # surface which file is malformed
-            rel = path.relative_to(layout.root).as_posix()
-            raise FrontmatterError(f"{rel}: {exc}") from exc
+        except FrontmatterError as exc:
+            if strict:  # surface which file is malformed for strict callers (the producer lint)
+                rel = path.relative_to(layout.root).as_posix()
+                raise FrontmatterError(f"{rel}: {exc}") from exc
+            # Tolerant read: degrade a fenceless/malformed note to empty frontmatter + full body,
+            # exactly like the query path (wiki._parse_note), so the browse face stays up.
+            fm, body = {}, text
         type_value = fm.get("type")
         type_str = type_value if isinstance(type_value, str) else None
         notes.append(
