@@ -77,14 +77,36 @@ inert field); this ADR records the corrected, honest decisions.
    routing (and the deferred Letta/mem0 API connectors that would call core directly) are **deferred
    to Phase 4**.
 
-7. **Cursor counter ownership (partial; the rest DEFERRED).** ADR-0011's flow contracts the
-   **curator** to update the §6 `accepted`/`rejected` counters from plan dispositions at finalize.
-   `worker.py` does not yet touch any cursor. So in this phase the **harvester owns only**
-   `connector` / `source_path` / `last_scan` / `last_content_sha256` / `proposed`; `accepted` /
-   `rejected` are initialized to 0 and **round-trip untouched** (preserved across harvester saves) so
-   a later curator change can populate them. Until then the doctor/dashboard surface shows `proposed`
-   with `accepted`/`rejected` at 0 — a known, recorded gap, not a bug (the counters remain rebuildable
-   from git + `processed/`).
+7. **Cursor counter ownership (IMPLEMENTED).** ADR-0011's flow contracts the **curator** to update
+   the §6 `accepted`/`rejected` counters from plan dispositions at finalize; this is now wired in
+   `worker.py` (`compute_harvest_cursor_deltas` + `_apply_harvest_cursor_deltas`). The **harvester**
+   still owns `connector` / `source_path` / `last_scan` / `last_content_sha256` / `proposed` and the
+   **curator** owns `accepted` / `rejected`; each writer load-then-saves via the atomic `CursorStore`
+   so neither clobbers the other. The chosen semantics:
+   - **Happy-path-only, mirroring `_bump_counters`.** The increment is applied in the SAME happy-path
+     finalize block as `state.counters` and is **never replayed in `_finalize_recovered`** (the
+     recovery path). That placement is exactly what makes it exactly-once (or under-count +
+     rebuildable on a rare crash) with NO `is_published` guard — the cursor is a derived, git-ignored,
+     **rebuildable** value (DATA-MODEL §6), so it is **best-effort, not transactional with the CAS**;
+     the additive write lands in `_kb/` (OUTSIDE the curated git tree), so the ADR-0008 integrity
+     boundary is byte-for-byte unchanged.
+   - **Per-harvested-event granularity.** A disposition over a candidate whose provenance carries K
+     harvested tuples from connector C contributes K to C (matching how `proposed` counts one per
+     written fact). A **mixed-provenance** candidate counts ONLY its `harvest:<agent>` tuples, each
+     attributed to its own connector; local-capture tuples are ignored. So `proposed` and
+     `accepted + rejected` reconcile at the same granularity.
+   - **accepted / rejected / NOOP.** `accepted` += op ∈ {`MERGE_INTO_THEME`, `MARK_CONTESTED`}
+     (kept/corroborated/contested); `rejected` += `DROP` (discarded as noise); **`NOOP` = SKIP** (an
+     exact duplicate already represented — neither newly accepted nor rejected). `NOOP`, `CREATE_THEME`
+     and `APPEND_DAILY` are all OUTSIDE the §4.1-check-10 `GATE_ALLOWED_OPS` set ({`MERGE_INTO_THEME`,
+     `MARK_CONTESTED`, `DROP`}) and so can never occur for a genuinely gated candidate — they are
+     rejected at validation. The NOOP-skip and the CREATE_THEME/APPEND_DAILY accepted fall-through are
+     therefore purely DEFENSIVE, guarding only a non-gated candidate that happens to carry harvested
+     provenance; they should never fire in practice.
+   - **Configured-connectors-only.** A harvested tuple's `source = harvest:<agent>` is mapped to its
+     connector NAME via the configured `adapters.yaml` connector list (`{agent → name}`); a tuple
+     whose connector has since been removed from config is **skipped** (no stray cursor is created).
+     No `adapters.yaml` / no harvested provenance ⇒ no cursor writes.
 
 ## Consequences
 - **+** ADR-0007 is realized end-to-end for the file connector: opt-in `agora harvest` pulls an
@@ -96,7 +118,9 @@ inert field); this ADR records the corrected, honest decisions.
 - **+** The `Connector` Protocol is the clean Phase-4 seam for Letta/mem0 API connectors.
 - **−** The reworded round-trip loop and the team-scope/multi-tenant boundary are explicitly
   *deferred*, not solved — documented residual risks rather than hidden ones.
-- **−** `accepted`/`rejected` cursor counters stay 0 until the curator-side finalize update lands.
+- **+** `accepted`/`rejected` cursor counters are now populated by the curator at finalize (§7),
+  closing the contracted-but-deferred gap; they are best-effort + rebuildable, never an integrity
+  control.
 - **−** v1 harvests one-line bullet summaries only (links not followed), so pointer-heavy memory
   files yield low-value candidates the curator gate must reliably DROP — validate noise behavior with
   `--dry-run` on a real `MEMORY.md` before relying on it.

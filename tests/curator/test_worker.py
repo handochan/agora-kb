@@ -21,6 +21,8 @@ import os
 from datetime import UTC, datetime
 from pathlib import Path
 
+import pytest
+
 from agora_kb.core import frontmatter
 from agora_kb.core.ids import new_event_id
 from agora_kb.core.inbox import Inbox
@@ -690,6 +692,250 @@ def test_recover_finalizes_a_published_crashed_run_without_backend(tmp_path: Pat
     assert (layout.processed_dir / crashed_run_id[:10] / f"{e2}.md").is_file()
     # state.json now records the crashed run's published commit.
     assert StateStore(layout).load().published_runs[crashed_run_id] == published_commit
+
+
+# --- (5) HARVEST CURSOR COUNTERS (ADR-0017 §7 — curator-owned accepted/rejected) ----------------
+
+
+def _write_harvested(
+    inbox: Inbox, *, text: str, second: int, agent: str = "demo-agent", event_key: str | None = None
+) -> str:
+    """Write one GATED harvested candidate (kind=candidate, source=harvest:<agent>) to the inbox.
+
+    Mirrors :meth:`agora_kb.harvester.harvester.Harvester._run_one`'s inbox write: a candidate-kind,
+    low-confidence event in the per-connector ``harvest-<agent>`` writer namespace with
+    ``source=harvest:<agent>``. The bundle flags it ``is_gated`` (kind=candidate), so the §4.1 gate
+    restricts its plan op to MERGE_INTO_THEME / MARK_CONTESTED / DROP.
+    """
+    from agora_kb.core.models import Confidence, Kind
+
+    now = datetime(2026, 6, 13, 2, 50, second, tzinfo=UTC)
+    return inbox.write(
+        text=text,
+        writer=f"harvest-{agent}",
+        source=f"harvest:{agent}",
+        domain="ai-tech",
+        kind=Kind.candidate,
+        confidence=Confidence.low,
+        event_key=event_key,
+        now=now,
+    ).id
+
+
+def _write_adapters_yaml(layout: RepoLayout, *agents: str) -> None:
+    """Write a minimal ``adapters.yaml`` declaring one ``file:<agent>`` connector per agent."""
+    lines = ["connectors:"]
+    for agent in agents:
+        lines += [f"  file:{agent}:", "    path: x/*.md", "    scope: personal"]
+    (layout.root / "adapters.yaml").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _merge_and_drop_plan(run_id: str, merge_event: str, drop_event: str, target: str) -> str:
+    """A plan that MERGES one gated candidate into ``target`` (accepted) and DROPS the other."""
+    return json.dumps(
+        {
+            "schema_version": 1,
+            "run_id": run_id,
+            "finished": True,
+            "dispositions": [
+                {
+                    "candidate_id": "c1",
+                    "event_ids": [merge_event],
+                    "op": "MERGE_INTO_THEME",
+                    "domain": "ai-tech",
+                    "target_basename": target,
+                    "summary": "Corroborates the existing theme.",
+                    "needs_prose": True,
+                    "reason": "Harvested corroboration of an existing theme.",
+                },
+                {
+                    "candidate_id": "c2",
+                    "event_ids": [drop_event],
+                    "op": "DROP",
+                    "reason": "Harvested noise — drop.",
+                },
+            ],
+        }
+    )
+
+
+def _seed_theme_and_harvested(tmp_path: Path) -> tuple[Repo, str, str]:
+    """Init a repo, publish a theme (the merge target), and queue two gated harvested candidates.
+
+    Returns ``(repo, merge_event_id, drop_event_id)`` ready for a MERGE+DROP run over the harvested
+    candidates with a ``file:demo-agent`` connector configured in ``adapters.yaml``.
+    """
+    repo = _init_repo(tmp_path)
+    layout = repo.layout
+    inbox = Inbox(layout)
+
+    # Run 1: publish a theme 'curator-concurrency' so there is a live MERGE target.
+    e0 = _write_capture(inbox, text="One curator advances the branch under a lock.", second=5)
+    _seed_raw(repo, e0)
+    report0 = _run(
+        repo,
+        FakeBackend(
+            _create_theme_plan("ignored", "c1", e0),
+            prose={"c1": "The single curator holds a per-repo flock."},
+        ),
+    )
+    assert report0.status == "published"
+
+    # Configure the connector + queue two harvested gated candidates (distinct content → c1, c2).
+    _write_adapters_yaml(layout, "demo-agent")
+    e_merge = _write_harvested(inbox, text="Harvested: curators serialize writes.", second=10)
+    e_drop = _write_harvested(inbox, text="Harvested: unrelated low-value chatter.", second=20)
+    _seed_raw(repo, e_merge, e_drop)
+    return repo, e_merge, e_drop
+
+
+def test_harvest_cursor_accepted_rejected_bumped_after_finalize(tmp_path: Path) -> None:
+    """A MERGE (accepted) + DROP (rejected) over harvested candidates bumps the §6 cursor (§7).
+
+    End-to-end through the real curator run (FakeBackend, ZERO model): the two harvested candidates
+    are gated (kind=candidate); the plan MERGES one into the live theme and DROPS the other. After
+    finalize the per-connector cursor records accepted=1 / rejected=1, reconciling with proposed.
+    """
+    from agora_kb.harvester.harvester import CursorStore
+
+    repo, e_merge, e_drop = _seed_theme_and_harvested(tmp_path)
+    layout = repo.layout
+
+    plan = _merge_and_drop_plan("merge-run", e_merge, e_drop, "curator-concurrency")
+    report = _run(
+        repo, FakeBackend(plan, prose={"merge-run--c1": "Harvested corroboration prose."})
+    )
+    assert report.status == "published"
+
+    cursor = CursorStore(layout).load("file:demo-agent")
+    assert cursor.accepted == 1
+    assert cursor.rejected == 1
+
+
+def test_harvest_cursor_not_bumped_for_unconfigured_connector(tmp_path: Path) -> None:
+    """With no ``adapters.yaml`` connector for the agent, the run writes NO cursor (no stray)."""
+    from agora_kb.harvester.harvester import CursorStore
+
+    repo, e_merge, e_drop = _seed_theme_and_harvested(tmp_path)
+    layout = repo.layout
+    # Remove the connector config so the harvested agent maps to no configured connector.
+    (layout.root / "adapters.yaml").unlink()
+
+    plan = _merge_and_drop_plan("merge-run", e_merge, e_drop, "curator-concurrency")
+    report = _run(
+        repo, FakeBackend(plan, prose={"merge-run--c1": "Harvested corroboration prose."})
+    )
+    assert report.status == "published"
+
+    # No stray cursor file was created for the unconfigured connector.
+    assert not layout.harvest_cursor_path("file:demo-agent").exists()
+    # A fresh load is the zero cursor (nothing bumped).
+    cursor = CursorStore(layout).load("file:demo-agent")
+    assert cursor.accepted == 0 and cursor.rejected == 0
+
+
+def test_harvest_cursor_increment_is_not_double_counted_on_recovery(tmp_path: Path) -> None:
+    """RECOVERY does NOT re-bump the cursor — the increment is happy-path-only (mirrors counters).
+
+    After the happy-path run bumps accepted=1/rejected=1, we simulate a crash at phase=published
+    (ref advanced, manifest still 'published') over the SAME run id and drive recover(). Because
+    _finalize_recovered NEVER touches the cursor (exactly like state.counters), the cursor stays at
+    the single happy-path increment — no double count.
+    """
+    from agora_kb.harvester.harvester import CursorStore
+
+    repo, e_merge, e_drop = _seed_theme_and_harvested(tmp_path)
+    layout = repo.layout
+
+    plan = _merge_and_drop_plan("merge-run", e_merge, e_drop, "curator-concurrency")
+    report = _run(
+        repo, FakeBackend(plan, prose={"merge-run--c1": "Harvested corroboration prose."})
+    )
+    assert report.status == "published"
+    assert report.run_id is not None
+
+    cursor_after_run = CursorStore(layout).load("file:demo-agent")
+    assert cursor_after_run.accepted == 1 and cursor_after_run.rejected == 1
+
+    # Simulate a published-but-unfinalized crash for a SEPARATE run id whose events are harvested,
+    # then drive recovery. _finalize_recovered must NOT bump the cursor (no plan in scope; counters
+    # and cursor are both rebuildable + happy-path-only). We hand-place a phase=published manifest
+    # whose published_commit is the curated tip, with a claimed harvested event.
+    published_commit = repo.branch_commit()
+    inbox = Inbox(layout)
+    e_extra = _write_harvested(inbox, text="Harvested: a crashed-run fact.", second=40)
+    crashed_run_id = new_event_id(now=datetime(2026, 6, 13, 5, 0, 0, tzinfo=UTC))
+    events_dir = layout.processing_dir / crashed_run_id / "events"
+    events_dir.mkdir(parents=True, exist_ok=True)
+    os.replace(layout.inbox_item_path("harvest-demo-agent", e_extra), events_dir / f"{e_extra}.md")
+    write_manifest(
+        layout,
+        RunManifest(
+            run_id=crashed_run_id,
+            base_commit=published_commit,
+            event_ids=(e_extra,),
+            phase="published",
+            prose_complete=True,
+            published_commit=published_commit,
+            started="2026-06-13T05:00:00Z",
+        ),
+    )
+
+    recover(repo, state_store=StateStore(layout))
+
+    # The cursor is UNCHANGED by recovery: still the single happy-path increment, never re-bumped.
+    cursor_after_recover = CursorStore(layout).load("file:demo-agent")
+    assert cursor_after_recover.accepted == 1
+    assert cursor_after_recover.rejected == 1
+
+
+def test_harvest_cursor_io_error_does_not_abort_an_already_published_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A cursor IO error MUST NOT abort an already-published run (ADR-0017 §7, best-effort).
+
+    The cursor bump runs AFTER the CAS (the run is durable in git) but BEFORE state is saved, events
+    move to processed/, and the manifest finalizes. Unlike _bump_counters (pure in-memory), the
+    cursor write does disk IO and CAN raise OSError (ENOSPC/EACCES/read-only FS). The worker must
+    degrade to under-count (rebuildable) — NOT propagate the OSError and crash finalize. We force
+    _apply_harvest_cursor_deltas to raise and assert the publish still completes end-to-end.
+    """
+    from agora_kb import curator
+    from agora_kb.harvester.harvester import CursorStore
+
+    repo, e_merge, e_drop = _seed_theme_and_harvested(tmp_path)
+    layout = repo.layout
+
+    def _boom(*_args: object, **_kwargs: object) -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(curator.worker, "_apply_harvest_cursor_deltas", _boom)
+
+    plan = _merge_and_drop_plan("merge-run", e_merge, e_drop, "curator-concurrency")
+    report = _run(
+        repo, FakeBackend(plan, prose={"merge-run--c1": "Harvested corroboration prose."})
+    )
+
+    # The publish is unperturbed: status published, the diff is durable in git.
+    assert report.status == "published"
+    assert report.published_commit is not None
+    new_tip = repo.branch_commit()
+    assert new_tip == report.published_commit
+
+    # state_store.save ran (the cursor failure happened BEFORE it but did not abort it).
+    state = StateStore(layout).load()
+    assert state.published_runs[report.run_id] == new_tip
+
+    # Events moved to processed/ and the manifest reached finalized — finalize was NOT aborted.
+    processed = layout.processed_dir / RUN_DATE
+    assert (processed / f"{e_merge}.md").is_file()
+    assert (processed / f"{e_drop}.md").is_file()
+    assert read_manifest(manifest_path(layout, report.run_id)).phase == "finalized"
+
+    # The cursor is left under-counted (rebuildable) — the IO error degraded, it did not corrupt.
+    cursor = CursorStore(layout).load("file:demo-agent")
+    assert cursor.accepted == 0
+    assert cursor.rejected == 0
 
 
 # --- misbehaving backends (for the §4.2 degrade + §4.6 strip + final-diff gate) ----------------

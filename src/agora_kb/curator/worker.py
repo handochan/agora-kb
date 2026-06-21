@@ -57,7 +57,7 @@ import subprocess
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Literal, Protocol
+from typing import TYPE_CHECKING, Literal, Protocol
 
 from ..core import frontmatter
 from ..core.ids import new_event_id
@@ -74,7 +74,7 @@ from .apply import (
     strip_stray_wikilinks,
     validate_author_diff,
 )
-from .bundle import build_bundle
+from .bundle import BundleResult, build_bundle
 from .claim import LockHeld, claim, curator_lock
 from .constants import (
     DEFAULT_MAX_ATTEMPTS,
@@ -86,11 +86,16 @@ from .manifest import RunManifest, list_processing, write_manifest
 from .plan import Disposition, Plan, PlanParseError, validate_plan
 from .subprocess_backend import BackendUnavailableError
 
+if TYPE_CHECKING:
+    from ..config import ConnectorSpec
+
 __all__ = [
     "AuthorRegion",
     "Backend",
     "FakeBackend",
+    "HarvestCursorDelta",
     "RunReport",
+    "compute_harvest_cursor_deltas",
     "run",
     "recover",
 ]
@@ -482,6 +487,13 @@ def _run_locked(
         counts = _disposition_counts(plan)
         _append_log(wt, run_id=run_id, base_commit=base_commit, counts=counts, plan=plan)
 
+        # ADR-0017 §7: compute the per-connector harvest cursor accepted/rejected deltas WHILE the
+        # plan + the bundle provenance are both in scope (the bundle does not survive the worktree
+        # block — only new_commit does). PURE + model-free; carried out and applied in the
+        # happy-path finalize block below, mirroring _bump_counters. Loading the connectors here (no
+        # adapters.yaml ⇒ empty) keeps the apply step a trivial cursor write.
+        harvest_deltas = compute_harvest_cursor_deltas(plan, bundle, _load_connector_specs(layout))
+
         # §4.0/§4.3/§4.5 FINAL-DIFF ALLOWLIST GATE (ADR-0008 step 4): the deterministic integrity
         # boundary. Stage everything and assert the working tree touches ONLY canonical-ALLOWLIST
         # paths — no off-allowlist file the backend physically wrote (a new file the §4.2 scope
@@ -547,6 +559,26 @@ def _run_locked(
     state.record_published_run(run_id, new_commit)
     state.mark_run(now, new_commit)
     _bump_counters(state, counts)
+    # ADR-0017 §7: bump the per-connector harvest cursors from THIS run's harvested-candidate
+    # dispositions. HAPPY-PATH ONLY — mirrors _bump_counters exactly and is NEVER replayed in
+    # _finalize_recovered, so it is exactly-once (or under-count + rebuildable on a rare crash)
+    # without an is_published guard. The cursor write lands in git-ignored _kb/, OUTSIDE the CAS /
+    # curated tree, so the integrity boundary is unchanged; it is best-effort + rebuildable, not
+    # transactional with the publish. CRITICAL: unlike _bump_counters (pure in-memory mutation),
+    # this does disk IO (CursorStore.load/save → atomic_write_text) which CAN raise OSError (ENOSPC,
+    # EACCES, read-only FS). The run is ALREADY published-in-git at this point, so a cursor IO error
+    # MUST NOT propagate and abort finalize — that would lose the published_runs entry, leave events
+    # in processing/, and surface a traceback on a successful publish. Degrade to under-count
+    # (rebuildable) by swallowing + logging, truly mirroring _bump_counters' inability to perturb
+    # the publish.
+    try:
+        _apply_harvest_cursor_deltas(layout, harvest_deltas)
+    except Exception as exc:  # noqa: BLE001 — best-effort; cursor is derived + rebuildable.
+        _logger.warning(
+            "harvest cursor update failed (rebuildable, run %s already published): %s",
+            run_id,
+            exc,
+        )
     # Move events to processed/ BEFORE recording tier-1 event_keys: _record_event_keys reads each
     # event's frontmatter from processed/<date>/, so the move must happen first or every key is
     # silently skipped (cross-run delivery idempotency would be lost, ADR-0011 §5 tier-1).
@@ -1245,6 +1277,156 @@ def _disposition_counts(plan: Plan) -> dict[str, int]:
     for disp in plan.dispositions:
         counts[disp.op] = counts.get(disp.op, 0) + 1
     return counts
+
+
+@dataclass(frozen=True)
+class HarvestCursorDelta:
+    """Per-connector ``accepted``/``rejected`` increments for ONE finalized run (ADR-0017 §7).
+
+    A pure, derived tally the worker computes from the validated :class:`Plan` dispositions over the
+    bundle's HARVESTED candidate provenance, attributed to the configured connector that produced
+    each tuple. Carried out of the worktree run block (where the bundle provenance is in scope) and
+    applied to the §6 cursor in the happy-path finalize block ONLY (mirrors :func:`_bump_counters`).
+    """
+
+    accepted: int = 0
+    rejected: int = 0
+
+
+# Disposition ops that COUNT a harvested tuple as REJECTED (discarded as noise) vs the accepted
+# catch-all (kept/corroborated/contested), per ADR-0017 §7 / INGEST-CONTRACT §6. A gated candidate
+# may ride ONLY MERGE_INTO_THEME / MARK_CONTESTED / DROP (the §4.1 check-10 GATE_ALLOWED_OPS set —
+# NOOP, CREATE_THEME and APPEND_DAILY are all rejected at validation for a gated candidate, so they
+# never occur for harvested provenance). NOOP and CREATE_THEME/APPEND_DAILY handling below is
+# therefore purely DEFENSIVE — harmless if a non-gated candidate ever carries harvested provenance.
+_HARVEST_REJECTED_OPS: frozenset[str] = frozenset({"DROP"})
+
+
+def compute_harvest_cursor_deltas(
+    plan: Plan,
+    bundle: BundleResult,
+    connector_specs: list[ConnectorSpec],
+) -> dict[str, HarvestCursorDelta]:
+    """Per-connector cursor ``accepted``/``rejected`` deltas from this run's plan (ADR-0017 §7).
+
+    PURE + deterministic + MODEL-FREE — a function of the validated :class:`Plan`, the read-only
+    :class:`BundleResult` provenance, and the configured connector list. Unit-testable with
+    hand-built plans + candidates and ZERO backend in the loop (the model is outside the integrity
+    boundary, ADR-0011 §7).
+
+    Granularity is per HARVESTED EVENT (per provenance tuple), matching how the harvester counts
+    ``proposed`` (one per written fact): a disposition over a candidate whose provenance carries K
+    harvested tuples from connector C contributes K to C. A MIXED-provenance candidate (some
+    harvested tuples, some local captures) counts ONLY its harvested tuples, each attributed to its
+    own connector, so ``proposed`` and ``accepted + rejected`` reconcile at the same granularity.
+
+    Mapping: a harvested tuple's ``source`` is ``"harvest:<agent>"`` (harvester.py); the cursor is
+    keyed by CONNECTOR NAME, so the agent is mapped to its connector via the CONFIGURED
+    ``connector_specs`` (``{agent -> name}``). Only connectors STILL PRESENT in config are counted —
+    a harvested tuple whose connector was removed from ``adapters.yaml`` is skipped (no stray cursor
+    is ever created). No connectors configured (no ``adapters.yaml``) ⇒ ``{}``; no harvested
+    provenance ⇒ ``{}``.
+
+    Counting (ADR-0017 §7 / INGEST-CONTRACT §6): ``rejected`` += op == DROP (discarded as noise);
+    ``accepted`` += every other non-NOOP op (MERGE_INTO_THEME / MARK_CONTESTED — kept / corroborated
+    / contested). NOOP = SKIP (neither). DEFENSIVE only: NOOP, CREATE_THEME and APPEND_DAILY cannot
+    occur for a GATED (harvested) candidate — the §4.1 check-10 gate (``GATE_ALLOWED_OPS`` =
+    {MERGE_INTO_THEME, MARK_CONTESTED, DROP}) rejects them at validation — so these branches only
+    ever fire for a (hypothetical) non-gated candidate that happens to carry harvested provenance.
+    """
+    agent_to_connector: dict[str, str] = {}
+    for spec in connector_specs:
+        # The connector agent is the part after the "<type>:" prefix of the spec name (the same form
+        # the harvester uses for source=f"harvest:{agent}", writer=f"harvest-{agent}"). A spec name
+        # without a ':' has no agent and cannot match a harvest source, so it is skipped.
+        _, _, agent = spec.name.partition(":")
+        if agent:
+            agent_to_connector[agent] = spec.name
+    if not agent_to_connector:
+        return {}
+
+    accepted: dict[str, int] = {}
+    rejected: dict[str, int] = {}
+    for disp in plan.dispositions:
+        if disp.op == "NOOP":
+            # DEFENSIVE: NOOP is NOT in GATE_ALLOWED_OPS (§4.1 check 10), so a gated candidate can
+            # never reach here via NOOP; skip it if a non-gated candidate ever carries harvested
+            # provenance — an exact duplicate is neither accepted nor rejected.
+            continue
+        # DROP is the only rejected op; everything else that is not NOOP is accepted. CREATE_THEME /
+        # APPEND_DAILY also cannot carry harvested provenance under the §4.1 gate; if one somehow
+        # does (non-gated path), it counts accepted (kept) — defensive, never expected.
+        is_rejected = disp.op in _HARVEST_REJECTED_OPS
+        bucket = rejected if is_rejected else accepted
+        for tup in bundle.provenance.get(disp.candidate_id, []):
+            source = tup.get("source")
+            if not isinstance(source, str) or not source.startswith("harvest:"):
+                continue  # a local capture tuple in a mixed-provenance candidate — not counted.
+            agent = source[len("harvest:") :]
+            name = agent_to_connector.get(agent)
+            if name is None:
+                continue  # this agent's connector was removed from config — skip (no stray cursor).
+            bucket[name] = bucket.get(name, 0) + 1
+
+    deltas: dict[str, HarvestCursorDelta] = {}
+    for name in accepted.keys() | rejected.keys():
+        deltas[name] = HarvestCursorDelta(
+            accepted=accepted.get(name, 0), rejected=rejected.get(name, 0)
+        )
+    return deltas
+
+
+def _load_connector_specs(layout: RepoLayout) -> list[ConnectorSpec]:
+    """Load the configured ``adapters.yaml`` connector specs, or ``[]`` when none (ADR-0017 §7).
+
+    Lazy import (``config`` imports back into the curator package, so importing it at module load
+    would risk a cycle). An absent ``adapters.yaml`` / ``connectors:`` block returns ``[]`` so the
+    harvest-cursor wiring is a clean no-op on a repo that never configured a connector — the common
+    case (harvesting is opt-in, ADR-0007). A malformed connectors block is a loud operator error
+    from :func:`agora_kb.config.load_connector_specs`; it must surface, not be swallowed here.
+    """
+    from ..config import ConfigError, load_connector_specs
+
+    try:
+        specs = load_connector_specs(layout.root / "adapters.yaml")
+    except ConfigError as exc:
+        # A malformed harvest-config block must NOT block an otherwise publish-ready curate run:
+        # the harvest cursor is best-effort + rebuildable (DATA-MODEL §6 / ADR-0017 §7), and curate
+        # would previously never parse the connectors block at all (backend loading ignores it).
+        # Degrade to "no connectors counted this run" with a loud log instead of aborting publish.
+        _logger.warning(
+            "adapters.yaml connectors block is malformed; skipping harvest-cursor accounting this "
+            "run (cursor is rebuildable): %s",
+            exc,
+        )
+        return []
+    return specs or []
+
+
+def _apply_harvest_cursor_deltas(layout: RepoLayout, deltas: dict[str, HarvestCursorDelta]) -> None:
+    """Add this run's harvested-candidate dispositions to the §6 cursors (ADR-0017 §7, finalize).
+
+    The HAPPY-PATH-ONLY mirror of :func:`_bump_counters`: applied next to it in the finalize block
+    and NEVER replayed in :func:`_finalize_recovered`, so the increment is exactly-once (or
+    under-count + rebuildable on a rare crash) without an ``is_published`` guard. The cursor is a
+    derived, git-ignored, rebuildable value (DATA-MODEL §6 / ADR-0017), so this is BEST-EFFORT,
+    NOT transactional with the CAS — the additive write lands OUTSIDE the curated git tree (``_kb/``
+    is git-ignored), so the ADR-0008 integrity boundary is byte-for-byte unchanged. Reuses the
+    harvester's atomic :class:`CursorStore` IO; preserves every other §6 field (the harvester owns
+    ``proposed`` / ``last_scan`` / etc.). Empty ``deltas`` is a no-op.
+    """
+    if not deltas:
+        return
+    # Lazy import: the harvester does not import the curator, so importing CursorStore here keeps
+    # the cursor IO single-sourced without creating a package import cycle at module load.
+    from ..harvester.harvester import CursorStore
+
+    store = CursorStore(layout)
+    for name, delta in deltas.items():
+        cursor = store.load(name)
+        cursor.accepted += delta.accepted
+        cursor.rejected += delta.rejected
+        store.save(cursor)
 
 
 def _bump_counters(state: CuratorState, counts: dict[str, int]) -> None:

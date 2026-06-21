@@ -145,9 +145,12 @@ never an integrity control: a missing/corrupt cursor loads fresh and the scan re
 (the candidate gate absorbs any re-flood). `last_content_sha256` is the whole-source fast no-op (an
 unchanged file emits nothing); pending-delivery idempotency reuses the inbox `event_key`
 (ADR-0017 §4). **Counter ownership (ADR-0017 §7):** the harvester writes `connector` / `source_path`
-/ `last_scan` / `last_content_sha256` / `proposed`; the curator owns `accepted` / `rejected` from
-plan dispositions at finalize (ADR-0011) — currently **deferred**, so those two stay `0` and
-round-trip untouched until that wiring lands. The connector name is sanitized to a safe filename
+/ `last_scan` / `last_content_sha256` / `proposed`; the curator owns `accepted` / `rejected`, bumped
+at finalize from each run's harvested-candidate dispositions (ADR-0011 / ADR-0017 §7 — `accepted` +=
+`MERGE_INTO_THEME`/`MARK_CONTESTED`, `rejected` += `DROP`, `NOOP` skipped, per harvested provenance
+tuple attributed to its connector). The bump is happy-path-only (mirrors the `state.json` counter
+bump, never replayed in recovery) so it is best-effort + rebuildable, never an integrity control;
+each writer load-then-saves so neither clobbers the other. The connector name is sanitized to a safe filename
 (`file:claude-code` → `file-claude-code.json`, path-traversal-guarded).
 
 ## 7. Provenance & loop prevention
