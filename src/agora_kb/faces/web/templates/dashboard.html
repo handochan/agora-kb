@@ -1,0 +1,49 @@
+{% extends "base.html" %}
+{% block title %}Agora — dashboard{% endblock %}
+{% block content %}
+<h1>Dashboard</h1>
+<p class="muted">Read-only status over already-existing metadata (DESIGN §5.3). No writes, no new data.</p>
+
+{#
+  Polling design (ADR-0019 §2 — HTMX live panels):
+  - The CURATOR and HARVESTER panels carry moving values (queue depth, in-flight, scan cursors), so
+    they hx-get their fragment route on load AND every 5s — a cheap read of state.json / cursors.
+  - The KB-HEALTH panel is HEAVY: it runs the deterministic lint() + a full note scan over the whole
+    tree, so it is loaded once and refreshed only on demand (the Refresh button), NOT on a tight
+    poll. Each panel swaps its fragment into its own #panel-* target.
+#}
+
+<section aria-label="KB health" class="panel">
+  <div class="panel-head">
+    <h2>KB health</h2>
+    {# Manual refresh only — this panel runs lint() + a whole-tree scan, too heavy to poll. #}
+    <button type="button" class="secondary"
+            hx-get="/dashboard/health" hx-target="#panel-health" hx-swap="innerHTML">
+      Refresh
+    </button>
+  </div>
+  {# Populated server-side by the include; refreshed only via the Refresh button above (which
+     hx-targets #panel-health) — no load trigger, so the heavy lint() runs ONCE per page load. #}
+  <div id="panel-health">
+    {% include "_health.html" %}
+  </div>
+</section>
+
+<section aria-label="Curator status" class="panel">
+  <h2>Curator status</h2>
+  {# Cheap + moving → poll every 5s (and on load). #}
+  <div id="panel-curator"
+       hx-get="/dashboard/curator" hx-trigger="load, every 5s" hx-swap="innerHTML">
+    {% include "_curator.html" %}
+  </div>
+</section>
+
+<section aria-label="Harvester status" class="panel">
+  <h2>Harvester status</h2>
+  {# Scans move → poll every 5s (and on load). #}
+  <div id="panel-harvester"
+       hx-get="/dashboard/harvester" hx-trigger="load, every 5s" hx-swap="innerHTML">
+    {% include "_harvester.html" %}
+  </div>
+</section>
+{% endblock %}

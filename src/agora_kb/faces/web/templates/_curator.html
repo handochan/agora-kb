@@ -1,0 +1,58 @@
+{# Curator-status panel fragment (DESIGN §5.3). Cheap + moving (queue depth / throughput), so the
+   dashboard polls this every 5s (see dashboard.html). #}
+<div class="status-strip">
+  <div class="stat">
+    <span class="label">Inbox depth</span>
+    <span class="value">{{ curator.inbox_depth }}</span>
+  </div>
+  <div class="stat">
+    <span class="label">Processed today</span>
+    <span class="value">{{ curator.processed_today }}</span>
+  </div>
+  <div class="stat">
+    <span class="label">Failed</span>
+    <span class="value">{{ curator.failed }}</span>
+  </div>
+  <div class="stat">
+    <span class="label">Active backend</span>
+    <span class="value">{{ curator.active_backend or "—" }}</span>
+  </div>
+  <div class="stat">
+    <span class="label">Last commit</span>
+    <span class="value mono">{{ curator.last_commit or "—" }}</span>
+  </div>
+  <div class="stat">
+    <span class="label">Last consolidation</span>
+    <span class="value mono">{{ curator.last_consolidation or "—" }}</span>
+  </div>
+</div>
+
+<h3>Cumulative counters</h3>
+<ul class="kv">
+  {% for name, count in curator.counters.items() %}
+    <li><span class="k">{{ name }}</span><span class="v">{{ count }}</span></li>
+  {% endfor %}
+</ul>
+
+<h3>Work log</h3>
+{% if curator.recent_log %}
+  <ul class="worklog">
+    {% for entry in curator.recent_log %}
+      <li>
+        <span class="run-id mono">{{ entry.run_id }}</span>
+        {% if entry.base %}<span class="base mono">base {{ entry.base }}</span>{% endif %}
+        {% if entry.ops %}
+          <span class="ops">
+            {% for op, n in entry.ops.items() %}<span class="op">{{ op }}={{ n }}</span>{% endfor %}
+          </span>
+        {% else %}
+          <span class="ops"><span class="op">no-op</span></span>
+        {% endif %}
+        {% if entry.dropped %}<span class="dropped">dropped: {{ entry.dropped | join(', ') }}</span>{% endif %}
+        {% if entry.contested %}<span class="contested">contested: {{ entry.contested | join(', ') }}</span>{% endif %}
+      </li>
+    {% endfor %}
+  </ul>
+{% else %}
+  <p class="empty">No consolidation runs logged yet.</p>
+{% endif %}

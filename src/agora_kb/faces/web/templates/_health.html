@@ -1,0 +1,56 @@
+{# KB-health panel fragment (DESIGN §5.3). Heavy: it runs lint() + a full note scan over the whole
+   tree, so it is refreshed on load + a manual button — NOT a tight poll (see dashboard.html). #}
+<div class="status-strip">
+  <div class="stat">
+    <span class="label">Notes</span>
+    <span class="value">{{ health.note_total }}</span>
+  </div>
+  <div class="stat">
+    <span class="label">Themes</span>
+    <span class="value">{{ health.themes }}</span>
+  </div>
+  <div class="stat">
+    <span class="label">Dailies</span>
+    <span class="value">{{ health.dailies }}</span>
+  </div>
+  <div class="stat">
+    <span class="label">Contested</span>
+    <span class="value">{{ health.contested }}</span>
+  </div>
+  <div class="stat">
+    <span class="label">Orphans</span>
+    <span class="value">{{ health.orphans }}</span>
+  </div>
+  <div class="stat">
+    <span class="label">Broken links</span>
+    <span class="value">{{ health.broken_links }}</span>
+  </div>
+  <div class="stat">
+    <span class="label">Lint</span>
+    <span class="value {{ 'ok' if health.lint_ok else 'warn' }}">
+      {{ 'ok' if health.lint_ok else health.lint_findings ~ ' findings' }}
+    </span>
+  </div>
+  <div class="stat">
+    <span class="label">Last consolidation</span>
+    <span class="value mono">{{ health.last_consolidation or "—" }}</span>
+  </div>
+</div>
+
+<h3>By status</h3>
+<ul class="kv">
+  {% for name, count in health.by_status.items() %}
+    <li><span class="k">{{ name }}</span><span class="v">{{ count }}</span></li>
+  {% endfor %}
+</ul>
+
+<h3>Tag distribution</h3>
+{% if health.tag_distribution %}
+  <ul class="kv">
+    {% for tag, count in health.tag_distribution | dictsort(by='value', reverse=true) %}
+      <li><span class="k">{{ tag }}</span><span class="v">{{ count }}</span></li>
+    {% endfor %}
+  </ul>
+{% else %}
+  <p class="empty">No tags yet.</p>
+{% endif %}

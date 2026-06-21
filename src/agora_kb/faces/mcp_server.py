@@ -208,6 +208,225 @@ class AgoraHandlers:
             "failed": self._failed_count(),
         }
 
+    # --- dashboard (meta; read-only — DESIGN §5.3 / ADR-0003) -----------------------------------
+    # The three panels below are a pure READ aggregation over already-existing metadata: the wiki
+    # notes (browse seam → core.wiki), the deterministic lint() (the SAME health-signal code path
+    # the curator runs, so dashboard and curator can never disagree — DESIGN §5.3), the curator
+    # state.json, log.md, and the harvester cursors. They add NO write path and touch no
+    # integrity/curator/inbox code; every value is JSON-serializable, consistent with status().
+    def health(self) -> dict[str, object]:
+        """KB-health panel (DESIGN §5.3): note counts, status/tag distribution, lint signals.
+
+        Counts are derived from :meth:`agora_kb.core.wiki.Wiki.list_notes` (the same core.wiki seam
+        :meth:`browse` uses) — themes vs dailies by the ``type`` field, status split over the frozen
+        vocabulary, and a tag-frequency map. ``broken_links`` and ``lint_findings`` come from the
+        deterministic :func:`agora_kb.schema.lint.lint` reused VERBATIM (called WITHOUT ``run_date``
+        — dashboard mode, so no historical note is flagged as a future date), so this never
+        reimplements a health check. ``orphans`` is a small read-time link-graph derivation (L2-1:
+        a theme nothing links TO — lint() emits no orphan finding, so it is NOT a lint signal).
+        ``contested`` counts notes whose frontmatter ``status == 'contested'``;
+        ``last_consolidation`` is from :meth:`status`. This panel runs lint() + a full note scan,
+        so it is the heavy one — refreshed on load + a manual button, not a poll.
+        """
+        from agora_kb.config import load_repo_config
+        from agora_kb.schema.lint import lint
+        from agora_kb.schema.notes import body_link_basenames, wikilinks
+
+        notes = self._wiki.list_notes()
+        note_total = len(notes)
+        themes = sum(1 for n in notes if n.type == "theme")
+        dailies = sum(1 for n in notes if n.type == "daily")
+
+        by_status = {"active": 0, "stub": 0, "contested": 0, "deprecated": 0}
+        tag_distribution: dict[str, int] = {}
+        for note in notes:
+            fm = note.frontmatter
+            status = fm.get("status")
+            if isinstance(status, str) and status in by_status:
+                by_status[status] += 1
+            raw_tags = fm.get("tags")
+            if isinstance(raw_tags, list):
+                for tag in raw_tags:
+                    if isinstance(tag, str):
+                        tag_distribution[tag] = tag_distribution.get(tag, 0) + 1
+        contested = by_status["contested"]
+
+        # Reuse the curator's deterministic L1 lint VERBATIM (the dashboard health-signal source,
+        # DESIGN §5.3). Dashboard mode = no run_date (the no-future-date half is a curator-run gate;
+        # outside a run there is no canonical "today" to compare historical notes against).
+        taxonomy = load_repo_config(self._repo.layout).taxonomy
+        result = lint(self._repo.layout, taxonomy=taxonomy)
+        lint_findings = len(result.findings)
+        # Two DISTINCT health signals (DESIGN §5.3), in opposite link directions:
+        #  - broken_links: dangling OUTBOUND references — L1-2 findings (a link whose target note
+        #    does not exist). A hard-gate signal, counted straight from lint().
+        #  - orphans: themes nothing links TO (L2-1) — read-time derived (lint() emits NO orphan
+        #    finding). A theme is an orphan when its basename is referenced by no other note's body
+        #    markdown link nor any frontmatter related:/children: [[ ]]; dailies and MOC/index roots
+        #    (type != "theme") are exempt.
+        broken_links = sum(1 for f in result.findings if f.code == "L1-2")
+        referenced: set[str] = set()
+        for n in notes:
+            referenced.update(body_link_basenames(n.body))
+            for fkey in ("related", "children"):
+                fval = n.frontmatter.get(fkey)
+                for item in fval if isinstance(fval, list) else [fval]:
+                    if isinstance(item, str):
+                        referenced.update(wikilinks(item))
+        orphans = sum(1 for n in notes if n.type == "theme" and n.basename not in referenced)
+
+        return {
+            "note_total": note_total,
+            "themes": themes,
+            "dailies": dailies,
+            "by_status": by_status,
+            "tag_distribution": tag_distribution,
+            "orphans": orphans,
+            "broken_links": broken_links,
+            "contested": contested,
+            "lint_ok": result.ok,
+            "lint_findings": lint_findings,
+            "last_consolidation": self.status()["last_consolidation"],
+        }
+
+    def curator_status(self) -> dict[str, object]:
+        """Curator panel (DESIGN §5.3): queue depth, throughput, active backend, work-log timeline.
+
+        Reuses :meth:`status` for the inbox/consolidation meta and the cumulative ``counters``, adds
+        the resolved ``active_backend`` label (the brain that runs the AUTHOR act — see
+        :meth:`_active_backend`, which mirrors ``agora doctor``'s routing resolution), and tails
+        ``log.md`` for the work-log timeline (:meth:`_recent_log`). All read-only — no curator
+        interaction, the moving values (queue depth) make this a cheap, pollable panel.
+        """
+        base = self.status()
+        return {
+            "inbox_depth": base["inbox_depth"],
+            "last_consolidation": base["last_consolidation"],
+            "last_commit": base["last_commit"],
+            "processed_today": base["processed_today"],
+            "failed": base["failed"],
+            "counters": base["counters"],
+            "active_backend": self._active_backend(),
+            "recent_log": self._recent_log(),
+        }
+
+    def harvester_status(self) -> dict[str, object]:
+        """Harvester panel (DESIGN §5.3): connectors enabled + per-source scan / candidate tally.
+
+        From :func:`agora_kb.config.load_harvest_policy` (``enabled``) and
+        :func:`agora_kb.config.load_connector_specs` + :class:`agora_kb.harvester.CursorStore` per
+        connector. ``accepted`` / ``rejected`` are the curator-owned cursor counters DEFERRED to
+        ADR-0017 §7 — they are CURRENTLY 0 and are rendered as-is (never faked); they light up later
+        without a redesign here. Tolerant: an unreadable ``repo.yaml`` / ``adapters.yaml`` degrades
+        to ``enabled=False`` / no connectors rather than crashing the read-only panel.
+        """
+        from agora_kb.config import (
+            ConfigError,
+            load_connector_specs,
+            load_harvest_policy,
+        )
+        from agora_kb.harvester import CursorStore
+
+        try:
+            policy = load_harvest_policy(self._repo.layout)
+            enabled = policy.enabled
+        except (ConfigError, ValueError):
+            enabled = False
+
+        adapters_path = self._repo.layout.root / "adapters.yaml"
+        try:
+            specs = load_connector_specs(adapters_path)
+        except (ConfigError, ValueError):
+            specs = None
+
+        store = CursorStore(self._repo.layout)
+        connectors: list[dict[str, object]] = []
+        for spec in specs or []:
+            cursor = store.load(spec.name)
+            connectors.append(
+                {
+                    "name": spec.name,
+                    "path": spec.path,
+                    "scope": spec.scope,
+                    "follow_links": spec.follow_links,
+                    "last_scan": (None if cursor.last_scan is None else _iso_z(cursor.last_scan)),
+                    "proposed": cursor.proposed,
+                    "accepted": cursor.accepted,
+                    "rejected": cursor.rejected,
+                }
+            )
+        return {"enabled": enabled, "connectors": connectors}
+
+    def _active_backend(self) -> str | None:
+        """Resolve the label of the brain that runs the AUTHOR act (the prose writer), or ``None``.
+
+        Mirrors ``agora doctor``'s routing resolution (cli.py ``_doctor_routing``):
+        ``load_backend_registry(adapters.yaml).routed_backends(default=repo.yaml curator.backend)``
+        under the ADR-0015 precedence (``routing[act]`` → repo default → adapters default). The
+        AUTHOR act is the brain that actually materializes wiki prose, so it is the meaningful
+        "active backend + model" the dashboard names (DESIGN §5.3). ``None`` when no
+        ``adapters.yaml`` is configured (or it is unreadable) — the same "no backend" signal
+        :meth:`curate` surfaces, never a crash on the read-only panel.
+        """
+        from agora_kb.config import load_backend_registry, load_repo_config
+
+        adapters_path = self._repo.layout.root / "adapters.yaml"
+        try:
+            registry = load_backend_registry(adapters_path)
+        except ValueError:
+            return None
+        if registry is None:
+            return None
+        default_backend = load_repo_config(self._repo.layout).default_backend
+        routed = registry.routed_backends(default=default_backend)
+        return routed.get("author") or default_backend
+
+    def _recent_log(self, limit: int = 10) -> list[dict[str, object]]:
+        """Tail the last ``limit`` structured ``log.md`` entries into a work-log timeline.
+
+        Matches the EXACT format the curator's ``worker._append_log`` writes (one ``## <run_id>``
+        section per run, followed by ``- base: \\`<base>\\``` / ``- dispositions: <op>=<n>, …`` and
+        optional ``- contested:`` / ``- dropped:`` / ``- pending-body:`` lines). Each parsed entry
+        is ``{run_id, base, ops:{op:count}, contested:[…], dropped:[…], pending_body:[…]}``, newest
+        first. A pure read of the git-tracked ``log.md`` (the curator alone writes it, ADR-0002); a
+        missing file yields ``[]``. Parsing is tolerant — a ``- dispositions: no-op`` line or an
+        unrecognized bullet simply yields an empty ``ops`` / is ignored rather than raising.
+        """
+        log_path = self._repo.layout.log_file
+        if not log_path.is_file():
+            return []
+        text = log_path.read_text(encoding="utf-8")
+        entries: list[dict[str, object]] = []
+        current: dict[str, object] | None = None
+        for line in text.splitlines():
+            if line.startswith("## "):
+                current = {
+                    "run_id": line[3:].strip(),
+                    "base": None,
+                    "ops": {},
+                    "contested": [],
+                    "dropped": [],
+                    "pending_body": [],
+                }
+                entries.append(current)
+                continue
+            if current is None:
+                continue
+            stripped = line.strip()
+            if stripped.startswith("- base:"):
+                current["base"] = stripped[len("- base:") :].strip().strip("`") or None
+            elif stripped.startswith("- dispositions:"):
+                current["ops"] = _parse_ops(stripped[len("- dispositions:") :].strip())
+            elif stripped.startswith("- contested:"):
+                current["contested"] = _split_csv(stripped[len("- contested:") :])
+            elif stripped.startswith("- dropped:"):
+                current["dropped"] = _split_csv(stripped[len("- dropped:") :])
+            elif stripped.startswith("- pending-body:"):
+                current["pending_body"] = _split_csv(stripped[len("- pending-body:") :])
+        # Newest first; cap at `limit`.
+        entries.reverse()
+        return entries[:limit]
+
     def _failed_count(self) -> int:
         """Number of terminal-failure events under ``_kb/failed/`` (0 if the dir is absent).
 
@@ -329,6 +548,32 @@ def _wiki_domain(rel_path: str) -> str | None:
     if len(parts) >= 3 and parts[0] == "wiki":
         return parts[1]
     return None
+
+
+def _parse_ops(value: str) -> dict[str, int]:
+    """Parse a ``log.md`` ``dispositions`` value (``CREATE_THEME=2, DROP=1`` | ``no-op``) → counts.
+
+    Mirrors the ``", ".join(f"{op}={n}" …)`` form ``worker._append_log`` writes. ``no-op`` (the
+    empty-counts marker) and any malformed ``op=n`` token (a non-integer count) is skipped, so the
+    dashboard tail never raises on a hand-edited or future log line.
+    """
+    ops: dict[str, int] = {}
+    if not value or value == "no-op":
+        return ops
+    for token in value.split(","):
+        op, sep, count = token.strip().partition("=")
+        if not sep:
+            continue
+        try:
+            ops[op.strip()] = int(count.strip())
+        except ValueError:
+            continue
+    return ops
+
+
+def _split_csv(value: str) -> list[str]:
+    """Split a comma-separated ``log.md`` list bullet (``contested``/``dropped``/…) into items."""
+    return [item.strip() for item in value.split(",") if item.strip()]
 
 
 def _now() -> datetime:

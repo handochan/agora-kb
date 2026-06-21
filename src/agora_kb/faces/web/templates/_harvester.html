@@ -1,0 +1,36 @@
+{# Harvester-status panel fragment (DESIGN §5.3). Scans move, so the dashboard polls this every 5s
+   (see dashboard.html). accepted/rejected are curator-owned cursor counters DEFERRED to ADR-0017
+   §7 — they stay 0 until that wiring lands and are rendered as-is, never faked. #}
+<p class="harvest-state">
+  Harvesting is
+  <strong class="{{ 'ok' if harvester.enabled else 'warn' }}">
+    {{ 'enabled' if harvester.enabled else 'disabled' }}
+  </strong>.
+</p>
+
+{% if harvester.connectors %}
+  <table class="connectors">
+    <thead>
+      <tr>
+        <th>Connector</th><th>Scope</th><th>Links</th><th>Source</th>
+        <th>Last scan</th><th>Proposed</th><th>Accepted</th><th>Rejected</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for c in harvester.connectors %}
+        <tr>
+          <td class="mono">{{ c.name }}</td>
+          <td>{{ c.scope }}</td>
+          <td>{{ 'yes' if c.follow_links else 'no' }}</td>
+          <td class="mono">{{ c.path or "—" }}</td>
+          <td class="mono">{{ c.last_scan or "never" }}</td>
+          <td>{{ c.proposed }}</td>
+          <td>{{ c.accepted }}</td>
+          <td>{{ c.rejected }}</td>
+        </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+{% else %}
+  <p class="empty">No connectors configured (ADR-0007 harvesting is opt-in).</p>
+{% endif %}

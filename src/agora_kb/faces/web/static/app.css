@@ -172,4 +172,40 @@ article.note .body code { font-family: var(--mono); font-size: 0.9em; }
 .field .hint { font-size: 0.82rem; color: var(--muted); margin-top: 0.2rem; }
 .or-divider { text-align: center; color: var(--muted); margin: 0.6rem 0; font-size: 0.85rem; }
 
+/* Dashboard panels (read-only meta face, DESIGN §5.3) */
+.panel {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 1rem 1.2rem;
+  background: var(--panel);
+  margin-bottom: 1.5rem;
+}
+.panel-head { display: flex; align-items: baseline; justify-content: space-between; gap: 1rem; }
+.panel h2 { margin: 0.2rem 0 0.8rem; }
+.panel h3 { font-size: 0.95rem; margin: 1rem 0 0.4rem; color: var(--muted); }
+.panel .status-strip { margin-bottom: 0.5rem; }
+.panel .value.ok { color: var(--ok); }
+.panel .value.warn { color: var(--warn); }
+
+ul.kv { list-style: none; margin: 0; padding: 0; display: flex; flex-wrap: wrap; gap: 0.4rem 1.2rem; }
+ul.kv li { display: flex; gap: 0.4rem; align-items: baseline; }
+ul.kv .k { color: var(--muted); }
+ul.kv .v { font-weight: 600; }
+
+ul.worklog { list-style: none; margin: 0; padding: 0; }
+ul.worklog li {
+  display: flex; flex-wrap: wrap; gap: 0.4rem 0.8rem; align-items: baseline;
+  padding: 0.5rem 0; border-bottom: 1px solid var(--border);
+}
+ul.worklog .run-id { font-size: 0.82rem; }
+ul.worklog .base { font-size: 0.78rem; color: var(--muted); }
+ul.worklog .op { font-size: 0.74rem; background: var(--accent-weak); color: var(--accent); padding: 0.05rem 0.45rem; border-radius: 999px; margin-right: 0.3rem; }
+ul.worklog .dropped, ul.worklog .contested { font-size: 0.78rem; color: var(--muted); }
+
+table.connectors { width: 100%; border-collapse: collapse; font-size: 0.9rem; }
+table.connectors th, table.connectors td { text-align: left; padding: 0.4rem 0.6rem; border-bottom: 1px solid var(--border); }
+table.connectors th { font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); }
+.harvest-state .ok { color: var(--ok); }
+.harvest-state .warn { color: var(--warn); }
+
 footer.site { max-width: 980px; margin: 2rem auto 1rem; padding: 0 1.5rem; color: var(--muted); font-size: 0.85rem; }
