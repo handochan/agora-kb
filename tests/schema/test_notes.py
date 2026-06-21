@@ -123,15 +123,30 @@ def test_parse_all_notes_missing_type_is_none(tmp_path: Path) -> None:
     assert note.type is None
 
 
-def test_parse_all_notes_malformed_frontmatter_raises_with_path(tmp_path: Path) -> None:
+def test_parse_all_notes_strict_malformed_frontmatter_raises_with_path(tmp_path: Path) -> None:
     layout = RepoLayout(tmp_path)
     (layout.root / "wiki" / "ai-tech").mkdir(parents=True)
     (layout.root / "wiki" / "ai-tech" / "broken.md").write_text(
         "no frontmatter at all", encoding="utf-8"
     )
     with pytest.raises(FrontmatterError) as exc:
-        parse_all_notes(layout)
+        parse_all_notes(layout, strict=True)
     assert "wiki/ai-tech/broken.md" in str(exc.value)
+
+
+def test_parse_all_notes_tolerant_default_degrades_fenceless_note(tmp_path: Path) -> None:
+    """The DEFAULT (tolerant) read must not raise on a fenceless note; it degrades to empty
+    frontmatter + the full text as body (ADR-0014 D1), so the browse face stays up."""
+    layout = RepoLayout(tmp_path)
+    (layout.root / "wiki" / "general").mkdir(parents=True)
+    (layout.root / "wiki" / "general" / "nofm.md").write_text(
+        "# No frontmatter here\n\nbody.\n", encoding="utf-8"
+    )
+    (note,) = parse_all_notes(layout)  # must NOT raise
+    assert note.rel_path == "wiki/general/nofm.md"
+    assert note.type is None
+    assert note.frontmatter == {}
+    assert note.body == "# No frontmatter here\n\nbody.\n"
 
 
 def test_note_basename_strips_md_suffix(tmp_path: Path) -> None:

@@ -13,11 +13,15 @@ A dependency-light :mod:`argparse` front-end over the core API. Subcommands:
   evaluation, e.g. driven by an external system cron / launchd).
 - ``agora serve [--repo PATH] [--writer W]`` — run the MCP stdio server face. The face is imported
   lazily so the rest of the CLI works even when an MCP transport dependency is missing.
+- ``agora web [--repo PATH] [--host H] [--port P] [--writer W] [--user U]`` — run the FastAPI + HTMX
+  web face (browse / search / upload; ADR-0019). Imported lazily (the optional ``web`` extra), so a
+  missing fastapi gives a clean ``install agora-kb[web]`` message, not an import error.
 - ``agora doctor`` — print a health report (git, python, key deps, repo init state).
 
-The MCP face is imported lazily (only inside ``serve``) on purpose: it keeps ``repo init`` /
-``status`` / ``curate`` / ``doctor`` usable in environments where the transport stack is not
-installed (invariant 4: every component has an OSS path, optional pieces stay optional).
+The MCP and web faces are imported lazily (only inside ``serve`` / ``web``) on purpose: it keeps
+``repo init`` / ``status`` / ``curate`` / ``doctor`` usable in environments where the transport /
+web stack is not installed (invariant 4: every component has an OSS path, optional pieces stay
+optional).
 """
 
 from __future__ import annotations
@@ -175,6 +179,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_serve.add_argument("--repo", default=".", help="repo root (default: .)")
     p_serve.add_argument("--writer", default=None, help="writer name for captures")
     p_serve.set_defaults(func=_cmd_serve)
+
+    # web — the FastAPI + HTMX web face (browse / search / upload; ADR-0019). Optional `web` extra.
+    p_web = sub.add_parser("web", help="run the web face (FastAPI + HTMX; needs the 'web' extra)")
+    p_web.add_argument("--repo", default=".", help="repo root (default: .)")
+    p_web.add_argument("--host", default="127.0.0.1", help="bind host (default: 127.0.0.1)")
+    p_web.add_argument("--port", type=int, default=8000, help="bind port (default: 8000)")
+    p_web.add_argument("--writer", default="web", help="inbox writer namespace (default: web)")
+    p_web.add_argument(
+        "--user", default="local", help="identity stamped into source=web:<user> (default: local)"
+    )
+    p_web.set_defaults(func=_cmd_web)
 
     # doctor
     p_doctor = sub.add_parser("doctor", help="print a health report")
@@ -644,6 +659,33 @@ def _cmd_serve(args: argparse.Namespace) -> int:
         kwargs["writer"] = args.writer
     server = mcp_server.build_server(**kwargs)
     server.run()  # pragma: no cover - blocking stdio loop, never run in tests
+    return 0
+
+
+def _cmd_web(args: argparse.Namespace) -> int:
+    """``agora web``: run the FastAPI + HTMX web face over the repo (ADR-0019 / DESIGN §5.2).
+
+    The web face is an OPTIONAL surface behind the ``web`` extra (fastapi/uvicorn/jinja2/
+    markdown-it-py), so — exactly like ``agora serve`` with the MCP face — it is imported LAZILY
+    here: a missing dependency prints a clean ``install agora-kb[web]`` message and exits 1 rather
+    than raising an ``ImportError`` at module load (invariant 4: optional pieces stay optional). It
+    binds ``--host``/``--port`` (default localhost:8000, Phase-3 single-user) and threads
+    ``--writer``/``--user`` into the app (the upload source is ``web:<user>``). Runs via uvicorn.
+    """
+    try:
+        web = importlib.import_module("agora_kb.faces.web")
+        uvicorn = importlib.import_module("uvicorn")
+    except ImportError as exc:  # pragma: no cover - exercised manually, not in tests
+        print(
+            f"{_PROG} web: web face unavailable ({exc}); "
+            f"install the web dependencies: pip install 'agora-kb[web]' "
+            f"(or uv sync --extra web).",
+            file=sys.stderr,
+        )
+        return 1
+    app = web.build_app(repo_path=Path(args.repo), writer=args.writer, user=args.user)
+    print(f"{_PROG} web: serving {Path(args.repo).resolve()} on http://{args.host}:{args.port}")
+    uvicorn.run(app, host=args.host, port=args.port)  # pragma: no cover - blocking server loop
     return 0
 
 

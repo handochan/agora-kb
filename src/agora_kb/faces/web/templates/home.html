@@ -1,0 +1,65 @@
+{% extends "base.html" %}
+{% block title %}Agora — browse &amp; search{% endblock %}
+{% block content %}
+<h1>Knowledge base</h1>
+
+<section aria-label="Status" class="status-strip">
+  <div class="stat">
+    <span class="label">Inbox depth</span>
+    <span class="value">{{ status.inbox_depth }}</span>
+  </div>
+  <div class="stat">
+    <span class="label">Processed today</span>
+    <span class="value">{{ status.processed_today }}</span>
+  </div>
+  <div class="stat">
+    <span class="label">Failed</span>
+    <span class="value">{{ status.failed }}</span>
+  </div>
+  <div class="stat">
+    <span class="label">Last consolidation</span>
+    <span class="value mono">{{ status.last_consolidation or "—" }}</span>
+  </div>
+</section>
+
+<section aria-label="Search">
+  <h2>Search</h2>
+  <form class="search" role="search"
+        hx-get="/search" hx-target="#search-results" hx-trigger="submit, keyup changed delay:400ms from:input[type=search]">
+    <input type="search" name="q" placeholder="Ask the wiki for evidence…" aria-label="Search query" autocomplete="off">
+    <button type="submit">Search</button>
+  </form>
+  <div id="search-results" aria-live="polite"></div>
+</section>
+
+<section aria-label="Notes">
+  <h2>Notes by domain</h2>
+  {% if browse.notes %}
+    <div class="domains">
+      {% for domain in browse.domains %}
+        <div class="domain-card">
+          <h3>{{ domain }}</h3>
+          <ul>
+            {% for note in browse.notes if note.domain == domain %}
+              <li><a href="/note/{{ note.rel_path }}">{{ note.title }}</a></li>
+            {% endfor %}
+          </ul>
+        </div>
+      {% endfor %}
+      {% set rootless = browse.notes | selectattr("domain", "none") | list %}
+      {% if rootless %}
+        <div class="domain-card">
+          <h3>Top level</h3>
+          <ul>
+            {% for note in rootless %}
+              <li><a href="/note/{{ note.rel_path }}">{{ note.title }}</a></li>
+            {% endfor %}
+          </ul>
+        </div>
+      {% endif %}
+    </div>
+  {% else %}
+    <p class="empty">No notes yet. <a href="/upload">Capture something</a> to seed the wiki.</p>
+  {% endif %}
+</section>
+{% endblock %}

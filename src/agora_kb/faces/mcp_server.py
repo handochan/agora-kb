@@ -123,6 +123,67 @@ class AgoraHandlers:
             ],
         }
 
+    # --- browse (read; web face, ADR-0003/0019) -------------------------------------------------
+    def browse(self) -> dict[str, object]:
+        """List every wiki note for the browse face; return ``{notes: [...], domains: [...]}``.
+
+        A thin shaping of :meth:`agora_kb.core.wiki.Wiki.list_notes` into JSON-serializable dicts —
+        one ``{rel_path, basename, type, title, status, tags, domain}`` per note, plus the sorted
+        unique non-``None`` ``domains``. ``title`` falls back to ``basename``; ``domain`` is the
+        ``wiki/<domain>/`` path segment (``None`` for ``index.md``). Notes are sorted by
+        ``rel_path`` for a deterministic listing. The body markdown is intentionally NOT included
+        here — that is the per-note :meth:`note` payload.
+        """
+        rows = [self._note_summary(note) for note in self._wiki.list_notes()]
+        rows.sort(key=lambda r: r["rel_path"])  # type: ignore[arg-type, return-value]
+        domains = sorted({d for r in rows if (d := r["domain"]) is not None})  # type: ignore[comparison-overlap]
+        return {"notes": rows, "domains": domains}
+
+    def note(self, rel_path: str) -> dict[str, object] | None:
+        """Return one note's full read payload by ``rel_path``, or ``None`` if not tracked.
+
+        Shapes :meth:`agora_kb.core.wiki.Wiki.get_note` into the browse summary fields plus the raw
+        ``frontmatter``, the raw markdown ``body`` (rendering to HTML is the web layer's job, never
+        the core/face's), and ``links`` — the body graph-edge basenames via
+        :func:`agora_kb.schema.notes.body_link_basenames`. Path-safety is the core's: an untracked
+        or traversal path resolves to no note, so this returns ``None``.
+        """
+        note = self._wiki.get_note(rel_path)
+        if note is None:
+            return None
+        from agora_kb.schema.notes import body_link_basenames
+
+        payload = self._note_summary(note)
+        payload.pop("type", None)  # the per-note shape carries the richer fields below instead
+        payload["frontmatter"] = note.frontmatter
+        payload["body"] = note.body
+        payload["links"] = body_link_basenames(note.body)
+        return payload
+
+    @staticmethod
+    def _note_summary(note: object) -> dict[str, object]:
+        """Derive the shared browse summary fields from a :class:`~agora_kb.schema.notes.Note`.
+
+        ``title`` ← ``frontmatter["title"]`` (else ``basename``); ``status`` ←
+        ``frontmatter.status`` (may be ``None``); ``tags`` ← ``frontmatter.tags`` (``[]`` when
+        absent/non-list); ``domain`` ← the ``wiki/<domain>/`` path segment (``None`` for
+        ``index.md`` or any non-``wiki/`` path).
+        """
+        fm = note.frontmatter  # type: ignore[attr-defined]
+        raw_title = fm.get("title")
+        title = raw_title if isinstance(raw_title, str) and raw_title else note.basename  # type: ignore[attr-defined]
+        raw_tags = fm.get("tags")
+        tags = list(raw_tags) if isinstance(raw_tags, list) else []
+        return {
+            "rel_path": note.rel_path,  # type: ignore[attr-defined]
+            "basename": note.basename,  # type: ignore[attr-defined]
+            "type": note.type,  # type: ignore[attr-defined]
+            "title": title,
+            "status": fm.get("status"),
+            "tags": tags,
+            "domain": _wiki_domain(note.rel_path),  # type: ignore[attr-defined]
+        }
+
     # --- meta -----------------------------------------------------------------------------------
     def status(self) -> dict[str, object]:
         """``kb_status``: the meta face — backlog + last consolidation + cumulative counters.
@@ -255,6 +316,19 @@ class AgoraHandlers:
             default_backend=default_backend,
             report=None,
         )
+
+
+def _wiki_domain(rel_path: str) -> str | None:
+    """Return the ``<domain>`` segment of a ``wiki/<domain>/...`` note path, else ``None``.
+
+    ``index.md`` (and any path not under ``wiki/<domain>/``) has no domain. POSIX-split on ``/``:
+    a path is in a domain iff it is ``wiki/<domain>/<...>`` (at least three segments under
+    ``wiki``).
+    """
+    parts = rel_path.split("/")
+    if len(parts) >= 3 and parts[0] == "wiki":
+        return parts[1]
+    return None
 
 
 def _now() -> datetime:

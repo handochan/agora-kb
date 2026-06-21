@@ -516,7 +516,7 @@ def lint(
     # a worktree with several malformed notes surfaces one L1-4 per lint pass — deterministic given
     # the bytes, and successive passes report the next file as each is fixed.
     try:
-        notes = parse_all_notes(layout)
+        notes = parse_all_notes(layout, strict=True)
     except FrontmatterError as exc:
         # parse_all_notes prefixes the message with "<rel_path>: ..."; recover the path for the
         # finding so the result still sorts deterministically and points at the broken file. Fall

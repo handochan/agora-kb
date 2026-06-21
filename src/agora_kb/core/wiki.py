@@ -31,12 +31,15 @@ import math
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 from pydantic import BaseModel, ConfigDict
 
 from . import frontmatter
 from .layout import RepoLayout
+
+if TYPE_CHECKING:
+    from agora_kb.schema.notes import Note
 
 __all__ = ["SearchHit", "QueryResult", "Wiki"]
 
@@ -511,6 +514,36 @@ class Wiki:
             for c in eligible[: max(0, limit)]
         )
         return QueryResult(query=question, status="ok", hits=hits)
+
+    # --- browse read helpers (ADR-0003: read logic stays in core, not the face) ---------------
+    def list_notes(self) -> list[Note]:
+        """Return every tracked wiki note (``index.md`` + ``wiki/**``) for the browse face.
+
+        Delegates to :func:`agora_kb.schema.notes.parse_all_notes`, the single deterministic note
+        scanner (the schema doc and its symlinks are already excluded there, ADR-0010 §1). This is
+        a pure read; it never touches :meth:`query` scoring. It uses ``parse_all_notes``' tolerant
+        default (NOT ``strict``), so one fenceless / foreign note degrades to empty-frontmatter +
+        full body instead of crashing the browse face — matching :meth:`query`'s tolerant-read
+        posture (ADR-0014 D1). Imported lazily inside the method to avoid a ``core`` ⇄
+        ``schema.notes`` import cycle (``schema.notes`` imports from ``core``).
+        """
+        from agora_kb.schema.notes import parse_all_notes
+
+        return parse_all_notes(self.layout)
+
+    def get_note(self, rel_path: str) -> Note | None:
+        """Return the tracked note whose POSIX repo-relative path is ``rel_path``, else ``None``.
+
+        Path-safe by construction: rather than reading an arbitrary path off disk, it matches
+        ``rel_path`` against the real :func:`parse_all_notes` results, so only a genuinely tracked
+        note (``index.md`` or ``wiki/**/*.md``, schema docs excluded) ever resolves. A traversal
+        attempt (``../secret``), an absolute path, or any untracked path simply finds no match and
+        returns ``None`` — the face can never read outside the repo through this seam.
+        """
+        for note in self.list_notes():
+            if note.rel_path == rel_path:
+                return note
+        return None
 
     # --- note loading --------------------------------------------------------------------------
     def _load_notes(self) -> list[_Note]:
