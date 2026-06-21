@@ -43,7 +43,8 @@ repo's `AGENTS.md`/`SCHEMA.md` under an `INGEST` section.
   the generic `agora-cli-brain` shim — any headless CLI agent is a swappable backend.
 - [ADR-0017 — Harvester file-connector mechanics](adr/0017-harvester-file-connector-mechanics.md):
   realizes the harvester cursor (DATA-MODEL §6) + candidate gating referenced in §0/§4.3/§5/§6, and
-  records that the curator-side `accepted`/`rejected` cursor counters are **deferred** (§7 below).
+  records the curator-side `accepted`/`rejected` cursor counters, now **implemented** at finalize
+  (§7 below; happy-path-only mirror of the state-counter bump, per-harvested-event granularity).
 - [ADR-0018 — Harvester link-following](adr/0018-harvester-link-following.md): opt-in following of a
   candidate's `[Title](sibling.md)` pointer.
 
@@ -73,7 +74,7 @@ append ONE structured entry to log.md (worker only; AFTER §4.2/§4.4 pass-or-de
 git commit worktree (one commit/run) ; compare-and-swap curated ref base→new            │
   (or open PR if review_mode=pr) ; record published_runs[run_id]=sha ; phase=published   │
 move events processing/ → processed/<date>/  (or failed/ + error record)                │
-update state.json counters from dispositions (harvester cursor accepted/rejected DEFERRED) ; finalized │
+update state.json counters from dispositions; bump harvest cursor accepted/rejected (§6) ; finalized │
 drop worktree ; release lock                                                            ┘
 ```
 
@@ -372,10 +373,11 @@ runs with an explicit atomicity boundary:
    CAS success is the single durable source of truth for "published".**
 3. record `published_runs[run_id]=sha` + rewrite `state.json` (atomic, under the lock); set
    `run.json.phase=published`;
-4. move events to `processed/<date>/`; update `state.json.counters` from plan dispositions (the
-   contracted harvester-cursor `accepted/rejected` update from dispositions, DATA-MODEL §6, is
-   **DEFERRED in Phase 2 — ADR-0017 §7;** the worker does not yet touch any cursor); set
-   `run.json.phase=finalized`;
+4. move events to `processed/<date>/`; update `state.json.counters` from plan dispositions AND bump
+   the per-connector harvest cursor `accepted`/`rejected` (DATA-MODEL §6) from this run's
+   harvested-candidate dispositions — happy-path-only, mirroring the state-counter bump, so it is
+   NEVER replayed in recovery (`_finalize_recovered`) and stays exactly-once + rebuildable without an
+   `is_published` guard (ADR-0017 §7); set `run.json.phase=finalized`;
 5. drop the worktree; release the lock.
 
 A crash between any two steps is recoverable from git: `published_runs` and `state.json` are rebuildable from
@@ -486,9 +488,17 @@ For any candidate with `is_gated == true` (`kind=candidate` OR `confidence=low`,
 - Kept-via-merge regions are tagged `origin: harvest:<agent>` by the worker (loop prevention); the candidate
   `confidence` is recorded so lint/dashboard surface low-confidence and contested regions for human review.
 - Harvester cursor counters: the harvester writes `proposed`; the curator-owned `accepted`/`rejected`
-  counters are contracted to be updated DETERMINISTICALLY from the plan dispositions at finalize, but
-  are **DEFERRED in Phase 2 (ADR-0017 §7)** — the worker does not yet touch any cursor, so they
-  round-trip at 0 (rebuildable from git + `processed/`). Never self-reported by the backend.
+  counters are updated DETERMINISTICALLY at finalize from the plan dispositions over each candidate's
+  HARVESTED provenance tuples (ADR-0017 §7): `accepted` += `MERGE_INTO_THEME`/`MARK_CONTESTED`,
+  `rejected` += `DROP`. `NOOP` = skip (neither) but is DEFENSIVE — like `CREATE_THEME`/`APPEND_DAILY`
+  it is not in the §4.1-check-10 `GATE_ALLOWED_OPS` set, so it can never occur for a genuinely gated
+  candidate (it is rejected at validation); the skip only guards a non-gated candidate that happens to
+  carry harvested provenance. Granularity is per harvested EVENT
+  (per provenance tuple, attributed to its configured connector), so `proposed` and
+  `accepted + rejected` reconcile; a mixed-provenance candidate counts only its harvested tuples; a
+  connector removed from config is skipped. The bump is happy-path-only (mirrors the state-counter
+  bump, never replayed in recovery) and best-effort + rebuildable, NOT transactional with the CAS.
+  Never self-reported by the backend.
 - Scope-lock (personal source → personal repo only, ADR-0007 §3) is enforced in Phase 2 as a
   **fail-closed harvester pre-write gate** keyed on the repo's declared `kind` (`check_scope`, before
   the inbox write), NOT yet at the core write boundary (a caller building a harvester/Inbox against the
@@ -695,5 +705,6 @@ from `git log` + `processed/`.
 | `log.md` append | worker (after §4.2/§4.4 only) | `worktree/log.md` | yes | append-only action log, single-writer |
 | commit + ref CAS | worker | git | — | atomic publish; CAS is the durable publish point (ADR-0002/0008) |
 | `state.json` | worker | `_kb/` | no | counters/idempotency, rebuildable from git + processed/ |
-| harvester cursor (`proposed`) | harvester | `_kb/harvest/<connector>.json` | no | scan position; the worker-owned `accepted/rejected` update is DEFERRED (ADR-0017 §7) |
+| harvester cursor (`proposed`) | harvester | `_kb/harvest/<connector>.json` | no | scan position; harvester owns `proposed`/scan fields |
+| harvester cursor (`accepted`/`rejected`) | **worker (finalize)** | `_kb/harvest/<connector>.json` | no | bumped from harvested-candidate dispositions, happy-path-only, best-effort + rebuildable (ADR-0017 §7) |
 | `lint` result | worker (§4.4) | in-memory | — | deterministic, same code path as dashboard (DESIGN §5.3) / ADR-0010 L1 |

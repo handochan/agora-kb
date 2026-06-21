@@ -20,7 +20,15 @@ from .manifest import (
 from .plan import Disposition, Plan, PlanError, PlanParseError, validate_plan
 from .subprocess_backend import BackendUnavailableError, SubprocessBackend
 from .triggers import TriggerConfig, TriggerDecision, TriggerReason, evaluate
-from .worker import Backend, FakeBackend, RunReport, recover, run
+from .worker import (
+    Backend,
+    FakeBackend,
+    HarvestCursorDelta,
+    RunReport,
+    compute_harvest_cursor_deltas,
+    recover,
+    run,
+)
 
 __all__ = [
     "TriggerConfig",
@@ -53,6 +61,8 @@ __all__ = [
     "build_bundle",
     "Backend",
     "FakeBackend",
+    "HarvestCursorDelta",
+    "compute_harvest_cursor_deltas",
     "RunReport",
     "run",
     "recover",

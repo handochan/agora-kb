@@ -21,8 +21,11 @@ keep/merge/drop review:
 
 The per-connector position is the DATA-MODEL §6 cursor ``_kb/harvest/<connector>.json``. The
 harvester owns ``proposed`` (and ``last_scan`` / ``last_content_sha256`` / ``source_path``); the
-``accepted`` / ``rejected`` counters are contracted to the curator at finalize (ADR-0011) and are
-DEFERRED — they round-trip untouched here so a later curator change can populate them (ADR-0017).
+``accepted`` / ``rejected`` counters are the CURATOR's, bumped at finalize from this run's
+harvested-candidate dispositions (ADR-0011 / ADR-0017 §7,
+:func:`agora_kb.curator.worker.compute_harvest_cursor_deltas`). The harvester PRESERVES them across
+its own saves so the two writers never clobber each other (the curator only ever increments via the
+atomic :class:`CursorStore`).
 """
 
 from __future__ import annotations
@@ -97,9 +100,10 @@ class HarvestCursor(BaseModel):
 
     Held to EXACTLY the documented §6 fields (no unbounded extension — ADR-0017). The harvester
     writes ``connector`` / ``source_path`` / ``last_scan`` / ``last_content_sha256`` / ``proposed``;
-    ``accepted`` / ``rejected`` are the curator's at finalize (ADR-0011) and are DEFERRED — they are
-    preserved across saves so a future curator change can populate them without the harvester
-    clobbering them.
+    ``accepted`` / ``rejected`` are the curator's, bumped at finalize from the run's
+    harvested-candidate dispositions (ADR-0011 / ADR-0017 §7). They are PRESERVED across harvester
+    saves so the harvester never clobbers the curator's increments (and vice versa — the curator
+    re-loads then increments via the atomic :class:`CursorStore`).
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -359,7 +363,9 @@ class Harvester:
             else:
                 deduped += 1
 
-        # Advance the §6 cursor: harvester-owned fields only; accepted/rejected stay untouched.
+        # Advance the §6 cursor: harvester-owned fields only. accepted/rejected are the curator's
+        # (bumped at finalize, ADR-0017 §7) — we load-then-save here, preserving them untouched so
+        # the two writers never clobber each other.
         # PRESERVE the prior whole-source hash on a no-match scan (content_sha256 is None) so a
         # transient source disappearance does not clobber the fast no-op next cycle (ADR-0017).
         cursor.source_path = scan.source_path
