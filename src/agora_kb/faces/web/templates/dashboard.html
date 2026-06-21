@@ -46,4 +46,11 @@
     {% include "_harvester.html" %}
   </div>
 </section>
+
+<footer class="muted dashboard-footer">
+  {# Operational time-series live at the Prometheus exposition; heavy graphing is external Grafana
+     (an AGPL operator-supplied sidecar, never bundled — ADR-0019 §5 / DESIGN §5.3). #}
+  <a href="/metrics">Prometheus metrics</a> — operational time-series for scraping. Heavy graphing
+  lives in external Grafana (AGPL sidecar, not bundled).
+</footer>
 {% endblock %}
