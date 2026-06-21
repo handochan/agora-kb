@@ -5,10 +5,11 @@ conceptual model; this doc maps it to modules and runtime processes.
 
 ## 1. Module map (`src/agora_kb/`)
 
-> **Phases 1–2 ship:** `core/`, `curator/` (incl. `isolation/` + the `backends` registry with per-act
-> routing), `adapters/` (the curator-brain shims), `harvester/` (file connectors), `ingest/vault_import.py`,
-> `faces/mcp_server.py`, `schema/`, `cli.py`, `config.py`. The `ingest/extractors/`, `faces/web/`, and
-> `auth/` packages below are later-phase (Phase 3–5) stubs, shown here for the full target map.
+> **Phases 1–3 ship:** `core/`, `curator/` (incl. `isolation/` + the `backends` registry with per-act
+> routing), `adapters/` (the curator-brain shims), `harvester/` (file connectors), `ingest/vault_import.py`
+> + `ingest/extractors/` (url/pdf/office), `faces/mcp_server.py`, `faces/web/` (FastAPI JSON API + HTMX UI,
+> dashboard, `/metrics`), `schema/`, `cli.py`, `config.py`. Only the `auth/` package below remains a
+> later-phase (Phase 4–5) stub, shown here for the full target map.
 
 ```
 core/                 The single internal API. Everything else is a face or adapter over this.
@@ -55,7 +56,13 @@ ingest/               INPUT adapters: uploads → markdown in raw/.
 
 faces/                The faces over core.
   mcp_server.py       FastMCP: kb_remember / kb_query / kb_status / kb_curate
-  web/                FastAPI app: browse, search, upload, dashboard (read-only meta)
+  web/                FastAPI web face (ADR-0019): API-first JSON API (GET /api/{status,search,notes,
+                      notes/{path}}, POST /api/upload) + server-rendered HTMX/Jinja2 UI (browse,
+                      search, upload, read-only dashboard); localhost no-auth
+    app.py            build_app: the JSON API + HTMX routes; markdown-it-py render (XSS-safe), upload
+                      extract→inbox write path (ADR-0020 — curator stays sole raw/ writer)
+    metrics.py        Prometheus /metrics exporter — cheap per-scrape operational metrics (NEVER runs
+                      lint on scrape); prometheus_client is the optional `metrics` extra
 
 auth/                 AuthN/AuthZ.
   identity.py         token / OIDC (Keycloak) verification
@@ -67,7 +74,7 @@ schema/               KB wiki schema emitted into each knowledge repo.
   notes.py            note-type helpers (index/moc/theme/daily) + link resolution
   templates/kb_schema.md   the AGENTS.md schema template
 
-cli.py                `agora` entry point: repo init · import · status · curate · harvest · watch · serve · doctor
+cli.py                `agora` entry point: repo init · import · status · curate · harvest · watch · serve · web · doctor
 config.py             load config (adapters.yaml backends/routing + connectors, repo.yaml, triggers, harvest policy)
 ```
 
@@ -107,10 +114,14 @@ agent/web → core.write(target, item)
 
 ### 3.2 Upload — capture with extraction
 ```
-web upload (file/url/text) → ingest extractor → markdown
-  ├─ save verbatim original → raw/<domain>/<date>-<slug>.<ext>          (immutable + sha256)
-  └─ core.write(target, item linking the raw source, source=web:<user>)
+web upload (file/url/text) → ingest extractor → markdown          (ADR-0020)
+  ├─ provenance-stamp the extracted markdown (extractor, content_sha256, source=web:<user>)
+  └─ core.write(target, item)                       (the inbox is the only write path — no face
+                                                     writes raw/; the curator alone materializes it)
 ```
+Storing the verbatim original binary in `raw/` (+ the re-ingest-drift sha256 sidecar) is a
+curator-side staging step **deferred** past Phase 3 (ADR-0020); Phase 3 carries provenance in the
+capture body, not a separate raw/ write.
 
 ### 3.3 Harvest — pull candidates
 ```
@@ -148,9 +159,13 @@ and may use only the returned hits; `not_found` is explicit and never synthesize
 
 ### 3.6 Dashboard (meta)
 ```
-web/dashboard → core.meta(scope)   reads: inbox count, state.json, log.md, git history, processed/failed
-                                    + Prometheus time-series for trends
-                                    (read-only; ACL-scoped)
+web/dashboard → AgoraHandlers.{health,curator_status,harvester_status}   (read-only meta panels)
+   reads: inbox count, state.json, log.md, processed/failed, harvest cursors, deterministic lint()
+   (HTMX-polled fragments; lint reused VERBATIM for KB-health signals — Phase 3c)
+
+GET /metrics  →  web/metrics.py            Prometheus exporter (separate surface — Phase 3d):
+   cheap per-scrape operational counters/gauges; NEVER runs lint on scrape; Grafana stays an
+   external (optional, AGPL) sidecar for time-series trends
 ```
 
 ## 4. Deployment topology

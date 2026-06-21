@@ -52,12 +52,36 @@ Goal: tool-agnostic curator and autonomous accumulation, still single-user.
       deferred to later phases (ADR-0017); Letta/mem0 API connectors remain Phase-4/5.
 **Exit:** swap the curator brain via config with no data risk; harvested candidates flow safely.
 
-## Phase 3 — Web face: upload + dashboard
+## Phase 3 — Web face: upload + dashboard — DONE (shipped; web/dashboard/metrics behind optional extras)
 Goal: humans contribute and observe via the browser.
-- [ ] `ingest` extractors (url/pdf/office) → `raw/` + inbox.
-- [ ] Web app: browse, search, upload.
-- [ ] Dashboard: KB health + curator status + harvester status (reads existing metadata).
-- [ ] Prometheus metrics export; optional Grafana dashboards.
+- [x] `ingest` extractors (url/pdf/office) → `raw/` + inbox. Shipped (PR #14): pure
+      `ingest/extractors/{base,url,pdf,office}.py` — `url` (trafilatura) / `pdf` (pdfminer.six,
+      MIT over AGPL pymupdf) / `office` (markitdown) → an `ExtractedDoc` carrying extracted markdown +
+      `content_sha256` (reuses `core.hashing`); the third-party libs are a lazy, optional `ingest`
+      extra (a missing dep surfaces as a clean `ExtractorUnavailable`, not an import error). The
+      curator stays the sole writer of `raw/` (per ADR-0020 the upload path goes extract → inbox).
+- [x] Web app: browse, search, upload. Shipped (PR #15, ADR-0019 + ADR-0020): `faces/web/app.py` —
+      an API-first FastAPI app with a first-class JSON API (`GET /api/{status,search,notes,notes/{path}}`,
+      `POST /api/upload`) **and** a server-rendered HTMX/Jinja2 UI (`/`, `/search`, `/note/{path}`,
+      `/upload`). Note bodies render via `markdown-it-py` with raw HTML disabled (`html=False`,
+      XSS-safe) and intra-wiki links rewritten to `/note/...`. New core read helpers
+      `Wiki.list_notes`/`get_note` + `AgoraHandlers.browse`/`note`; upload write-path (ADR-0020)
+      extracts then `Inbox.write`s a gated capture (curator remains sole writer of `raw/`; storing the
+      original binary verbatim + its drift sidecar is a deliberate deferral). CLI `agora web` (lazy,
+      optional `web` extra += jinja2/python-multipart/markdown-it-py); localhost, no auth.
+- [x] Dashboard: KB health + curator status + harvester status (reads existing metadata). Shipped
+      (PR #16): a read-only dashboard over `AgoraHandlers.health()`/`curator_status()`/`harvester_status()`,
+      surfaced at `GET /dashboard` + `/api/dashboard/*` with HTMX-polling fragments. Health reuses the
+      deterministic `lint()` verbatim (DESIGN §5.3) and reports distinct `orphans` (L2-1, read-time
+      link-graph derivation) vs `broken_links` (L1-2, dangling outbound) signals.
+- [x] Prometheus metrics export; optional Grafana dashboards. Shipped (PR #17): `faces/web/metrics.py`
+      — a `GET /metrics` exporter of cheap operational metrics that reads CURRENT state per scrape and
+      **never** runs `lint()` or a whole-tree scan; `prometheus_client` is the lazy, optional `metrics`
+      extra (a missing dep returns a clean HTTP 503 with an install remedy). Grafana stays an external
+      AGPL sidecar (out of the core; see the deferred list). And (PR #18, ADR-0017 §7) the curator now
+      wires the harvest cursor `accepted`/`rejected` counters at finalize (happy-path-only mirror of the
+      `_bump_counters` state bump, per-event, best-effort + rebuildable), so the dashboard and metrics
+      surface real harvest dispositions rather than zeros.
 **Exit:** upload a PDF/URL in the browser → it becomes a linked wiki note; dashboard shows the queue.
 
 ## Phase 4 — Small team (multi-tenant, network)

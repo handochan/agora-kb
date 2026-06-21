@@ -160,25 +160,43 @@ One MCP registration = every MCP client (Claude Code, Codex, Qwen, Hermes, …) 
 these tools. No per-tool plugin needed.
 
 ### 5.2 Web app (people)
-A FastAPI + lightweight-frontend face for humans:
-- **Browse & search** the wiki (read path).
-- **Upload** text / files (PDF, docx, …) / URLs → stored verbatim in `raw/` (+ provenance, sha256),
-  then an inbox candidate is enqueued; the curator turns it into a wiki note. Upload reuses the
-  `raw/` + inbox path exactly — no new concept, same concurrency & access control. (ADR-0003.)
+Implemented (Phase 3 — ADR-0019/0020). `faces/web/app.py` is a **FastAPI** face that is
+**API-first**: a first-class JSON API (`GET /api/{status,search,notes,notes/{path}}`,
+`POST /api/upload`) plus a thin **server-rendered HTMX + Jinja2** UI over it (`/`, `/search`,
+`/note/{path}`, `/upload`). Run it with `agora web` (the optional `web` extra). Localhost, no-auth
+for now (auth is Phases 4–5). Both layers call the same core read helpers (`Wiki.list_notes` /
+`Wiki.get_note`, surfaced as `AgoraHandlers.browse` / `AgoraHandlers.note`) and the same inbox
+write path the MCP face uses — the web face never reads or mutates `wiki/` / git / `raw/` directly.
+- **Browse & search** the wiki (read path). Note bodies render via `markdown-it-py` with raw HTML
+  disabled (`html=False`, XSS-safe) and intra-wiki `[Title](relative.md)` links rewritten to UI URLs.
+- **Upload** text / files (PDF, docx, …) / URLs: the face runs the matching **input extractor**
+  (§2.3) to produce markdown + provenance, then writes a single inbox capture — exactly the
+  `kb_remember` write path, no new concept, same concurrency & access control (ADR-0003). The
+  **curator remains the sole writer of `raw/`** (ADR-0002): it materializes `raw/` from the capture
+  body during consolidation; the *face* never writes `raw/`. (ADR-0020.) Staging the **original
+  binary** verbatim in `raw/` (+ the sha256 re-ingest-drift sidecar) is a deferred follow-up.
 - Binary assets → `assets/`, referenced from notes (outside the navigation graph).
 
 ### 5.3 Dashboard (status, read-only)
-A read-only meta face. **All data it needs already exists** in `_kb/state.json`, the live `inbox/`
-count, `log.md`, git history, and `processed/`+`failed/`. Panels:
+Implemented (Phase 3 — part of the web face). A read-only meta face served at `/dashboard` with
+`GET /api/dashboard/*` JSON endpoints and HTMX-polling fragments, backed by
+`AgoraHandlers.health` / `curator_status` / `harvester_status`. **All data it needs already exists**
+in `_kb/state.json`, the live `inbox/` count, `log.md`, git history, `processed/`+`failed/`, and the
+harvest cursors. Panels:
 - **KB health (per team / per person):** note counts, themes vs daily, tag distribution, growth,
-  orphan/contested notes (lint signals), last consolidation.
+  orphan notes vs broken links (distinct lint signals — `health` reuses the existing `lint()` path
+  verbatim), last consolidation.
 - **Curator/agent status:** queue depth, in-flight, throughput, success/fail, active backend+model,
   cost (if a paid backend), and a work-log timeline (what was ingested/merged/dropped).
-- **Harvester status:** connectors enabled, last scan per source, candidates proposed/accepted/rejected.
+- **Harvester status:** connectors enabled, last scan per source, candidates proposed/accepted/rejected
+  (the curator now wires the accepted/rejected cursor counters at finalize — ADR-0017 §7).
 
-Observability splits in two: operational time-series (queue depth, throughput) via
-**Prometheus + Grafana** (the curator exports metrics); content/health views via the web app.
-Scope is filtered by access control — a viewer sees only their teams/personal repos.
+Observability splits in two: operational time-series (queue depth, throughput) via a **Prometheus
+exporter** (`faces/web/metrics.py`, `GET /metrics`; `prometheus_client` is the optional `metrics`
+extra, returning 503 if absent). The exporter is a cheap read of current state — it **never** runs
+`lint()` or a whole-tree scan on scrape; the content/health views stay in the dashboard above.
+Grafana remains an external (AGPL) sidecar for graphing. Scope is filtered by access control — a
+viewer sees only their teams/personal repos.
 
 ## 6. Memory harvester (autonomous accumulation — optional)
 
