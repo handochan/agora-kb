@@ -32,7 +32,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Annotated
 
 from fastapi import FastAPI, Form, HTTPException, Query, Request, UploadFile
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
@@ -183,6 +183,31 @@ def build_app(*, repo_path: Path, writer: str = "web", user: str = "local") -> F
     def api_dashboard_harvester() -> dict[str, object]:
         """Whether harvesting is enabled + per-connector last scan / candidate tally."""
         return handlers.harvester_status()
+
+    # --- Prometheus exposition (the operational half of the observability split) ----------------
+    # NOT a JSON API endpoint: this serves the Prometheus text exposition format
+    # (CONTENT_TYPE_LATEST), the operational time-series half of DESIGN §5.3's two-way split (heavy
+    # graphing lives in external Grafana — AGPL sidecar, never bundled — ADR-0019 §5). It is a CHEAP
+    # scrape: a fresh read of state.json / cursors / the inbox dir count via the meta seams, NEVER
+    # lint()/health() (the heavy content/health path, which stays in the dashboard). The
+    # prometheus-client dep is the optional `metrics` extra, imported lazily inside render_latest —
+    # when it is absent the route returns 503 with the install remedy instead of crashing startup.
+    @app.get("/metrics", include_in_schema=False)
+    def metrics() -> Response:
+        """Prometheus exposition for the repo (text/plain; 503 without the metrics extra).
+
+        Cheap per-scrape read of already-materialized metadata (inbox depth, cumulative curator
+        counters, harvester cursors, last-run timestamps, active backend) — no lint(), no whole-tree
+        scan. Returns the Prometheus ``CONTENT_TYPE_LATEST`` media type; a missing
+        ``prometheus-client`` (optional ``metrics`` extra) yields 503 with the install remedy.
+        """
+        from agora_kb.faces.web.metrics import MetricsUnavailable, render_latest
+
+        try:
+            body, content_type = render_latest(repo)
+        except MetricsUnavailable as exc:
+            return Response(content=str(exc), status_code=503, media_type="text/plain")
+        return Response(content=body, media_type=content_type)
 
     # ============================================================================================
     # HTMX / Jinja2 server-rendered UI (ADR-0019 §2).
