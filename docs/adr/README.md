@@ -25,3 +25,4 @@ Format: lightweight [MADR](https://adr.github.io/madr/)-style.
 | [0016](0016-cli-agent-brains-as-text-generators.md) | Headless CLI agents as curator brains (text-generator shim) | Accepted |
 | [0017](0017-harvester-file-connector-mechanics.md) | Harvester file-connector mechanics (segmentation / cursor / loop / scope) | Accepted · realizes 0007 · §2 superseded by 0018 |
 | [0018](0018-harvester-link-following.md) | Harvester file-connector link-following (opt-in; follow `[Title](sibling.md)`) | Accepted · supersedes 0017 §2 |
+| [0019](0019-web-face-stack.md) | Web face stack: API-first FastAPI + server-rendered HTMX (SPA-island escape hatch) | Accepted · realizes 0003 |
