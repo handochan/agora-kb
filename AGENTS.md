@@ -48,20 +48,23 @@ src/agora_kb/
   harvester/   read adapters: connectors.py (Connector Protocol + FileConnector, opt-in
                link-following) + harvester.py (orchestrator, scope gate, cursor) — pull other
                agents' memory → gated candidates (ADR-0007/0017/0018)
-  ingest/      input adapters: vault_import.py (Obsidian/markdown vault normalizer)
-  faces/       mcp_server.py (the MCP face — agents)
+  ingest/      input adapters: vault_import.py (Obsidian/markdown vault normalizer) +
+               extractors/ (url/pdf/office → ExtractedDoc; lazy optional `ingest` extra)
+  faces/       mcp_server.py (the MCP face — agents) + web/ (the web face — humans):
+               web/app.py (API-first FastAPI: JSON /api/* + server-rendered HTMX/Jinja2 UI,
+               ADR-0019/0020), web/metrics.py (Prometheus /metrics exporter), web/templates/,
+               web/static/
   schema/      the KB wiki schema (AGENTS.md template emitted into each knowledge repo) + lint
   config.py    load config (adapters.yaml, repo.yaml, triggers + harvest policy + connector specs)
   cli.py       `agora` entry point
-               (repo init · import · status · curate · harvest · watch · serve · doctor)
+               (repo init · import · status · curate · harvest · watch · serve · web · doctor)
   # --- not yet implemented (later phases) ---
-  faces/web/   (Phase 3+ — stub) FastAPI app: upload, search, dashboard
   auth/        (Phase 4+ — stub) authn/authz (tokens, OpenFGA/Forgejo delegation)
 docs/          DESIGN, ARCHITECTURE, DATA-MODEL, ROADMAP, INGEST-CONTRACT, adr/
 ```
 
 ## Where to start (current phase)
-The repo has **shipped Phases 1 and 2**.
+The repo has **shipped Phases 1, 2, and 3**.
 
 **Phase 1** (Personal MVP): the **core API**, the `agora` CLI, the **MCP face** (four tools —
 `kb_remember` / `kb_query` / `kb_status` / `kb_curate`), the local-model curator (Qwen via Ollama)
@@ -74,5 +77,16 @@ CLI-agent shim (ADR-0016), and the opt-in **harvester** with file connectors, th
 provenance, fail-closed scope lock, and link-following (ADR-0007/0017/0018) — surfaced via
 `agora harvest`, `agora curate --backend`, and the `agora doctor` routing/connectors tables.
 
-Next is **Phase 3** (ingest extractors + web/dashboard); see [`docs/ROADMAP.md`](docs/ROADMAP.md).
-Auth and multi-tenancy remain deferred to Phases 4–5.
+**Phase 3** (ingest extractors + web face): the `ingest/extractors/` pure transforms (url via
+trafilatura, pdf via pdfminer.six, office via markitdown → `ExtractedDoc`, behind the lazy optional
+`ingest` extra), and the **web face** (`faces/web/app.py`, `agora web`) — an API-first FastAPI app
+(JSON `GET /api/{status,search,notes,notes/{path}}` + `POST /api/upload`) with a server-rendered
+HTMX/Jinja2 UI and XSS-safe markdown-it-py rendering (ADR-0019); the upload write-path runs an
+extractor then `Inbox.write` (the curator remains the sole writer of `raw/`, ADR-0020); a read-only
+**dashboard** (`/dashboard`, `AgoraHandlers.health()/curator_status()/harvester_status()`) that
+reuses `lint()` verbatim; and a cheap Prometheus exporter (`faces/web/metrics.py`, `GET /metrics`,
+which never runs lint on scrape). The curator now also wires the harvest cursor `accepted`/`rejected`
+counters at finalize (ADR-0017 §7), so the dashboard/metrics surface real values.
+
+Next is **Phase 4** (auth + multi-tenancy); see [`docs/ROADMAP.md`](docs/ROADMAP.md). Auth,
+multi-tenancy, original-binary-in-`raw/`, and Letta/mem0 API connectors remain deferred to Phases 4–5.

@@ -812,6 +812,58 @@ def test_harvest_cursor_accepted_rejected_bumped_after_finalize(tmp_path: Path) 
     assert cursor.rejected == 1
 
 
+def test_phase3_exit_web_upload_becomes_a_queryable_curated_note(tmp_path: Path) -> None:
+    """Phase-3 EXIT, end-to-end across all three web-face seams (FakeBackend, ZERO model).
+
+    The headline exit criterion ("upload a PDF/URL in the browser → it becomes a linked wiki note;
+    dashboard shows the queue") as ONE chain: a browser upload (web face, extract→Inbox.write per
+    ADR-0020) → the deterministic curator publishes it as a theme → the read face (kb_query) finds
+    it. Locks the criterion the per-seam tests cover only compositionally.
+    """
+    pytest.importorskip("fastapi")
+    from fastapi.testclient import TestClient
+
+    from agora_kb.faces.mcp_server import AgoraHandlers
+    from agora_kb.faces.web import build_app
+
+    repo = _init_repo(tmp_path)
+
+    # 1) UPLOAD through the browser face → one web:-sourced inbox capture (queued, not searchable).
+    client = TestClient(build_app(repo_path=tmp_path, writer="web", user="alice"))
+    resp = client.post(
+        "/api/upload",
+        data={
+            "text": "One curator advances the curated branch under a per-repo lock.",
+            "domain": "ai-tech",
+        },
+    )
+    assert resp.status_code == 200
+    receipt = resp.json()
+    assert receipt["queued"] is True
+    event_id = receipt["id"]
+    # Eventual consistency: before curation the read face does NOT yet find it.
+    assert AgoraHandlers(repo).query("curator advances the branch")["status"] == "not_found"
+
+    # 2) CURATE the capture into a theme (deterministic worker; canned plan, zero model). _seed_raw
+    # mirrors production core.ingest persisting raw/<domain>/<event_id>.md at capture time so the
+    # theme sources: resolve (lint L1-8); the curator never overwrites a pre-existing raw/ artifact.
+    _seed_raw(repo, event_id)
+    report = _run(
+        repo,
+        FakeBackend(
+            _create_theme_plan("exit-run", "c1", event_id),
+            prose={"c1": "The single curator serializes every wiki write behind one flock."},
+        ),
+    )
+    assert report.status == "published"
+
+    # 3) the uploaded knowledge is now QUERYABLE through the read face, as a real linked wiki note.
+    result = AgoraHandlers(repo).query("curator advances the branch")
+    assert result["status"] == "ok"
+    assert result["hits"]
+    assert any(hit["path"].endswith("curator-concurrency.md") for hit in result["hits"])
+
+
 def test_harvest_cursor_not_bumped_for_unconfigured_connector(tmp_path: Path) -> None:
     """With no ``adapters.yaml`` connector for the agent, the run writes NO cursor (no stray)."""
     from agora_kb.harvester.harvester import CursorStore
