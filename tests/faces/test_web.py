@@ -368,6 +368,36 @@ def test_note_render_escapes_script_xss(tmp_path: Path) -> None:
     assert "&lt;script&gt;" in html
 
 
+def test_note_render_strips_body_sentinels_and_breaks_lines(tmp_path: Path) -> None:
+    """The curator's `<!-- agora:body:start/end -->` region markers must NOT appear in the rendered
+    note — they are an internal AUTHOR-pass mechanism, and html=False would otherwise escape them
+    into VISIBLE text. A single newline between prose lines renders as a break, not a run-on."""
+    from agora_kb.faces.web.app import render_note_body
+
+    body = (
+        "<!-- agora:body:start id=2026-06-21T15-44-44.960Z--44ad09--c1 -->\n"
+        "Core Thesis & Definition\n"
+        "AI agents are systems, not isolated models.\n"
+        "<!-- agora:body:end id=2026-06-21T15-44-44.960Z--44ad09--c1 -->\n"
+    )
+    html = render_note_body(body)
+    assert "agora:body" not in html  # internal sentinels stripped
+    assert "<!--" not in html
+    assert "Core Thesis" in html  # prose preserved
+    assert "<br" in html  # single newline → line break (breaks=True), not a collapsed run-on
+
+    # End-to-end over the route: a stored note whose body carries sentinels renders clean.
+    _init_repo(tmp_path)
+    domain = tmp_path / "wiki" / "general"
+    domain.mkdir(parents=True, exist_ok=True)
+    (domain / "sentinel.md").write_text(
+        "---\ntype: theme\nstatus: active\n---\n\n" + body, encoding="utf-8"
+    )
+    resp = _client(tmp_path).get("/note/wiki/general/sentinel.md")
+    assert resp.status_code == 200
+    assert "agora:body" not in resp.text
+
+
 def test_note_render_rewrites_intra_wiki_links(tmp_path: Path) -> None:
     _init_repo(tmp_path)
     _write_wiki_notes(tmp_path)
