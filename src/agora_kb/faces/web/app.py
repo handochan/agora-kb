@@ -161,6 +161,29 @@ def build_app(*, repo_path: Path, writer: str = "web", user: str = "local") -> F
         )
         return UploadReceipt(**receipt)
 
+    # --- dashboard JSON API (read-only meta face; DESIGN §5.3 / ADR-0003) -----------------------
+    # The first-class, documented JSON for the three dashboard panels — the SAME transport-free
+    # AgoraHandlers aggregations the HTML fragments below render. Read-only: no write path, no new
+    # canonical data; KB-health reuses the deterministic lint() verbatim (curator never disagrees).
+    @app.get("/api/dashboard/health", tags=["api"], summary="KB-health panel (counts/lint/tags).")
+    def api_dashboard_health() -> dict[str, object]:
+        """Note counts, status/tag distribution, contested/orphan + lint signals, last run."""
+        return handlers.health()
+
+    @app.get(
+        "/api/dashboard/curator", tags=["api"], summary="Curator-status panel (queue/backend/log)."
+    )
+    def api_dashboard_curator() -> dict[str, object]:
+        """Inbox depth, throughput, counters, active backend, and the log.md work-log timeline."""
+        return handlers.curator_status()
+
+    @app.get(
+        "/api/dashboard/harvester", tags=["api"], summary="Harvester-status panel (connectors)."
+    )
+    def api_dashboard_harvester() -> dict[str, object]:
+        """Whether harvesting is enabled + per-connector last scan / candidate tally."""
+        return handlers.harvester_status()
+
     # ============================================================================================
     # HTMX / Jinja2 server-rendered UI (ADR-0019 §2).
     # ============================================================================================
@@ -237,6 +260,44 @@ def build_app(*, repo_path: Path, writer: str = "web", user: str = "local") -> F
             request,
             "_receipt.html",
             {"receipt": receipt, "error": None, "status_code": 200},
+        )
+
+    # --- dashboard (read-only meta face; DESIGN §5.3) -------------------------------------------
+    @app.get("/dashboard", response_class=HTMLResponse, include_in_schema=False)
+    def dashboard(request: Request) -> _TemplateResponse:
+        """The three-panel read-only dashboard (KB health + curator + harvester status).
+
+        Renders each panel's initial content server-side; HTMX then refreshes the curator/harvester
+        panels on a 5s poll and the (heavier) health panel on load + a manual button (see
+        ``dashboard.html``). All three read already-existing metadata only.
+        """
+        return templates.TemplateResponse(
+            request,
+            "dashboard.html",
+            {
+                "health": handlers.health(),
+                "curator": handlers.curator_status(),
+                "harvester": handlers.harvester_status(),
+            },
+        )
+
+    @app.get("/dashboard/health", response_class=HTMLResponse, include_in_schema=False)
+    def dashboard_health(request: Request) -> _TemplateResponse:
+        """HTML FRAGMENT of the KB-health panel (the manual-refresh / on-load hx-get target)."""
+        return templates.TemplateResponse(request, "_health.html", {"health": handlers.health()})
+
+    @app.get("/dashboard/curator", response_class=HTMLResponse, include_in_schema=False)
+    def dashboard_curator(request: Request) -> _TemplateResponse:
+        """HTML FRAGMENT of the curator-status panel (the 5s-poll hx-get target)."""
+        return templates.TemplateResponse(
+            request, "_curator.html", {"curator": handlers.curator_status()}
+        )
+
+    @app.get("/dashboard/harvester", response_class=HTMLResponse, include_in_schema=False)
+    def dashboard_harvester(request: Request) -> _TemplateResponse:
+        """HTML FRAGMENT of the harvester-status panel (the 5s-poll hx-get target)."""
+        return templates.TemplateResponse(
+            request, "_harvester.html", {"harvester": handlers.harvester_status()}
         )
 
     return app
