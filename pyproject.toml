@@ -24,7 +24,9 @@ web = [
 ingest = [
     "trafilatura>=1.8",   # URL extraction (Apache)
     "pdfminer.six>=2024", # PDF extraction (MIT) — avoid AGPL pymupdf
-    "markitdown>=0.0.1",  # docx/xlsx/pptx (MIT)
+    # markitdown's docx/xlsx/pptx readers (mammoth, openpyxl, python-pptx) live in its own
+    # format extras; the bare package only ships the core dispatcher (all MIT).
+    "markitdown[docx,xlsx,pptx]>=0.1",  # docx/xlsx/pptx → markdown (MIT)
 ]
 metrics = [
     "prometheus-client>=0.20",  # dashboard time-series export
