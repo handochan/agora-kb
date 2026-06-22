@@ -701,7 +701,11 @@ worker-placed `<!-- agora:body:start id=<id> -->` and `<!-- agora:body:end id=<i
 (the worker keys each region with a run-scoped id `<run_id>--<candidate_id>` so merge/daily sub-regions
 never collide across runs — you only edit BETWEEN the markers you are handed and never author the id).
 `CREATE_THEME` wraps the whole body; `MERGE_INTO_THEME` wraps only a NEW augmentation sub-region appended
-below existing prose, so you never rewrite — and never lose — prior prose. Do NOT edit frontmatter, do
+below existing prose, so you never rewrite — and never lose — prior prose. Author bodies with real markdown
+structure: use `##`/`###` sub-headings to organize the distinct sections of THIS note and `-` bullet lists
+for enumerations (no top-level `#` title — that lives in the frontmatter; sub-headings must not imply a
+separate note should exist). A `MERGE_INTO_THEME` augmentation is a small fragment — a bullet or short
+paragraph — and does NOT introduce its own `##` sub-headings. Do NOT edit frontmatter, do
 NOT add new `[[wikilinks]]` (links are structure, owned by APPLY — stray links you add are
 deterministically stripped to plain text), do NOT touch any other file or sentinel. Cite the relevant
 `raw/` source inline (footnote `[^n]` recommended) consistent with the note's `sources:`. If your prose
