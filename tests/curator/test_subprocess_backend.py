@@ -188,6 +188,18 @@ def test_author_invokes_once_per_region_with_grounded_prompt(tmp_path: Path) -> 
     assert "op = MERGE_INTO_THEME" in merge_prompt
     assert "write ONLY the NEW claim" in merge_prompt  # op-aware MERGE instruction.
 
+    # The grounded prompt now asks for markdown STRUCTURE while KEEPING the existing constraints.
+    # NOTE: the model's actual structured output (real `##`/`-` markers in the body) is verified by
+    # a live curate e2e, NOT here — this only asserts the deterministic PROMPT STRING.
+    for prompt in (create_prompt, merge_prompt):
+        assert "sub-headings" in prompt  # the new markdown-structure instruction.
+        assert "## " in prompt  # the `##` sub-heading guidance literal.
+        assert "Do NOT add a top-level `# heading`" in prompt  # no-top-#-title clause.
+        assert "stripped to plain text" in prompt  # existing no-wikilinks constraint kept.
+        assert "<!-- agora:body:start id=<candidate_id> -->" in prompt  # markers kept.
+    # CREATE authors a full structured body; MERGE must NOT add its own sub-headings.
+    assert "do NOT add your own `##`" in merge_prompt
+
 
 def test_author_missing_context_falls_back_to_minimal_prompt(tmp_path: Path) -> None:
     """A region with no §8.2 context entry feeds the minimal prompt (keeps the control lines)."""

@@ -630,10 +630,15 @@ CONTEXT
   related excerpts (for tone/consistency only, do not copy): {related}
 TASK
 Write a concise, atomic, human- and agent-readable body (<= {N} KB) that states the concept and its
-claims grounded ONLY in the provided source facts. Do NOT add wikilinks (links are managed for you; any
+claims grounded ONLY in the provided source facts. Use markdown structure for readability: `## sub-headings`
+to organize the distinct sections of THIS note, and `-` bullet lists for enumerations (use real `-` list
+markers, not a literal bullet character). Do NOT add a top-level `# heading` — the note's title already
+lives in its frontmatter; use `##`/`###` sub-headings only to organize THIS note's own content, and do NOT
+create headings that imply a SEPARATE note should exist. Do NOT add wikilinks (links are managed for you; any
 you add will be stripped to plain text). Do NOT add sections that imply other notes. For a MERGE
-augmentation region, write only the NEW claim to fold in — do not restate the existing prose. Output
-ONLY the body text for the marked region.
+augmentation region, write only the NEW claim to fold in — do not restate the existing prose, and do NOT
+introduce your own `##` sub-headings (the fragment is folded into an existing note). Output ONLY the body
+text for the marked region.
 ```
 
 **Substitution contract (deterministic, worker-side):** `{candidate_id}`, `{title}`, `{summary}`, `{N}`

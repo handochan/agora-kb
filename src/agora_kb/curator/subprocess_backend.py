@@ -124,10 +124,16 @@ CONTEXT
   candidate_ids = {candidate_ids}
 TASK
 For each candidate_id, write a concise, atomic, human- and agent-readable body (<= {n_bytes} bytes)
-grounded ONLY in the facts already present in that region and the note's source facts. Do NOT add
-wikilinks (links are managed for you; any you add will be stripped to plain text). Do NOT add
-sections that imply other notes. For a MERGE augmentation region, write only the NEW claim to fold
-in — do not restate existing prose. Edit the file in place, writing ONLY inside the marked regions.
+grounded ONLY in the facts already present in that region and the note's source facts. Use markdown
+structure for readability: `## sub-headings` to organize the distinct sections of THIS note, and `-`
+bullet lists for enumerations (use real `-` list markers, not a literal bullet character). Do NOT
+add a top-level `# heading` — the note's title already lives in its frontmatter; use `##`/`###`
+sub-headings only to organize THIS note's own content, and do NOT create headings that imply a
+SEPARATE note should exist. Do NOT add wikilinks (links are managed for you; any you add will be
+stripped to plain text). Do NOT add sections that imply other notes. For a MERGE augmentation
+region, write only the NEW claim to fold in — do not restate existing prose, and do NOT introduce
+your own `##` sub-headings (the fragment is folded into an existing note). Edit the file in place,
+writing ONLY inside the marked regions.
 """
 
 # PASS-2 AUTHOR prompt — GROUNDED per region (INGEST-CONTRACT §8.2). Substituted deterministically
@@ -157,17 +163,27 @@ GROUNDING (the facts to write from)
   --- END SOURCE ---
 TASK
 {op_instruction} Write a concise, atomic, human- and agent-readable body (<= {n_bytes} bytes)
-grounded ONLY in the source facts above. Do NOT add wikilinks (links are managed for you; any you
-add will be stripped to plain text). Do NOT add sections that imply other notes. Edit the file in
-place, writing ONLY inside this region's markers.
+grounded ONLY in the source facts above. Use markdown structure for readability: `## sub-headings`
+to organize the distinct sections of THIS note, and `-` bullet lists for enumerations (use real `-`
+list markers, not a literal bullet character). Do NOT add a top-level `# heading` — the note's title
+already lives in its frontmatter; use `##`/`###` sub-headings only to organize THIS note's own
+content, and do NOT create headings that imply a SEPARATE note should exist. Do NOT add wikilinks
+(links are managed for you; any you add will be stripped to plain text). Do NOT add sections that
+imply other notes. Edit the file in place, writing ONLY inside this region's markers.
 """
 
 # Op-aware instruction woven into the grounded prompt (§8.2): each op authors a different shape.
 _OP_INSTRUCTIONS = {
-    "CREATE_THEME": "This is a NEW theme note: write the FULL note body from the source facts.",
+    "CREATE_THEME": (
+        "This is a NEW theme note: write the FULL note body from the source facts, using "
+        "`##`/`###` sub-headings to organize its distinct sections and `-` bullet lists for "
+        "enumerations (no top-level `#` title — that lives in the frontmatter)."
+    ),
     "MERGE_INTO_THEME": (
         "This is a MERGE augmentation region: write ONLY the NEW claim to fold into the existing "
-        "note — do NOT restate prose already in the note."
+        "note — do NOT restate prose already in the note, and do NOT add your own `##` "
+        "sub-headings (use a bullet or short paragraph; the fragment is folded into an existing "
+        "note)."
     ),
     "APPEND_DAILY": "This is a dated daily capture: write the body of THIS day's captured fact.",
 }
