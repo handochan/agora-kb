@@ -435,6 +435,102 @@ def test_note_page_404(tmp_path: Path) -> None:
     assert "not found" in resp.text.lower()
 
 
+# --- note header: collapsible frontmatter metadata block (pure-template, autoescaped) -----------
+def test_note_header_renders_rich_frontmatter_metadata(tmp_path: Path) -> None:
+    """A note with rich frontmatter surfaces summary/sources/created/updated/aliases/related/
+    confidence in the collapsible <details>Metadata</details> header block (ADR-0019 read face)."""
+    _init_repo(tmp_path)
+    domain = tmp_path / "wiki" / "general"
+    domain.mkdir(parents=True, exist_ok=True)
+    (domain / "rich.md").write_text(
+        "---\n"
+        "type: theme\n"
+        "status: active\n"
+        "title: Rich Note\n"
+        "summary: A concise note summary line.\n"
+        "sources:\n"
+        "  - raw/2026/06/web-alice/a1b2.md\n"
+        "  - raw/2026/06/web-alice/c3d4.md\n"
+        "created: 2026-06-01\n"
+        "updated: 2026-06-20\n"
+        "aliases:\n"
+        "  - Wealthy Note\n"
+        "related:\n"
+        "  - '[[inbox-design]]'\n"
+        "confidence: high\n"
+        "---\n"
+        "# Rich Note\n\nBody text.\n",
+        encoding="utf-8",
+    )
+    client = _client(tmp_path)
+
+    resp = client.get("/note/wiki/general/rich.md")
+    assert resp.status_code == 200
+    html = resp.text
+    # The collapsible block exists.
+    assert "<details" in html
+    assert "Metadata" in html
+    # Each present field's value is rendered into the header.
+    assert "A concise note summary line." in html
+    assert "raw/2026/06/web-alice/a1b2.md" in html
+    assert "2026-06-01" in html  # created
+    assert "2026-06-20" in html  # updated
+    assert "Wealthy Note" in html  # alias
+    assert "high" in html  # confidence
+
+
+def test_note_header_sparse_frontmatter_omits_metadata_block(tmp_path: Path) -> None:
+    """A sparse note (only type/status/title) renders 200 with NO metadata <details> block and no
+    broken/empty rows — guarding the `note.frontmatter.get(...)` missing-key path."""
+    _init_repo(tmp_path)
+    domain = tmp_path / "wiki" / "general"
+    domain.mkdir(parents=True, exist_ok=True)
+    (domain / "sparse.md").write_text(
+        "---\ntype: theme\nstatus: active\ntitle: Sparse Note\n---\n# Sparse Note\n\nBody.\n",
+        encoding="utf-8",
+    )
+    client = _client(tmp_path)
+
+    resp = client.get("/note/wiki/general/sparse.md")
+    assert resp.status_code == 200
+    html = resp.text
+    # No metadata block is emitted when none of the optional fields are present.
+    assert "<details" not in html
+    assert ">Metadata<" not in html
+    # No literal None leaked from a missing-key render.
+    assert "None" not in html
+
+
+def test_note_header_metadata_is_html_escaped(tmp_path: Path) -> None:
+    """Untrusted frontmatter values (a `<script>` summary, a `[[x]]` related entry) MUST be
+    HTML-escaped by Jinja autoescape in the header — never rendered as raw markup (no |safe)."""
+    _init_repo(tmp_path)
+    domain = tmp_path / "wiki" / "general"
+    domain.mkdir(parents=True, exist_ok=True)
+    (domain / "xss.md").write_text(
+        "---\n"
+        "type: theme\n"
+        "status: active\n"
+        "title: XSS Note\n"
+        'summary: "<script>alert(1)</script>"\n'
+        "related:\n"
+        "  - '[[evil]]'\n"
+        "---\n"
+        "# XSS Note\n\nBody.\n",
+        encoding="utf-8",
+    )
+    client = _client(tmp_path)
+
+    resp = client.get("/note/wiki/general/xss.md")
+    assert resp.status_code == 200
+    html = resp.text
+    # The raw <script> from the summary frontmatter never survives unescaped into the header.
+    assert "<script>alert(1)</script>" not in html
+    assert "&lt;script&gt;alert(1)&lt;/script&gt;" in html
+    # The [[evil]] related entry is rendered as escaped text (brackets are literal, not markup).
+    assert "[[evil]]" in html
+
+
 # --- the lazy-import invariant (import agora_kb without fastapi must not regress) ----------------
 def test_import_agora_kb_does_not_require_fastapi() -> None:
     """`import agora_kb` (and `import agora_kb.faces.web`) must not import fastapi at module load.

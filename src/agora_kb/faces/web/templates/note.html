@@ -16,6 +16,58 @@
           {% for tag in note.tags %}<span class="tag">{{ tag }}</span>{% endfor %}
         </div>
       {% endif %}
+      {# Additive, collapsed-by-default metadata block. Renders only frontmatter fields that are
+         present AND non-empty; the whole <details> is omitted when none are. Values are rendered
+         via Jinja2 AUTOESCAPE (no |safe) — sources `raw/` paths and `related` `[[..]]` entries
+         are untrusted text and MUST be escaped, never interpreted as HTML. #}
+      {% set fm = note.frontmatter %}
+      {% if fm.get("summary") or fm.get("sources") or fm.get("created") or fm.get("updated")
+            or fm.get("aliases") or fm.get("related") or fm.get("confidence") or fm.get("origin") %}
+        <details class="fm-meta">
+          <summary>Metadata</summary>
+          <dl class="meta-dl">
+            {% if fm.get("summary") %}
+              <dt>Summary</dt><dd>{{ fm.get("summary") }}</dd>
+            {% endif %}
+            {% if fm.get("created") %}
+              <dt>Created</dt><dd>{{ fm.get("created") }}</dd>
+            {% endif %}
+            {% if fm.get("updated") %}
+              <dt>Updated</dt><dd>{{ fm.get("updated") }}</dd>
+            {% endif %}
+            {% if fm.get("confidence") %}
+              <dt>Confidence</dt><dd>{{ fm.get("confidence") }}</dd>
+            {% endif %}
+            {% if fm.get("origin") %}
+              <dt>Origin</dt><dd class="mono">{{ fm.get("origin") }}</dd>
+            {% endif %}
+            {% if fm.get("aliases") %}
+              <dt>Aliases</dt>
+              <dd>
+                <ul class="meta-list">
+                  {% for alias in fm.get("aliases") %}<li>{{ alias }}</li>{% endfor %}
+                </ul>
+              </dd>
+            {% endif %}
+            {% if fm.get("related") %}
+              <dt>Related</dt>
+              <dd>
+                <ul class="meta-list">
+                  {% for rel in fm.get("related") %}<li>{{ rel }}</li>{% endfor %}
+                </ul>
+              </dd>
+            {% endif %}
+            {% if fm.get("sources") %}
+              <dt>Sources</dt>
+              <dd>
+                <ul class="meta-list mono">
+                  {% for src in fm.get("sources") %}<li>{{ src }}</li>{% endfor %}
+                </ul>
+              </dd>
+            {% endif %}
+          </dl>
+        </details>
+      {% endif %}
     </header>
     {# body_html is produced by markdown-it-py with html=False (raw HTML disabled), so embedded
        <script>/<img onerror=…> in (untrusted) note content is ESCAPED, not executed. Marked safe

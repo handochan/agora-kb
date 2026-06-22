@@ -153,6 +153,16 @@ article.note .body pre { background: #f4f5f7; padding: 0.8rem; border-radius: va
 article.note .body code { font-family: var(--mono); font-size: 0.9em; }
 .badge-status { font-size: 0.78rem; padding: 0.1rem 0.5rem; border-radius: 999px; border: 1px solid var(--border); }
 
+/* Collapsible note frontmatter metadata block (additive, collapsed by default) */
+article.note .fm-meta { margin-top: 0.6rem; font-size: 0.9rem; }
+article.note .fm-meta > summary { cursor: pointer; color: var(--muted); font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.04em; }
+article.note .fm-meta > summary:hover { color: var(--accent); }
+article.note .meta-dl { display: grid; grid-template-columns: max-content 1fr; gap: 0.25rem 0.9rem; margin: 0.5rem 0 0; }
+article.note .meta-dl dt { color: var(--muted); font-weight: 600; }
+article.note .meta-dl dd { margin: 0; }
+article.note .meta-list { list-style: none; margin: 0; padding: 0; }
+article.note .meta-list li { margin: 0.05rem 0; word-break: break-word; }
+
 /* Receipt / eventual-consistency callout */
 .receipt {
   border: 1px solid var(--border);
