@@ -87,6 +87,19 @@ function initGraph(el) {
         el.parentNode.insertBefore(banner, el);
       }
 
+      // Auto-frame the graph to the canvas ONCE, when its layout first settles — force-graph does
+      // NOT zoom-to-fit by default, so without this the graph clusters small in the centre. The
+      // `framed` guard keeps it to a single fit so a later tick (or a window resize) can't yank a
+      // user's manual zoom/pan afterwards.
+      let framed = false;
+      function frameGraph() {
+        if (framed) {
+          return;
+        }
+        framed = true;
+        g.zoomToFit(400, 40); // 400ms ease, 40px padding
+      }
+
       // force-graph 1.51.4 is a CLASS constructor; it wants link arrays under the key "links" and
       // references nodes by the id field. Our edges already carry {source, target} as rel_path ids.
       const g = new ForceGraph(el)
@@ -103,8 +116,15 @@ function initGraph(el) {
         .onNodeClick(function (n) {
           window.location.href = noteHref(n.id);
         })
+        // Bound the simulation so it settles fast on a small KB, then frame on engine stop.
+        .cooldownTicks(120)
+        .onEngineStop(frameGraph)
         .width(el.clientWidth)
         .height(el.clientHeight);
+
+      // Fallback frame: cover a graph that settles before onEngineStop is wired, or a degenerate
+      // single-node local graph that never emits the event. Idempotent via the `framed` guard.
+      window.setTimeout(frameGraph, 1500);
 
       // Re-fit the canvas to the container on resize so it stays full-width — coalesced via rAF so a
       // resize drag relayouts at most once per frame, not on every event.
