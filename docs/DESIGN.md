@@ -143,6 +143,42 @@ step is delegated to a swappable agent. Transactional worktrees, validation, and
 backend outside the integrity boundary. (ADR-0004, ADR-0008, ADR-0013.) Routing is supported: bulk/simple →
 local open-weight model (free); hard merges /
 contradiction resolution → a stronger (optional, possibly proprietary) backend.
+**No-drop on unclassifiable durable captures (planned — ADR-0022, Proposed).** A durable,
+non-gated capture must **not** be silently dropped merely because it matches no existing
+`_meta/taxonomy.yaml` domain. Today the local path does exactly that (`ollama_brain.py` cascading
+downgrade-to-DROP on a missing valid domain, ~line 380; `plan.py` check-4 TAXONOMY reject of any
+`domain ∉ domains`) — that behavior is **superseded** by the policy below:
+
+- **Fallback, not loss.** An unclassifiable capture is routed to a reserved catch-all domain
+  (`general`/`uncategorized` — the same `general` domain `agora repo init` seeds, `cli.py`) so the
+  fact survives to the wiki and stays navigable, never discarded. This no-loss floor ships **first**.
+- **Governed new-domain proposal (separate lane).** The same capture **MAY** additionally trigger a
+  *governed* domain-creation proposal. Domain creation is a deliberately-closed decision (ADR-0010
+  D6 / ADR-0011 §6.1) and stays so: the sandboxed brain may **never** directly widen
+  `_meta/taxonomy.yaml`. A new domain is born only via the governed lane — a deterministic worker
+  step driven by a closed-vocabulary plan field — gated by `taxonomy_policy` (open = deterministic
+  auto-create, solo/MVP; review-only = emit a proposal artifact/PR instead of committing;
+  capped:&lt;N&gt; = at most N new domains per run). The inert `taxonomy_policy` + L1-18 machinery is
+  what #23 wires; it governs the creation lane only, never plain INGEST. A **hard prerequisite** of
+  that change: the same edit that lands worker-applied `CREATE_DOMAIN` must flip the effective
+  default to be repo-kind-aware (personal → `open`; team → `review-only`/`capped:1`), since the code
+  default is unconditionally `"open"` today (`emit.py` `Taxonomy.taxonomy_policy="open"`, `lint.py`
+  `loaded.get("taxonomy_policy","open")`) — so a team repo never auto-mints a domain in-INGEST. L1-18
+  is likewise **extended**, not merely activated: today it diffs only `allowed_tags(after) −
+  allowed_tags(before)` (`schema/lint.py`, `kb_schema.md`) and never inspects `domains`; the creation
+  lane needs a `domains` set-difference branch added. The whole proposal (taxonomy write + lazy MOC +
+  theme) is **one atomic worktree diff** published by a single CAS — a failed publish discards the
+  worktree, leaving no half-created domain, and the fact falls back to the catch-all floor.
+
+The taxonomy entry shape is planned to widen from a bare string list to a list-**or**-mapping
+(`{<domain>: {created, created_by, status: proposed|active, …}}`) so auto-created domains can be
+marked provisional/audited and per-domain custom handling (#24) can attach additively. `allowed_tags`
+already demonstrates this list-or-mapping pattern (`config.py` `_load_taxonomy`), but `domains` is
+**list-only in all three readers today** (`config._load_taxonomy`, `ollama_brain.parse_taxonomy`,
+`schema/lint`), so the normalizer is **net-new** in each. The mapping form is additive: it does NOT
+bump `schema_version` (L1-17 untouched), the bare list stays valid indefinitely, and no migration
+command is needed. See ADR-0022 (Proposed) and DATA-MODEL §3.
+
 
 ## 5. Faces
 
@@ -169,12 +205,39 @@ for now (auth is Phases 4–5). Both layers call the same core read helpers (`Wi
 write path the MCP face uses — the web face never reads or mutates `wiki/` / git / `raw/` directly.
 - **Browse & search** the wiki (read path). Note bodies render via `markdown-it-py` with raw HTML
   disabled (`html=False`, XSS-safe) and intra-wiki `[Title](relative.md)` links rewritten to UI URLs.
-- **Upload** text / files (PDF, docx, …) / URLs: the face runs the matching **input extractor**
-  (§2.3) to produce markdown + provenance, then writes a single inbox capture — exactly the
-  `kb_remember` write path, no new concept, same concurrency & access control (ADR-0003). The
-  **curator remains the sole writer of `raw/`** (ADR-0002): it materializes `raw/` from the capture
-  body during consolidation; the *face* never writes `raw/`. (ADR-0020.) Staging the **original
-  binary** verbatim in `raw/` (+ the sha256 re-ingest-drift sidecar) is a deferred follow-up.
+- **Upload** text / **one-or-many** files / URLs — drag-and-drop **multi-upload** is supported, and
+  **each file is its own independent inbox capture** (fan-out, not a merge): the face runs the
+  matching **input extractor** (§2.3) per file to produce markdown + provenance, then writes one
+  inbox item per file — exactly the `kb_remember` write path, N times, no new concept, same
+  concurrency & access control (ADR-0003). The single-writer curator invariant (ADR-0002) is
+  unchanged: a batch is just N appends to per-writer inboxes, never N writers. The endpoint returns
+  a **per-file batch receipt** (`{id, queued}` per file, partial-success tolerant, not atomic) and
+  each item is `queued` — **eventually consistent**, searchable only after the next curator run.
+  Supported input formats are an **extensible, registry-routed set of pure extractors** (ADR-0004)
+  behind the lazy optional `ingest` extra (`.txt`/`.md` dependency-free passthroughs; richer formats
+  — PDF, docx, url, … — via the pinned dispatcher, §2.3); broadening the accepted extension/MIME set
+  (e.g. html/csv/json/epub through the already-pinned dispatcher) is a localized change at that one
+  dispatch seam — image/OCR/audio stay deferred behind their own opt-in extra + ADR-0005 license
+  vetting. The **curator remains the sole writer of `raw/`** (ADR-0002): it materializes `raw/` from
+  each capture body during consolidation; the *face* never writes `raw/`. (ADR-0020.) Staging the
+  **original binary** verbatim in `raw/` (+ the sha256 re-ingest-drift sidecar) and image/OCR
+  extraction remain deferred follow-ups. Per-batch max-files / total-bytes caps and an untrusted-input
+  hardening pass (decompression-bomb / SVG·HTML XSS guards) ride with the multi-upload surface —
+  Proposed **ADR-0025**.
+- **Knowledge graph** (read-only) at `/graph`: a derived, Obsidian-like view of the wiki's
+  link/relation structure — global plus a per-note local ego-graph. It is purely derived from the
+  markdown (reuses the §5.3 dashboard helpers — `Wiki.list_notes` + body link basenames + frontmatter
+  `related`/`children`), holds no canonical state (invariant 1), and never writes. Rendering is a
+  single vendored MIT force-graph lib over a JSON graph endpoint (`GET /api/graph` + the `/graph`
+  page) — the extended "single bolt-on charting" precedent, the first firing of the ADR-0019 §7
+  escape hatch (a vendored client-side renderer with no Node/SPA toolchain) — **ADR-0021** (Accepted).
+  The render layer (route, template, vendored `force-graph.min.js`, per-note local-graph link) is
+  already shipped under ADR-0021; node/depth caps are hardcoded today (`MAX_GRAPH_NODES`/
+  `MAX_GRAPH_DEPTH`, `faces/mcp_server.py`). Those caps plus upload limits, the accepted-extension
+  allowlist, and feature toggles are *planned* to become operator-configurable via a reserved
+  optional `web:` block in (git-ignored, non-canonical — invariant 1) `_kb/repo.yaml`, resolved
+  **per-repo in `build_app(repo_path)`** (never a global mutable — tenant-safe for Phase 4,
+  invariant 5) rather than hardcoded; the graph caps are its first consumers — Proposed **ADR-0025**.
 - Binary assets → `assets/`, referenced from notes (outside the navigation graph).
 
 ### 5.3 Dashboard (status, read-only)
@@ -198,41 +261,69 @@ extra, returning 503 if absent). The exporter is a cheap read of current state �
 Grafana remains an external (AGPL) sidecar for graphing. Scope is filtered by access control — a
 viewer sees only their teams/personal repos.
 
-## 6. Memory harvester (autonomous accumulation — optional)
+## 6. Context harvester (autonomous accumulation — optional)
 
-The mirror of the curator: **read adapters** that periodically scan other agents' memory systems and
-propose candidate knowledge.
+The mirror of the curator: **read adapters** that periodically scan agent memory *and* work-context
+sources and propose candidate knowledge. Originally a *memory* harvester (agent `MEMORY.md` files); the
+seam generalizes to any **work-context source** behind the **same triad** — candidate gate +
+fail-closed scope lock + provenance — with **no core change** (each source is an ADR-0004 read-adapter).
 
 > **Status (Phase 2, shipped — ADR-0007/0017/0018).** Implemented and CLI-exposed via
 > `agora harvest [--dry-run] [--connector NAME]` over a `FileConnector` (the only Phase-2 connector).
 > Opt-in: disabled unless `harvest.enabled` is set in `_kb/repo.yaml`, with `connectors:` declared in
 > `adapters.yaml`; `agora doctor` lists the configured connectors. Opt-in **link-following** follows a
 > pointer bullet's `[Title](sibling.md)` to harvest the sibling's content (ADR-0018). The API
-> connectors (Letta, mem0) remain Phase 5.
+> connectors (Letta, mem0) remain Phase 5. The broader work-context source classes below are
+> **Proposed** (issues #25/#28), pending **ADR-0023** (context-harvester connectors: taxonomy,
+> OSS paths, safety envelope); only *memory files* ship today.
 
-```
-agent memory sources                          candidate flow
-─────────────────────                          ──────────────
-Claude Code  ~/.claude/**/MEMORY.md   (file)   diff vs cursor → new/changed only
-Hermes       ~/.hermes/MEMORY.md      (file)   → inbox item:
-(any MEMORY.md-shaped markdown glob)              source=harvest:<agent>, kind=candidate,
-Letta        memory blocks            (API)       confidence=low
-mem0         vector store             (API)   → curator review gate: keep / merge / drop
-```
+**Source classes** — all flow through the one triad and map to `source=harvest:<agent>` (no new inbox
+`source` enum member; the parametric `harvest:<agent>` form already covers every class):
 
-The FileConnector accepts any `MEMORY.md`-shaped markdown path/glob; `file:claude-code` and
-`file:hermes` are the examples emitted in the default `adapters.yaml`. Letta/mem0 are Phase-5 stubs.
+| Source class | Connector key | OSS path | Status |
+|---|---|---|---|
+| Agent memory files | `file:<agent>` (`letta:`/`mem0:` API) | `MEMORY.md`-shaped markdown glob | **shipped** (file); Letta/mem0 Phase 5 |
+| Local working folders | `dir:<agent>` | filesystem walk | Proposed (ADR-0023) |
+| Git repos | `git:<agent>` | plain git (commit/diff) | Proposed (ADR-0023) |
+| Agent sessions | `session:<agent>` | transcript glob (e.g. `~/.claude/projects/**/*.jsonl`) | Proposed (#25, ADR-0023) |
+| Mail | `mail:<agent>` | IMAP/JMAP (Gmail/Graph optional) | Proposed (ADR-0023) |
+| Chat | `chat:<agent>` | Matrix (Slack/Teams optional) | Proposed (ADR-0023) |
+| Calendar | `calendar:<agent>` | CalDAV (Google/MS optional) | Proposed (ADR-0023) |
 
-Three safety mechanisms are mandatory (without them this feature poisons the base):
+Connector-type key grammar is `<type>:<agent>` — `session:`/`dir:`/`git:`/`mail:`/`chat:`/`calendar:`
+join the existing `file:`/`letta:`/`mem0:`. `build_connectors` dispatches on the type prefix and
+remains fail-loud on an unknown type; reserving the namespace now avoids a future collision.
+`file:claude-code` and `file:hermes` are the examples emitted in the default `adapters.yaml`.
+
+Three safety mechanisms are mandatory for **every** source class (without them this feature poisons
+the base):
 
 | Risk | Mitigation |
 |---|---|
 | **Feedback loop** (KB → agent memory → harvest → KB …) | provenance tags (`harvest:<agent>`) + origin marking; a best-effort, verbatim-only origin-marker skip avoids re-harvesting unchanged KB-originated facts. The candidate gate (below) is the *primary* loop break; the reworded KB→memory→KB loop is a documented residual risk (ADR-0017) |
 | **Noise pollution** | harvested items are `kind=candidate` / `confidence=low` → must pass the curator review gate before promotion to `wiki/`; never written directly |
-| **Privacy leakage** | scope enforcement: a personal agent-memory source feeds **only** the personal repo, never a team repo; team harvest requires explicitly-designated team sources; consent-based |
+| **Privacy leakage** | scope enforcement: a personal source feeds **only** the personal repo, never a team repo; team harvest requires explicitly-designated team sources; consent-based |
 
-Effect: Agora becomes the **shared long-term memory of all the user's/team's agents** — the
-"memory of memories." (ADR-0007.)
+Three additional rules govern the noisier, higher-volume context sources (Proposed, ADR-0023):
+
+- **(a) Connector-boundary distillation + redaction.** Noisier sources (sessions/mail/chat) are
+  reduced by **deterministic, model-free** distillation and **PII/secret redaction** at the connector
+  boundary *before* anything reaches the immutable, append-only inbox — never a raw firehose, and
+  never retro-scrubbed (invariant #3). ANY PII-bearing source (local OR networked) runs redaction
+  before persistence; the high-PII `session:` connector is the **first concrete trigger** for the
+  redaction policy (a shared `core/redact.py` is a hard dependency of its merge), not the first
+  networked one.
+- **(b) Opt-in pre-curation digest.** High-volume sources MAY route through an opt-in pre-curation
+  *digest* stage (summarize/cluster into fewer candidate facts) so the per-run bundle caps and the
+  curator gate are not overwhelmed; this is a read-side transform only — **the gate still adjudicates**
+  keep / merge / drop and the integrity boundary is unchanged.
+- **(c) Team/corporate-shared scope deferred.** Any team- or corporate-*shared* source is **scope-
+  deferred to Phase 4** (multi-tenancy + auth); fail-closed scope-lock keeps personal sources personal
+  until then. Session→**skill-suggestion** write-back (#25) is deferred to its own ADR (**ADR-0026**,
+  reserved; opt-in dry-run/staging only, never auto-writes back to an agent).
+
+Effect: Agora becomes the **shared long-term memory of all the user's/team's agents and work
+context** — the "memory of memories." (ADR-0007; broadening Proposed under ADR-0023.)
 
 ## 7. Multi-tenancy & access control
 

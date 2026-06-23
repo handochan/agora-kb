@@ -83,6 +83,82 @@ and under `curator:` only `backend`, `max_attempts`, `allow_reduced_isolation`, 
 the `harvest:` block (`enabled`, `scope_lock`). Any other keys (e.g. a forward-looking
 `curator.limits` / `curator.lint` / top-level `health` from the ADR-0011 design) are **silently
 ignored** — they are not yet wired, so they neither take effect nor break loading.
+### 3.1 Forward-looking config shapes (silently-ignored-until-wired)
+
+The following keys are **planned, not yet parsed** — they follow the §3 convention above (unknown
+keys load without effect and never break `load_repo_config`) and are recorded here so an implementer
+has a fixed target. Each points to the ADR that governs the behavior; none is presented as settled
+v1 behavior.
+
+**(a) Bounded-batch claim cap — `curator.limits.max_events_per_run`** (default: unbounded,
+back-compat). Caps how many events `claim()` pulls per run (today `claim()`/`_fifo_snapshot` is
+whole-inbox, uncapped); the remainder stays in the inbox for the next trigger. This is **intra-repo
+pipelining** (smaller, more frequent single-writer runs to bound prompt/context cost), **NOT a
+second writer** — the per-repo single-writer CAS+flock remains the throughput ceiling by design
+(#27, ADR-0024 *Proposed*; ROADMAP Phase 3.5; formalizes the existing `curator.limits` stub
+referenced in `bundle.py`/`apply.py`). It pairs with the already-documented sibling
+`curator.limits.max_candidates_per_run` (INGEST-CONTRACT §1.3, default 32) — note BOTH are currently
+**documented-but-not-yet-wired** (`load_repo_config` parses no `curator.limits` today), so neither is
+enforced pre-implementation; ADR-0024 must reconcile them (event cap slices the FIFO head pre-dedup;
+candidate cap bounds the post-dedup bundle).
+
+```yaml
+curator:
+  limits:
+    max_events_per_run: 32          # planned; default unbounded — caps the per-run claim, not a 2nd writer
+```
+
+**(b) Per-domain curation override — `curator.domains.<domain>`** (planned, ADR-0022 *Proposed* —
+per-domain custom processing, #24). An override block layering onto the **tuning surfaces only**
+(the existing deterministic tunables + default-brain selection); ADR-0022 pins that per-domain
+config may NEVER alter the closed op vocabulary, the §4.0 allowlist, the fixed taxonomy, or the
+§4.1/§4.4 validators — the integrity gate stays domain-agnostic. When wired it is **fail-loud** if
+`<domain>` is absent from the fixed taxonomy.
+
+```yaml
+curator:
+  domains:
+    legal:    { body_byte_bound: 8192, max_orphans: 5, related_k: 6, backend: claude }  # planned (ADR-0022)
+```
+
+**(c) Structured domains entry** (planned, ADR-0022 *Proposed* — governed domain auto-creation,
+#23). `domains` MAY be either the current list of strings (back-compat) OR a mapping carrying
+per-domain metadata. `allowed_tags` demonstrates the list-or-mapping PATTERN the loader already
+tolerates, but `domains` is currently **list-only in all three readers** (`config._load_taxonomy`
+reads it via `_str_list`; `ollama_brain.parse_taxonomy` accepts list/tuple/set; `schema/lint`), so a
+normalizing reader that also accepts the mapping form is **net-new work added + tested in each** of
+the three — not an existing-tolerance freebie. The mapping is **additive**: it does NOT bump
+`schema_version` (L1-17 untouched), `_load_taxonomy` would normalize both forms, and the bare list
+stays valid indefinitely, so no migration command is needed for already-dogfooded repos. The mapping
+lets an auto-created domain be marked provisional/audited. Domain *creation itself* is a governed lane
+(ADR-0022 cross-refs ADR-0010 D6 / ADR-0011 §4.0/§6.1 / ADR-0007 gate): the sandboxed brain still
+may never widen `_meta/taxonomy.yaml` directly, and `taxonomy_policy` (`open | review-only |
+capped:<N>`) governs whether new domains are committed, proposed, or capped per run.
+
+```yaml
+domains:                            # planned superset of the list form (ADR-0022)
+  ai-tech: { status: active }
+  fintech: { status: proposed, created: 2026-06-24, created_by: curator, source_run_id: 2026-06-24T03-00-00.000Z--7f31ab }
+```
+
+**(d) Web-face operator policy — top-level `web:` block** (planned, ADR-0025 *Proposed* — web
+config / multi-upload / extensions, #29 — parsed by a future `load_web_config`). repo.yaml is the
+established git-ignored operator-policy file (non-canonical operator policy, invariant #1), so the
+graph caps, upload limits, and extension allowlist all land here rather than in a parallel
+`web.yaml`, and the block is resolved **per-repo** in `build_app(repo_path)` (never a global mutable
+— tenant-safe for Phase 4, invariant #5). The knowledge-graph itself is already shipped under
+ADR-0021 (*Accepted*, branch `feat/web-knowledge-graph-viz` — `GET /api/graph` + `GET /graph`,
+vendored MIT `force-graph.min.js`, per-note ego-graph) and hardcodes its caps
+(`MAX_GRAPH_NODES`/`MAX_GRAPH_DEPTH`, `faces/mcp_server.py:59-60`); this `web.graph` block is the
+documented config seam that lifts those two constants into operator-local policy (a post-merge
+follow-up — ADR-0025 adds the config the graph's caps will consume; it does NOT re-build the graph).
+
+```yaml
+web:                                # planned operator-local policy (ADR-0025); silently ignored until wired
+  graph:    { max_nodes: 500, max_depth: 2 }   # lifts MAX_GRAPH_NODES/MAX_GRAPH_DEPTH (mcp_server.py:59-60)
+  upload:   { max_bytes: 26214400, max_files: 20, allowed_extensions: [.md, .txt, .pdf, .docx, .html] }
+  features: { graph_enabled: true }
+```
 
 ## 4. Curator state — `_kb/state.json`
 
