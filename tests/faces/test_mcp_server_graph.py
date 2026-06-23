@@ -415,3 +415,40 @@ def test_graph_empty_repo(tmp_path: Path) -> None:
     assert result["node_total"] == 1
     assert result["edge_total"] == 0
     assert result["truncated"] is False
+
+
+# --- ADR-0025: configurable graph caps (the web face threads WebConfig values via graph()) -------
+
+
+def test_graph_caps_default_to_module_constants(tmp_path: Path) -> None:
+    """Calling graph() with no caps uses the module defaults — backward-compatible (no cap args)."""
+    repo = _init_repo(tmp_path)
+    _write_wiki_notes(tmp_path)
+    handlers = AgoraHandlers(repo, writer="local")
+    # Small corpus << the (raised, large) module default → never truncated.
+    assert handlers.graph()["truncated"] is False
+    # The raised default is the configurable LARGE value (ADR-0025).
+    assert mcp_server.MAX_GRAPH_NODES == 10_000
+
+
+def test_graph_explicit_max_nodes_truncates(tmp_path: Path) -> None:
+    """An explicit max_nodes=1 truncates honestly (node_total stays the true pre-cap count)."""
+    repo = _init_repo(tmp_path)
+    _write_wiki_notes(tmp_path)
+    handlers = AgoraHandlers(repo, writer="local")
+
+    result = handlers.graph(max_nodes=1)
+    assert result["truncated"] is True
+    assert len(result["nodes"]) == 1
+    assert result["node_total"] >= 2  # honest pre-cap count
+
+
+def test_graph_explicit_max_depth_clamps_local(tmp_path: Path) -> None:
+    """An explicit max_depth clamps the local ego-BFS depth even when a larger depth is asked."""
+    repo = _init_repo(tmp_path)
+    _write_wiki_notes(tmp_path)
+    handlers = AgoraHandlers(repo, writer="local")
+
+    center = "wiki/ai-tech/themes/curator-concurrency.md"
+    result = handlers.graph(center=center, depth=5, max_depth=1)
+    assert result["depth"] == 1  # clamped to the supplied max_depth

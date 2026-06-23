@@ -51,6 +51,12 @@ __all__ = [
     "load_harvest_policy",
     "ConnectorSpec",
     "load_connector_specs",
+    "WebConfig",
+    "WebGraphConfig",
+    "WebUploadConfig",
+    "WebExtensionsConfig",
+    "WebFeaturesConfig",
+    "load_web_config",
 ]
 
 # Harvest scope values (ADR-0007 mechanism 3). Kept as plain strings HERE (not the harvester's
@@ -391,6 +397,163 @@ def load_connector_specs(path: str | Path) -> list[ConnectorSpec] | None:
             )
         )
     return specs
+
+
+# --- web face config (ADR-0025: operator settings for the web face) -----------------------------
+#
+# The web face's operator-tunable policy: graph caps, per-file/per-batch upload limits, an optional
+# allowed-extension restriction, and feature flags. Read from ``_kb/repo.yaml`` ``web:`` (DATA-MODEL
+# §3) — NON-CANONICAL operator config (invariant 1): it lives in the git-ignored ``_kb/`` spool,
+# never in ``wiki/`` and never round-tripped by the curator. Kept a SEPARATE model from
+# :class:`RepoConfig` (web policy is a distinct concern; ``RepoConfig`` is the integrity-neutral
+# curator input). :func:`load_web_config` resolves it PER-REPO inside the face's ``build_app`` so a
+# browser can never flip one repo's policy onto another (invariant 5 / ADR-0006).
+
+# Graph soft-cap default — LARGE so a sizable KB renders by default; honest truncation is kept
+# (ADR-0021 §cap). Configurable down for small/slow clients.
+_DEFAULT_GRAPH_MAX_NODES = 10_000
+_DEFAULT_GRAPH_MAX_DEPTH = 3
+# Upload limits — per-FILE (the today's MAX_UPLOAD_BYTES footgun bound) + per-BATCH count/total caps
+# for the multi-upload path (ADR-0025). Localhost single-user guards, not auth controls.
+_DEFAULT_UPLOAD_MAX_BYTES = 25 * 1024 * 1024  # 25 MiB per file
+_DEFAULT_UPLOAD_MAX_FILES = 50  # per-batch file count
+_DEFAULT_UPLOAD_TOTAL_BYTES = 200 * 1024 * 1024  # 200 MiB per batch
+
+
+class WebGraphConfig(BaseModel):
+    """Graph-viz caps (ADR-0021 caps → config, ADR-0025). ``extra='forbid'`` — a typo fails loud."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    max_nodes: int = Field(default=_DEFAULT_GRAPH_MAX_NODES, ge=1)
+    max_depth: int = Field(default=_DEFAULT_GRAPH_MAX_DEPTH, ge=1)
+
+
+class WebUploadConfig(BaseModel):
+    """Upload limits (ADR-0025): per-file max_bytes, per-batch max_files + total_bytes caps."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    max_bytes: int = Field(default=_DEFAULT_UPLOAD_MAX_BYTES, ge=1)
+    max_files: int = Field(default=_DEFAULT_UPLOAD_MAX_FILES, ge=1)
+    total_bytes: int = Field(default=_DEFAULT_UPLOAD_TOTAL_BYTES, ge=1)
+
+
+class WebExtensionsConfig(BaseModel):
+    """Allowed-extension gate (ADR-0025).
+
+    ``allowed=None`` (the default) → use the extractor's built-in supported set (no face-level
+    gate); a LIST → restrict uploads to those extensions (face gates BEFORE calling ``extract``, so
+    ``extract`` itself stays format-driven). Values are dotted, lowercased extensions (``.pdf``).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    allowed: list[str] | None = None
+
+
+class WebFeaturesConfig(BaseModel):
+    """Web feature flags (ADR-0025). ``graph_enabled`` off → /graph routes 404 + nav link hides."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    graph_enabled: bool = True
+
+
+class WebConfig(BaseModel):
+    """Operator settings for the web face (ADR-0025), read from ``_kb/repo.yaml`` ``web:``.
+
+    The keystone the rest of the web-face enhancements consume: :class:`WebGraphConfig` caps, the
+    :class:`WebUploadConfig` per-file/per-batch limits, the :class:`WebExtensionsConfig` allow-list,
+    and :class:`WebFeaturesConfig` flags. NON-CANONICAL config (invariant 1) — never canonical
+    knowledge, never touched by the curator. ``extra='forbid'`` on every sub-model so a typo'd wired
+    key fails loud; the LOADER (:func:`load_web_config`) tolerates an absent ``web:`` block (→ all
+    defaults) and unknown TOP-LEVEL ``repo.yaml`` keys.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    graph: WebGraphConfig = Field(default_factory=WebGraphConfig)
+    upload: WebUploadConfig = Field(default_factory=WebUploadConfig)
+    extensions: WebExtensionsConfig = Field(default_factory=WebExtensionsConfig)
+    features: WebFeaturesConfig = Field(default_factory=WebFeaturesConfig)
+
+
+def load_web_config(layout: RepoLayout) -> WebConfig:
+    """Load the ``web:`` block from ``_kb/repo.yaml`` (DATA-MODEL §3, ADR-0025); defaults if absent.
+
+    Read via the same raw-mapping ``.get()`` path the other loaders use (NOT ``WebConfig(**raw)``):
+    each field is narrowed with the tolerant ``_opt_int``/``_opt_bool``/``_str_list`` helpers, so an
+    absent ``web:`` block (or any absent sub-key) yields the documented default. A present-but-
+    wrong-typed value (e.g. ``graph.max_nodes: "lots"``) raises :class:`ConfigError` — operator
+    policy must change CLEARLY, never silently take a default (mirrors the harvest/isolation
+    loaders; see the module docstring near ``ConfigError``). Resolved PER-REPO by ``build_app`` so
+    web policy can never leak across repos (invariant 5 / ADR-0006). Unknown sub-keys (e.g.
+    ``web.graph.typo``) are IGNORED at the loader level, consistent with the other ``.get()``-based
+    loaders (only WIRED keys are read), so a stray key never crashes the face.
+    """
+    raw = _read_yaml_mapping(repo_config_path(layout))
+    web = _sub_mapping(raw.get("web"))
+
+    graph = _sub_mapping(web.get("graph"))
+    upload = _sub_mapping(web.get("upload"))
+    extensions = _sub_mapping(web.get("extensions"))
+    features = _sub_mapping(web.get("features"))
+
+    allowed_raw = extensions.get("allowed")
+    allowed: list[str] | None
+    if allowed_raw is None:
+        allowed = None
+    else:
+        # Normalize to lowercased, dot-prefixed extensions so the face's gate compares apples to the
+        # extractor's `_ext()` output. A non-list `allowed:` is operator confusion → fail loud.
+        if not isinstance(allowed_raw, list):
+            raise ConfigError(f"web.extensions.allowed must be a list, got {allowed_raw!r}")
+        # Validate every element is a string BEFORE normalizing: `_str_list` would SILENTLY drop a
+        # non-string entry (e.g. `[.pdf, 123, .md]` → ['.pdf', '.md']), masking operator confusion.
+        # Mirror the "must be a list" rule — change the stated policy CLEARLY, never silently.
+        for e in allowed_raw:
+            if not isinstance(e, str):
+                raise ConfigError(f"web.extensions.allowed entries must be strings, got {e!r}")
+        allowed = [_normalize_ext(e) for e in _str_list(allowed_raw)]
+
+    return WebConfig(
+        graph=WebGraphConfig(
+            max_nodes=_opt_int(
+                graph.get("max_nodes"), _DEFAULT_GRAPH_MAX_NODES, key="web.graph.max_nodes"
+            ),
+            max_depth=_opt_int(
+                graph.get("max_depth"), _DEFAULT_GRAPH_MAX_DEPTH, key="web.graph.max_depth"
+            ),
+        ),
+        upload=WebUploadConfig(
+            max_bytes=_opt_int(
+                upload.get("max_bytes"), _DEFAULT_UPLOAD_MAX_BYTES, key="web.upload.max_bytes"
+            ),
+            max_files=_opt_int(
+                upload.get("max_files"), _DEFAULT_UPLOAD_MAX_FILES, key="web.upload.max_files"
+            ),
+            total_bytes=_opt_int(
+                upload.get("total_bytes"),
+                _DEFAULT_UPLOAD_TOTAL_BYTES,
+                key="web.upload.total_bytes",
+            ),
+        ),
+        extensions=WebExtensionsConfig(allowed=allowed),
+        features=WebFeaturesConfig(
+            graph_enabled=_opt_bool(
+                features.get("graph_enabled"), True, key="web.features.graph_enabled"
+            ),
+        ),
+    )
+
+
+def _normalize_ext(ext: str) -> str:
+    """Lowercase + dot-prefix an operator-supplied extension (``MD`` / ``.md`` → ``.md``)."""
+    e = ext.strip().lower()
+    if e and not e.startswith("."):
+        e = f".{e}"
+    return e
 
 
 # --- internals ----------------------------------------------------------------------------------

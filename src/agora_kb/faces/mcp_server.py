@@ -55,9 +55,12 @@ DEFAULT_SOURCE = "manual"
 # Knowledge-graph viz bounds (faces/web /graph seam — ADR-0019 §7 / graph-plan). The global graph is
 # soft-capped so a very large KB stays responsive in the browser; when the kept node set exceeds the
 # cap it is truncated to the first MAX_GRAPH_NODES by sorted rel_path and ``truncated`` is set (the
-# honest signal — node_total still reports the true pre-cap count, never silently dropped).
-MAX_GRAPH_NODES = 2000  # soft cap for the global graph (browser perf); honest truncated flag
-MAX_GRAPH_DEPTH = 3  # clamp for the local ego-graph depth
+# honest signal — node_total still reports the true pre-cap count, never silently dropped). These
+# the CONFIGURABLE DEFAULTS (ADR-0025): the web face's :class:`WebConfig` graph caps override them
+# per-call via ``graph(max_nodes=…, max_depth=…)``; the default is raised LARGE so a sizable KB
+# renders out of the box (the honest-truncation behaviour is unchanged).
+MAX_GRAPH_NODES = 10_000  # soft-cap default for the global graph; honest truncated flag (ADR-0025)
+MAX_GRAPH_DEPTH = 3  # clamp default for the local ego-graph depth (ADR-0025)
 
 
 class AgoraHandlers:
@@ -366,7 +369,13 @@ class AgoraHandlers:
 
     # --- graph (read; web face /graph viz — ADR-0003/0019 §7 / graph-plan) -----------------------
     def graph(
-        self, *, center: str | None = None, depth: int = 1, domain: str | None = None
+        self,
+        *,
+        center: str | None = None,
+        depth: int = 1,
+        domain: str | None = None,
+        max_nodes: int | None = None,
+        max_depth: int | None = None,
     ) -> dict[str, object]:
         """Knowledge-graph data for the web ``/graph`` viz (DESIGN §5.3 / ADR-0019 §7, graph-plan).
 
@@ -411,6 +420,12 @@ class AgoraHandlers:
         ``depth`` echoes the clamped value; every value is JSON-serializable.
         """
         from agora_kb.schema.notes import body_link_basenames, wikilinks
+
+        # ADR-0025: resolve the EFFECTIVE caps — a caller-supplied value (the web face threads its
+        # WebConfig graph caps) wins, else the module default. Backward-compatible: a graph() call
+        # with no caps (MCP/tests) keeps the module-default behaviour.
+        eff_max_nodes = max_nodes if max_nodes is not None else MAX_GRAPH_NODES
+        eff_max_depth = max_depth if max_depth is not None else MAX_GRAPH_DEPTH
 
         notes = self._wiki.list_notes()
 
@@ -475,9 +490,9 @@ class AgoraHandlers:
             kept_ids = {n.rel_path for n in kept_notes}
             node_total = len(kept_notes)
             edge_total = len(_induced_edges(kept_ids))
-            truncated = node_total > MAX_GRAPH_NODES
+            truncated = node_total > eff_max_nodes
             if truncated:
-                kept_notes = kept_notes[:MAX_GRAPH_NODES]  # first N by sorted rel_path
+                kept_notes = kept_notes[:eff_max_nodes]  # first N by sorted rel_path
                 kept_ids = {n.rel_path for n in kept_notes}
             nodes = [_node(n) for n in kept_notes]
             edges = _induced_edges(kept_ids)
@@ -492,7 +507,7 @@ class AgoraHandlers:
             }
 
         # LOCAL scope — ego-graph around `center` out to a clamped depth.
-        clamped_depth = max(1, min(depth, MAX_GRAPH_DEPTH))
+        clamped_depth = max(1, min(depth, eff_max_depth))
         if center not in all_node_ids:
             # Unknown center → empty graph, center echoed as None (no node to seed the BFS).
             return {
