@@ -18,8 +18,10 @@ import yaml
 from agora_kb.config import (
     ConfigError,
     RepoConfig,
+    WebConfig,
     load_backend_registry,
     load_repo_config,
+    load_web_config,
     repo_config_path,
     write_default_repo_config,
 )
@@ -245,3 +247,120 @@ def test_malformed_repo_yaml_raises_config_error(tmp_path: Path) -> None:
     with pytest.raises(ConfigError) as exc:
         load_repo_config(layout)
     assert "malformed YAML" in str(exc.value)
+
+
+# --- (n) WebConfig — the web-face operator settings keystone (ADR-0025) -------------------------
+
+
+def test_web_config_absent_file_loads_defaults(tmp_path: Path) -> None:
+    """No repo.yaml (and no web: block) → every WebConfig field is its documented default."""
+    cfg = load_web_config(_layout(tmp_path))
+
+    assert isinstance(cfg, WebConfig)
+    assert cfg.graph.max_nodes == 10_000  # LARGE default per ADR-0025
+    assert cfg.graph.max_depth == 3
+    assert cfg.upload.max_bytes == 25 * 1024 * 1024
+    assert cfg.upload.max_files == 50
+    assert cfg.upload.total_bytes == 200 * 1024 * 1024
+    assert cfg.extensions.allowed is None
+    assert cfg.features.graph_enabled is True
+
+
+def test_web_config_absent_web_block_loads_defaults(tmp_path: Path) -> None:
+    """A repo.yaml WITHOUT a web: block still yields all WebConfig defaults (tolerant loader)."""
+    layout = _layout(tmp_path)
+    _write_repo_yaml(layout, "name: r\nkind: personal\n")
+    cfg = load_web_config(layout)
+    assert cfg.graph.max_nodes == 10_000
+    assert cfg.features.graph_enabled is True
+
+
+def test_web_config_overrides_each_field(tmp_path: Path) -> None:
+    """An explicit web: block overrides each field; the allow-list is normalized to dotted/lower."""
+    layout = _layout(tmp_path)
+    _write_repo_yaml(
+        layout,
+        "web:\n"
+        "  graph:\n"
+        "    max_nodes: 250\n"
+        "    max_depth: 2\n"
+        "  upload:\n"
+        "    max_bytes: 1048576\n"
+        "    max_files: 5\n"
+        "    total_bytes: 5242880\n"
+        "  extensions:\n"
+        "    allowed: [PDF, .md, txt]\n"
+        "  features:\n"
+        "    graph_enabled: false\n",
+    )
+    cfg = load_web_config(layout)
+    assert cfg.graph.max_nodes == 250
+    assert cfg.graph.max_depth == 2
+    assert cfg.upload.max_bytes == 1048576
+    assert cfg.upload.max_files == 5
+    assert cfg.upload.total_bytes == 5242880
+    # Each allowed extension is normalized to a lowercased, dot-prefixed form.
+    assert cfg.extensions.allowed == [".pdf", ".md", ".txt"]
+    assert cfg.features.graph_enabled is False
+
+
+def test_web_config_bad_int_fails_loud(tmp_path: Path) -> None:
+    """A wrong-typed numeric (a string) fails loud with a ConfigError, not a default."""
+    layout = _layout(tmp_path)
+    _write_repo_yaml(layout, "web:\n  graph:\n    max_nodes: lots\n")
+    with pytest.raises(ConfigError, match="web.graph.max_nodes"):
+        load_web_config(layout)
+
+
+def test_web_config_bad_bool_fails_loud(tmp_path: Path) -> None:
+    """A non-boolean feature flag (the string 'yes') fails loud, never truthy-coerces."""
+    layout = _layout(tmp_path)
+    _write_repo_yaml(layout, "web:\n  features:\n    graph_enabled: 'yes'\n")
+    with pytest.raises(ConfigError, match="web.features.graph_enabled"):
+        load_web_config(layout)
+
+
+def test_web_config_non_list_allowed_fails_loud(tmp_path: Path) -> None:
+    """A non-list extensions.allowed (a scalar) is operator confusion → fail loud."""
+    layout = _layout(tmp_path)
+    _write_repo_yaml(layout, "web:\n  extensions:\n    allowed: .pdf\n")
+    with pytest.raises(ConfigError, match="web.extensions.allowed"):
+        load_web_config(layout)
+
+
+def test_web_config_non_string_allowed_entry_fails_loud(tmp_path: Path) -> None:
+    """A non-string entry in extensions.allowed fails loud — never silently dropped.
+
+    ``_str_list`` would discard the ``123`` and load ``['.pdf', '.md']``, silently changing the
+    operator's stated policy. The loader must surface it (mirrors the "must be a list" rule).
+    """
+    layout = _layout(tmp_path)
+    _write_repo_yaml(layout, "web:\n  extensions:\n    allowed: [.pdf, 123, .md]\n")
+    with pytest.raises(ConfigError, match="entries must be strings"):
+        load_web_config(layout)
+
+
+def test_web_config_ge_one_validators(tmp_path: Path) -> None:
+    """A zero count violates the ge=1 validator on the sub-model → ValidationError surfaces."""
+    layout = _layout(tmp_path)
+    _write_repo_yaml(layout, "web:\n  upload:\n    max_files: 0\n")
+    with pytest.raises(ValueError):  # pydantic ValidationError is a ValueError subclass
+        load_web_config(layout)
+
+
+def test_web_config_unknown_subkey_is_ignored(tmp_path: Path) -> None:
+    """An unknown sub-key under a sub-model is IGNORED at the loader level (only WIRED keys read).
+
+    Consistent with the other .get()-based loaders — a stray key never crashes the face. (The
+    pydantic sub-models are extra='forbid', but the loader never feeds them the raw dict; it reads
+    only the wired keys, so an unknown key is silently dropped, matching load_repo_config.)
+    """
+    layout = _layout(tmp_path)
+    _write_repo_yaml(layout, "web:\n  graph:\n    max_nodes: 7\n    typo_key: 99\n")
+    cfg = load_web_config(layout)
+    assert cfg.graph.max_nodes == 7  # the wired key is read; the unknown one is dropped
+
+
+def test_web_config_not_added_to_repo_config(tmp_path: Path) -> None:
+    """RepoConfig stays a separate concern — it has no `web` field (web policy is its own model)."""
+    assert "web" not in RepoConfig.model_fields

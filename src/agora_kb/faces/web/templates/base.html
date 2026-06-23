@@ -13,7 +13,9 @@
     <span class="brand"><a href="/">Agora</a></span>
     <nav aria-label="Primary">
       <a href="/">Browse</a>
-      <a href="/graph">Graph</a>
+      {# graph_enabled is set on the Jinja env per-app (ADR-0025); default True for any caller that
+         renders without it. Hidden entirely when the operator disables the graph feature. #}
+      {% if graph_enabled | default(true) %}<a href="/graph">Graph</a>{% endif %}
       <a href="/upload">Capture</a>
       <a href="/dashboard">Dashboard</a>
     </nav>

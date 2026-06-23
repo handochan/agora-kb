@@ -54,6 +54,30 @@ _OFFICE_MIMES = frozenset(
 )
 _PDF_MIME = "application/pdf"
 
+# Dependency-free text passthrough (ADR-0025): markdown / plain text is already the body.
+_TEXT_EXTS = frozenset({".txt", ".md", ".markdown"})
+_TEXT_MIMES = frozenset({"text/plain", "text/markdown", "text/x-markdown"})
+
+# WIDENED markitdown routing (ADR-0025): TEXT-based markup/data formats the ALREADY-pinned
+# markitdown core handles (no new dependency, invariant 4). Routed to the generic markitdown path
+# in office.py.
+_MARKITDOWN_EXTS = frozenset({".html", ".htm", ".csv", ".json", ".xml"})
+_MARKITDOWN_MIMES = frozenset(
+    {
+        "text/html",
+        "application/xhtml+xml",
+        "text/csv",
+        "application/json",
+        "application/xml",
+        "text/xml",
+    }
+)
+
+# epub, image (OCR), and audio (transcription) are DEFERRED: each needs its own pinned markitdown
+# reader / optional extra + ADR-0005 vetting (extra deps, privacy/cost). The `ingest` extra pins
+# only markitdown[docx,xlsx,pptx], so an epub upload would fail confusingly at runtime — so it is
+# deliberately NOT routed here.
+
 
 class ExtractorUnavailable(RuntimeError):
     """An optional dependency for the chosen extractor is not installed.
@@ -119,12 +143,14 @@ def extract(
     Exactly one of ``url`` or ``data`` must be provided:
 
     - ``url`` given → the URL extractor (:func:`~agora_kb.ingest.extractors.url.extract_url`).
-    - ``data`` given → choose PDF vs office by ``mime``/``filename`` extension: ``.pdf`` (or
-      ``application/pdf``) → PDF; ``.docx``/``.xlsx``/``.pptx``/``.doc``… (or the matching office
-      MIME) → office.
+    - ``data`` given → choose the extractor by ``mime``/``filename`` extension:
+      ``.pdf`` (or ``application/pdf``) → PDF; ``.docx``/``.xlsx``/``.pptx``/``.doc``… (or the
+      matching office MIME) → office; ``.html``/``.csv``/``.json``/``.xml`` (or the
+      matching MIME) → markitdown (ADR-0025, reuses the office engine); ``.txt``/``.md``/
+      ``.markdown`` (or ``text/plain``/``text/markdown``) → the dependency-free text passthrough.
 
     Raises :class:`ValueError` when neither or both of ``url``/``data`` are given, or when the
-    ``data`` type is unsupported/ambiguous (no recognizable PDF/office signal).
+    ``data`` type is unsupported/ambiguous (no recognizable PDF/office/markitdown/text signal).
     """
     if (url is None) == (data is None):
         raise ValueError(
@@ -145,11 +171,40 @@ def extract(
 
     is_pdf = norm_mime == _PDF_MIME or ext == ".pdf"
     is_office = norm_mime in _OFFICE_MIMES or ext in _OFFICE_EXTS
+    is_markitdown = norm_mime in _MARKITDOWN_MIMES or ext in _MARKITDOWN_EXTS
 
-    if is_pdf and is_office:
-        raise ValueError(
-            f"ambiguous upload: both PDF and office signals (mime={mime!r}, filename={filename!r})"
+    # A generic ``text/plain``/``text/markdown`` MIME is a WEAK signal: browsers, OSes, and curl
+    # routinely attach it to ``.csv``/``.json``/``.html``/``.xml`` exports (especially on the
+    # drag-and-drop path). When a MORE-SPECIFIC pdf/office/markitdown EXTENSION is present, the
+    # extension is the authoritative router and the generic text MIME must NOT veto it — otherwise
+    # the common ``data.csv`` + ``text/plain`` upload would (wrongly) read as a conflict. So only
+    # treat the generic-MIME case as a "text" signal when no stronger extension claims the file.
+    has_specific_ext = ext == ".pdf" or ext in _OFFICE_EXTS or ext in _MARKITDOWN_EXTS
+    is_text_mime_only = norm_mime in _TEXT_MIMES and ext not in _TEXT_EXTS
+    is_text = ext in _TEXT_EXTS or (
+        norm_mime in _TEXT_MIMES and not (is_text_mime_only and has_specific_ext)
+    )
+
+    # Disjoint-format guard: a contradictory pair of SPECIFIC signals (e.g. a .pdf filename with an
+    # office MIME, or a .csv filename with application/pdf) is operator/upload confusion, not a
+    # routable document — surface it rather than silently picking a winner. A generic text MIME
+    # riding alongside a specific extension (handled above) is NOT a conflict.
+    flagged = [
+        name
+        for name, flag in (
+            ("PDF", is_pdf),
+            ("office", is_office),
+            ("markitdown", is_markitdown),
+            ("text", is_text),
         )
+        if flag
+    ]
+    if len(flagged) > 1:
+        raise ValueError(
+            f"ambiguous upload: conflicting {flagged} signals "
+            f"(mime={mime!r}, filename={filename!r})"
+        )
+
     if is_pdf:
         from .pdf import extract_pdf
 
@@ -160,9 +215,22 @@ def extract(
         if not filename:
             raise ValueError("office extraction requires a filename to determine the document type")
         return extract_office(data, filename=filename)
+    if is_markitdown:
+        from .office import extract_markitdown
+
+        if not filename:
+            raise ValueError(
+                "markitdown extraction requires a filename to determine the document type"
+            )
+        return extract_markitdown(data, filename=filename)
+    if is_text:
+        from .text import extract_text
+
+        return extract_text(data, filename=filename, mime=mime)
 
     raise ValueError(
         "unsupported or ambiguous upload: cannot determine extractor from "
-        f"mime={mime!r}, filename={filename!r}. Supported: .pdf and "
-        ".docx/.doc/.xlsx/.xls/.pptx/.ppt office documents."
+        f"mime={mime!r}, filename={filename!r}. Supported: .pdf; "
+        ".docx/.doc/.xlsx/.xls/.pptx/.ppt office documents; "
+        ".html/.htm/.csv/.json/.xml (markitdown); and .txt/.md/.markdown text."
     )

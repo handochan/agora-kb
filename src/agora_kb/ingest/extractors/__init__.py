@@ -15,8 +15,9 @@ from .base import (
     ExtractorUnavailable,
     extract,
 )
-from .office import extract_office
+from .office import extract_markitdown, extract_office
 from .pdf import extract_pdf
+from .text import extract_text
 from .url import extract_url
 
 __all__ = [
@@ -25,7 +26,9 @@ __all__ = [
     "ExtractorError",
     "ExtractorUnavailable",
     "extract",
+    "extract_markitdown",
     "extract_office",
     "extract_pdf",
+    "extract_text",
     "extract_url",
 ]

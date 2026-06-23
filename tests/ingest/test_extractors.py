@@ -26,8 +26,10 @@ from agora_kb.ingest.extractors import (
     ExtractorError,
     ExtractorUnavailable,
     extract,
+    extract_markitdown,
     extract_office,
     extract_pdf,
+    extract_text,
     extract_url,
 )
 from agora_kb.ingest.extractors import base as base_mod
@@ -172,9 +174,13 @@ def test_extract_office_requires_filename() -> None:
 
 
 def test_extract_unsupported_data_type() -> None:
-    """Unknown extension + no mime → unsupported ValueError, no extractor chosen."""
+    """Unknown extension + no mime → unsupported ValueError, no extractor chosen.
+
+    ``.bin`` carries no pdf/office/markitdown/text signal, so it is genuinely unroutable. (``.txt``
+    no longer lands here — it routes to the dependency-free text passthrough, ADR-0025.)
+    """
     with pytest.raises(ValueError, match="unsupported or ambiguous"):
-        extract(data=b"plain text bytes", filename="notes.txt")
+        extract(data=b"plain text bytes", filename="notes.bin")
 
 
 def test_extract_ambiguous_pdf_and_office() -> None:
@@ -182,6 +188,177 @@ def test_extract_ambiguous_pdf_and_office() -> None:
     office_mime = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
     with pytest.raises(ValueError, match="ambiguous"):
         extract(data=b"junk", filename="x.pdf", mime=office_mime)
+
+
+# --- text passthrough (ADR-0025; dependency-free, no optional dep needed) -----------------------
+
+
+def test_extract_text_passthrough_md() -> None:
+    """``.md`` bytes pass through verbatim as the body (extractor='text', canonical hash)."""
+    body = "# A note\n\n- a bullet\n- another\n"
+    doc = extract_text(body.encode("utf-8"), filename="note.md")
+    assert doc.extractor == "text"
+    assert doc.markdown == body
+    assert doc.title is None
+    assert doc.source_url is None
+    assert doc.content_sha256 == content_sha256(body)
+
+
+def test_extract_text_passthrough_via_dispatch_txt() -> None:
+    """The dispatcher routes ``.txt`` data to the dependency-free text passthrough."""
+    body = "plain text finding\n"
+    doc = extract(data=body.encode("utf-8"), filename="finding.txt")
+    assert doc.extractor == "text"
+    assert doc.markdown == body
+    assert doc.content_sha256 == content_sha256(body)
+
+
+def test_extract_text_via_mime_only() -> None:
+    """A ``text/markdown`` MIME (no recognizable extension) still routes to the text passthrough."""
+    body = "## from mime\n\nbody\n"
+    doc = extract(data=body.encode("utf-8"), filename="blob", mime="text/markdown; charset=utf-8")
+    assert doc.extractor == "text"
+    assert doc.markdown == body
+    # The normalized mime is recorded for provenance.
+    assert doc.mime == "text/markdown"
+
+
+def test_extract_text_decodes_invalid_utf8_with_replacement() -> None:
+    """Untrusted non-UTF-8 bytes never raise — they decode with the replacement char."""
+    doc = extract_text(b"valid \xff\xfe bytes", filename="weird.txt")
+    assert doc.extractor == "text"
+    assert "�" in doc.markdown  # the replacement character
+    assert doc.content_sha256 == content_sha256(doc.markdown)
+
+
+def test_extract_text_no_third_party_import() -> None:
+    """The text extractor module binds no optional third-party package at module scope."""
+    from agora_kb.ingest.extractors import text as text_mod
+
+    for mod in ("trafilatura", "pdfminer", "markitdown"):
+        assert mod not in vars(text_mod)
+
+
+# --- widened markitdown routing (ADR-0025; reuses the pinned markitdown, no new dep) ------------
+
+
+def test_extract_dispatches_markitdown_by_extension(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An ``.html`` filename routes data to the widened markitdown extractor."""
+    sentinel = ExtractedDoc(
+        markdown="m", content_sha256=content_sha256("m"), extractor="markitdown"
+    )
+    import agora_kb.ingest.extractors.office as office_mod
+
+    monkeypatch.setattr(office_mod, "extract_markitdown", lambda data, *, filename: sentinel)
+    assert extract(data=b"<html></html>", filename="page.html") is sentinel
+
+
+def test_extract_dispatches_markitdown_by_mime(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A ``text/csv`` mime routes data to the widened markitdown extractor."""
+    sentinel = ExtractedDoc(
+        markdown="m", content_sha256=content_sha256("m"), extractor="markitdown"
+    )
+    import agora_kb.ingest.extractors.office as office_mod
+
+    monkeypatch.setattr(office_mod, "extract_markitdown", lambda data, *, filename: sentinel)
+    assert extract(data=b"a,b\n1,2\n", filename="data", mime="text/csv") is sentinel
+
+
+@pytest.mark.parametrize(
+    ("filename", "payload"),
+    [
+        ("data.csv", b"a,b\n1,2\n"),
+        ("data.json", b'{"a": 1}'),
+        ("page.html", b"<html></html>"),
+        ("doc.xml", b"<root/>"),
+        ("page.htm", b"<html></html>"),
+    ],
+)
+def test_extract_generic_text_mime_does_not_veto_markitdown_ext(
+    filename: str, payload: bytes, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A markitdown extension + the browser/OS-default generic ``text/plain`` MIME routes to
+    markitdown — the generic MIME must NOT make it a conflict (regression: the disjoint guard
+    used to raise ``ambiguous`` on the common drag-and-drop ``.csv``/``.json`` + ``text/plain``)."""
+    sentinel = ExtractedDoc(
+        markdown="m", content_sha256=content_sha256("m"), extractor="markitdown"
+    )
+    import agora_kb.ingest.extractors.office as office_mod
+
+    monkeypatch.setattr(office_mod, "extract_markitdown", lambda data, *, filename: sentinel)
+    assert extract(data=payload, filename=filename, mime="text/plain") is sentinel
+    # ``text/markdown`` (the other generic text MIME) likewise must not veto a markitdown ext.
+    assert extract(data=payload, filename=filename, mime="text/markdown") is sentinel
+
+
+def test_extract_octet_stream_with_markitdown_ext_routes(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A ``.csv`` + ``application/octet-stream`` (a non-text generic MIME) still routes by ext."""
+    sentinel = ExtractedDoc(
+        markdown="m", content_sha256=content_sha256("m"), extractor="markitdown"
+    )
+    import agora_kb.ingest.extractors.office as office_mod
+
+    monkeypatch.setattr(office_mod, "extract_markitdown", lambda data, *, filename: sentinel)
+    assert extract(data=b"a,b\n1,2\n", filename="data.csv", mime="application/octet-stream") is (
+        sentinel
+    )
+
+
+def test_extract_still_ambiguous_for_contradictory_specific_signals() -> None:
+    """A SPECIFIC vs SPECIFIC clash (a ``.csv`` filename + ``application/pdf`` MIME) is still a
+    genuine conflict — the generic-MIME relaxation must not weaken the real ambiguity guard."""
+    with pytest.raises(ValueError, match="ambiguous"):
+        extract(data=b"a,b\n1,2\n", filename="data.csv", mime="application/pdf")
+
+
+def test_extract_markitdown_requires_filename() -> None:
+    """A markitdown MIME with no filename cannot determine the format → ValueError."""
+    with pytest.raises(ValueError, match="requires a filename"):
+        extract(data=b"<html></html>", mime="text/html")
+
+
+def test_extract_markitdown_unavailable_when_missing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A simulated-missing markitdown import → ExtractorUnavailable on the widened path too."""
+    import builtins
+
+    real_import = builtins.__import__
+
+    def fake_import(name, *args, **kwargs):
+        if name == "markitdown" or name.startswith("markitdown."):
+            raise ImportError("simulated missing markitdown")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+    with pytest.raises(ExtractorUnavailable, match="markitdown"):
+        extract_markitdown(b"<html></html>", filename="x.html")
+
+
+def test_unsupported_message_lists_new_supported_set() -> None:
+    """The unsupported-error message advertises the widened supported set (text + markitdown)."""
+    with pytest.raises(ValueError) as excinfo:
+        extract(data=b"junk", filename="thing.bin")
+    msg = str(excinfo.value)
+    assert ".txt/.md/.markdown" in msg
+    assert "markitdown" in msg
+
+
+def test_extract_html_real_via_markitdown() -> None:
+    """markitdown over a tiny HTML doc yields markdown with extractor='markitdown'."""
+    pytest.importorskip("markitdown")
+    html = b"<html><head><title>T</title></head><body><h1>Heading</h1><p>Para.</p></body></html>"
+    doc = extract_markitdown(html, filename="page.html")
+    assert doc.extractor == "markitdown"
+    assert doc.mime == "text/html"
+    assert "Heading" in doc.markdown
+    assert doc.content_sha256 == content_sha256(doc.markdown)
+
+
+def test_extract_csv_real_via_dispatch() -> None:
+    """The dispatcher routes raw CSV bytes (by extension) to the markitdown path end to end."""
+    pytest.importorskip("markitdown")
+    doc = extract(data=b"name,score\nagora,42\n", filename="data.csv")
+    assert doc.extractor == "markitdown"
+    assert "agora" in doc.markdown
 
 
 # --- canonical content_sha256 reuse (NOT reinvention) -------------------------------------------

@@ -283,3 +283,20 @@ table.connectors th { font-size: 0.72rem; text-transform: uppercase; letter-spac
 .graph-reset:hover { color: var(--accent); border-color: var(--accent); opacity: 1; }
 
 footer.site { max-width: 980px; margin: 2rem auto 1rem; padding: 0 1.5rem; color: var(--muted); font-size: 0.85rem; }
+
+/* Drag-and-drop multi-upload (ADR-0025). Vanilla drop-zone styled to match the form fields; the
+   real <input type=file multiple> sits inside it and upload.js fills it on drop. */
+.dropzone {
+  border: 1.5px dashed var(--border);
+  border-radius: 8px;
+  padding: 1rem;
+  cursor: pointer;
+  transition: border-color 0.15s, background 0.15s;
+}
+.dropzone.dragover { border-color: var(--accent); background: var(--panel); }
+.dropzone .dropzone-hint { color: var(--muted); margin: 0 0 0.5rem; font-size: 0.92rem; }
+.file-list { list-style: none; margin: 0.5rem 0 0; padding: 0; font-size: 0.88rem; }
+.file-list li { font-family: var(--mono); color: var(--muted); }
+.receipt.batch .batch-results { list-style: none; margin: 0.5rem 0; padding: 0; font-size: 0.9rem; }
+.receipt.batch .batch-results li.ok { color: var(--fg); }
+.receipt.batch .batch-results li.error .err { color: #b3261e; }

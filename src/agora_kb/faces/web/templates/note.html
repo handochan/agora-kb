@@ -76,11 +76,14 @@
   </article>
 
   {# Local ego-graph (this note + its 1-hop neighbours). graph.js fetches the JSON and renders the
-     same force-graph canvas as /graph; the center rel_path is URL-encoded by Jinja (autoescaped). #}
+     same force-graph canvas as /graph; the center rel_path is URL-encoded by Jinja (autoescaped).
+     Omitted entirely when the operator disables the graph feature (ADR-0025) — /api/graph 404s. #}
+  {% if graph_enabled | default(true) %}
   <section aria-label="Connections">
     <h2>Connections</h2>
     <div class="local-graph" data-graph-src="/api/graph?center={{ note.rel_path|urlencode }}&amp;depth=1"></div>
   </section>
+  {% endif %}
 {% else %}
   <h1>Note not found</h1>
   <p class="empty">No tracked note at <span class="mono">{{ rel_path }}</span>.</p>
@@ -90,8 +93,8 @@
 
 {% block scripts %}
 {# Load the viz ONLY on a real note (the not-found branch has no graph container, so load nothing
-   — force-graph is 177KB). #}
-{% if note %}
+   — force-graph is 177KB) AND only when the graph feature is enabled (ADR-0025). #}
+{% if note and (graph_enabled | default(true)) %}
 <script src="/static/force-graph.min.js" defer></script>
 <script src="/static/graph.js" defer></script>
 {% endif %}

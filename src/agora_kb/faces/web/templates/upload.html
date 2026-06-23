@@ -3,15 +3,21 @@
 {% block content %}
 <h1>Capture knowledge</h1>
 <p class="muted">
-  Upload a file (PDF / Office doc), point at a URL, or paste text. Agora extracts it to markdown,
+  Drop one or more files (or point at a URL, or paste text). Agora extracts each to markdown,
   appends it to the inbox, and the curator makes it searchable on its next run.
 </p>
 
 <form hx-post="/upload" hx-target="#capture-receipt" hx-encoding="multipart/form-data" hx-swap="innerHTML">
   <div class="field">
-    <label for="file">File</label>
-    <input type="file" id="file" name="file">
-    <p class="hint">PDF, .docx, .xlsx, or .pptx — extracted to markdown (the original binary is not stored verbatim yet; ADR-0020).</p>
+    <label for="file">Files</label>
+    {# Drop-zone: vanilla JS (static/upload.js, no Node/CDN) fills this input on drop + lists the
+       chosen files. `multiple` enables the batch path; HTMX posts every `file` part as multipart. #}
+    <div id="dropzone" class="dropzone" tabindex="0">
+      <p class="dropzone-hint">Drag &amp; drop files here, or click to choose. Multiple files are captured as one batch.</p>
+      <input type="file" id="file" name="file" multiple>
+      <ul id="file-list" class="file-list" aria-live="polite"></ul>
+    </div>
+    <p class="hint">PDF, Office docs (.docx/.xlsx/.pptx), .html/.csv/.json/.epub/.xml, and .txt/.md — extracted to markdown (the original binary is not stored verbatim yet; ADR-0020).</p>
   </div>
 
   <div class="or-divider">— or —</div>
@@ -49,4 +55,8 @@
 </form>
 
 <div id="capture-receipt" aria-live="polite"></div>
+{% endblock %}
+
+{% block scripts %}
+<script src="/static/upload.js" defer></script>
 {% endblock %}
