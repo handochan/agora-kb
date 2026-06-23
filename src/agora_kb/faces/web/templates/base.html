@@ -13,6 +13,7 @@
     <span class="brand"><a href="/">Agora</a></span>
     <nav aria-label="Primary">
       <a href="/">Browse</a>
+      <a href="/graph">Graph</a>
       <a href="/upload">Capture</a>
       <a href="/dashboard">Dashboard</a>
     </nav>
@@ -24,5 +25,8 @@
     Agora — a markdown + git shared-memory hub. Reads are evidence, not synthesis;
     captures become searchable after the next curator run.
   </footer>
+  {# Per-page viz scripts inject here — force-graph (177KB) loads ONLY on the graph + note pages,
+     never globally (ADR-0019 §7). #}
+  {% block scripts %}{% endblock %}
 </body>
 </html>
