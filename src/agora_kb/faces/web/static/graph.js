@@ -139,6 +139,21 @@ function initGraph(el) {
           g.width(el.clientWidth).height(el.clientHeight);
         });
       });
+
+      // "Reset view" control overlaid on the canvas: re-frame the whole graph on demand, so after
+      // panning/zooming around the user can snap straight back to the initial auto-fit framing. It
+      // calls g.zoomToFit DIRECTLY (not the one-shot, guarded frameGraph) because this is an
+      // explicit user action — and since panning/zooming only move the CAMERA (node positions are
+      // unchanged), zoomToFit(400, 40) restores exactly the same fitted view as the initial load.
+      const resetBtn = document.createElement("button");
+      resetBtn.type = "button";
+      resetBtn.className = "graph-reset";
+      resetBtn.textContent = "Reset view";
+      resetBtn.title = "Re-fit the whole graph to the view (the initial auto-fit)";
+      resetBtn.addEventListener("click", function () {
+        g.zoomToFit(400, 40);
+      });
+      el.appendChild(resetBtn);
     })
     .catch(function () {
       el.classList.add("graph-empty");

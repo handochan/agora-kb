@@ -195,6 +195,7 @@ def test_graph_js_served_with_xss_and_click_wiring(tmp_path: Path) -> None:
     assert "onNodeClick" in body  # the click handler is wired
     assert "/note/" in body  # the click navigates to the note route
     assert "zoomToFit" in body  # auto-frame the graph once the layout settles (onEngineStop)
+    assert "graph-reset" in body  # the on-demand "Reset view" control (re-fit to the initial view)
 
 
 # --- per-note Connections embed -----------------------------------------------------------------
