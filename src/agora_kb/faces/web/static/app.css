@@ -262,5 +262,24 @@ table.connectors th { font-size: 0.72rem; text-transform: uppercase; letter-spac
   margin-bottom: 0.6rem;
 }
 .graph-empty { color: var(--muted); padding: 1rem; }
+/* "Reset view" control overlaid on the top-right of a graph canvas (created by graph.js). The
+   container is position:relative, so this anchors to it; z-index keeps it above the force-graph
+   <canvas>. Styled like the filter chips. */
+.graph-reset {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  z-index: 5;
+  font: inherit;
+  font-size: 0.78rem;
+  padding: 0.2rem 0.65rem;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--panel);
+  color: var(--muted);
+  cursor: pointer;
+  opacity: 0.92;
+}
+.graph-reset:hover { color: var(--accent); border-color: var(--accent); opacity: 1; }
 
 footer.site { max-width: 980px; margin: 2rem auto 1rem; padding: 0 1.5rem; color: var(--muted); font-size: 0.85rem; }
