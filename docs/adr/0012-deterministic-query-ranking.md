@@ -508,6 +508,19 @@ returned hits.
   never written by the sandboxed curator backend and not in the ADR-0008 INGEST allowlist; the read path
   is read-only and falls back to a pure-Python scan — honoring invariant #2, ADR-0008, and contract C10,
   with no multi-writer race across concurrent `kb_query` callers.
+- **(status, 2026-06-24 — issue #26 search performance at scale):** the §2/§9 derived READER cache
+  (`_kb/index/<repo>.notes.json` + the OPTIONAL `_kb/index/<repo>.fts.sqlite` FTS5 prefilter +
+  `_kb/index/<repo>.meta.json`) was specified here but never built (Phase-1 ships the pure-Python scan
+  only). Issue #26 now IMPLEMENTS that cache so query stays fast as the KB grows. **This is an
+  implementation of this already-Accepted ADR — it needs NO new ADR**, and it does not relax any
+  invariant here: the cache stays git-ignored, NEVER canonical, and fully rebuildable from the curated
+  commit (invariant #1, keyed on curated-commit-SHA + per-file `content_sha256` per §2); it is
+  materialized by deterministic worker/reader code ONLY — NEVER by the sandboxed curator backend and NOT
+  in the ADR-0008 INGEST allowlist (invariant #2 / contract C10); the FTS5 table remains a candidate
+  PREFILTER over `tokenize()` output (`tokenize='ascii'`, CPython-bundled), never a scorer, and the
+  pure-Python BM25F oracle (§0a/§4) stays the sole source of every `SearchHit` field (§9). Semantic/vector
+  search (ROADMAP "explicitly deferred") stays DEFERRED until corporate volume (issue #28) proves lexical
+  + navigation insufficient at scale — it is NOT in scope for #26.
 - **+** Cache invalidation keyed on curated-commit-SHA + per-file `content_sha256` only means any clone of
   the same commit rebuilds an identical cache (invariant #1); mtime/size are a non-correctness fast-path
   hint that can never cause a silent cache/markdown mismatch.

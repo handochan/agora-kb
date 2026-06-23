@@ -508,6 +508,33 @@ For any candidate with `is_gated == true` (`kind=candidate` OR `confidence=low`,
 All captured AND harvested content is treated as untrusted (prompt-injection / memory-poisoning): the prompts
 harden against embedded instructions (§8) and the integrity boundary (validation) does not depend on the
 content being benign.
+### 6.2 Forward-looking: high-volume / low-signal harvest sources (Proposed — context-harvester connectors ADR-0023)
+
+Planned harvester source classes beyond `file:` (session transcripts `session:<agent>`, plus the
+corporate-context set — `dir:`/`git:`/`mail:`/`chat:`/`calendar:` — diversifying work-context capture, #25/#28)
+all feed the SAME gate. Two consequences, recorded now so the integrity boundary is not silently widened (a
+load-bearing taxonomy + safety decision → its own ADR, proposed **ADR-0023 — Context-harvester connectors**;
+any team/corporate-shared source is sequenced after Phase-4 multi-tenancy, ROADMAP Phase 5+):
+
+- **Same `is_gated` treatment, with DROP as a validated requirement.** Transcript- and corporate-derived
+  candidates land as `kind=candidate`/`confidence=low` (gated) exactly like file harvests, so §4.1 check 9
+  already forbids them from originating a theme/daily (MERGE/CONTEST/DROP only). But their signal-to-noise
+  ratio is far lower than a curated `MEMORY.md`, so **reliable DROP behavior on a real corpus is a validation
+  prerequisite** before relying on a session/context connector — run `agora harvest --dry-run` against a
+  representative corpus and confirm the gate drops the noise (mirroring the [ADR-0017](adr/0017-harvester-file-connector-mechanics.md)
+  "validate noise with `--dry-run`" guidance). The gate is unchanged; what changes is the burden of proof on
+  the connector author.
+
+- **Optional pre-gate digest for firehose volume.** High-volume/low-signal sources (mail/chat/sessions) MAY be
+  summarized or clustered into fewer candidate facts **before the inbox** — as a connector-side reduction or a
+  separate pre-curation digest adapter step (ADR-0004 read-adapter) — so the per-run bundle cap
+  (§1.3 `max_candidates_per_run`, default 32 — documented but not yet wired in `load_repo_config`, same status
+  as the proposed `curator.limits.max_events_per_run`, so it is not an enforced ceiling pre-implementation) and
+  the curator's keep/merge/drop gate are not overwhelmed by a raw stream. This is purely a **read-side
+  transform**: the integrity boundary is unchanged — the digested facts still enter as untrusted, still go
+  through the candidate gate, and the curator still adjudicates keep/merge/drop. Summarization NEVER substitutes
+  for the gate.
+
 
 ### 6.1 Schema/taxonomy evolution is OUT of the INGEST contract
 No op evolves `AGENTS.md`/`SCHEMA.md` or expands `_meta/taxonomy.yaml`. The model can NEVER add a tag or

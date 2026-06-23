@@ -109,6 +109,168 @@ Goal: production-grade access control and review.
 - [ ] Packaging: Docker Compose, Helm (optional), published `agora-kb` (PyPI) + images.
 **Exit:** self-hostable multi-team deployment with auth, review, and governance.
 
+## Backlog (post-Phase-3) / corporate-AX — re-sequenced
+
+The seven backlog issues (#23–#29) re-sequenced into phases. **No invariant changes**: every item is
+additive over the existing seams (read-connectors/extractors per ADR-0004, the candidate gate +
+scope + provenance triad per ADR-0007, the single-writer curator per ADR-0002, markdown-SSOT per
+ADR-0001). Load-bearing pieces are tracked to **Proposed** ADRs and presented as *planned*, not
+settled. The graph piece of #29 is already **shipped** on `feat/web-knowledge-graph-viz` (tip
+`1bad37e`): the vendored MIT force-graph render over a JSON graph endpoint, the per-note ego-graph,
+and `AgoraHandlers.graph()` (caps `MAX_GRAPH_NODES`/`MAX_GRAPH_DEPTH` at `mcp_server.py:59-60`) all
+land under the **Accepted ADR-0021** — the first firing of the ADR-0019 §7 escape hatch. So #29's
+*remaining* scope here is config/upload/extensions, **not** the graph render.
+
+ADR numbering for the new work (ADR-0021 is the graph, already Accepted): taxonomy governance =
+**ADR-0022**, context-harvester connectors = **ADR-0023**, bulk/horizontal scale = **ADR-0024**,
+web config/multi-upload/extensions = **ADR-0025**, skill-suggestion write-back = **ADR-0026**
+(reserved, deferred).
+
+### Phase 3.5 — Web hardening + throughput floor (pull-forward; additive over ADR-0019/0020/0021)
+Low-risk, repo-local, OSS-safe; lands post-Phase-3 with no invariant change.
+- [ ] **#29 web enhancement (config/upload/extensions).** The knowledge-graph render is already shipped
+      (Accepted ADR-0021); this slice is the post-merge follow-up tracked to a new **ADR-0025 —
+      web config, multi-upload, extensions** (Proposed). Lift the two hardcoded graph caps
+      (`MAX_GRAPH_NODES`/`MAX_GRAPH_DEPTH`, `mcp_server.py:59-60`) into an operator-configurable
+      `web.graph.{max_nodes,max_depth}` (the first consumer of the new `web:` block). Add drag-and-drop
+      **multi-upload** (each file → one independent ADR-0020 extract→inbox capture + a per-file batch
+      receipt, best-effort not atomic; per-batch max-files/total-bytes caps; curator stays sole writer
+      of `raw/`) and **broadened extractors** behind the `ingest` extra via the `extractors/base.py`
+      dispatch (`.txt`/`.md` dependency-free passthroughs; widen markitdown routing to
+      html/csv/json/epub — already pinned, no new dep; image-OCR/audio DEFERRED behind their own opt-in
+      extra + ADR-0005 license vetting). Add a `web:` block in git-ignored `_kb/repo.yaml`
+      (`web.graph.{max_nodes,max_depth}`, `web.upload.{max_bytes,max_files,allowed_extensions}`,
+      `web.features.{graph_enabled}`) resolved **per-repo** in `build_app(repo_path)` (never a global
+      mutable — tenant-safe for Phase 4, invariant #5); silently-ignored-if-unwired, same pattern as
+      today's forward-looking keys (DATA-MODEL §3). Plus an untrusted-input hardening pass
+      (decompression-bomb caps, SVG/HTML XSS, per-batch caps). Update DESIGN §5.2 (multi-upload +
+      extensible formats; the read-only `/graph` already documented under ADR-0021).
+- [ ] **#26 search index.** Implement the **Accepted** ADR-0012 derived ranking cache as a rebuildable,
+      git-ignored `_kb/index/` (metadata/index, never canonical — ADR-0001) with an optional
+      CPython-bundled FTS5 prefilter behind the deterministic-query contract (ADR-0009); the pure-Python
+      BM25F stays the oracle. This is an **implementation of the already-Accepted ADR-0012, not a new
+      ADR**. Rebuildable-from-markdown is a hard requirement; **semantic/vector** stays deferred (see
+      below), with #28 corporate volume as the explicit future trigger.
+- [ ] **#27 (part) bounded-batch claim + throughput observability.** Wire a claim cap in `repo.yaml`
+      `curator.limits` (today documented-but-UNWIRED — `load_repo_config` does not parse `curator.limits`,
+      DATA-MODEL §3) to cap how many events `claim()` pulls per run, leaving the remainder for the next
+      trigger. Reconcile against the already-specified `max_candidates_per_run` (INGEST-CONTRACT §1.3,
+      default 32, likewise unwired): either wire that existing key (note: the contract already documents
+      32, not unbounded) or justify a distinct event-level `max_events_per_run` that slices the FIFO head
+      *pre-dedup* while the candidate cap bounds the *post-dedup* bundle — to be settled in ADR-0024. This
+      is **intra-repo pipelining (smaller, more frequent runs), NOT a second writer** — single-writer
+      CAS+flock stays the ceiling. Surface per-run throughput + CAS-conflict rate on the
+      dashboard/metrics.
+- [ ] **#23 (floor) no-loss catch-all.** "No matching domain" must **NOT** default to DROP: route an
+      unclassifiable durable capture to a reserved fallback domain (`general`/`uncategorized`) — a
+      deterministic safety net that prevents data loss *today* (removes the silent downgrade-to-DROP in
+      `ollama_brain.py`), before the governed auto-create lane lands. Documented in DESIGN §4 +
+      INGEST-CONTRACT op table (supersedes the current downgrade-to-DROP behavior).
+
+### Phase 4-coupled — Governed taxonomy + per-domain + personal connectors (multi-tenant-adjacent)
+Gated on / co-developed with Phase-4 multi-tenancy where a source is team/shared.
+- [ ] **#23/#24 governed CREATE_DOMAIN lane + per-domain customization.** New **ADR-0022 — curator
+      taxonomy governance** (Proposed): record that domain creation is a *governed* lane, **not** a
+      relaxation of ADR-0010 D6 inside INGEST — the sandboxed brain may NEVER directly widen
+      `_meta/taxonomy.yaml`; it only PROPOSES, the deterministic worker applies. The (currently inert)
+      `taxonomy_policy` + L1-18 get their job on the creation lane only: `open` = deterministic
+      auto-create (solo/MVP); `review-only` = emit a domain *proposal*/PR; `capped:<N>` = ≤N new domains
+      per run. **HARD prerequisite**: the same change that lands worker-applied CREATE_DOMAIN MUST flip
+      the effective default to be repo-kind-aware (personal→`open`; team→`review-only` or `capped:1`) —
+      today the code default is unconditionally `"open"` (`emit.py Taxonomy.taxonomy_policy="open"`;
+      `lint.py loaded.get("taxonomy_policy","open")`); a team repo with no explicit policy must NOT
+      auto-create a domain in-INGEST (test-locked). **L1-18 must be EXTENDED**, not "activated": today it
+      diffs only `allowed_tags(after)−allowed_tags(before)` and never looks at `domains` (kb_schema.md
+      L1-18 row + §5.2 prose, `schema/lint.py check_taxonomy_policy`) — add a `domains` set-difference
+      branch + a test that an over-cap domain add is rejected. CREATE_DOMAIN follows the SAME
+      all-or-nothing CAS-publish-or-discard semantics as every op (taxonomy write + lazy MOC + theme are
+      ONE atomic worktree diff published by one CAS); a failed publish discards the whole worktree (no
+      half-created domain) and the fact falls to the catch-all floor. Pin a structured
+      `_meta/taxonomy.yaml` `domains` shape (list-of-strings **or**
+      `{<domain>: {created, created_by, status: proposed|active, source_run_id?}}`) — mirroring the
+      `allowed_tags` list-or-mapping PATTERN, but note `domains` is currently **list-only in all three
+      readers** (`config._load_taxonomy`, `ollama_brain.parse_taxonomy`, `schema/lint`), so the
+      normalizer is net-new in EACH; additive, does NOT bump `schema_version` (L1-17 untouched), no
+      migration command needed (the bare list stays valid). Per-domain customization (#24) layers only
+      onto *tuning* surfaces (PASS-1/PASS-2 prompts in read-only `_meta/domains/<domain>.md`, per-act
+      brain selection, soft thresholds `body_byte_bound`/`max_orphans`/`related_k`) — it may NEVER alter
+      the closed op vocabulary, the §4.0 allowlist, the fixed taxonomy, or the §4.1/§4.4 validators; the
+      integrity gate stays domain-agnostic + model-independent (default brain = OSS Qwen for every
+      domain, invariant #4). `is_gated` candidates can NEVER mint a domain (extend `plan.py` check-10).
+      Sequence the deterministic+prompt parts early (repo-global first); per-domain brain routing later
+      (gated behind ADR-0015 per-domain split).
+- [ ] **#25 (read side) session connector + #28 (personal) local/work-context connectors.** Reframe the
+      harvester (ADR-0007, DESIGN §6) from "agent MEMORY files" to "agent memory AND working-context
+      sources" via **ADR-0023 — context-harvester connectors** (Proposed) — same gate/scope/provenance,
+      no new core path (orchestrator/cursor/gate/scope reused; only `build_connectors` gains type
+      branches behind the existing ADR-0004 Connector Protocol). Reserve the connector-type grammar
+      `<type>:<agent>` beyond `file:`: `session:<agent>` (e.g. `session:claude-code`,
+      `path: ~/.claude/projects/**/*.jsonl`), `dir:`, `git:` — `build_connectors` dispatches on type with
+      the existing fail-loud unknown-type behavior; each maps to `source=harvest:<agent>` (the FIXED inbox
+      source enum needs no new members — corporate sources reuse the parametric `harvest:<agent>` form).
+      v1 distillation is deterministic + model-free. **Personal-first, team/shared scope deferred to
+      Phase-4** core write-boundary. ANY PII-bearing source (local OR networked) MUST run a shared
+      deterministic `core/redact.py` before the append-only `Inbox.write` (the immutable inbox cannot be
+      retro-scrubbed — invariant #3); `session:`/`dir:`/`git:` are HIGH-PII (verbatim prompts, pasted
+      secrets, file contents), so `redact.py` is a HARD dependency of the `session:` connector merge and
+      the first concrete trigger for the redaction-policy decision (with a metadata-only redaction-event
+      counter via Prometheus + `agora harvest --dry-run` printing what WOULD be redacted, never the
+      secret). `git:` reuses the fixed DATA-MODEL §6 whole-source `last_content_sha256` no-op (hash of the
+      concatenated since-cursor commit payloads — not a separate SHA cursor — so `extra='forbid'` is
+      respected). Transcript-derived candidates get the same `is_gated` treatment; their lower
+      signal-to-noise makes reliable DROP a `--dry-run` validation requirement (INGEST-CONTRACT §6).
+
+### Phase 5 — Cross-host single-writer + networked corporate sources + skill write-back
+- [ ] **#27 repo→owner fencing lease + sharder.** Promote the scattered one-liners into one rule:
+      **shard BY REPO, never within a repo** (ARCHITECTURE §2 / DESIGN §7), tracked to **ADR-0024 —
+      bulk processing / horizontal curator scale** (Proposed). The per-repo `flock` is host-local
+      (`fcntl`), so the CAS on the single curated ref (`repo.py compare_and_swap_branch` updates one ref)
+      is the only cross-host net — two hosts merely SERIALIZE (loser discards, never corrupts), wasteful
+      not unsafe. Sub-items: **(5a)** repo→owner assignment + fencing lease (git-ref CAS + fencing token,
+      OSS-pure default; optional etcd/Consul adapter never core) for cross-host single-writer; **(5b)**
+      within-repo throughput knobs (bounded batch from Phase 3.5 + trigger tuning). Don't rely on prose
+      "multi-host unsupported": make CAS-conflict rate a first-class dashboard alert + a host-local
+      stale-lock warning when >1 curator heartbeat is seen, so a wasteful cross-host double-writer is
+      VISIBLE (not "looks like a hang"). **Intra-repo MULTI-writer is explicitly out of scope** pending
+      an ADR + benchmark evidence of single-curator saturation — even disjoint file sets (per-domain
+      index fragments + per-curator log shards) still contend on the SINGLE curated-branch-ref CAS, so
+      domain-partitioned writers would need per-domain branches or a serialized publish step (default
+      no-go).
+- [ ] **#28 networked corporate work-context connectors.** Extends **ADR-0023**: (1) each is an ADR-0004
+      read-adapter, zero core change; (2) a mandatory OSS path per class — mail (IMAP/JMAP; Gmail/Graph
+      optional), chat (Matrix; Slack/Teams optional), calendar (CalDAV; Google/MS optional), git
+      (commit/diff), local folders (`dir:`), meetings (file/extractor); (3) safety = ADR-0007 triad
+      **plus** connector-boundary PII/secret redaction (`core/redact.py`) **plus** a pre-gate
+      summarization/clustering stage so high-volume/low-signal sources don't overwhelm the per-run bundle
+      cap (INGEST-CONTRACT §1.3 `max_candidates_per_run=32`, itself documented-but-not-yet-wired) —
+      summarization is a read-side transform, the gate still adjudicates; (4) team/corporate-shared scope
+      deferred to Phase-4 multi-tenancy. **Letta/mem0 API connectors are one member of this broader
+      connector family** (was the only Phase-5 connector listed). **How the collected context is USED**
+      (the issue's open second half) is bounded, not vague: (a) once curated it becomes queryable wiki
+      knowledge via the existing read/query/MOC/graph path; (b) the digest/clustering consumption stage
+      is the genuinely-open piece, gated on a CONCRETE evidence trigger (inbox backlog depth or per-run
+      DROP-rate from #27's metrics), not "until volume exists". DESIGN §6 broadens "Memory harvester" →
+      "Context harvester" with a source-class table.
+- [ ] **#25 skill-suggestion write-back.** Opt-in, **never auto-write** to a locally-installed agent;
+      needs its **own ADR-0026** (Proposed, reserved) — sequenced after the #28 context-collection
+      design, mirroring how Letta/mem0 write-back was deferred. Acceptance criteria: opt-in flag, emits a
+      proposed `SKILL.md` to stdout or `_kb/staging/` only, NEVER writes `~/.claude/skills`, a
+      human-confirm gate, and a test asserting no filesystem write outside the staging dir. Note (recorded
+      in ADR-0023 §9) that the `session:` connector + a future skill write-back together form a potential
+      KB→skill→session→KB cycle the verbatim origin-marker skip cannot catch (reworded by construction),
+      so the write-back must stamp provenance the session distiller recognizes and drops — loop-break
+      responsibility sits in BOTH the write-back ADR and the session distiller, not the candidate gate
+      alone.
+
+### Explicitly deferred from the backlog (with evidence-triggers)
+- **Image-OCR / audio extractors** (#29) and **binary-staging on multi-upload** — defer until a concrete
+  format need + an OSS-pure engine (ADR-0005); multi-upload ships text/markdown + existing extractors first.
+- **Intra-repo multi-writer** (#27) — defer pending an ADR **and** measured single-curator saturation on a
+  real repo (sharding is by-repo only until then).
+- **Semantic/vector search** (#26) — already on the global deferred list; revisit only if FTS5 + the
+  ADR-0012 ranking cache prove insufficient at scale, with #28 corporate volume as the explicit trigger.
+
+
 ## Cross-cutting (every phase)
 - Tests for the **core API** and **adapter contracts** (the stable surfaces).
 - Keep core dependency-light and OSS-pure (ADR-0005); proprietary pieces stay behind adapters.
