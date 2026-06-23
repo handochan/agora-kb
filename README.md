@@ -10,8 +10,10 @@ and the `agora` CLI. The curator's brain is **pluggable/swappable via `adapters.
 Ollama model or any headless CLI agent) with per-act `plan`/`author` routing (ADR-0015/0016), and an
 opt-in **harvester** pulls other agents' on-disk memory into gated candidates (`agora harvest`,
 ADR-0007). Phase 3 adds the **web face** (`agora web`): URL/PDF/office upload extractors, an API-first
-FastAPI server with a server-rendered HTMX UI for browse/search/upload, a read-only **dashboard**
-(KB health · curator · harvester), and a Prometheus `/metrics` exporter (ADR-0019/0020). Phases 4–5
+FastAPI server with a server-rendered HTMX UI for browse/search/upload, an interactive **knowledge
+graph** (`/graph` + a per-note local graph; vendored MIT force-graph, no Node — ADR-0021), a
+read-only **dashboard** (KB health · curator · harvester), and a Prometheus `/metrics` exporter
+(ADR-0019/0020/0021). Phases 4–5
 (multi-tenant, auth, governance) are still ahead; see
 [`docs/ROADMAP.md`](docs/ROADMAP.md). Package/distribution name: `agora-kb`.
 
@@ -115,7 +117,9 @@ uv run agora web --repo ~/my-kb            # → http://127.0.0.1:8000
 
 You get a browse/search UI (markdown rendered XSS-safe via `markdown-it-py`), an **upload** page that
 runs URL/PDF/office extractors and writes the result through the inbox (the curator stays the sole
-writer of `raw/`; ADR-0020), a first-class JSON API under `/api/*`, a read-only **`/dashboard`**
+writer of `raw/`; ADR-0020), a first-class JSON API under `/api/*`, an interactive **`/graph`**
+knowledge graph (plus a per-note local/backlink graph; canvas drag/zoom/click → the note, vendored
+MIT force-graph, no Node — ADR-0021), a read-only **`/dashboard`**
 (KB health · curator · harvester status, HTMX-polled), and a Prometheus **`/metrics`** endpoint for
 external scraping. It binds to `127.0.0.1` by default and ships no authentication — keep it local.
 

@@ -28,6 +28,7 @@ upload is stamped ``source = f"web:{user}"`` (the inbox ``web:<user>`` source fo
 from __future__ import annotations
 
 import re
+import urllib.parse
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated
 
@@ -131,6 +132,27 @@ def build_app(*, repo_path: Path, writer: str = "web", user: str = "local") -> F
         if payload is None:
             raise HTTPException(status_code=404, detail=f"note not found: {rel_path}")
         return payload
+
+    @app.get(
+        "/api/graph",
+        tags=["api"],
+        summary="Knowledge-graph node/edge data for the /graph viz (read-only).",
+    )
+    def api_graph(
+        center: Annotated[
+            str | None, Query(description="A note rel_path to ego-center the graph on (local).")
+        ] = None,
+        depth: Annotated[int, Query(description="Local ego-graph BFS depth (clamped 1..3).")] = 1,
+        domain: Annotated[
+            str | None, Query(description="Restrict the global graph to one domain.")
+        ] = None,
+    ) -> dict[str, object]:
+        """Return ``{nodes, edges, node_total, edge_total, truncated, center, depth}``.
+
+        A THIN pass-through to :meth:`AgoraHandlers.graph` — clamping, empty-handling, the global
+        cap, and the local ego-BFS all live in the handler (ADR-0019 §1/§6, no logic in the route).
+        """
+        return handlers.graph(center=center, depth=depth, domain=domain)
 
     @app.post(
         "/api/upload",
@@ -249,6 +271,28 @@ def build_app(*, repo_path: Path, writer: str = "web", user: str = "local") -> F
             request,
             "note.html",
             {"note": payload, "rel_path": rel_path, "body_html": body_html},
+        )
+
+    @app.get("/graph", response_class=HTMLResponse, include_in_schema=False)
+    def graph_page(request: Request, domain: str | None = None) -> _TemplateResponse:
+        """The interactive knowledge-graph page (a per-route force-graph canvas, ADR-0019 §7).
+
+        Builds the JSON ``api_src`` server-side (``/api/graph`` + an optional ``?domain=`` when a
+        non-empty domain is selected) and renders ``graph.html`` with the domain-filter chips. The
+        canvas fetches ``api_src`` client-side via ``graph.js``; this route adds no graph logic.
+        """
+        api_src = "/api/graph"
+        active = (domain or "").strip() or None
+        if active:
+            api_src = f"{api_src}?domain={urllib.parse.quote(active)}"
+        return templates.TemplateResponse(
+            request,
+            "graph.html",
+            {
+                "domains": handlers.browse()["domains"],
+                "active_domain": active,
+                "api_src": api_src,
+            },
         )
 
     @app.get("/upload", response_class=HTMLResponse, include_in_schema=False)

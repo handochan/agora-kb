@@ -52,6 +52,13 @@ DEFAULT_WRITER = "local"
 # of the FIXED_SOURCES the core accepts (DATA-MODEL §1).
 DEFAULT_SOURCE = "manual"
 
+# Knowledge-graph viz bounds (faces/web /graph seam — ADR-0019 §7 / graph-plan). The global graph is
+# soft-capped so a very large KB stays responsive in the browser; when the kept node set exceeds the
+# cap it is truncated to the first MAX_GRAPH_NODES by sorted rel_path and ``truncated`` is set (the
+# honest signal — node_total still reports the true pre-cap count, never silently dropped).
+MAX_GRAPH_NODES = 2000  # soft cap for the global graph (browser perf); honest truncated flag
+MAX_GRAPH_DEPTH = 3  # clamp for the local ego-graph depth
+
 
 class AgoraHandlers:
     """Transport-free handlers for the 4 MCP tools (DESIGN §5.1).
@@ -356,6 +363,179 @@ class AgoraHandlers:
                 }
             )
         return {"enabled": enabled, "connectors": connectors}
+
+    # --- graph (read; web face /graph viz — ADR-0003/0019 §7 / graph-plan) -----------------------
+    def graph(
+        self, *, center: str | None = None, depth: int = 1, domain: str | None = None
+    ) -> dict[str, object]:
+        """Knowledge-graph data for the web ``/graph`` viz (DESIGN §5.3 / ADR-0019 §7, graph-plan).
+
+        A thin, deterministic READ aggregation over :meth:`agora_kb.core.wiki.Wiki.list_notes` (the
+        same core.wiki seam :meth:`browse` / :meth:`health` use) into a JSON-serializable
+        node/edge graph — it adds NO write path and touches no integrity/curator/inbox code
+        (ADR-0003 thin-face). It is the data seam the graph plan and ADR-0019 §7 prescribe; the
+        rendering (force-graph layout) is the web layer's job, never this face's.
+
+        **Nodes.** One per note via :meth:`_note_summary` (reused verbatim, NOT duplicated) for
+        ``title`` / ``domain`` / ``status`` / ``type``, with ``id == rel_path`` — the canonical
+        unique identity, which is exactly what ``/note/<id>`` navigates to — plus an ``orphan``
+        flag.
+
+        **Orphan.** Reuses :meth:`health`'s EXACT derivation: a referenced set is built over the
+        FULL note set = the union of :func:`agora_kb.schema.notes.body_link_basenames` of each body
+        plus, for ``related`` / ``children``, the :func:`agora_kb.schema.notes.wikilinks` of each
+        str item (list-or-scalar tolerant, exactly as ``health()`` iterates). A node is an orphan
+        iff ``type == "theme"`` and its basename is referenced by nothing; a non-theme is never an
+        orphan. Orphan is a GLOBAL property, so it is computed over every note regardless of the
+        ``center`` / ``domain`` filter (so the count matches ``health()["orphans"]``).
+
+        **Edges.** Directed, deduped, no self-loops, both endpoints real nodes. A ``by_basename``
+        map (basename → rel_path, ``setdefault`` over notes sorted by ``rel_path`` for determinism)
+        resolves each source note's body links + ``related`` / ``children`` wikilinks to a target
+        rel_path; an unresolved (dangling) basename is NOT an edge, and self-loops are dropped.
+        Emitted as ``{"source", "target"}``, sorted by ``(source, target)``.
+
+        **Scope.** GLOBAL (``center is None``): all notes, optionally filtered to one ``domain``
+        (kept iff ``_wiki_domain(rel_path) == domain``); ``edge_total`` / ``node_total`` are the
+        kept counts BEFORE the cap. If the kept node count exceeds :data:`MAX_GRAPH_NODES` the kept
+        set is truncated to the first ``MAX_GRAPH_NODES`` by sorted rel_path, edges are recomputed
+        on the survivors, and ``truncated`` is ``True`` — but ``node_total`` still reports the true
+        pre-cap count (no silent truncation). LOCAL (``center`` is a rel_path): ``depth`` is clamped
+        to ``[1, MAX_GRAPH_DEPTH]``; an unknown center returns an empty graph with ``center=None``;
+        otherwise a BFS over the UNDIRECTED adjacency of the global edge set (both directions) from
+        the center out to ``depth`` hops yields the reached notes (``domain`` is ignored for local),
+        with edges induced on that reached set and ``truncated`` always ``False``.
+
+        Returns ``{nodes, edges, node_total, edge_total, truncated, center, depth}`` — ``center``
+        echoes the resolved center rel_path (``None`` for global or an unknown requested center) and
+        ``depth`` echoes the clamped value; every value is JSON-serializable.
+        """
+        from agora_kb.schema.notes import body_link_basenames, wikilinks
+
+        notes = self._wiki.list_notes()
+
+        # Orphan derivation — reused VERBATIM from health() (a GLOBAL property over every note,
+        # computed before any center/domain filtering so the count matches health()["orphans"]).
+        referenced: set[str] = set()
+        for n in notes:
+            referenced.update(body_link_basenames(n.body))
+            for fkey in ("related", "children"):
+                fval = n.frontmatter.get(fkey)
+                for item in fval if isinstance(fval, list) else [fval]:
+                    if isinstance(item, str):
+                        referenced.update(wikilinks(item))
+
+        # Stable basename → rel_path resolver (setdefault over notes sorted by rel_path so a
+        # duplicate basename deterministically resolves to the first path).
+        sorted_notes = sorted(notes, key=lambda n: n.rel_path)
+        by_basename: dict[str, str] = {}
+        for n in sorted_notes:
+            by_basename.setdefault(n.basename, n.rel_path)
+
+        def _node(n: object) -> dict[str, object]:
+            summary = self._note_summary(n)
+            return {
+                "id": summary["rel_path"],
+                "title": summary["title"],
+                "domain": summary["domain"],
+                "status": summary["status"],
+                "type": summary["type"],
+                "orphan": (
+                    n.type == "theme" and n.basename not in referenced  # type: ignore[attr-defined]
+                ),
+            }
+
+        # The full directed, deduped, self-loop-free edge set over every real node — the basis for
+        # both the global induced edges and the local undirected BFS adjacency.
+        all_node_ids = {n.rel_path for n in notes}
+        edge_pairs: set[tuple[str, str]] = set()
+        for n in sorted_notes:
+            targets = list(body_link_basenames(n.body))
+            for fkey in ("related", "children"):
+                fval = n.frontmatter.get(fkey)
+                for item in fval if isinstance(fval, list) else [fval]:
+                    if isinstance(item, str):
+                        targets.extend(wikilinks(item))
+            for base in targets:
+                target_id = by_basename.get(base)
+                if target_id is None or target_id == n.rel_path:
+                    continue  # dangling link → not an edge; self-loop dropped
+                edge_pairs.add((n.rel_path, target_id))
+
+        def _induced_edges(node_ids: set[str]) -> list[dict[str, object]]:
+            kept = sorted((s, t) for (s, t) in edge_pairs if s in node_ids and t in node_ids)
+            return [{"source": s, "target": t} for (s, t) in kept]
+
+        if center is None:
+            # GLOBAL scope — all notes, optionally filtered to one domain.
+            if domain is None:
+                kept_notes = sorted_notes
+            else:
+                kept_notes = [n for n in sorted_notes if _wiki_domain(n.rel_path) == domain]
+            kept_ids = {n.rel_path for n in kept_notes}
+            node_total = len(kept_notes)
+            edge_total = len(_induced_edges(kept_ids))
+            truncated = node_total > MAX_GRAPH_NODES
+            if truncated:
+                kept_notes = kept_notes[:MAX_GRAPH_NODES]  # first N by sorted rel_path
+                kept_ids = {n.rel_path for n in kept_notes}
+            nodes = [_node(n) for n in kept_notes]
+            edges = _induced_edges(kept_ids)
+            return {
+                "nodes": nodes,
+                "edges": edges,
+                "node_total": node_total,  # honest pre-cap count
+                "edge_total": edge_total,
+                "truncated": truncated,
+                "center": None,
+                "depth": depth,
+            }
+
+        # LOCAL scope — ego-graph around `center` out to a clamped depth.
+        clamped_depth = max(1, min(depth, MAX_GRAPH_DEPTH))
+        if center not in all_node_ids:
+            # Unknown center → empty graph, center echoed as None (no node to seed the BFS).
+            return {
+                "nodes": [],
+                "edges": [],
+                "node_total": 0,
+                "edge_total": 0,
+                "truncated": False,
+                "center": None,
+                "depth": clamped_depth,
+            }
+
+        adjacency: dict[str, set[str]] = {}
+        for s, t in edge_pairs:
+            adjacency.setdefault(s, set()).add(t)
+            adjacency.setdefault(t, set()).add(s)
+
+        reached: set[str] = {center}
+        frontier: set[str] = {center}
+        for _ in range(clamped_depth):
+            nxt: set[str] = set()
+            for node_id in frontier:
+                for neighbor in adjacency.get(node_id, ()):
+                    if neighbor not in reached:
+                        nxt.add(neighbor)
+            reached.update(nxt)
+            frontier = nxt
+            if not frontier:
+                break
+
+        by_path = {n.rel_path: n for n in sorted_notes}
+        local_notes = [by_path[rel] for rel in sorted(reached) if rel in by_path]
+        nodes = [_node(n) for n in local_notes]
+        edges = _induced_edges(reached)
+        return {
+            "nodes": nodes,
+            "edges": edges,
+            "node_total": len(nodes),
+            "edge_total": len(edges),
+            "truncated": False,
+            "center": center,
+            "depth": clamped_depth,
+        }
 
     def _active_backend(self) -> str | None:
         """Resolve the label of the brain that runs the AUTHOR act (the prose writer), or ``None``.

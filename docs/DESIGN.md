@@ -161,9 +161,9 @@ these tools. No per-tool plugin needed.
 
 ### 5.2 Web app (people)
 Implemented (Phase 3 — ADR-0019/0020). `faces/web/app.py` is a **FastAPI** face that is
-**API-first**: a first-class JSON API (`GET /api/{status,search,notes,notes/{path}}`,
+**API-first**: a first-class JSON API (`GET /api/{status,search,notes,notes/{path},graph}`,
 `POST /api/upload`) plus a thin **server-rendered HTMX + Jinja2** UI over it (`/`, `/search`,
-`/note/{path}`, `/upload`). Run it with `agora web` (the optional `web` extra). Localhost, no-auth
+`/note/{path}`, `/upload`, `/graph`). Run it with `agora web` (the optional `web` extra). Localhost, no-auth
 for now (auth is Phases 4–5). Both layers call the same core read helpers (`Wiki.list_notes` /
 `Wiki.get_note`, surfaced as `AgoraHandlers.browse` / `AgoraHandlers.note`) and the same inbox
 write path the MCP face uses — the web face never reads or mutates `wiki/` / git / `raw/` directly.
@@ -176,6 +176,13 @@ write path the MCP face uses — the web face never reads or mutates `wiki/` / g
   body during consolidation; the *face* never writes `raw/`. (ADR-0020.) Staging the **original
   binary** verbatim in `raw/` (+ the sha256 re-ingest-drift sidecar) is a deferred follow-up.
 - Binary assets → `assets/`, referenced from notes (outside the navigation graph).
+- **Knowledge graph** (`/graph` + a per-note local/backlink graph, ADR-0021): an interactive
+  canvas of the link graph — nodes are notes, edges are body `[Title](x.md)` links + frontmatter
+  `related`/`children`; node click → the note, with a domain filter and contested/orphan accents.
+  It is a read-only thin-face derivation (`AgoraHandlers.graph`, reusing `Wiki.list_notes` +
+  `schema.notes` + `health()`'s orphan logic — no graph store; invariant 1), drawn by a vendored
+  MIT force-graph lib (no Node/build/CDN). This is the first firing of the ADR-0019 §7 per-route
+  viz escape hatch; a graph DB (Neo4j) was rejected on license/SSOT/overkill grounds (ADR-0021).
 
 ### 5.3 Dashboard (status, read-only)
 Implemented (Phase 3 — part of the web face). A read-only meta face served at `/dashboard` with
