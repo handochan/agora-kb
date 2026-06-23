@@ -27,7 +27,9 @@ upload is stamped ``source = f"web:{user}"`` (the inbox ``web:<user>`` source fo
 
 from __future__ import annotations
 
+import os
 import re
+import urllib.parse
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated
 
@@ -37,6 +39,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
 
+from agora_kb.config import WebConfig, load_web_config
 from agora_kb.core import Repo
 from agora_kb.core.hashing import content_sha256
 from agora_kb.faces.mcp_server import AgoraHandlers
@@ -81,6 +84,27 @@ class UploadReceipt(BaseModel):
     inbox_depth: int
 
 
+class FileReceipt(BaseModel):
+    """One file's outcome in a multi-upload batch (ADR-0025).
+
+    Best-effort, per-file: a good file carries its inbox ``id`` + ``queued`` (the
+    :meth:`AgoraHandlers.remember` outcome); a bad file carries ``error`` (the human-readable
+    failure) with ``id=None`` / ``queued=False``. The batch is NOT atomic — a bad file never blocks
+    a good one (the inbox is append-only per-event, so partial success is correct, ADR-0002/0020).
+    """
+
+    filename: str
+    id: str | None = None
+    queued: bool = False
+    error: str | None = None
+
+
+class BatchUploadReceipt(BaseModel):
+    """The receipt for ``POST /api/upload-batch`` — one :class:`FileReceipt` per submitted file."""
+
+    results: list[FileReceipt]
+
+
 def build_app(*, repo_path: Path, writer: str = "web", user: str = "local") -> FastAPI:
     """Construct the FastAPI web face over ``repo_path`` (mirrors ``mcp_server.build_server``).
 
@@ -91,7 +115,15 @@ def build_app(*, repo_path: Path, writer: str = "web", user: str = "local") -> F
     """
     repo = Repo.resolve(repo_path)
     handlers = AgoraHandlers(repo, writer=writer)
+    # ADR-0025: resolve the operator's web policy PER-REPO (invariant 5 / ADR-0006) — never a
+    # module-global the browser could flip across repos. Threaded into the graph caps, the upload
+    # limits, the allowed-extension gate, and the graph-feature flag below.
+    web_config = load_web_config(repo.layout)
     templates = Jinja2Templates(directory=str(_TEMPLATES_DIR))
+    # Expose the graph-feature flag to every template (base.html nav link, the per-note Connections
+    # embed) without threading it through each route's context — set once on this app's own Jinja
+    # environment, so it stays per-repo/tenant-safe (each build_app has its own Jinja2Templates).
+    templates.env.globals["graph_enabled"] = web_config.features.graph_enabled
 
     app = FastAPI(
         title="Agora web face",
@@ -132,6 +164,37 @@ def build_app(*, repo_path: Path, writer: str = "web", user: str = "local") -> F
             raise HTTPException(status_code=404, detail=f"note not found: {rel_path}")
         return payload
 
+    @app.get(
+        "/api/graph",
+        tags=["api"],
+        summary="Knowledge-graph node/edge data for the /graph viz (read-only).",
+    )
+    def api_graph(
+        center: Annotated[
+            str | None, Query(description="A note rel_path to ego-center the graph on (local).")
+        ] = None,
+        depth: Annotated[int, Query(description="Local ego-graph BFS depth (clamped 1..3).")] = 1,
+        domain: Annotated[
+            str | None, Query(description="Restrict the global graph to one domain.")
+        ] = None,
+    ) -> dict[str, object]:
+        """Return ``{nodes, edges, node_total, edge_total, truncated, center, depth}``.
+
+        A THIN pass-through to :meth:`AgoraHandlers.graph` — clamping, empty-handling, the global
+        cap, and the local ego-BFS all live in the handler (ADR-0019 §1/§6, no logic in the route).
+        The graph caps come from the operator's :class:`WebConfig` (ADR-0025); a disabled graph
+        feature 404s (the route is not served when graph is off).
+        """
+        if not web_config.features.graph_enabled:
+            raise HTTPException(status_code=404, detail="graph feature is disabled")
+        return handlers.graph(
+            center=center,
+            depth=depth,
+            domain=domain,
+            max_nodes=web_config.graph.max_nodes,
+            max_depth=web_config.graph.max_depth,
+        )
+
     @app.post(
         "/api/upload",
         tags=["api"],
@@ -157,9 +220,47 @@ def build_app(*, repo_path: Path, writer: str = "web", user: str = "local") -> F
         (:class:`ExtractorUnavailable`, with the install remedy).
         """
         receipt = await _do_upload(
-            handlers, user=user, file=file, url=url, text=text, domain=domain, tags=tags
+            handlers,
+            web_config=web_config,
+            user=user,
+            file=file,
+            url=url,
+            text=text,
+            domain=domain,
+            tags=tags,
         )
         return UploadReceipt(**receipt)
+
+    @app.post(
+        "/api/upload-batch",
+        tags=["api"],
+        summary="Capture N files in one drag-and-drop batch (multipart/form).",
+        response_model=BatchUploadReceipt,
+    )
+    async def api_upload_batch(
+        files: list[UploadFile],
+        domain: Annotated[str | None, Form()] = None,
+        tags: Annotated[str | None, Form()] = None,
+    ) -> BatchUploadReceipt:
+        """Capture multiple files in one batch → N independent inbox appends (ADR-0025).
+
+        Each file flows through the SAME per-file extract→provenance→:meth:`AgoraHandlers.remember`
+        path as :func:`_do_upload` (single-writer unchanged — the face only appends to the inbox,
+        ADR-0002/0020). BEST-EFFORT, not atomic: a bad file yields its own ``error`` receipt
+        while the good files still queue (the inbox is append-only per-event). Per-batch caps
+        (``upload.max_files`` count, ``upload.total_bytes`` total) are enforced UP-FRONT and reject
+        the whole batch with 413 before any write (count is known; the total is checked as each file
+        is read, stopping + reporting on the first overflow).
+        """
+        results = await _do_upload_batch(
+            handlers,
+            web_config=web_config,
+            user=user,
+            files=files,
+            domain=domain,
+            tags=tags,
+        )
+        return BatchUploadReceipt(results=results)
 
     # --- dashboard JSON API (read-only meta face; DESIGN §5.3 / ADR-0003) -----------------------
     # The first-class, documented JSON for the three dashboard panels — the SAME transport-free
@@ -251,6 +352,31 @@ def build_app(*, repo_path: Path, writer: str = "web", user: str = "local") -> F
             {"note": payload, "rel_path": rel_path, "body_html": body_html},
         )
 
+    @app.get("/graph", response_class=HTMLResponse, include_in_schema=False)
+    def graph_page(request: Request, domain: str | None = None) -> _TemplateResponse:
+        """The interactive knowledge-graph page (a per-route force-graph canvas, ADR-0019 §7).
+
+        Builds the JSON ``api_src`` server-side (``/api/graph`` + an optional ``?domain=`` when a
+        non-empty domain is selected) and renders ``graph.html`` with the domain-filter chips. The
+        canvas fetches ``api_src`` client-side via ``graph.js``; this route adds no graph logic.
+        A disabled graph feature 404s (ADR-0025), matching ``/api/graph``.
+        """
+        if not web_config.features.graph_enabled:
+            raise HTTPException(status_code=404, detail="graph feature is disabled")
+        api_src = "/api/graph"
+        active = (domain or "").strip() or None
+        if active:
+            api_src = f"{api_src}?domain={urllib.parse.quote(active)}"
+        return templates.TemplateResponse(
+            request,
+            "graph.html",
+            {
+                "domains": handlers.browse()["domains"],
+                "active_domain": active,
+                "api_src": api_src,
+            },
+        )
+
     @app.get("/upload", response_class=HTMLResponse, include_in_schema=False)
     def upload_form(request: Request) -> _TemplateResponse:
         """The multi-modal capture form (file | url | text, + domain/tags)."""
@@ -263,16 +389,46 @@ def build_app(*, repo_path: Path, writer: str = "web", user: str = "local") -> F
     @app.post("/upload", response_class=HTMLResponse, include_in_schema=False)
     async def upload_submit(
         request: Request,
-        file: UploadFile | None = None,
+        file: list[UploadFile] | None = None,
         url: Annotated[str | None, Form()] = None,
         text: Annotated[str | None, Form()] = None,
         domain: Annotated[str | None, Form()] = None,
         tags: Annotated[str | None, Form()] = None,
     ) -> _TemplateResponse:
-        """Run the SAME upload pipeline as ``/api/upload`` and return the receipt fragment."""
+        """Run the SAME upload pipeline as the JSON API and return the receipt fragment (ADR-0025).
+
+        The ``multiple`` file input submits 0..N ``file`` parts. With ≥2 real files this runs the
+        batch path (best-effort per-file outcomes → ``_batch_receipt.html``); with ≤1 file (plus the
+        url/text single-capture form) it runs the single :func:`_do_upload` → ``_receipt.html``. An
+        empty file input degrades to the url/text path (FastAPI sends an empty-filename part).
+        """
+        real_files = [f for f in (file or []) if f.filename]
+        if len(real_files) > 1:
+            results = await _do_upload_batch(
+                handlers,
+                web_config=web_config,
+                user=user,
+                files=real_files,
+                domain=domain,
+                tags=tags,
+            )
+            return templates.TemplateResponse(
+                request,
+                "_batch_receipt.html",
+                {"results": results, "error": None, "status_code": 200},
+            )
+
+        single = real_files[0] if real_files else None
         try:
             receipt = await _do_upload(
-                handlers, user=user, file=file, url=url, text=text, domain=domain, tags=tags
+                handlers,
+                web_config=web_config,
+                user=user,
+                file=single,
+                url=url,
+                text=text,
+                domain=domain,
+                tags=tags,
             )
         except HTTPException as exc:
             return templates.TemplateResponse(
@@ -328,10 +484,11 @@ def build_app(*, repo_path: Path, writer: str = "web", user: str = "local") -> F
     return app
 
 
-# --- the shared upload pipeline (one body for /api/upload and the HTMX POST) ---------------------
+# --- the shared upload pipeline (one body for /api/upload, /api/upload-batch, and the HTMX POST) --
 async def _do_upload(
     handlers: AgoraHandlers,
     *,
+    web_config: WebConfig,
     user: str,
     file: UploadFile | None,
     url: str | None,
@@ -342,31 +499,26 @@ async def _do_upload(
     """Extract → provenance-stamp → ``remember``; return the ``{id, queued, inbox_depth}`` receipt.
 
     Precedence: an uploaded ``file`` wins, then ``url``, then raw ``text``. The chosen input is
-    turned into markdown (``file``/``url`` via :func:`extract`; ``text`` used verbatim), a
-    deterministic provenance header is prepended (ADR-0020), and the result is appended to the
-    inbox with ``source = web:<user>``. Raises :class:`fastapi.HTTPException` for the documented
-    error cases (no input/empty → 400, oversize → 413, extractor failure → 422, missing dependency
-    → 503, and a non-kebab tag or other inbox-model validation failure → 422).
+    turned into markdown (``file`` via the shared :func:`_file_to_markdown`; ``url`` via
+    :func:`extract`; ``text`` used verbatim), a deterministic provenance header is prepended
+    (ADR-0020), and the result is appended to the inbox with ``source = web:<user>``. The per-file
+    size limit + the allowed-extension gate come from the operator's :class:`WebConfig` (ADR-0025).
+    Raises :class:`fastapi.HTTPException` for the documented error cases (no input/empty → 400,
+    oversize → 413, blocked extension → 415, extractor failure → 422, missing dependency → 503, and
+    a non-kebab tag or other inbox-model validation failure → 422).
     """
     url_val = (url or "").strip() or None
     text_val = text if (text and text.strip()) else None
+    max_bytes = web_config.upload.max_bytes
 
     if file is not None and file.filename:
         data = await file.read()
-        if len(data) > MAX_UPLOAD_BYTES:
-            raise HTTPException(
-                status_code=413,
-                detail=f"upload too large: {len(data)} bytes > {MAX_UPLOAD_BYTES} limit",
-            )
-        doc = _extract(data=data, filename=file.filename, mime=file.content_type)
-        markdown = (
-            _provenance_header(
-                source_url=doc.source_url,
-                title=doc.title,
-                extractor=doc.extractor,
-                content_sha256=doc.content_sha256,
-            )
-            + doc.markdown
+        markdown = _file_to_markdown(
+            data,
+            filename=file.filename,
+            mime=file.content_type,
+            max_bytes=max_bytes,
+            allowed=web_config.extensions.allowed,
         )
     elif url_val is not None:
         doc = _extract(url=url_val)
@@ -381,10 +533,10 @@ async def _do_upload(
         )
     elif text_val is not None:
         encoded = text_val.encode("utf-8")
-        if len(encoded) > MAX_UPLOAD_BYTES:
+        if len(encoded) > max_bytes:
             raise HTTPException(
                 status_code=413,
-                detail=f"text too large: {len(encoded)} bytes > {MAX_UPLOAD_BYTES} limit",
+                detail=f"text too large: {len(encoded)} bytes > {max_bytes} limit",
             )
         markdown = (
             _provenance_header(
@@ -401,6 +553,151 @@ async def _do_upload(
             detail="provide exactly one of: a file upload, a url, or text.",
         )
 
+    return _remember_markdown(handlers, markdown, user=user, domain=domain, tags=tags)
+
+
+async def _do_upload_batch(
+    handlers: AgoraHandlers,
+    *,
+    web_config: WebConfig,
+    user: str,
+    files: list[UploadFile],
+    domain: str | None,
+    tags: str | None,
+) -> list[FileReceipt]:
+    """Capture N files as N independent inbox appends; one :class:`FileReceipt` each (ADR-0025).
+
+    Per-batch caps are enforced UP-FRONT: the file COUNT is known immediately
+    (``upload.max_files``), and the running TOTAL is checked as each file's bytes are read
+    (``upload.total_bytes``) — either overflow rejects the WHOLE batch with 413 before any inbox
+    write (the count/total are batch-level policy, not per-file). Within the cap each file flows
+    through the SAME per-file path as :func:`_do_upload` (size limit, extension gate, extract,
+    provenance, :meth:`AgoraHandlers.remember`); a per-file failure is captured as that file's own
+    ``error`` :class:`FileReceipt` (BEST-EFFORT, not atomic — a bad file never blocks a good one,
+    the inbox is append-only per-event, ADR-0002/0020). The shared ``domain``/``tags`` apply to
+    every file; an invalid shared tag fails the whole batch up-front (it would fail every file).
+    """
+    if not files:
+        raise HTTPException(status_code=400, detail="provide at least one file in the batch.")
+    if len(files) > web_config.upload.max_files:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"too many files: {len(files)} > {web_config.upload.max_files} per-batch limit."
+            ),
+        )
+    # Validate the shared tags ONCE up-front: an invalid tag would fail every file identically, so
+    # surface it as a single clean batch error rather than N duplicate per-file errors.
+    _parse_tags(tags)
+
+    # Read every file first, enforcing the running per-batch total cap BEFORE any inbox write (so a
+    # too-large batch is rejected whole, never partially queued).
+    read: list[tuple[str, bytes, str | None]] = []
+    running_total = 0
+    for f in files:
+        data = await f.read()
+        running_total += len(data)
+        if running_total > web_config.upload.total_bytes:
+            raise HTTPException(
+                status_code=413,
+                detail=(
+                    f"batch too large: {running_total} bytes > "
+                    f"{web_config.upload.total_bytes} per-batch limit."
+                ),
+            )
+        read.append((f.filename or "", data, f.content_type))
+
+    results: list[FileReceipt] = []
+    for filename, data, mime in read:
+        try:
+            markdown = _file_to_markdown(
+                data,
+                filename=filename,
+                mime=mime,
+                max_bytes=web_config.upload.max_bytes,
+                allowed=web_config.extensions.allowed,
+            )
+            receipt = _remember_markdown(handlers, markdown, user=user, domain=domain, tags=tags)
+        except HTTPException as exc:
+            results.append(FileReceipt(filename=filename or "(unnamed)", error=str(exc.detail)))
+            continue
+        results.append(
+            FileReceipt(
+                filename=filename or "(unnamed)",
+                id=str(receipt["id"]),
+                queued=bool(receipt["queued"]),
+            )
+        )
+    return results
+
+
+def _file_to_markdown(
+    data: bytes,
+    *,
+    filename: str,
+    mime: str | None,
+    max_bytes: int,
+    allowed: list[str] | None,
+) -> str:
+    """Size-check + extension-gate + extract one file's bytes → provenance-stamped markdown.
+
+    The single per-file branch shared by :func:`_do_upload` and :func:`_do_upload_batch` (DRY, no
+    behaviour drift). Enforces the per-file ``max_bytes`` (413) and the optional ``allowed``
+    extension gate (415) at the FACE — ``extract`` itself stays format-driven — then prepends the
+    deterministic provenance header (ADR-0020).
+    """
+    if len(data) > max_bytes:
+        raise HTTPException(
+            status_code=413,
+            detail=f"upload too large: {len(data)} bytes > {max_bytes} limit",
+        )
+    _check_allowed_ext(filename, allowed)
+    doc = _extract(data=data, filename=filename, mime=mime)
+    return (
+        _provenance_header(
+            source_url=doc.source_url,
+            title=doc.title,
+            extractor=doc.extractor,
+            content_sha256=doc.content_sha256,
+        )
+        + doc.markdown
+    )
+
+
+def _check_allowed_ext(filename: str, allowed: list[str] | None) -> None:
+    """Gate a filename against the operator's ``extensions.allowed`` list at the face (ADR-0025).
+
+    ``allowed=None`` → no gate (the extractor's built-in supported set governs). A LIST → the file's
+    lowercased extension MUST be in it, else 415 (Unsupported Media Type) with a clear message —
+    gated BEFORE ``extract`` so the extractor stays format-driven and never sees a blocked file.
+    """
+    if allowed is None:
+        return
+    ext = os.path.splitext(filename)[1].lower() if filename else ""
+    if ext not in allowed:
+        raise HTTPException(
+            status_code=415,
+            detail=(
+                f"file extension {ext or '(none)'!r} is not allowed; "
+                f"allowed extensions: {sorted(allowed)}."
+            ),
+        )
+
+
+def _remember_markdown(
+    handlers: AgoraHandlers,
+    markdown: str,
+    *,
+    user: str,
+    domain: str | None,
+    tags: str | None,
+) -> dict[str, object]:
+    """Append provenance-stamped ``markdown`` to the inbox; return the ``remember`` receipt.
+
+    The single write seam shared by the single + batch paths: validates tags (kebab-case, 422),
+    normalizes the domain, and calls :meth:`AgoraHandlers.remember` with ``source = web:<user>``
+    (the only write path — the curator alone materializes ``raw/``, single-writer ADR-0002/0020).
+    """
     parsed_tags = _parse_tags(tags)
     dom = (domain or "").strip() or None
     try:

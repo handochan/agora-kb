@@ -197,9 +197,9 @@ these tools. No per-tool plugin needed.
 
 ### 5.2 Web app (people)
 Implemented (Phase 3 — ADR-0019/0020). `faces/web/app.py` is a **FastAPI** face that is
-**API-first**: a first-class JSON API (`GET /api/{status,search,notes,notes/{path}}`,
+**API-first**: a first-class JSON API (`GET /api/{status,search,notes,notes/{path},graph}`,
 `POST /api/upload`) plus a thin **server-rendered HTMX + Jinja2** UI over it (`/`, `/search`,
-`/note/{path}`, `/upload`). Run it with `agora web` (the optional `web` extra). Localhost, no-auth
+`/note/{path}`, `/upload`, `/graph`). Run it with `agora web` (the optional `web` extra). Localhost, no-auth
 for now (auth is Phases 4–5). Both layers call the same core read helpers (`Wiki.list_notes` /
 `Wiki.get_note`, surfaced as `AgoraHandlers.browse` / `AgoraHandlers.note`) and the same inbox
 write path the MCP face uses — the web face never reads or mutates `wiki/` / git / `raw/` directly.
@@ -225,7 +225,8 @@ write path the MCP face uses — the web face never reads or mutates `wiki/` / g
   hardening pass (decompression-bomb / SVG·HTML XSS guards) ride with the multi-upload surface —
   Proposed **ADR-0025**.
 - **Knowledge graph** (read-only) at `/graph`: a derived, Obsidian-like view of the wiki's
-  link/relation structure — global plus a per-note local ego-graph. It is purely derived from the
+  link/relation structure — global plus a per-note local ego-graph (node click → the note, a domain
+  filter, contested/orphan accents). It is purely derived from the
   markdown (reuses the §5.3 dashboard helpers — `Wiki.list_notes` + body link basenames + frontmatter
   `related`/`children`), holds no canonical state (invariant 1), and never writes. Rendering is a
   single vendored MIT force-graph lib over a JSON graph endpoint (`GET /api/graph` + the `/graph`

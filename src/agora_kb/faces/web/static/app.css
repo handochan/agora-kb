@@ -218,4 +218,85 @@ table.connectors th { font-size: 0.72rem; text-transform: uppercase; letter-spac
 .harvest-state .ok { color: var(--ok); }
 .harvest-state .warn { color: var(--warn); }
 
+/* Knowledge-graph viz (force-graph canvas; ADR-0019 §7). An explicit height is REQUIRED — the lib
+   appends a <canvas> sized to the container, so a height-less box renders nothing. */
+.graph-canvas {
+  width: 100%;
+  height: 72vh;
+  min-height: 420px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+  position: relative;
+  background: var(--panel);
+}
+.local-graph {
+  width: 100%;
+  height: 340px;
+  min-height: 340px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+  position: relative;
+  background: var(--panel);
+}
+.graph-filters { display: flex; flex-wrap: wrap; gap: 0.4rem; margin: 0.6rem 0 0.9rem; }
+.graph-filters a {
+  font-size: 0.82rem;
+  padding: 0.15rem 0.7rem;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--panel);
+  color: var(--muted);
+}
+.graph-filters a:hover { color: var(--accent); border-color: var(--accent); text-decoration: none; }
+.graph-filters a.active { background: var(--accent-weak); color: var(--accent); border-color: var(--accent); }
+.graph-banner {
+  font-size: 0.85rem;
+  color: var(--warn);
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--warn);
+  border-radius: var(--radius);
+  padding: 0.5rem 0.8rem;
+  margin-bottom: 0.6rem;
+}
+.graph-empty { color: var(--muted); padding: 1rem; }
+/* "Reset view" control overlaid on the top-right of a graph canvas (created by graph.js). The
+   container is position:relative, so this anchors to it; z-index keeps it above the force-graph
+   <canvas>. Styled like the filter chips. */
+.graph-reset {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  z-index: 5;
+  font: inherit;
+  font-size: 0.78rem;
+  padding: 0.2rem 0.65rem;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--panel);
+  color: var(--muted);
+  cursor: pointer;
+  opacity: 0.92;
+}
+.graph-reset:hover { color: var(--accent); border-color: var(--accent); opacity: 1; }
+
 footer.site { max-width: 980px; margin: 2rem auto 1rem; padding: 0 1.5rem; color: var(--muted); font-size: 0.85rem; }
+
+/* Drag-and-drop multi-upload (ADR-0025). Vanilla drop-zone styled to match the form fields; the
+   real <input type=file multiple> sits inside it and upload.js fills it on drop. */
+.dropzone {
+  border: 1.5px dashed var(--border);
+  border-radius: 8px;
+  padding: 1rem;
+  cursor: pointer;
+  transition: border-color 0.15s, background 0.15s;
+}
+.dropzone.dragover { border-color: var(--accent); background: var(--panel); }
+.dropzone .dropzone-hint { color: var(--muted); margin: 0 0 0.5rem; font-size: 0.92rem; }
+.file-list { list-style: none; margin: 0.5rem 0 0; padding: 0; font-size: 0.88rem; }
+.file-list li { font-family: var(--mono); color: var(--muted); }
+.receipt.batch .batch-results { list-style: none; margin: 0.5rem 0; padding: 0; font-size: 0.9rem; }
+.receipt.batch .batch-results li.ok { color: var(--fg); }
+.receipt.batch .batch-results li.error .err { color: #b3261e; }

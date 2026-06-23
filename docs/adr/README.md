@@ -27,9 +27,9 @@ Format: lightweight [MADR](https://adr.github.io/madr/)-style.
 | [0018](0018-harvester-link-following.md) | Harvester file-connector link-following (opt-in; follow `[Title](sibling.md)`) | Accepted · supersedes 0017 §2 |
 | [0019](0019-web-face-stack.md) | Web face stack: API-first FastAPI + server-rendered HTMX (SPA-island escape hatch) | Accepted · realizes 0003 |
 | [0020](0020-web-upload-write-path.md) | Web upload write-path: extract→inbox now, `raw/` binary staging deferred | Accepted · amends 0003 |
+| [0021](0021-knowledge-graph-viz.md) | Interactive knowledge-graph viz (vendored MIT force-graph; Neo4j rejected) | Accepted · realizes 0019 §7 |
 | [0022](0022-curator-taxonomy-governance.md) | Governed taxonomy: worker-applied `CREATE_DOMAIN` (no-loss catch-all floor) + repo-kind-aware `taxonomy_policy` default + per-domain tuning surfaces; integrity gate stays domain-agnostic | Proposed · governs 0010 D6 · layers on 0011/0015 (#23, #24) |
 | [0023](0023-context-harvester-connectors.md) | Context-harvester connectors (`session:`/`dir:`/`git:`/`mail:`/`chat:`/`calendar:` via 0004 Connector Protocol), connector-boundary redaction before append-only write, fail-closed personal scope (team → Phase 4) | Proposed · extends 0007/0017 · OSS-path per 0005 (#25, #28) |
 | [0024](0024-bulk-processing-horizontal-curator-scale.md) | Bulk processing: shard-by-repo only (never a 2nd writer within a repo), repo→owner fencing lease for cross-host, bounded-batch claim cap | Proposed · scales 0002 (#27) |
 | [0025](0025-web-config-multiupload-extensions.md) | Web operator `web:` settings (per-repo in `build_app`, tenant-safe), multi-upload (N × 0020 extract→inbox + batch receipt), broadened extractor extensions; graph render itself = 0021 | Proposed · additive over 0020 · references 0021 (#29) |
 <!-- 0026 reserved: outbound skill write-back (opt-in, dry-run/staging only) — deferred, not yet authored (#25). -->
-

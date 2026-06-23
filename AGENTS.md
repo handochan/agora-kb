@@ -50,10 +50,13 @@ src/agora_kb/
                agents' memory → gated candidates (ADR-0007/0017/0018)
   ingest/      input adapters: vault_import.py (Obsidian/markdown vault normalizer) +
                extractors/ (url/pdf/office → ExtractedDoc; lazy optional `ingest` extra)
-  faces/       mcp_server.py (the MCP face — agents) + web/ (the web face — humans):
-               web/app.py (API-first FastAPI: JSON /api/* + server-rendered HTMX/Jinja2 UI,
-               ADR-0019/0020), web/metrics.py (Prometheus /metrics exporter), web/templates/,
-               web/static/
+  faces/       mcp_server.py (the MCP face — agents; AgoraHandlers also hosts the read-only web
+               aggregations: browse/note/health/curator_status/harvester_status + graph, ADR-0021)
+               + web/ (the web face — humans):
+               web/app.py (API-first FastAPI: JSON /api/* incl. /api/graph + server-rendered
+               HTMX/Jinja2 UI incl. /graph, ADR-0019/0020/0021), web/metrics.py (Prometheus /metrics
+               exporter), web/templates/ (graph.html), web/static/ (vendored MIT htmx + force-graph +
+               graph.js — no Node/CDN)
   schema/      the KB wiki schema (AGENTS.md template emitted into each knowledge repo) + lint
   config.py    load config (adapters.yaml, repo.yaml, triggers + harvest policy + connector specs)
   cli.py       `agora` entry point
@@ -86,7 +89,12 @@ extractor then `Inbox.write` (the curator remains the sole writer of `raw/`, ADR
 **dashboard** (`/dashboard`, `AgoraHandlers.health()/curator_status()/harvester_status()`) that
 reuses `lint()` verbatim; and a cheap Prometheus exporter (`faces/web/metrics.py`, `GET /metrics`,
 which never runs lint on scrape). The curator now also wires the harvest cursor `accepted`/`rejected`
-counters at finalize (ADR-0017 §7), so the dashboard/metrics surface real values.
+counters at finalize (ADR-0017 §7), so the dashboard/metrics surface real values. An interactive
+**knowledge graph** (`GET /graph` + `GET /api/graph` + a per-note local ego-graph on `/note`,
+`AgoraHandlers.graph()`) reuses `Wiki.list_notes` + `schema.notes` + `health()`'s orphan derivation
+and is drawn by a vendored MIT force-graph lib (`web/static/force-graph.min.js` + `graph.js`, no
+Node/build/CDN) — the first firing of the ADR-0019 §7 per-route-viz escape hatch (ADR-0021; a graph
+DB such as Neo4j was rejected on license/SSOT/overkill grounds).
 
 Next is **Phase 4** (auth + multi-tenancy); see [`docs/ROADMAP.md`](docs/ROADMAP.md). Auth,
 multi-tenancy, original-binary-in-`raw/`, and Letta/mem0 API connectors remain deferred to Phases 4–5.

@@ -1,0 +1,25 @@
+{% extends "base.html" %}
+{% block title %}Agora — knowledge graph{% endblock %}
+{% block content %}
+<h1>Knowledge graph</h1>
+<p class="muted">Each node is a note; arrows are intra-wiki links. Click a node to open it. Drag to
+  pan, scroll to zoom.</p>
+
+{# Domain-filter chips: an "All" link plus one /graph?domain=<d> per domain, marking the active.
+   Values are URL-encoded in the href and autoescaped as text — untrusted domain strings stay safe. #}
+<nav class="graph-filters" aria-label="Domain filter">
+  <a href="/graph"{% if not active_domain %} class="active"{% endif %}>All</a>
+  {% for d in domains %}
+    <a href="/graph?domain={{ d | urlencode }}"{% if d == active_domain %} class="active"{% endif %}>{{ d }}</a>
+  {% endfor %}
+</nav>
+
+{# force-graph appends a <canvas> sized to this container, so an explicit height (in app.css) is
+   required or nothing shows. graph.js reads data-graph-src and fetches the JSON. #}
+<div id="graph" class="graph-canvas" data-graph-src="{{ api_src }}"></div>
+{% endblock %}
+
+{% block scripts %}
+<script src="/static/force-graph.min.js" defer></script>
+<script src="/static/graph.js" defer></script>
+{% endblock %}

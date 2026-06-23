@@ -1,0 +1,26 @@
+{# Batch-upload receipt fragment (HTMX swap; ADR-0025). One row per submitted file — best-effort,
+   per-file: a queued file shows its inbox id, a failed file shows its error. Values are rendered
+   via Jinja autoescape (no |safe) — filenames + error text are untrusted and MUST be escaped. #}
+{% set ok = results | selectattr("queued") | list %}
+{% set bad = results | rejectattr("queued") | list %}
+<div class="receipt batch" role="status">
+  <strong>Batch captured.</strong>
+  <span class="muted">{{ ok | length }} queued, {{ bad | length }} failed (of {{ results | length }}).</span>
+  <ul class="batch-results">
+    {% for r in results %}
+      <li class="{% if r.queued %}ok{% else %}error{% endif %}">
+        <span class="mono">{{ r.filename }}</span>
+        {% if r.queued %}
+          — queued <span class="id">id {{ r.id }}</span>
+        {% else %}
+          — <span class="err">{{ r.error }}</span>
+        {% endif %}
+      </li>
+    {% endfor %}
+  </ul>
+  <p class="eventual">
+    Queued files become searchable <em>after the next curator run</em> — capture is fire-and-forget,
+    the wiki is eventually consistent (DESIGN §2.2). The batch is best-effort: a failed file never
+    blocks a queued one (the inbox is append-only per-event).
+  </p>
+</div>
