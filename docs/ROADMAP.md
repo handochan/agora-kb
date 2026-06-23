@@ -82,6 +82,12 @@ Goal: humans contribute and observe via the browser.
       wires the harvest cursor `accepted`/`rejected` counters at finalize (happy-path-only mirror of the
       `_bump_counters` state bump, per-event, best-effort + rebuildable), so the dashboard and metrics
       surface real harvest dispositions rather than zeros.
+- [x] Interactive knowledge graph (Phase-3-adjacent enhancement). Shipped (ADR-0021): `GET /graph` +
+      `GET /api/graph` + a per-note local ego-graph embedded on `/note`, backed by the read-only
+      `AgoraHandlers.graph()` (reuses `Wiki.list_notes` + `schema.notes` + `health()`'s orphan
+      derivation — no graph store; invariant 1). Drawn by a vendored MIT force-graph lib (no
+      Node/build/CDN) — the first firing of the ADR-0019 §7 per-route-viz escape hatch; a graph DB
+      (Neo4j) was rejected on license/SSOT/overkill grounds.
 **Exit:** upload a PDF/URL in the browser → it becomes a linked wiki note; dashboard shows the queue.
 
 ## Phase 4 — Small team (multi-tenant, network)

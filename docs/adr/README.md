@@ -27,3 +27,4 @@ Format: lightweight [MADR](https://adr.github.io/madr/)-style.
 | [0018](0018-harvester-link-following.md) | Harvester file-connector link-following (opt-in; follow `[Title](sibling.md)`) | Accepted · supersedes 0017 §2 |
 | [0019](0019-web-face-stack.md) | Web face stack: API-first FastAPI + server-rendered HTMX (SPA-island escape hatch) | Accepted · realizes 0003 |
 | [0020](0020-web-upload-write-path.md) | Web upload write-path: extract→inbox now, `raw/` binary staging deferred | Accepted · amends 0003 |
+| [0021](0021-knowledge-graph-viz.md) | Interactive knowledge-graph viz (vendored MIT force-graph; Neo4j rejected) | Accepted · realizes 0019 §7 |

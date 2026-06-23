@@ -57,10 +57,13 @@ ingest/               INPUT adapters: uploads → markdown in raw/.
 faces/                The faces over core.
   mcp_server.py       FastMCP: kb_remember / kb_query / kb_status / kb_curate
   web/                FastAPI web face (ADR-0019): API-first JSON API (GET /api/{status,search,notes,
-                      notes/{path}}, POST /api/upload) + server-rendered HTMX/Jinja2 UI (browse,
-                      search, upload, read-only dashboard); localhost no-auth
+                      notes/{path},graph}, POST /api/upload) + server-rendered HTMX/Jinja2 UI (browse,
+                      search, upload, knowledge graph, read-only dashboard); localhost no-auth
     app.py            build_app: the JSON API + HTMX routes; markdown-it-py render (XSS-safe), upload
-                      extract→inbox write path (ADR-0020 — curator stays sole raw/ writer)
+                      extract→inbox write path (ADR-0020 — curator stays sole raw/ writer); GET /graph
+                      + /api/graph + per-note local ego-graph (ADR-0021)
+    static/           vendored MIT JS (no Node/CDN): htmx.min.js, force-graph.min.js + graph.js (the
+                      knowledge-graph viz, ADR-0021), app.css
     metrics.py        Prometheus /metrics exporter — cheap per-scrape operational metrics (NEVER runs
                       lint on scrape); prometheus_client is the optional `metrics` extra
 
@@ -166,6 +169,11 @@ web/dashboard → AgoraHandlers.{health,curator_status,harvester_status}   (read
 GET /metrics  →  web/metrics.py            Prometheus exporter (separate surface — Phase 3d):
    cheap per-scrape operational counters/gauges; NEVER runs lint on scrape; Grafana stays an
    external (optional, AGPL) sidecar for time-series trends
+
+GET /api/graph → AgoraHandlers.graph(center,depth,domain)   (read-only graph data — ADR-0021):
+   nodes = Wiki.list_notes; edges = body_link_basenames + frontmatter related/children; orphan flag
+   reuses health()'s derivation. Global /graph page + per-note local ego-graph; the canvas is the
+   vendored MIT force-graph (static/graph.js), the first firing of the ADR-0019 §7 per-route viz.
 ```
 
 ## 4. Deployment topology
