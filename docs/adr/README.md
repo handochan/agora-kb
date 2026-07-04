@@ -32,4 +32,9 @@ Format: lightweight [MADR](https://adr.github.io/madr/)-style.
 | [0023](0023-context-harvester-connectors.md) | Context-harvester connectors (`session:`/`dir:`/`git:`/`mail:`/`chat:`/`calendar:` via 0004 Connector Protocol), connector-boundary redaction before append-only write, fail-closed personal scope (team → Phase 4) | Proposed · extends 0007/0017 · OSS-path per 0005 (#25, #28) |
 | [0024](0024-bulk-processing-horizontal-curator-scale.md) | Bulk processing: shard-by-repo only (never a 2nd writer within a repo), repo→owner fencing lease for cross-host, bounded-batch claim cap | Proposed · scales 0002 (#27) |
 | [0025](0025-web-config-multiupload-extensions.md) | Web operator `web:` settings (per-repo in `build_app`, tenant-safe), multi-upload (N × 0020 extract→inbox + batch receipt), broadened extractor extensions; graph render itself = 0021 | Proposed · additive over 0020 · references 0021 (#29) |
+| [0027](0027-gold-context-packs.md) | Gold context packs: derived, deterministic, token-budgeted `_kb/gold/` tier assembled from the wiki + the single normative outbound sentinel/loop-break contract (§8) | Proposed · layers on 0009/0012 · extends 0017 · co-ratifies 0026 sentinel |
 <!-- 0026 reserved: outbound skill write-back (opt-in, dry-run/staging only) — deferred, not yet authored (#25). -->
+<!-- 0028 reserved: LLM `DISTILL` curator act (→ wiki/digests/, one new closed-vocab op) — evidence-triggered per 0027, not yet authored. -->
+<!-- 0029 reserved: connector ecosystem — CWP exec wire, registration UX, enablement re-consent / injection opt-in (extending 0023) — evidence-triggered, not yet authored. -->
+<!-- 0030 reserved: federation / team-audience pack composition — Phase-4-coupled, not yet authored. -->
+<!-- 0031 reserved: retention — hard prerequisite for mail:/chat: connectors, not yet authored. -->
