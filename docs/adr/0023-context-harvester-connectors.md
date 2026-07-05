@@ -327,3 +327,92 @@ discipline). The recommended outcome is **Adopt**.
 8. **(Reserved ADR-0026, separate decision)** the #25 skill-suggestion dry-run/staging sketch with the
    shared write-back ⇄ session-distiller loop-break (§9); **(Phase 4)** shared/team `chat:` (Matrix OSS
    path; Slack/Teams optional) and all shared corporate sources.
+
+## Addendum — Redaction v1 policy (#39, landed 2026-07-06)
+
+Decision 5 mandated `core/redact.py` and its observability but left the concrete secret/PII policy to
+be **decided with the module, not deferred** (§decision 5). Issue **#39** landed that module (plus the
+`--dry-run` would-redact preview and a dormant metric); this addendum records the settled policy so
+#25 (the `session:` connector), reserved **ADR-0026** (skill write-back), and reserved **ADR-0030**
+(federation) do not re-litigate it.
+
+### 1. v1 policy classes (`redact.DEFAULT_ON_CLASSES` / `KNOWN_CLASSES`)
+
+Precision-FIRST for the default set: a false positive **corrupts unscrubbable curated content**, whereas
+a false negative is still caught downstream (the candidate gate + curator, and the broad structural
+coverage below). Every default-on pattern is a distinctive, structural secret shape — not a broad
+heuristic. The table is the doc/code lockstep source (a test asserts the default-on rows equal
+`DEFAULT_ON_CLASSES`, and default-on ∪ opt-in equals `KNOWN_CLASSES`).
+
+| class | tier | pattern family | precision | notes |
+| --- | --- | --- | --- | --- |
+| `pem_private_key` | default-on | `-----BEGIN…PRIVATE KEY-----` … `-----END…` whole block | high | non-crossing gap (no over-redaction), unbounded+linear (no numeric cap — a cap would fail open on a large key body), substring-pregated |
+| `aws_access_key_id` | default-on | `AKIA`/`ASIA` + 16 upper-alnum | high | leading boundary + maximal run |
+| `github_token` | default-on | `gh[opsru]_…` / `github_pat_…` | high | distinctive prefix + length floor |
+| `slack_token` | default-on | `xox[baprs]-…` | high | Slack-reserved shape |
+| `google_api_key` | default-on | `AIza` + 35 | high | Google-reserved |
+| `stripe_secret_key` | default-on | `[sr]k_(live\|test)_…` | high | ordered before `openai_anthropic_key` (disjoint, but pinned) |
+| `openai_anthropic_key` | default-on | `sk-ant-`/`sk-proj-` (hyphens ok) or bare hyphen-free `sk-…` | medium | TIGHTENED so a kebab slug (`sk-learn-…`) is not a hit; a long hyphen-free `sk-` identifier is an accepted over-redaction |
+| `jwt` | default-on | `eyJ….….…` three b64url segments | medium | a documented example JWT IS redacted (accepted) |
+| `bearer_token` | default-on | `Authorization:… Bearer <token>` (group replace) | medium | context-anchored; header preserved |
+| `generic_assigned_secret` | opt-in | secret-noun + `[:=]` + long value | medium | in the registry, NOT in `DEFAULT_POLICY`; `(?!\[REDACTED:)` keeps it idempotent; #25 may enable it |
+| `aws_secret_access_key` | deferred | bare 40 b64 | — | no prefix → collides with hashes/base64; a keyword-anchored variant may land in v1.1 |
+| `credit_card_pan` | deferred | 13–19 digits + Luhn | — | collides with order-IDs/versions on a curated KB |
+| `email` | deferred | RFC-ish | — | abundant LEGITIMATE curated content; behind an explicit PII opt-in |
+| `phone_number` | deferred | E.164 / grouped digits | — | catastrophic FP rate |
+| `high_entropy_blob` | deferred | Shannon entropy | — | REJECTED: this KB is saturated with legit 64-hex `content_sha256`, commit SHAs, UUIDs, data-URIs |
+
+### 2. Reversibility & no-retention (the load-bearing privacy guarantee)
+
+Redaction is **irreversible by construction** — forced by invariant #3 (the inbox is unscrubbable, so
+redaction must be a one-way gate before persistence). The matched bytes are discarded at substitution
+time: no sidecar map, no reversible token, no offsets. The only survivors are per-class integer counts
++ class names + the redacted text carrying `[REDACTED:<class>]`. A reverse map would itself be a new
+unscrubbable secret store, and **a SHA of a short/low-entropy credential is a brute-force reversal
+oracle** — so when #25 wires the live write path, `fact_key = content_sha256(REDACTED text)`, never the
+raw secret, and redaction runs **before** the hash. The module is locked by a six-surface
+no-secret-retention test (text / hit fields / repr / metric label / dry-run note / logs).
+
+### 3. Determinism, idempotence, placeholder
+
+A fixed, ordered `_RULES` registry, no randomness/clock/set-iteration in the output path → byte-identical
+across runs and processes. The placeholder `[REDACTED:<class>]` is a pure function of the class name (no
+index/offset/count/hash), so a second pass yields byte-identical text (idempotence, incl. the opt-in
+class). **Documented residual (tested):** the leading `(?<![A-Za-z0-9])` boundary skips a key glued to a
+*preceding* word char (`wordAKIA…`); keys are ~always preceded by a separator, and dropping the boundary
+would false-positive on a coincidental alnum-embedded prefix — #25 may revisit for the live path.
+
+### 4. Sentinel canonical home (do NOT fork ADR-0027 §8)
+
+The ADR-0027 §8 CONSUMER-duty machinery (span-drop + marker-strip) moved to a new `core/sentinel.py`
+(the redaction module lives in `core/` and may not import from `harvester/`); `harvester/connectors.py`
+re-exports it byte-identically. **The normative sentinel + loop-break contract remains ADR-0027 §8**
+(cited here, not restated — §8 is the single source every consumer must cite). `redact.sanitize`
+composes `core.sentinel.strip_agora_sentinels` (phase-0) then the secret scan (phase-1). The producer
+duty stays with the emitter in `core/gold.py`.
+
+### 5. #39 / #25 scope split (recorded so #25 does not re-decide)
+
+**#39 (landed):** `core/sentinel.py` + `core/redact.py` + tests; the read-only `--dry-run` would-redact
+preview (redacted preview text + metadata-only class×count notes); a **dormant**
+`agora_harvester_redacted{connector,class}` counter. The shipped write path is **byte-identical** — no
+`redact()` call was added between scan and `Inbox.write`.
+
+**#25 (deferred):** the live write-path invocation (redact at the connector boundary, before
+`content_sha256`, guarded by a kill-switch); the `harvest.redact.{enabled,pii,allow,deny}` repo.yaml
+loader (fail-loud, mirroring `load_harvest_policy`); the persisted counter source (see §6 below); the
+two loop-proof e2e (injection-pack round-trip strip; reworded residue landing as a gated candidate).
+
+### 6. Observability & the staged `HarvestCursor.redacted` field
+
+Decision 5's "counter labelled by class" is realized as the two-label family
+`agora_harvester_redacted{connector,class}` (the extra `connector` label is for parity with the existing
+per-connector `agora_harvester_{proposed,accepted,rejected}`); metadata-only — the label is the class
+NAME, never the secret. It is **dormant** in #39 (no persisted source → no samples, an honest 0). #25
+adds the source: a **`HarvestCursor.redacted: dict[str,int]`** field (a dict, to keep the class
+dimension), incremented once per fact per class present, bumped beside `cursor.proposed`. This is a new
+DATA-MODEL §6 cursor field, which decision 8 defaults to "no schema change / would require its own ADR";
+it is **explicitly authorized here** as a decision-5-mandated observability field (ADR-0023's redaction
+mandate IS the authorizing ADR), and #25 must update **both** DATA-MODEL §6 and the `HarvestCursor`
+docstring's "no unbounded extension" note to enumerate it. No `schema_version` impact (git-ignored
+`_kb/` cursor state only).

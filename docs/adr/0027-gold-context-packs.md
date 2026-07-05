@@ -59,11 +59,11 @@ injected into *every* session of every subscribed agent, so any harvested (attac
 content that reaches a pack turns the harvester's residual reworded loop (ADR-0017 §5) into a
 broadcast channel — attacker mail/message → harvest → curated summary → injected everywhere.
 Second, **loop closure**: emitted packs land in agent context, agents write memory, the harvester
-reads memory — Agora's own output becomes its input. The existing sentinel-strip is not enough:
-`FileConnector._neutralize` (`connectors.py:596`, `_AGORA_SENTINEL_RE` at `connectors.py:74`)
-removes only the comment *markers* and leaves span *content* in place, so a harvested pack would
-re-enter as facts today. The outbound contract in §8 exists to close the verbatim half of that loop
-and to say honestly what stays open.
+reads memory — Agora's own output becomes its input. A marker-only strip is not enough: removing just
+the comment *markers* leaves the span *content* in place, so a harvested pack would re-enter as facts.
+The §8 span-drop (SHIPPED in #37, homed in `core/sentinel.py` since #39) removes the whole span; the
+outbound contract in §8 exists to close the verbatim half of that loop and to say honestly what stays
+open.
 
 An LLM that *distills* notes into denser summaries is deliberately **not** this ADR: that is a new
 generation point with a new write surface, and it is reserved as **ADR-0028** behind an evidence
@@ -162,17 +162,20 @@ outcome is **Adopt**.
      `<!-- agora:pack repo=<r> pack=<p> commit=<sha> -->` …
      `<!-- agora:pack:end repo=<r> pack=<p> commit=<sha> -->` — the closer keeps the `agora:`
      prefix (the `agora:body:start`/`agora:body:end` sentinel family, `apply.py:76–77`), so BOTH
-     markers match the existing `_AGORA_SENTINEL_RE` (`connectors.py:74`) and the assembly-time
-     neutralization below genuinely covers a forged closer.
+     markers match `core.sentinel.AGORA_SENTINEL_RE` and the assembly-time neutralization below
+     genuinely covers a forged closer.
    - **Assembly-time neutralization (producer duty).** The `PackAssembler` neutralizes any embedded
      `<!-- agora:` sequence inside assembled content, defeating the forged-early-close attack (a
      hostile summary line containing a literal closer cannot terminate the span early). Regression
      test: a summary containing a literal closer round-trips without breaking span-drop.
-   - **Span-drop (consumer duty — NET-NEW code).** The current `FileConnector._neutralize`
-     (`connectors.py:596`, `_AGORA_SENTINEL_RE.sub` with the pattern at `connectors.py:74`) strips
-     only the comment MARKERS and leaves span content in place — insufficient. `FileConnector` (and
-     the future ADR-0023 session distiller) must remove entire sentinel **SPANS** (opening marker
-     through closing marker, inclusive) *before* the existing marker-strip runs.
+   - **Span-drop (consumer duty).** SHIPPED in #37 and, since #39, homed in `core/sentinel.py`
+     (`strip_sentinel_spans` removes whole `agora:` SPANS — opener through closer, inclusive; the full
+     `strip_agora_sentinels` runs span-drop THEN the residual marker-strip). `FileConnector` re-exports
+     these byte-identically as `_strip_sentinel_spans` / `_neutralize`, and the future ADR-0023 session
+     distiller composes them via `redact.sanitize`. Span-drop runs *before* the marker-strip so a
+     harvested gold pack contributes zero facts. (This subsection was written pre-#37 as "NET-NEW code";
+     the machinery now exists and lives in `core/sentinel.py` — see the ADR-0023 "Redaction v1 policy"
+     addendum §4 for its canonical home.)
    - **Path exclusion.** The harvester excludes `_kb/gold/` and any documented mirror paths from
      every connector's scan; `agora doctor` checks and reports the exclusion.
    - **Tests.** A pack-bearing `MEMORY.md` yields **zero** pack-derived facts through a real
@@ -245,8 +248,9 @@ outcome is **Adopt**.
   farmed by harvest-sourced updates — the reworded loop is not *rewarded* even where it is not
   closed.
 - **+** The outbound sentinel + loop-break contract (§8) exists once, normatively, before ADR-0026
-  / the ADR-0023 session distiller / ADR-0030 need it — with the span-drop gap in the current
-  marker-only `_neutralize` (`connectors.py:596`) identified and closed by test.
+  / the ADR-0023 session distiller / ADR-0030 need it — with the span-drop gap in the original
+  marker-only strip identified and closed by test (shipped in #37; the machinery is homed in
+  `core/sentinel.py` since #39).
 - **+** Consumption is agent-neutral (invariant #6) across file include, MCP tool/resource/prompt,
   and bridges, with a normative producer/composer/consumer role split that keeps pack assembly in
   exactly one place.

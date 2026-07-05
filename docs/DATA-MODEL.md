@@ -262,6 +262,13 @@ bump, never replayed in recovery) so it is best-effort + rebuildable, never an i
 each writer load-then-saves so neither clobbers the other. The connector name is sanitized to a safe filename
 (`file:claude-code` → `file-claude-code.json`, path-traversal-guarded).
 
+**Staged (deferred to #25):** a `redacted: {<class>: <count>}` map — facts with ≥1 redaction, per
+secret/PII class — is authorized as a decision-5-mandated observability field (ADR-0023 "Redaction v1
+policy" addendum §6). It is NOT present yet: #39 landed the redactor + a **dormant**
+`agora_harvester_redacted{connector,class}` metric (no samples until this field feeds it); #25 adds the
+field, bumps it beside `proposed` at the connector boundary, and updates this section + the
+`HarvestCursor` docstring's "no unbounded extension" note when it lands.
+
 ## 6a. Gold context pack + meta sidecar — `_kb/gold/<pack>.md` + `_kb/gold/<pack>.meta.json`
 
 A derived, git-ignored **context pack**: a small, token-budgeted, byte-stable slice of the wiki
