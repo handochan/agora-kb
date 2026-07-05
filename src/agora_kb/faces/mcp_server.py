@@ -762,6 +762,7 @@ class AgoraHandlers:
             taxonomy=cfg.taxonomy,
             max_attempts=cfg.max_attempts,
             related_k=cfg.related_k,
+            max_orphans=cfg.max_orphans,
         )
         return {
             "status": report.status,

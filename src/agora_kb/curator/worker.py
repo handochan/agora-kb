@@ -253,6 +253,7 @@ def run(
     taxonomy: Taxonomy,
     max_attempts: int = DEFAULT_MAX_ATTEMPTS,
     related_k: int = DEFAULT_RELATED_K,
+    max_orphans: int | None = None,
 ) -> RunReport:
     """Execute ONE transactional curator run (ADR-0008 steps 1-6 / DESIGN §4 / ADR-0011 §0).
 
@@ -283,6 +284,7 @@ def run(
                 taxonomy=taxonomy,
                 max_attempts=max_attempts,
                 related_k=related_k,
+                max_orphans=max_orphans,
             )
     except LockHeld:
         # A run is already in progress for this repo (ADR-0008 step 1 / DESIGN §4 step 1): exit
@@ -299,6 +301,7 @@ def _run_locked(
     taxonomy: Taxonomy,
     max_attempts: int = DEFAULT_MAX_ATTEMPTS,
     related_k: int = DEFAULT_RELATED_K,
+    max_orphans: int | None = None,
 ) -> RunReport:
     """The body of :func:`run`, executed UNDER the held curator lock (ADR-0011 §0)."""
     layout = repo.layout
@@ -475,7 +478,13 @@ def _run_locked(
 
         # §4.4 deterministic LINT of the full worktree — the SAME gate the dashboard runs. A lint
         # failure is a structural failure: discard the whole diff, publish nothing (§4.4).
-        lint_result = lint(wt_layout, taxonomy=taxonomy, run_date=run_date, run_id=run_id)
+        lint_result = lint(
+            wt_layout,
+            taxonomy=taxonomy,
+            run_date=run_date,
+            run_id=run_id,
+            max_orphans=max_orphans,
+        )
         if not lint_result.ok:
             return _fail(
                 layout,

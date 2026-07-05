@@ -873,3 +873,50 @@ def test_malformed_frontmatter_is_l1_reject(tmp_path: Path) -> None:
     result = lint(layout, taxonomy=_TAXONOMY, run_date=RUN_DATE)
     assert not result.ok
     assert any("broken.md" in f.path for f in result.findings)
+
+
+# --- L2-1 orphan-theme warning (ADR-0022 step 2, opt-in, warning-only) ---------------------------
+
+
+def _add_orphan_theme(layout: RepoLayout) -> None:
+    """Add an L1-clean theme that NO note links to → one L2-1 orphan (not an L1 error)."""
+    _raw_source(layout, "raw/ai-tech/2026-06-09-orphan.md")
+    _write(
+        layout,
+        "wiki/ai-tech/themes/lonely-orphan.md",
+        _theme_fm(
+            title="Lonely",
+            summary="nobody links here",
+            sources=["raw/ai-tech/2026-06-09-orphan.md"],
+            related=[],
+        ),
+        "An unreferenced theme.",
+    )
+
+
+def test_lint_max_orphans_none_is_byte_identical(tmp_path: Path) -> None:
+    """max_orphans=None (default) never emits an L2-1 finding — lint is byte-identical to today."""
+    layout = _valid_repo(tmp_path)
+    _add_orphan_theme(layout)
+    result = lint(layout, taxonomy=_TAXONOMY, run_date=RUN_DATE)  # default max_orphans=None
+    assert all(f.code != "L2-1" for f in result.findings)
+
+
+def test_lint_max_orphans_warns_over_threshold_but_stays_ok(tmp_path: Path) -> None:
+    layout = _valid_repo(tmp_path)
+    _add_orphan_theme(layout)
+    # 1 orphan > max_orphans=0 → exactly one warning-only L2-1 finding; ok stays True.
+    result = lint(layout, taxonomy=_TAXONOMY, run_date=RUN_DATE, max_orphans=0)
+    orphan_findings = [f for f in result.findings if f.code == "L2-1"]
+    assert len(orphan_findings) == 1
+    assert orphan_findings[0].severity == "warning"
+    assert "1 orphan" in orphan_findings[0].message
+    assert result.ok is True  # a warning never flips ok → the §4.4 gate/dashboard are unaffected
+
+
+def test_lint_max_orphans_under_threshold_no_finding(tmp_path: Path) -> None:
+    layout = _valid_repo(tmp_path)
+    _add_orphan_theme(layout)
+    # 1 orphan <= max_orphans=5 → no finding.
+    result = lint(layout, taxonomy=_TAXONOMY, run_date=RUN_DATE, max_orphans=5)
+    assert all(f.code != "L2-1" for f in result.findings)

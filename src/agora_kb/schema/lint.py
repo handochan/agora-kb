@@ -469,6 +469,7 @@ def lint(
     taxonomy: Taxonomy | None = None,
     run_date: str | None = None,
     run_id: str | None = None,
+    max_orphans: int | None = None,
 ) -> LintResult:
     """Run the deterministic L1 lint over the worktree at ``layout`` (ADR-0010 §6 / ADR-0011 §4.4).
 
@@ -748,6 +749,32 @@ def lint(
 
     # --- L1-17 schema_version drift across locations present in the worktree -----------------
     findings.extend(_check_schema_version(layout, tax))
+
+    # --- L2-1 orphan-theme count (DERIVED, warning-only; ADR-0022 step 2) ---------------------
+    # OFF by default (max_orphans is None ⇒ byte-identical). When set, replicate health()'s exact
+    # whole-tree derivation: a THEME whose basename is referenced by NO other note's body markdown
+    # link nor any frontmatter related:/children: [[ ]] is an orphan (dailies + MOC/index roots are
+    # exempt, type != "theme"). severity="warning" so LintResult.ok is UNCHANGED — this never breaks
+    # the §4.4 curator gate or the dashboard; it is a signal, not a per-note error (INGEST §4.4).
+    if max_orphans is not None:
+        referenced: set[str] = set()
+        for n in notes:
+            referenced.update(body_link_basenames(n.body))
+            for fkey in ("related", "children"):
+                fval = n.frontmatter.get(fkey)
+                for item in fval if isinstance(fval, list) else [fval]:
+                    if isinstance(item, str):
+                        referenced.update(wikilinks(item))
+        orphans = sum(1 for n in notes if n.type == "theme" and n.basename not in referenced)
+        if orphans > max_orphans:
+            findings.append(
+                LintFinding(
+                    "L2-1",
+                    "warning",
+                    "index.md",
+                    f"{orphans} orphan theme(s) exceed curator.lint.max_orphans={max_orphans}",
+                )
+            )
 
     findings.sort(key=lambda f: (f.path, f.code))
     ok = not any(f.severity == "error" for f in findings)
