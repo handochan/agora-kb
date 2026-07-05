@@ -469,6 +469,7 @@ def build_routed_backend(
     allow_reduced_isolation: bool = False,
     default_backend: str | None = None,
     override: str | None = None,
+    body_byte_bound: int = DEFAULT_BODY_BYTE_BOUND,
     report: Callable[[str], None] | None = None,
 ) -> RoutedBackend | SubprocessBackend | None:
     """Build the curator backend for a run, honoring ADR-0015 per-act ``routing``.
@@ -512,7 +513,7 @@ def build_routed_backend(
                     f"usable OS sandbox is available: {exc}"
                 )
                 return None
-        return SubprocessBackend(spec, isolation=isolation)
+        return SubprocessBackend(spec, isolation=isolation, body_byte_bound=body_byte_bound)
 
     try:
         if override is not None:

@@ -14,6 +14,7 @@ from pathlib import Path
 import pytest
 
 from agora_kb.curator.backends import BackendRegistry
+from agora_kb.curator.constants import DEFAULT_BODY_BYTE_BOUND
 from agora_kb.curator.subprocess_backend import (
     RoutedBackend,
     SubprocessBackend,
@@ -145,6 +146,22 @@ def test_builder_routing_returns_a_routed_backend() -> None:
     assert isinstance(backend, RoutedBackend)
     assert backend._plan.spec.name == "claude"  # type: ignore[attr-defined]
     assert backend._author.spec.name == "qwen"  # type: ignore[attr-defined]
+
+
+def test_builder_threads_body_byte_bound_to_all_sub_backends() -> None:
+    # Single-brain path: the plain SubprocessBackend carries the operator's bound.
+    single = build_routed_backend(BackendRegistry.from_yaml(_THREE), body_byte_bound=4096)
+    assert isinstance(single, SubprocessBackend)
+    assert single._body_byte_bound == 4096  # type: ignore[attr-defined]
+    # Default preserves DEFAULT_BODY_BYTE_BOUND (byte-identical to pre-wiring).
+    default = build_routed_backend(BackendRegistry.from_yaml(_THREE))
+    assert default._body_byte_bound == DEFAULT_BODY_BYTE_BOUND  # type: ignore[attr-defined]
+    # Routed path: BOTH per-act sub-backends get the bound.
+    reg = BackendRegistry.from_yaml(_yaml("routing:\n  plan: claude\n  author: qwen\n"))
+    routed = build_routed_backend(reg, body_byte_bound=2048)
+    assert isinstance(routed, RoutedBackend)
+    assert routed._plan._body_byte_bound == 2048  # type: ignore[attr-defined]
+    assert routed._author._body_byte_bound == 2048  # type: ignore[attr-defined]
 
 
 def test_builder_same_brain_for_both_acts_collapses_to_single_backend() -> None:

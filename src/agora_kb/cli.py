@@ -48,6 +48,7 @@ from .config import (
 from .core import Inbox, Repo, RepoLayout, StateStore
 from .core.repo import GitError
 from .curator import evaluate
+from .curator.constants import DEFAULT_BODY_BYTE_BOUND
 from .curator.cron import is_cron_due
 from .curator.isolation import SandboxUnavailable, select_backend_isolation
 from .curator.subprocess_backend import RoutedBackend, SubprocessBackend, build_routed_backend
@@ -446,6 +447,7 @@ def _cmd_curate(args: argparse.Namespace) -> int:
         default_backend=cfg.default_backend,
         override=args.backend,
         allow_reduced_isolation=cfg.allow_reduced_isolation,
+        body_byte_bound=cfg.body_byte_bound,
     )
     if backend is None:
         return 1
@@ -471,6 +473,7 @@ def _build_backend(
     default_backend: str | None = None,
     override: str | None = None,
     allow_reduced_isolation: bool = False,
+    body_byte_bound: int = DEFAULT_BODY_BYTE_BOUND,
 ) -> RoutedBackend | SubprocessBackend | None:
     """Resolve the configured WRITE-adapter(s) into a worker backend, or print why not.
 
@@ -508,6 +511,7 @@ def _build_backend(
         allow_reduced_isolation=allow_reduced_isolation,
         default_backend=default_backend,
         override=override,
+        body_byte_bound=body_byte_bound,
         report=lambda msg: print(f"{_PROG} curate: {msg}", file=sys.stderr),
     )
 
@@ -663,6 +667,7 @@ def _watch_tick(repo: Repo) -> None:
         layout,
         default_backend=cfg.default_backend,
         allow_reduced_isolation=cfg.allow_reduced_isolation,
+        body_byte_bound=cfg.body_byte_bound,
     )
     if backend is None:
         print(f"{stamp} due ({decision.reason}) but no usable backend — skipping this tick")
