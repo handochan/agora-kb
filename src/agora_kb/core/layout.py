@@ -126,8 +126,9 @@ class RepoLayout:
         """Derived READER cache directory ``_kb/index/`` (ADR-0012 §2, issue #26).
 
         Git-ignored, NEVER canonical, fully rebuildable from the markdown at the curated commit
-        (invariant #1). Holds one parsed-note cache + optional FTS5 prefilter per repo. Not created
-        here (this module only computes paths); the deterministic writer mkdirs before it writes.
+        (invariant #1). Holds one parsed-note cache per repo (``<repo>.notes.json``; the ADR-0012 §9
+        FTS5/ripgrep candidate accelerators are deferred to a load-avoiding reader, issue #28). Not
+        created here (this module only computes paths); the writer mkdirs before writing.
         """
         return self.kb_dir / "index"
 

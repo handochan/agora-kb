@@ -282,7 +282,18 @@ def _note_from_dict(data: dict) -> _Note:
 
     ``indeg`` is left at its ``0`` default (recomputed by :meth:`Wiki._compute_indegrees`). Tuple
     fields are restored from the serialized lists; headings are rebuilt as :class:`_Heading` values.
+
+    STRICT by design: a missing/mis-typed key (including an INCOMPLETE ``field_tokens`` missing
+    one of the four scoring fields, which would otherwise ``KeyError`` later in the scorer)
+    raises ``KeyError``/``TypeError``/``ValueError``. The reuse path in :meth:`Wiki._load_notes`
+    catches exactly those and re-parses that one file, so a structurally-corrupt cached entry can
+    never crash ``kb_query`` (ADR-0012 §2 crash-proof read path).
     """
+    field_tokens = data["field_tokens"]
+    if not isinstance(field_tokens, dict) or any(
+        not isinstance(field_tokens.get(f), list) for f in ("title", "tags", "headings", "body")
+    ):
+        raise ValueError("cached note has a missing/malformed field_tokens field")
     return _Note(
         path=data["path"],
         basename=data["basename"],

@@ -291,6 +291,36 @@ def test_corrupt_cache_falls_back_and_read_path_never_writes(tmp_path: Path) -> 
     assert path.read_bytes() == before, "the read path must not rewrite/repair the cache"
 
 
+def test_corrupt_inner_note_reparses_not_crashes(tmp_path: Path) -> None:
+    """A structurally-corrupt cached inner ``note`` (valid ENVELOPE, matching sha) must NOT crash
+    kb_query — the reuse path re-parses that one file (finding-6 guard). Covers both a bogus dict
+    (KeyError in _note_from_dict) AND an INCOMPLETE field_tokens (valid until the scorer reads a
+    missing field) — the case that survived construction and crashed later before the strict check.
+    """
+    repo = _repo(tmp_path)
+    baseline = Wiki(repo.layout).query("curator concurrency control")  # same-repo uncached oracle
+    build_cache(repo)
+    path = repo.layout.index_notes_path()
+    target = "wiki/ai-tech/themes/curator-concurrency.md"  # the note the query hits
+    pristine_text = path.read_text(encoding="utf-8")
+    valid_note = json.loads(pristine_text)["notes"][target]["note"]
+
+    corruptions = [
+        {"bogus": 1},  # missing every key → KeyError inside _note_from_dict
+        {
+            **valid_note,
+            "field_tokens": {"title": ["curator"]},
+        },  # INCOMPLETE field_tokens → ValueError
+    ]
+    for corruption in corruptions:
+        doc = json.loads(pristine_text)  # start from a fresh, valid cache each time
+        doc["notes"][target]["note"] = corruption  # keep the matching sha → reuse branch is taken
+        path.write_text(json.dumps(doc), encoding="utf-8")
+        result = Wiki(repo.layout).query("curator concurrency control")
+        assert result == baseline, f"corrupt inner note {list(corruption)[:1]} not self-healed"
+        assert any(h.path == target for h in result.hits)
+
+
 def test_empty_repo_not_found_with_cache_enabled(tmp_path: Path) -> None:
     root = tmp_path / "empty"
     root.mkdir()

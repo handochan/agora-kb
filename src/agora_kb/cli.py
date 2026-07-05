@@ -171,7 +171,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_index_build.add_argument("--repo", default=".", help="repo root (default: .)")
     p_index_build.set_defaults(func=_cmd_index_build)
     p_index_status = index_sub.add_parser(
-        "status", help="show cache presence, freshness vs the curated tip, and accelerators"
+        "status", help="show cache presence + freshness vs the curated tip"
     )
     p_index_status.add_argument("--repo", default=".", help="repo root (default: .)")
     p_index_status.set_defaults(func=_cmd_index_status)
