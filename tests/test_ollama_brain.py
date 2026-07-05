@@ -246,6 +246,182 @@ def test_normalize_plan_gated_create_downgraded_to_drop() -> None:
     assert disp["event_ids"] == [E1]  # provenance kept even on DROP
 
 
+# --- catch_all_domain helper + the ADR-0022 §A no-loss floor -----------------------------------
+
+
+def test_catch_all_domain() -> None:
+    # first DECLARED domain (list order), read before parse_taxonomy's set-collapse.
+    assert ob.catch_all_domain({"domains": ["general", "ai-tech"]}) == "general"
+    assert ob.catch_all_domain({"domains": ("foo", "bar")}) == "foo"
+    assert ob.catch_all_domain({"domains": [1, "two"]}) == "1"  # int coerced to str
+    # empty / missing / mapping (ADR-0022 §B, deferred) / non-dict → None (floor is a safe no-op).
+    assert ob.catch_all_domain({"domains": []}) is None
+    assert ob.catch_all_domain({}) is None
+    assert ob.catch_all_domain({"domains": {"general": {}}}) is None
+    assert ob.catch_all_domain(None) is None
+    assert ob.catch_all_domain("nope") is None
+
+
+def test_load_taxonomy_arity(tmp_path) -> None:
+    """Both return paths of _load_taxonomy are 3-tuples (locks the early-return arity the run_plan
+    unpack depends on — a bundle with no taxonomy.yaml must not crash the PLAN pass)."""
+    assert ob._load_taxonomy(tmp_path) == (set(), set(), None)  # no taxonomy.yaml (pre-emit repo)
+    (tmp_path / "taxonomy.yaml").write_text(
+        "domains:\n  - general\n  - ai-tech\nallowed_tags:\n  - curator\n", encoding="utf-8"
+    )
+    allowed_tags, domains, catch_all = ob._load_taxonomy(tmp_path)
+    assert catch_all == "general"  # first declared domain
+    assert domains == {"general", "ai-tech"}
+    assert allowed_tags == {"curator"}
+
+
+def test_normalize_plan_unresolvable_domain_routes_to_catch_all() -> None:
+    """ADR-0022 §A: a NON-gated basename op whose domain is unresolvable floors to the catch-all
+    (the first declared domain) instead of DROP — and the result still passes the §4.1 validator."""
+    candidates = [
+        _candidate(
+            "c1", text="An orphaned durable fact", event_id=E1, gated=False, domain="no-such-domain"
+        ),
+    ]
+    raw = {
+        "dispositions": [
+            {
+                "candidate_id": "c1",
+                "op": "CREATE_THEME",
+                "domain": "also-missing",  # neither model nor candidate domain ∈ DOMAINS
+                "title": "Orphaned Fact",
+                "status": "active",
+                "summary": "A fact with no home domain.",
+                "reason": "no matching domain",
+            }
+        ]
+    }
+    plan_dict = ob.normalize_plan(
+        raw,
+        candidates=candidates,
+        allowed_tags=ALLOWED_TAGS,
+        domains=DOMAINS,
+        live_basenames=set(),
+        live_theme_basenames=set(),
+        run_id=RUN_ID,
+        catch_all="general",
+    )
+    disp = plan_dict["dispositions"][0]
+    assert disp["op"] == "CREATE_THEME"  # NOT dropped
+    assert disp["domain"] == "general"  # floored to the catch-all
+    assert disp["event_ids"] == [E1]
+    # and it validates by construction (check-4 TAXONOMY passes: general ∈ DOMAINS).
+    plan = Plan.from_json(json.dumps(plan_dict))
+    errors = validate_plan(
+        plan,
+        manifest_event_ids={E1},
+        allowed_tags=ALLOWED_TAGS,
+        domains=DOMAINS,
+        live_basenames=set(),
+        theme_basenames=set(),
+        gated_candidate_ids=set(),
+    )
+    assert errors == [], errors
+
+
+def test_normalize_plan_unresolvable_domain_no_catch_all_drops() -> None:
+    """catch_all=None (empty taxonomy) keeps pre-floor behavior: unresolvable → DROP, no crash."""
+    candidates = [
+        _candidate("c1", text="x", event_id=E1, gated=False, domain="no-such-domain"),
+    ]
+    raw = {
+        "dispositions": [
+            {"candidate_id": "c1", "op": "CREATE_THEME", "domain": "bad", "reason": "x"}
+        ]
+    }
+    plan_dict = ob.normalize_plan(
+        raw,
+        candidates=candidates,
+        allowed_tags=ALLOWED_TAGS,
+        domains=set(),
+        live_basenames=set(),
+        live_theme_basenames=set(),
+        run_id=RUN_ID,
+        catch_all=None,
+    )
+    disp = plan_dict["dispositions"][0]
+    assert disp["op"] == "DROP"
+    assert disp["domain"] is None
+    assert disp["event_ids"] == [E1]
+
+
+def test_normalize_plan_gated_never_routes_to_catch_all() -> None:
+    """A gated candidate is DROPped by the step-2 gate BEFORE step 3, so the floor can never
+    originate a catch-all domain for harvested/low-confidence memory (ADR-0007)."""
+    candidates = [
+        _candidate("c1", text="harvested", event_id=E1, gated=True, domain="no-such-domain"),
+    ]
+    raw = {
+        "dispositions": [
+            {"candidate_id": "c1", "op": "CREATE_THEME", "domain": "bad", "reason": "x"}
+        ]
+    }
+    plan_dict = ob.normalize_plan(
+        raw,
+        candidates=candidates,
+        allowed_tags=ALLOWED_TAGS,
+        domains=DOMAINS,
+        live_basenames=set(),
+        live_theme_basenames=set(),
+        run_id=RUN_ID,
+        catch_all="general",
+    )
+    disp = plan_dict["dispositions"][0]
+    assert disp["op"] == "DROP"  # gate wins; floor never reached
+    assert disp["domain"] is None
+
+
+def test_normalize_plan_model_drop_stays_drop() -> None:
+    """The floor rescues only originate-intent (CREATE_THEME/APPEND_DAILY). A model that chose DROP
+    for genuine noise is not resurrected (DROP ∉ _BASENAME_OPS → step 3 skipped)."""
+    candidates = [
+        _candidate("c1", text="noise", event_id=E1, gated=False, domain="general"),
+    ]
+    raw = {"dispositions": [{"candidate_id": "c1", "op": "DROP", "reason": "noise"}]}
+    plan_dict = ob.normalize_plan(
+        raw,
+        candidates=candidates,
+        allowed_tags=ALLOWED_TAGS,
+        domains=DOMAINS,
+        live_basenames=set(),
+        live_theme_basenames=set(),
+        run_id=RUN_ID,
+        catch_all="general",
+    )
+    assert plan_dict["dispositions"][0]["op"] == "DROP"
+
+
+def test_normalize_plan_append_daily_floors_to_catch_all() -> None:
+    """APPEND_DAILY with an unresolvable domain also floors; basename is f'{catch_all}-{date}'."""
+    candidates = [
+        _candidate("c1", text="a daily log line", event_id=E1, gated=False, domain="bad"),
+    ]
+    raw = {
+        "dispositions": [
+            {"candidate_id": "c1", "op": "APPEND_DAILY", "domain": "bad", "reason": "x"}
+        ]
+    }
+    plan_dict = ob.normalize_plan(
+        raw,
+        candidates=candidates,
+        allowed_tags=ALLOWED_TAGS,
+        domains=DOMAINS,
+        live_basenames=set(),
+        live_theme_basenames=set(),
+        run_id=RUN_ID,
+        catch_all="general",
+    )
+    disp = plan_dict["dispositions"][0]
+    assert disp["op"] == "APPEND_DAILY"  # not dropped
+    assert disp["domain"] == "general"
+    assert disp["basename"].startswith("general-")
+
+
 def test_normalize_plan_merge_unknown_target_downgraded_to_drop() -> None:
     candidates = [
         _candidate("c1", text="claim", event_id=E1, gated=False, domain="ai-tech"),

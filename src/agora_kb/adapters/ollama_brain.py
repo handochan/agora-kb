@@ -50,6 +50,7 @@ __all__ = [
     "select_model",
     "extract_json_object",
     "parse_taxonomy",
+    "catch_all_domain",
     "related_basenames",
     "related_theme_basenames",
     "normalize_plan",
@@ -234,6 +235,23 @@ def parse_taxonomy(doc: object) -> tuple[set[str], set[str]]:
     return allowed_tags, domains
 
 
+def catch_all_domain(doc: object) -> str | None:
+    """The first DECLARED domain (list order) — the deterministic no-loss catch-all (ADR-0022 §A).
+
+    Read from the ordered ``domains`` list BEFORE :func:`parse_taxonomy` collapses it to an
+    unordered set (so ``domains[0]`` is recoverable). For a default repo this is exactly
+    ``general``. Returns ``None`` for the empty / missing / mapping forms (the mapping shape is
+    ADR-0022 §B, deferred), so the no-loss floor is a safe no-op until at least one domain exists.
+    """
+    if not isinstance(doc, dict):
+        return None
+    raw = doc.get("domains")
+    if isinstance(raw, (list, tuple)) and raw:
+        first = raw[0]
+        return str(first) if isinstance(first, (str, int)) else None
+    return None
+
+
 def related_basenames(related_docs: list[dict]) -> set[str]:
     """Return the union of ``Path(hit["path"]).stem`` over every related doc's ``hits[]``.
 
@@ -367,6 +385,7 @@ def normalize_plan(
     live_basenames: set[str],
     live_theme_basenames: set[str],
     run_id: str,
+    catch_all: str | None = None,
 ) -> dict:
     """Reshape the model's raw plan into one valid-by-construction vs :func:`plan.validate_plan`.
 
@@ -378,7 +397,8 @@ def normalize_plan(
     * ``event_ids`` set from the candidate's own provenance for EVERY op (incl. DROP/NOOP) so the
       union is an exact partition of the manifest;
     * op forced into the closed vocabulary, with cascading downgrades to DROP when the model's
-      choice can't be honored (gated candidate originating; no valid domain; un-slugifiable name; a
+      choice can't be honored (gated candidate originating; no valid domain AND no catch-all floor —
+      i.e. an empty taxonomy; un-slugifiable name; a
       MERGE/CONTEST target not in the live THEME registry — ``live_theme_basenames``, since those
       ops may only target a theme; a MARK_CONTESTED with no resolvable competing THEME link — which
       validate_plan / apply._apply_contested reject);
@@ -426,7 +446,11 @@ def normalize_plan(
         if is_gated and op not in GATE_ALLOWED_OPS:
             op = "DROP"
 
-        # 3. Domain selection (only meaningful for basename ops); a missing valid domain downgrades.
+        # 3. Domain selection (only meaningful for basename ops). A missing valid domain no longer
+        #    downgrades to DROP: it falls back to the no-loss catch-all (the first declared domain,
+        #    ADR-0022 §A) so a non-gated durable capture is never dropped merely for lack of a
+        #    domain. Gated candidates never reach here (step 2 forced DROP; GATE_ALLOWED_OPS ∩
+        #    _BASENAME_OPS = ∅). DROP is only reached when the taxonomy declares no domain at all.
         domain: str | None = None
         if op in _BASENAME_OPS:
             md_domain = md.get("domain")
@@ -435,6 +459,8 @@ def normalize_plan(
                 domain = md_domain
             elif isinstance(cand_domain, str) and cand_domain in domains:
                 domain = cand_domain
+            elif catch_all is not None and catch_all in domains:
+                domain = catch_all
             else:
                 op = "DROP"
 
@@ -744,14 +770,15 @@ def _resolve_model(model: str | None, host: str) -> str:
     return select_model(model, os.environ.get(_MODEL_ENV), list_ollama_models(host))
 
 
-def _load_taxonomy(cwd: Path) -> tuple[set[str], set[str]]:
+def _load_taxonomy(cwd: Path) -> tuple[set[str], set[str], str | None]:
     tax_path = cwd / "taxonomy.yaml"
     if not tax_path.exists():
-        return set(), set()
+        return set(), set(), None
     import yaml  # local import: keep the module import-light + stdlib-first
 
     doc = yaml.safe_load(tax_path.read_text(encoding="utf-8"))
-    return parse_taxonomy(doc)
+    allowed_tags, domains = parse_taxonomy(doc)
+    return allowed_tags, domains, catch_all_domain(doc)
 
 
 def _build_plan_prompt(
@@ -836,7 +863,7 @@ def run_plan(
     if not isinstance(candidates, list):
         candidates = []
 
-    allowed_tags, domains = _load_taxonomy(cwd)
+    allowed_tags, domains, catch_all = _load_taxonomy(cwd)
 
     related_by_id: dict[str, dict] = {}
     for candidate in candidates:
@@ -893,6 +920,7 @@ def run_plan(
         live_basenames=live_basenames,
         live_theme_basenames=live_theme_basenames,
         run_id=run_id,
+        catch_all=catch_all,
     )
     _debug_dump(
         {
