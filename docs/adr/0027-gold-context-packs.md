@@ -1,6 +1,6 @@
 # ADR-0027 — Gold context packs + the outbound knowledge contract
 
-**Status:** Proposed · 2026-07-04
+**Status:** Accepted · 2026-07-05 (Step-0 ratified, #36) · Proposed 2026-07-04
 
 Adds a **derived, deterministic, token-budgeted context tier** ("gold packs") assembled from the
 existing validator-gated wiki, plus the **single normative outbound sentinel + loop-break contract**
@@ -198,17 +198,18 @@ outcome is **Adopt**.
      frontmatter vocabulary that DOES bump `schema_version` goes through the ADR-0022 L1-17 lint
      discipline (schema-doc header + `_kb/repo.yaml` version edit) before it lands.
 
-### Open sub-decisions (the owner defaults this ADR parameterizes)
-- **S1 — Default pack budget.** **(A)** `budget_tokens=2000`; **(B)** 4000.
-  **Recommendation: A (2000)** — a standing include should stay cheap in every prompt; 4000 is one
-  config line away once real packs measure short.
-- **S2 — `contested` handling.** **(A)** default-excluded from packs; **(B)** included with a
-  per-line "contested" label. **Recommendation: A** — a standing context slot is the wrong place
-  for unresolved conflict; `kb_query` still surfaces contested notes with full context.
-- **S3 — `_meta/gold.yaml` timing.** **(A)** defer until pins/team packs land (v1 = implicit
-  zero-config `default` pack only); **(B)** ship the policy file now. **Recommendation: A** — no
-  pins and one pack need no policy surface; shipping it early creates a git-tracked contract
+### Sub-decisions (resolved in the Step-0 session, #36, 2026-07-05)
+- **S1 — Default pack budget → (A) `budget_tokens=2000`.** A standing include stays cheap in every
+  prompt; 4000 is one config line away once real packs measure short (revisit after the V4
+  curator-economics measurement).
+- **S2 — `contested` handling → (A) default-excluded from packs.** A standing context slot is the
+  wrong place for unresolved conflict; `kb_query` still surfaces contested notes with full context.
+- **S3 — `_meta/gold.yaml` timing → (A) defer until pins/team packs land.** v1 = implicit
+  zero-config `default` pack only; shipping the policy file early creates a git-tracked contract
   (and a `schema_version` question, decision 9) with zero users.
+- **Freshness bound (V4) → accept eventual consistency.** Gold freshness = curation cadence;
+  tighter cadence (watch/cron) is funded only after a one-day curator-economics measurement, not by
+  new machinery.
 
 ## Alternatives considered
 - **LLM-distilled gold as v1 (rejected — reserved ADR-0028).** Nondeterministic bytes defeat the

@@ -1,6 +1,6 @@
 # ADR-0023 — Context-harvester connectors: taxonomy, safety envelope, OSS paths
 
-**Status:** Proposed · 2026-06-24
+**Status:** Accepted · 2026-07-05 (Step-0 ratified, #36) · Proposed 2026-06-24
 
 Realizes the broader-source half of [ADR-0007](0007-memory-harvester-safety.md) (memory harvester
 with provenance / gate / scope safety) for issues **#25** (harvest analyzes agent *sessions*, not

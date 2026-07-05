@@ -1,6 +1,6 @@
 # ADR-0022 — Curator taxonomy governance: governed domain auto-creation + per-domain customization
 
-**Status:** Proposed · 2026-06-24
+**Status:** Accepted · 2026-07-05 (Step-0 ratified, #36) · Proposed 2026-06-24
 
 Covers backlog issues **#23** (auto-create & classify domains) and **#24** (per-domain custom
 processing). Extends — does **not** relax — [ADR-0010](0010-kb-wiki-schema.md) **D6** (taxonomy is a
