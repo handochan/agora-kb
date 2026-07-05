@@ -162,6 +162,13 @@ never overflows context), `related_k` (default 8), `related_excerpt_bytes` (defa
 deterministic head-truncation with an ellipsis marker). Truncation is byte-deterministic so two
 implementations produce identical bundles.
 
+**Wired repo-global (ADR-0022 step 2, Phase 3.5):** `curator.limits.body_byte_bound` (default 8192, the
+`{n_bytes}` PASS-2 prompt hint) and `curator.limits.related_k` (default 8) are now parsed by
+`load_repo_config` and threaded through `worker.run` → `build_routed_backend`/`build_bundle` at every
+run site; `curator.lint.max_orphans` (default absent ⇒ check off) adds a warning-only `L2-1` lint
+signal. Defaults reproduce the prior constants, so a repo setting none of them is byte-identical.
+`max_candidates_per_run` stays unwired (deferred to #27 / ADR-0024).
+
 ---
 ## 2. EDIT-OPERATION SEMANTICS — closed vocabulary (the PLAN)
 
@@ -330,7 +337,11 @@ change to them fails the run. The schema doc (`AGENTS.md`/`SCHEMA.md`) and its s
 4. **TAXONOMY** — all `tags ⊆ _meta/taxonomy.yaml allowed_tags`; `domain ∈ _meta/taxonomy.yaml domains`
    (kebab-case). `_meta/taxonomy.yaml` is a FIXED, READ-ONLY input — it is NOT written during INGEST and NOT
    in the §4.0 allowlist; the model MAY NOT add a tag or domain. A CREATE_THEME naming a non-taxonomy domain
-   is rejected here (taxonomy evolution is OUT of INGEST, §6.1).
+   is rejected here (taxonomy evolution is OUT of INGEST, §6.1). **No-loss floor (ADR-0022 §A):** the check
+   is unchanged, but a NON-gated basename op whose domain does not resolve is now floored to the first
+   declared domain `domains[0]` *upstream* (in `ollama_brain.normalize_plan` step 3) instead of downgraded
+   to DROP, so `domains[0]` — a taxonomy member by construction — passes this check; a gated candidate still
+   never reaches the floor (the §6 candidate gate forces DROP first).
 5. **BASENAME** — each proposed `basename` is not in the live worktree tree at base_commit and is unique
    within the plan (daily exempt); each `target_basename` exists in the live tree. (The bundle registry is
    advisory; this check re-scans the tree, §1.2.)

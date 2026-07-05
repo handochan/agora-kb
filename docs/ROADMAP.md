@@ -161,11 +161,17 @@ Low-risk, repo-local, OSS-safe; lands post-Phase-3 with no invariant change.
       is **intra-repo pipelining (smaller, more frequent runs), NOT a second writer** — single-writer
       CAS+flock stays the ceiling. Surface per-run throughput + CAS-conflict rate on the
       dashboard/metrics.
-- [ ] **#23 (floor) no-loss catch-all.** "No matching domain" must **NOT** default to DROP: route an
-      unclassifiable durable capture to a reserved fallback domain (`general`/`uncategorized`) — a
-      deterministic safety net that prevents data loss *today* (removes the silent downgrade-to-DROP in
-      `ollama_brain.py`), before the governed auto-create lane lands. Documented in DESIGN §4 +
-      INGEST-CONTRACT op table (supersedes the current downgrade-to-DROP behavior).
+- [x] **#23 (floor) no-loss catch-all + repo-global thresholds — DONE (ADR-0022 step 1/2, Phase 3.5).**
+      "No matching domain" no longer defaults to DROP: an unclassifiable non-gated basename op is routed
+      to the deterministic catch-all — the **first declared domain `domains[0]`** (default repo →
+      `general`) — in `ollama_brain.normalize_plan` step 3, a data-loss safety net that lands *before*
+      the governed auto-create lane. Shipped with the repo-global threshold wiring (E.3 leg): the
+      previously-inert `curator.limits.{body_byte_bound,related_k}` / `curator.lint.max_orphans`
+      (the last a warning-only L2-1 lint signal) are now parsed by `load_repo_config` and threaded
+      through `build_routed_backend` / `worker.run` → `build_bundle` / `lint` at all three run sites
+      (curate, watch, mcp). Documented in DESIGN §4 + DATA-MODEL §3.1; `domains[0]` chosen over a
+      literal `general` (which `repo init --domain foo,bar` erases). The governed CREATE_DOMAIN lane +
+      per-domain customization remain Phase-4-coupled below.
 
 ### Phase 4-coupled — Governed taxonomy + per-domain + personal connectors (multi-tenant-adjacent)
 Gated on / co-developed with Phase-4 multi-tenancy where a source is team/shared.

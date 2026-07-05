@@ -170,15 +170,21 @@ step is delegated to a swappable agent. Transactional worktrees, validation, and
 backend outside the integrity boundary. (ADR-0004, ADR-0008, ADR-0013.) Routing is supported: bulk/simple →
 local open-weight model (free); hard merges /
 contradiction resolution → a stronger (optional, possibly proprietary) backend.
-**No-drop on unclassifiable durable captures (planned — ADR-0022, Proposed).** A durable,
-non-gated capture must **not** be silently dropped merely because it matches no existing
-`_meta/taxonomy.yaml` domain. Today the local path does exactly that (`ollama_brain.py` cascading
-downgrade-to-DROP on a missing valid domain, ~line 380; `plan.py` check-4 TAXONOMY reject of any
+**No-drop on unclassifiable durable captures (ADR-0022, Accepted; no-loss floor SHIPPED — Phase 3.5).**
+A durable, non-gated capture must **not** be silently dropped merely because it matches no existing
+`_meta/taxonomy.yaml` domain. The local path used to do exactly that (`ollama_brain.py` cascading
+downgrade-to-DROP on a missing valid domain; `plan.py` check-4 TAXONOMY reject of any
 `domain ∉ domains`) — that behavior is **superseded** by the policy below:
 
-- **Fallback, not loss.** An unclassifiable capture is routed to a reserved catch-all domain
-  (`general`/`uncategorized` — the same `general` domain `agora repo init` seeds, `cli.py`) so the
-  fact survives to the wiki and stays navigable, never discarded. This no-loss floor ships **first**.
+- **Fallback, not loss (SHIPPED).** An unclassifiable non-gated basename op is routed to the
+  deterministic catch-all — the **first declared domain `domains[0]`** (for a default repo, exactly
+  the `general` domain `agora repo init` seeds) — instead of `op = "DROP"`, so the fact survives to
+  the wiki and stays navigable. The floor lives in `ollama_brain.normalize_plan` step 3 (a pure
+  post-process keyed on the injected taxonomy, so the model-independent §4.1 gate is unchanged); a
+  gated candidate keeps its gate and can never originate the catch-all. Shipped alongside the
+  repo-global `curator.limits.{body_byte_bound,related_k}` / `curator.lint.max_orphans` threshold
+  wiring (ADR-0022 step 2). `domains[0]` was chosen over a literal `general` because `general` is
+  only the `repo init` default, not a guarantee (`repo init --domain foo,bar` has none).
 - **Governed new-domain proposal (separate lane).** The same capture **MAY** additionally trigger a
   *governed* domain-creation proposal. Domain creation is a deliberately-closed decision (ADR-0010
   D6 / ADR-0011 §6.1) and stays so: the sandboxed brain may **never** directly widen
