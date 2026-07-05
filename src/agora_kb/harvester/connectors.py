@@ -41,6 +41,15 @@ from typing import Protocol, runtime_checkable
 
 from agora_kb.core.hashing import content_sha256
 from agora_kb.core.layout import validate_writer
+from agora_kb.core.sentinel import strip_agora_sentinels, strip_sentinel_spans
+
+# The ADR-0027 §8 sentinel grammar + its consumer-duty strippers now live canonically in
+# ``agora_kb.core.sentinel`` (``core`` may not import from ``harvester``, so they had to move up the
+# layering). These aliases preserve the historical private names — used at the three ``_neutralize``
+# fact-body sites and the one span-only link-following ``fact_key`` site below, and imported by the
+# harvester test suite — so behavior is byte-identical to the pre-move implementation.
+_strip_sentinel_spans = strip_sentinel_spans
+_neutralize = strip_agora_sentinels
 
 __all__ = [
     "Scope",
@@ -67,25 +76,6 @@ _MD_LINK_RE = re.compile(r"(?<!!)\[([^\]]*)\]\(([^)]*)\)")
 _URL_SCHEME_RE = re.compile(r"\A[A-Za-z][A-Za-z0-9+.\-]*:")
 # A body that already opens with an ATX H1 — reused as the followed fact's title (else synthesized).
 _H1_RE = re.compile(r"\A#\s")
-# An agora structural sentinel HTML comment (the curator's body-region markers, apply.py grammar).
-# Stripped from harvested text so a poisoned memory bullet cannot inject a fake region into the
-# candidate bundle the planning brain reads (defense-in-depth; the curator's diff gate is the real
-# integrity boundary).
-_AGORA_SENTINEL_RE = re.compile(r"<!--\s*agora:[^>]*-->", re.IGNORECASE)
-# A full agora sentinel SPAN — an opening marker THROUGH its matching closing marker, INCLUSIVE
-# (ADR-0027 §8 consumer duty, the NET-NEW half of the outbound loop-break contract). The marker-only
-# strip above leaves the span CONTENT in place, which is insufficient: a harvested gold pack
-# (``agora:pack …`` … ``agora:pack:end …``) would re-enter as facts. So the whole span is removed
-# BEFORE the marker strip runs. The opener requires whitespace after ``pack`` (``agora:pack\s``) so
-# it matches only the true opener, never the ``:end`` closer; ``.*?`` reaches the FIRST real closer,
-# the producer's assembly-time neutralization (``gold._neutralize_sentinels``) defangs any forged
-# early closer so a hostile summary line cannot terminate the span early. The body-region family
-# (``agora:body:start`` … ``agora:body:end``) is covered symmetrically.
-_AGORA_SPAN_RE = re.compile(
-    r"<!--\s*agora:pack\s[^>]*-->.*?<!--\s*agora:pack:end\b[^>]*-->"
-    r"|<!--\s*agora:body:start\b[^>]*-->.*?<!--\s*agora:body:end\b[^>]*-->",
-    re.IGNORECASE | re.DOTALL,
-)
 # Glob magic characters: the "base root" is the longest leading path prefix free of these chars.
 _GLOB_MAGIC = set("*?[")
 
@@ -613,28 +603,6 @@ def _segment(text: str) -> list[str]:
         i += 1
     flush()
     return blocks
-
-
-def _strip_sentinel_spans(text: str) -> str:
-    """Remove whole agora sentinel SPANS (open marker → close marker inclusive) — ADR-0027 §8.
-
-    The NET-NEW consumer duty: a harvested gold pack (or a body-region span) is removed ENTIRELY so
-    it contributes zero facts, closing the verbatim half of the loop (ADR-0027 §8, ADR-0017
-    §5). This runs BEFORE the marker-only :func:`_neutralize` strip.
-    """
-    return _AGORA_SPAN_RE.sub("", text)
-
-
-def _neutralize(text: str) -> str:
-    """Strip agora structural sentinels from untrusted harvested text (defense-in-depth, ADR-0017).
-
-    First removes whole agora SPANS (:func:`_strip_sentinel_spans`, ADR-0027 §8 — a pack/body span
-    is dropped content-and-all), THEN strips any residual lone marker comments (``<!-- agora: -->``)
-    a poisoned memory bullet cannot inject a fake region into the candidate bundle. The candidate
-    text is already treated as untrusted DATA by the planning prompt (INGEST-CONTRACT §8) and the
-    curator's deterministic diff gate is the real integrity boundary; this is a cheap extra layer.
-    """
-    return _AGORA_SENTINEL_RE.sub("", _strip_sentinel_spans(text))
 
 
 def _clean_link_path(raw: str) -> str | None:

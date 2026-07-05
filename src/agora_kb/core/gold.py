@@ -116,7 +116,7 @@ _UNREACHED = 1_000_000
 # An embedded agora sentinel comment OPENER inside assembled content. The producer NEUTRALIZES it
 # (ADR-0027 §8 assembly-time neutralization) by breaking the ``<!--`` opener so a hostile summary
 # line carrying a literal ``<!-- agora:pack:end … -->`` cannot terminate the span early: the closer
-# no longer matches the harvester's ``_AGORA_SENTINEL_RE`` (``<!--\s*agora:…``), so the REAL closer
+# no longer matches ``core.sentinel.AGORA_SENTINEL_RE`` (``<!--\s*agora:…``), so the REAL closer
 # still terminates the span and span-drop removes the whole span cleanly.
 _EMBEDDED_SENTINEL_OPEN = re.compile(r"<!--(\s*agora:)", re.IGNORECASE)
 
