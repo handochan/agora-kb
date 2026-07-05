@@ -85,15 +85,26 @@ Establish a **governed taxonomy-evolution lane** and a **tuning-surface-only per
 lane**. The sandboxed brain may **NEVER** directly widen `_meta/taxonomy.yaml`; that property of D6 is
 preserved exactly. The relaxation is narrow and deterministic.
 
-**(A) No-loss floor — ship first, invariant-neutral (#23).** A reserved catch-all domain (`general`,
-already the `repo init` default) is **guaranteed to exist** and is the deterministic no-loss floor.
-`adapters/ollama_brain.py` step 3 is changed so a basename op whose domain cannot be resolved against
-the taxonomy falls back to the catch-all domain **instead of `op = "DROP"`** (removing the silent
-downgrade-to-DROP at ~line 438) for a NON-gated durable capture; the prompt (`kb_schema.md`) is updated
-to instruct "route to the catch-all rather than DROP when unsure of domain". A gated candidate
-(`is_gated`, computed in `bundle.py:265`) keeps its gate verbatim — it may still only
-MERGE/CONTEST/DROP and can never originate. This alone makes "never drop a fact merely for lack of a
-domain" literally true with near-zero risk and no contract change.
+**(A) No-loss floor — ship first, invariant-neutral (#23).** The deterministic no-loss floor is the
+**first declared domain `domains[0]`** (list order) of the fixed taxonomy — **for a default repo this
+is exactly `general`** (the `repo init` seed), and every repo created via `agora repo init` /
+`agora import` has ≥1 domain, so `domains[0]` always exists. *(Amended 2026-07-05 during Phase-3.5
+implementation: an earlier draft named a "reserved `general` domain guaranteed to exist"; that premise
+is false — `agora repo init --domain foo --domain bar` produces a taxonomy with no `general`, and
+nothing injects it at load. Using `domains[0]` needs zero taxonomy mutation, passes the check-4
+TAXONOMY validator by construction, and unifies with the import lane, which already treats the first
+domain as its catch-all — see `vault_import.py`. Materializing a literal `general` was rejected: it
+would require an INGEST-time `_meta/taxonomy.yaml` write (breaks D6) or a config-vs-bundle taxonomy
+divergence.)* `adapters/ollama_brain.py` step 3 is changed so a basename op whose domain cannot be
+resolved against the taxonomy falls back to `domains[0]` **instead of `op = "DROP"`** (removing the
+silent downgrade-to-DROP at ~line 438) for a NON-gated durable capture; because `parse_taxonomy`
+collapses `domains` to an unordered set, a small helper recovers the ordered `domains[0]` before that
+collapse. The prompt (`kb_schema.md`) is updated to instruct "route to the first declared domain (the
+catch-all) rather than DROP when unsure of domain". A gated candidate (`is_gated`, computed in
+`bundle.py`) keeps its gate verbatim — it may still only MERGE/CONTEST/DROP and can never originate
+(the step-2 gate runs before step 3, and `GATE_ALLOWED_OPS ∩ _BASENAME_OPS = ∅`, so the floor is
+structurally unreachable for gated candidates). This alone makes "never drop a fact merely for lack of
+a domain" literally true with near-zero risk and no contract change.
 
 **(B) Structured domain entry shape (#23+#24 coupling).** `domains` in `_meta/taxonomy.yaml` MAY be
 either the existing `list[str]` (back-compat) **or** a mapping `{<domain>: {status, created,
