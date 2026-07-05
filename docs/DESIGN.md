@@ -445,7 +445,7 @@ on a new repo = fail-loud.
 file-`@include` channel is first-class: a per-agent memory-path map (e.g. `CLAUDE.md`,
 `.github/copilot-instructions.md`, `.cursor/rules`) receives a sentinel-fenced, refresh-only gold-pack
 region written only on the user's explicit `agora link <agent>` (standing consent; never a silent
-write into an agent config dir — the reserved-[ADR-0026] posture holds). Tier-1 target agents: Claude
+write into an agent config dir — the reserved-[ADR-0026](adr/README.md) posture holds). Tier-1 target agents: Claude
 Code, Codex, Antigravity CLI, OpenCode, GitHub Copilot, Pi, Qwen, aelix — tested integrations, not
 hard-coded (invariant 6).
 
