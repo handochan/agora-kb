@@ -396,6 +396,61 @@ def test_normalize_plan_model_drop_stays_drop() -> None:
     assert plan_dict["dispositions"][0]["op"] == "DROP"
 
 
+def test_run_plan_e2e_floors_unclassifiable_capture_to_first_domain(tmp_path) -> None:
+    """FULL brain PLAN path (real e2e): _load_taxonomy → catch_all_domain → normalize_plan.
+
+    A non-gated capture whose domain matches nothing floors to domains[0] instead of DROP —
+    exercising the run_plan wiring (3-tuple unpack + catch_all threading), not normalize_plan alone.
+    """
+    (tmp_path / "taxonomy.yaml").write_text(
+        "domains:\n  - general\n  - ai-tech\nallowed_tags:\n  - architecture\n", encoding="utf-8"
+    )
+    (tmp_path / "candidates.json").write_text(
+        json.dumps(
+            {
+                "run_id": RUN_ID,
+                "candidates": [
+                    {
+                        "candidate_id": "c1",
+                        "text": "an unclassifiable durable fact",
+                        "is_gated": False,
+                        "domain": "no-such-domain",
+                        "provenance": [{"event_id": E1}],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def infer(_prompt: str) -> str:
+        # The model originates a theme but names a domain that is NOT in the taxonomy.
+        return json.dumps(
+            {
+                "schema_version": 1,
+                "run_id": RUN_ID,
+                "finished": True,
+                "dispositions": [
+                    {
+                        "candidate_id": "c1",
+                        "op": "CREATE_THEME",
+                        "domain": "no-such-domain",
+                        "title": "Homeless Fact",
+                        "status": "active",
+                        "summary": "no home domain",
+                        "reason": "no matching domain",
+                    }
+                ],
+            }
+        )
+
+    plan = json.loads(ob.run_plan(tmp_path, "", infer=infer))
+    disp = plan["dispositions"][0]
+    assert disp["op"] == "CREATE_THEME"  # NOT dropped
+    assert disp["domain"] == "general"  # floored to domains[0] (first declared)
+    assert disp["event_ids"] == [E1]
+
+
 def test_normalize_plan_append_daily_floors_to_catch_all() -> None:
     """APPEND_DAILY with an unresolvable domain also floors; basename is f'{catch_all}-{date}'."""
     candidates = [
