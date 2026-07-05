@@ -168,6 +168,18 @@ class AgoraCollector:
             "Unix time of a connector's last scan (omitted per-connector when never scanned).",
             labels=["connector"],
         )
+        # Facts carrying >=1 redaction, labelled by connector AND secret/PII class (ADR-0023
+        # decision 5). Metadata-only — the label is the CLASS NAME, never the secret. DORMANT until
+        # the session connector (#25) adds the persisted HarvestCursor.redacted source; until then
+        # harvester_status() supplies no 'redacted' key, so this emits NO samples (an honest 0),
+        # mirroring the accepted/rejected deferred-0 precedent above.
+        redacted = CounterMetricFamily(
+            "agora_harvester_redacted",
+            "Facts with >=1 redaction, by connector and secret/PII class (metadata-only; never "
+            "the secret). Write-path wiring lands with the session connector (#25); dormant "
+            "until then.",
+            labels=["connector", "class"],
+        )
         for conn in connectors:  # type: ignore[union-attr]
             name = str(conn["name"])
             proposed.add_metric([name], float(conn["proposed"]))
@@ -177,10 +189,15 @@ class AgoraCollector:
             scanned = _iso_to_epoch(conn["last_scan"])
             if scanned is not None:
                 last_scan.add_metric([name], scanned)
+            by_class = conn.get("redacted", {})  # type: ignore[union-attr]
+            if isinstance(by_class, dict):
+                for cls in sorted(by_class):
+                    redacted.add_metric([name, str(cls)], float(by_class[cls]))
         yield proposed
         yield accepted
         yield rejected
         yield last_scan
+        yield redacted
 
         # --- gold pack gauges (ADR-0027 / #37) ---------------------------------------------------
         # Cheap: the `gold` row is read from the pack's meta sidecar (no assemble, no git — the

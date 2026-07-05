@@ -30,7 +30,7 @@ atomic :class:`CursorStore`).
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import Literal
 
@@ -41,6 +41,7 @@ from agora_kb.core.atomicio import atomic_write_text
 from agora_kb.core.inbox import Inbox
 from agora_kb.core.layout import RepoLayout, validate_writer
 from agora_kb.core.models import Confidence, Kind
+from agora_kb.core.redact import DEFAULT_POLICY, redact
 
 from .connectors import Connector, ConnectorError, FileConnector, HarvestedFact, Scope
 
@@ -223,6 +224,39 @@ def build_connectors(specs: list[ConnectorSpec]) -> list[Connector]:
     return connectors
 
 
+def _redaction_preview(
+    facts: tuple[HarvestedFact, ...],
+) -> tuple[tuple[HarvestedFact, ...], tuple[str, ...]]:
+    """Redact each dry-run preview fact; return (redacted facts, metadata-only notes).
+
+    Read-only: this runs ONLY in the ``--dry-run`` branch (which never touches the inbox or a
+    cursor), so the shipped write path stays byte-identical — the live write-path redaction lands
+    with the session connector (#25). The preview text is REDACTED so ``agora harvest --dry-run``
+    never prints a secret to the terminal (ADR-0023 decision 5: the preview counts + classifies,
+    it NEVER logs the secret). The note carries the class name + integer count only.
+    """
+    previewed: list[HarvestedFact] = []
+    counts: dict[str, int] = {}
+    n_facts = 0
+    for fact in facts:
+        result = redact(fact.text, policy=DEFAULT_POLICY)
+        if result.redacted:
+            n_facts += 1
+            for hit in result.hits:
+                counts[hit.cls] = counts.get(hit.cls, 0) + hit.count
+            # Only ``text`` is redacted; ``fact_key`` stays the raw-derived content_sha256 (the CLI
+            # prints a 12-char prefix — a weak whole-line SHA, not the secret). Moving fact_key over
+            # the redacted text lands with the live write path (#25, ADR-0023 addendum §2).
+            previewed.append(replace(fact, text=result.text))
+        else:
+            previewed.append(fact)
+    if not counts:
+        return tuple(previewed), ()
+    breakdown = ", ".join(f"{cls} x{counts[cls]}" for cls in sorted(counts))
+    note = f"would redact {n_facts} fact(s) before persistence: {breakdown}"
+    return tuple(previewed), (note,)
+
+
 class Harvester:
     """Run the configured connectors, gate them, and append gated candidates to the inbox."""
 
@@ -318,15 +352,18 @@ class Harvester:
         scan_notes = scan.notes + self._gold_loop_notes(scan.facts)
 
         if dry_run:
+            # Preview text is REDACTED (ADR-0023 decision 5) so --dry-run never prints a secret; the
+            # write path below is left untouched (byte-identical), redaction lands there with #25.
+            preview_facts, redaction_notes = _redaction_preview(scan.facts)
             return ConnectorReport(
                 name=connector.name,
                 agent=connector.agent,
                 scope=connector.scope.value,
                 status="ok",
                 facts_found=len(scan.facts),
-                notes=scan_notes,
+                notes=scan_notes + redaction_notes,
                 dry_run=True,
-                preview=scan.facts,
+                preview=preview_facts,
             )
 
         writer = f"harvest-{connector.agent}"
