@@ -90,6 +90,8 @@ RULES (closed — the engine rejects your plan if you break these):
 - Decide each candidate against related/<id>.json (pre-retrieved existing notes). DO NOT SEARCH.
   overlap -> MERGE_INTO_THEME (give target_basename); genuinely new -> CREATE_THEME;
   contradiction -> MARK_CONTESTED (keep both); noise/duplicate -> DROP / NOOP.
+- If a genuinely-new durable fact fits NO domain in taxonomy.yaml, still CREATE_THEME/APPEND_DAILY
+  (the engine routes an unmatched domain to the catch-all) — do NOT DROP just for lack of a domain.
 - CANDIDATE / low-confidence items (candidates.json is_gated=true): ONLY MERGE_INTO_THEME, \
 MARK_CONTESTED, or DROP. Default to DROP on any doubt. They may NEVER CREATE_THEME or APPEND_DAILY.
 

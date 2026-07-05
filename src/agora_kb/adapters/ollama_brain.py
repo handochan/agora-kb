@@ -829,7 +829,9 @@ def _build_plan_prompt(
         + "tags, links, reason}]}. Exactly one disposition per candidate above. op is one of "
         + "CREATE_THEME, APPEND_DAILY, MERGE_INTO_THEME, MARK_CONTESTED, DROP, NOOP. "
         + "For MERGE_INTO_THEME / MARK_CONTESTED give an existing target_basename from "
-        + "related_existing_notes. Use ONLY the allowed tags/domains above."
+        + "related_existing_notes. Use ONLY the allowed tags/domains above. If no domain fits a "
+        + "genuinely-new fact, still CREATE_THEME/APPEND_DAILY rather than DROP — the engine "
+        + "routes an unmatched domain to the catch-all."
     )
     return "\n".join(lines)
 
