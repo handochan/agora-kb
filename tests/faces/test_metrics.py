@@ -244,3 +244,22 @@ def test_metrics_does_not_call_health(tmp_path: Path, monkeypatch: pytest.Monkey
     resp = _client(tmp_path).get("/metrics")
     assert resp.status_code == 200
     assert "agora_inbox_depth" in resp.text
+
+
+def test_gold_gauges_after_build(tmp_path: Path) -> None:
+    """ADR-0027 / #37: the gold pack gauges appear once a pack is built (and are absent before)."""
+    from datetime import UTC, datetime
+
+    from agora_kb.core.gold import build_gold
+    from agora_kb.faces.web.metrics import render_latest
+
+    repo = _init_repo(tmp_path)
+    # Before any build: no gold gauges (present=False → omitted).
+    assert "agora_gold_pack_note_count" not in render_latest(repo)[0].decode("utf-8")
+    build_gold(repo, generated_at=datetime.now(UTC))
+    text = render_latest(repo)[0].decode("utf-8")
+    assert 'agora_gold_pack_note_count{pack="default"}' in text
+    assert 'agora_gold_pack_est_tokens{pack="default"}' in text
+    assert 'agora_gold_pack_harvest_derived_share{pack="default"}' in text
+    assert 'agora_gold_pack_age_seconds{pack="default"}' in text
+    assert 'agora_gold_pack_generated_timestamp_seconds{pack="default"}' in text

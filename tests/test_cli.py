@@ -768,3 +768,91 @@ def test_harvest_follow_links_harvests_sibling_content(
     body = items[0].read_text(encoding="utf-8")
     assert "One curator holds a per-repo lock." in body  # the SIBLING content was harvested
     assert "[Curator](curator.md)" not in body  # the thin pointer markup was replaced
+
+
+# --- gold packs (ADR-0027, issue #37) -----------------------------------------------------------
+def _gold_repo(tmp_path: Path) -> Path:
+    """Init a repo, add one eligible theme note, and commit it (hermetic git env)."""
+    import os
+    import subprocess
+
+    target = tmp_path / "kb"
+    assert main(["repo", "init", str(target)]) == 0
+    themes = target / "wiki" / "ai-tech" / "themes"
+    themes.mkdir(parents=True, exist_ok=True)
+    (themes / "curator-concurrency.md").write_text(
+        "---\ntitle: Curator Concurrency\ntype: theme\naliases: []\ntags: []\n"
+        "created: '2026-06-01'\nupdated: '2026-07-01'\nstatus: active\n"
+        "summary: single-writer CAS keeps the wiki consistent\nsources: [raw/a.md]\n"
+        "related: []\nconfidence: high\n---\n\n# Curator Concurrency\n\nbody\n",
+        encoding="utf-8",
+    )
+    env = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": "t",
+        "GIT_AUTHOR_EMAIL": "t@t",
+        "GIT_COMMITTER_NAME": "t",
+        "GIT_COMMITTER_EMAIL": "t@t",
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_CONFIG_SYSTEM": "/dev/null",
+        "GIT_AUTHOR_DATE": "2026-07-05T00:00:00+00:00",
+        "GIT_COMMITTER_DATE": "2026-07-05T00:00:00+00:00",
+    }
+    subprocess.run(["git", "add", "-A"], cwd=target, check=True, capture_output=True, env=env)
+    subprocess.run(
+        ["git", "commit", "-m", "theme"], cwd=target, check=True, capture_output=True, env=env
+    )
+    return target
+
+
+@requires_git
+def test_cli_gold_build_status_check(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    target = _gold_repo(tmp_path)
+    root = str(target)
+
+    assert main(["gold", "build", "--repo", root]) == 0
+    out = capsys.readouterr().out
+    assert "built pack 'default'" in out
+    assert RepoLayout(target).gold_pack_path("default").is_file()
+
+    assert main(["gold", "status", "--repo", root]) == 0
+    out = capsys.readouterr().out
+    assert "FRESH" in out and "Curator Concurrency" not in out  # status is a meta read, not content
+
+    # --check on a fresh pack passes (byte-identical rebuild contract).
+    assert main(["gold", "build", "--repo", root, "--check"]) == 0
+    assert "byte-identical" in capsys.readouterr().out
+
+
+@requires_git
+def test_cli_gold_check_detects_stale(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    target = _gold_repo(tmp_path)
+    root = str(target)
+    assert main(["gold", "build", "--repo", root]) == 0
+    capsys.readouterr()
+    # Corrupt the on-disk pack: --check must fail (exit 1) against a fresh rebuild.
+    RepoLayout(target).gold_pack_path("default").write_text("tampered\n", encoding="utf-8")
+    assert main(["gold", "build", "--repo", root, "--check"]) == 1
+    assert "DIFFERS" in capsys.readouterr().out
+
+
+@requires_git
+def test_cli_gold_status_absent(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    target = _gold_repo(tmp_path)
+    assert main(["gold", "status", "--repo", str(target)]) == 0
+    assert "absent" in capsys.readouterr().out
+
+
+def test_cli_gold_missing_subcommand_returns_2(capsys: pytest.CaptureFixture[str]) -> None:
+    assert main(["gold"]) == 2
+    assert "usage: agora gold" in capsys.readouterr().out
+
+
+@requires_git
+def test_cli_doctor_reports_gold_line(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    target = _gold_repo(tmp_path)
+    assert main(["gold", "build", "--repo", str(target)]) == 0
+    capsys.readouterr()
+    main(["doctor", "--repo", str(target)])
+    out = capsys.readouterr().out
+    assert "gold: pack=fresh" in out and "_kb/gold/" in out

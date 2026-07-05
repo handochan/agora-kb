@@ -213,6 +213,23 @@ class Repo:
         """Name of the checked-out branch in the main working copy."""
         return self._git("symbolic-ref", "--short", "HEAD").stdout.strip()
 
+    def commit_committer_datetime(self, commit: str) -> datetime:
+        """Return a commit's COMMITTER timestamp as a timezone-aware UTC :class:`datetime`.
+
+        The gold-pack recency decay is anchored to the curated commit's committer instant — NEVER a
+        wall clock — so a rebuild at a fixed commit is byte-identical (ADR-0027 decision 4). Uses
+        ``git show -s --format=%cI`` (strict ISO-8601 committer date). ``commit`` must be a full
+        non-zero object id (a branch tip resolved via :meth:`branch_commit`); a malformed id is
+        rejected before it reaches git. Raises :class:`GitError` if the commit cannot be read."""
+        _require_commit_sha(commit)
+        out = self._git("show", "-s", "--format=%cI", commit).stdout.strip()
+        try:
+            return datetime.fromisoformat(out).astimezone(UTC)
+        except ValueError as exc:  # a git that emitted a non-ISO committer date (should not happen)
+            raise GitError(
+                f"could not parse committer date {out!r} for {commit}", command=("show", commit)
+            ) from exc
+
     # --- repo-owner sync / admin commit ---------------------------------------------------------
     def sync_to_branch(self, branch: str | None = None) -> str:
         """Fast-forward the MAIN working copy to the curated branch tip; return the new HEAD sha.

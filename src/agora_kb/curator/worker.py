@@ -620,6 +620,16 @@ def _run_locked(
     if not synced or not rebuild_index_cache(repo):
         counts = {**counts, "index_cache_unbuilt": 1}
 
+    # ADR-0027 §2a / issue #37: refresh the derived gold pack(s) best-effort AFTER the working copy
+    # is synced to the new curated tip — the SAME posture as the index-cache rebuild above and the
+    # ADR-0017 §7 harvest-cursor bump: the run is already published, so a build/IO failure only
+    # DEGRADES the injection surface (a stale/absent pack) and is surfaced, never aborting finalize.
+    # Skipped when UNSYNCED (building from the un-advanced base tree would stamp new_commit onto
+    # stale content); `and` short-circuits so rebuild_gold_packs is not called in that case. This is
+    # the freshness half of decision 6: a pack is never staler than silver.
+    if not synced or not rebuild_gold_packs(repo, now=now):
+        counts = {**counts, "gold_unbuilt": 1}
+
     return RunReport(run_id=run_id, status="published", published_commit=new_commit, counts=counts)
 
 
@@ -928,6 +938,29 @@ def rebuild_index_cache(repo: Repo) -> bool:
         return True
     except Exception as exc:  # noqa: BLE001 — derived + rebuildable; must not abort finalize.
         _logger.warning("index cache rebuild failed (rebuildable, run already published): %s", exc)
+        return False
+
+
+def rebuild_gold_packs(repo: Repo, *, now: datetime) -> bool:
+    """Best-effort rebuild of the ADR-0027 gold pack(s) after a publish (issue #37).
+
+    Deterministic, non-sandboxed reader/worker code — NEVER the sandboxed curator backend, NEVER in
+    the ADR-0008 INGEST allowlist (invariant #2). NEVER raises: the run is ALREADY published in git,
+    so a build/IO failure must only DEGRADE (a stale/absent pack → no fresh injection) and be
+    surfaced as a signal, exactly the ADR-0017 §7 harvest-cursor + ADR-0012 §2 index-cache
+    swallow+log posture — it must not perturb a durable publish. Returns ``True`` on success, and
+    ``False`` on a genuine failure so the caller can raise an observable ``gold_unbuilt`` signal.
+    ``now`` is the run's wall clock, recorded ONLY in the pack meta sidecar (the body stays stable).
+    v1 ships one implicit zero-config ``default`` pack (ADR-0027 §S3); a ``_meta/gold.yaml`` policy
+    file (per-audience packs) is the deferred future home.
+    """
+    from ..core.gold import build_gold
+
+    try:
+        build_gold(repo, generated_at=now)
+        return True
+    except Exception as exc:  # noqa: BLE001 — derived + rebuildable; must not abort finalize.
+        _logger.warning("gold pack rebuild failed (rebuildable, run already published): %s", exc)
         return False
 
 

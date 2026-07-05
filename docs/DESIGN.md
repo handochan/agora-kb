@@ -109,6 +109,9 @@ repo's own `AGENTS.md`/`SCHEMA.md`, tool-agnostic via symlinks `CLAUDE.md`/`QWEN
                                        DATA-MODEL §6, ADR-0007)
     index/<repo>.notes.json            derived query READER cache (parsed-note + inverted index);
                                        rebuildable, never canonical (ADR-0012 §2, #26)
+    gold/<pack>.md                     derived GOLD context pack (verbatim summary lines, budgeted)
+                                       + <pack>.meta.json sidecar; a pure fn of (commit, spec),
+                                       rebuildable, never canonical (ADR-0027 §3, #37)
     state.json                         curator state: counters, last_run, published runs
     curator.lock                       flock held during a consolidation run
 ```
@@ -123,6 +126,18 @@ pipeline: **bronze** = the ingress concept (the append-only `_kb/inbox/` spool +
 `raw/`/`assets/` captures), **silver** = the curated `wiki/` SSOT, **gold** = derived, always-fresh
 context packs assembled from the wiki for injection into agents ([ADR-0027](adr/0027-gold-context-packs.md)).
 Medallion words are a docs/vocabulary overlay; the code keeps the `inbox`/`raw`/`wiki`/`gold` names.
+A gold pack is a **pure, deterministic function of (curated commit, pack spec)** — reader-class code
+(`core/gold.py`'s `PackAssembler`) assembles verbatim summary lines from validator-gated theme notes
+into a small, token-budgeted, byte-stable slice; no LLM runs, no new curator op, nothing writes
+`wiki/`/the inbox/indexes. It is built best-effort in the curator's finalize (never staler than
+silver), on the explicit `agora gold build`, and lazily on read. **Consumption is pull-only** and
+agent-neutral: the documented file channel is a CLAUDE.md-style include `@<repo>/_kb/gold/default.md`
+— the one-line include IS the standing human consent (Agora never writes agent config dirs). Every
+emission is wrapped in the normative `<!-- agora:pack … -->` … `<!-- agora:pack:end … -->` sentinel
+and the harvester drops that whole span, so an emitted pack round-trips to **zero** harvested facts
+(the outbound loop-break contract, ADR-0027 §8). Harvest-origin notes are default-excluded from packs
+so gold can never become a prompt-injection amplifier. The MCP `kb_context` tool + web `/api/gold`
+consumption channels are deferred to a follow-up (Phase C).
 **Source assets are never-lossy:** an original captured file (pdf/pptx/…) is retained under
 `raw/`/`assets/` and linked from every note it feeds (`raw_ref`/`sources:`), and the curator's
 provenance union keeps that link even when the note's *content* deduplicates — no asset is ever

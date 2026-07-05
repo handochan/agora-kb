@@ -47,6 +47,16 @@
   </div>
 </section>
 
+<section aria-label="Gold context pack" class="panel">
+  <h2>Gold context pack</h2>
+  {# Cheap meta-sidecar read (no assemble) → poll every 5s (and on load). Medallion: bronze → silver
+     → gold; the pack is a rebuildable derived tier (ADR-0027). #}
+  <div id="panel-gold"
+       hx-get="/dashboard/gold" hx-trigger="load, every 5s" hx-swap="innerHTML">
+    {% with panel = gold %}{% include "_gold.html" %}{% endwith %}
+  </div>
+</section>
+
 <footer class="muted dashboard-footer">
   {# Operational time-series live at the Prometheus exposition; heavy graphing is external Grafana
      (an AGPL operator-supplied sidecar, never bundled — ADR-0019 §5 / DESIGN §5.3). #}

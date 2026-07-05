@@ -15,6 +15,10 @@ conceptual model; this doc maps it to modules and runtime processes.
 core/                 The single internal API. Everything else is a face or adapter over this.
   inbox.py            append-only write path: write(target, item) → _kb/inbox/<writer>/<id>.md
   wiki.py             deterministic retrieval: QueryResult with ordered SearchHit citations
+  gold.py             GOLD context packs (ADR-0027, #37): deterministic PackAssembler — verbatim
+                      summary lines from validator-gated theme notes → _kb/gold/<pack>.md + meta
+                      sidecar; a pure fn of (curated commit, spec); commit-anchored gold-score +
+                      CJK-aware estimator + §8 outbound sentinel wrap/neutralization + loop shingle
   repo.py             Repo/tenant model: resolve repo, git ops (commit, push, PR), layout
   state.py            curator state (_kb/state.json): counters, event keys, published runs
 
@@ -77,7 +81,7 @@ schema/               KB wiki schema emitted into each knowledge repo.
   notes.py            note-type helpers (index/moc/theme/daily) + link resolution
   templates/kb_schema.md   the AGENTS.md schema template
 
-cli.py                `agora` entry point: repo init · import · status · curate · harvest · watch · serve · web · doctor
+cli.py                `agora` entry point: repo init · import · status · curate · harvest · index · gold · watch · serve · web · doctor
 config.py             load config (adapters.yaml backends/routing + connectors, repo.yaml, triggers, harvest policy)
 ```
 
@@ -162,8 +166,9 @@ and may use only the returned hits; `not_found` is explicit and never synthesize
 
 ### 3.6 Dashboard (meta)
 ```
-web/dashboard → AgoraHandlers.{health,curator_status,harvester_status}   (read-only meta panels)
-   reads: inbox count, state.json, log.md, processed/failed, harvest cursors, deterministic lint()
+web/dashboard → AgoraHandlers.{health,curator_status,harvester_status,gold_status}  (read-only panels)
+   reads: inbox count, state.json, log.md, processed/failed, harvest cursors, deterministic lint(),
+   the gold-pack meta sidecar (ADR-0027 medallion panel, #37)
    (HTMX-polled fragments; lint reused VERBATIM for KB-health signals — Phase 3c)
 
 GET /metrics  →  web/metrics.py            Prometheus exporter (separate surface — Phase 3d):

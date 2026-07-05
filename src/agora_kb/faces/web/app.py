@@ -285,6 +285,11 @@ def build_app(*, repo_path: Path, writer: str = "web", user: str = "local") -> F
         """Whether harvesting is enabled + per-connector last scan / candidate tally."""
         return handlers.harvester_status()
 
+    @app.get("/api/dashboard/gold", tags=["api"], summary="Gold-pack panel (medallion, ADR-0027).")
+    def api_dashboard_gold() -> dict[str, object]:
+        """The medallion gold tier: the derived pack's presence, freshness vs silver, size, age."""
+        return handlers.gold_status()
+
     # --- Prometheus exposition (the operational half of the observability split) ----------------
     # NOT a JSON API endpoint: this serves the Prometheus text exposition format
     # (CONTENT_TYPE_LATEST), the operational time-series half of DESIGN §5.3's two-way split (heavy
@@ -459,6 +464,7 @@ def build_app(*, repo_path: Path, writer: str = "web", user: str = "local") -> F
                 "health": handlers.health(),
                 "curator": handlers.curator_status(),
                 "harvester": handlers.harvester_status(),
+                "gold": handlers.gold_status(),
             },
         )
 
@@ -480,6 +486,11 @@ def build_app(*, repo_path: Path, writer: str = "web", user: str = "local") -> F
         return templates.TemplateResponse(
             request, "_harvester.html", {"harvester": handlers.harvester_status()}
         )
+
+    @app.get("/dashboard/gold", response_class=HTMLResponse, include_in_schema=False)
+    def dashboard_gold(request: Request) -> _TemplateResponse:
+        """HTML FRAGMENT of the gold-pack (medallion) panel (the 5s-poll hx-get target)."""
+        return templates.TemplateResponse(request, "_gold.html", {"panel": handlers.gold_status()})
 
     return app
 

@@ -182,6 +182,26 @@ def build_parser() -> argparse.ArgumentParser:
     p_index_clear.set_defaults(func=_cmd_index_clear)
     p_index.set_defaults(func=_cmd_index_missing)
 
+    # gold (group) — the ADR-0027 derived context packs (build/status). Issue #37.
+    p_gold = sub.add_parser("gold", help="manage derived gold context packs (_kb/gold/, ADR-0027)")
+    gold_sub = p_gold.add_subparsers(dest="gold_command", metavar="<subcommand>")
+    p_gold_build = gold_sub.add_parser("build", help="(re)build a gold pack from the curated wiki")
+    p_gold_build.add_argument("--repo", default=".", help="repo root (default: .)")
+    p_gold_build.add_argument("--pack", default="default", help="pack name (default: default)")
+    p_gold_build.add_argument(
+        "--check",
+        action="store_true",
+        help="verify the on-disk pack byte-matches a fresh rebuild (CI); write nothing",
+    )
+    p_gold_build.set_defaults(func=_cmd_gold_build)
+    p_gold_status = gold_sub.add_parser(
+        "status", help="show pack presence + freshness vs the curated tip"
+    )
+    p_gold_status.add_argument("--repo", default=".", help="repo root (default: .)")
+    p_gold_status.add_argument("--pack", default="default", help="pack name (default: default)")
+    p_gold_status.set_defaults(func=_cmd_gold_status)
+    p_gold.set_defaults(func=_cmd_gold_missing)
+
     # watch — the in-process scheduler loop (cron + threshold + idle).
     p_watch = sub.add_parser(
         "watch", help="run the curator scheduler loop (cron + threshold + idle triggers)"
@@ -796,6 +816,85 @@ def _cmd_index_missing(args: argparse.Namespace) -> int:
     return 2
 
 
+def _cmd_gold_build(args: argparse.Namespace) -> int:
+    """``agora gold build``: assemble + write the pack (or ``--check`` a byte-identical rebuild).
+
+    Explicit operator action (builds regardless of curation cadence). A pack is a pure function
+    of ``(curated commit, spec)``; ``--check`` assembles a fresh pack in memory and compares it to
+    on-disk bytes WITHOUT writing — a CI guard for the byte-identical-rebuild contract (ADR-0027
+    decision 3). ``--check`` exits non-zero when the pack is absent or has drifted (stale).
+    """
+    from .core.gold import PackAssembler, PackSpec, build_gold
+
+    repo = Repo.resolve(args.repo)
+    if not repo.is_initialized():
+        print(f"repo {repo.root}: not initialized (run 'agora repo init')")
+        return 1
+    spec = PackSpec(name=args.pack)
+    now = datetime.now(UTC)
+    if args.check:
+        try:
+            fresh = PackAssembler(repo).assemble(spec, generated_at=now).text
+            pack_path = repo.layout.gold_pack_path(spec.name)
+        except (GitError, ValueError) as exc:
+            print(f"gold: could not assemble ({exc})")
+            return 1
+        if not pack_path.is_file():
+            print(f"gold: pack {spec.name!r} absent ({pack_path}); run 'agora gold build'")
+            return 1
+        if pack_path.read_text(encoding="utf-8") == fresh:
+            print(f"gold: pack {spec.name!r} is byte-identical to a fresh rebuild")
+            return 0
+        print(f"gold: pack {spec.name!r} DIFFERS from a fresh rebuild (stale)")
+        return 1
+    try:
+        result = build_gold(repo, spec, generated_at=now)
+    except (GitError, ValueError) as exc:
+        print(f"gold: could not build ({exc})")
+        return 1
+    print(
+        f"gold: built pack {result.pack!r} ({result.note_count} notes, ~{result.est_tokens} "
+        f"tokens) at commit {result.curated_sha[:12]}"
+    )
+    print(f"  pack: {result.pack_path}")
+    return 0
+
+
+def _cmd_gold_status(args: argparse.Namespace) -> int:
+    """``agora gold status``: report pack presence + freshness vs the curated tip (ADR-0027)."""
+    from .core.gold import read_meta
+
+    repo = Repo.resolve(args.repo)
+    layout = repo.layout
+    print(f"repo: {layout.root}")
+    if not repo.is_initialized():
+        print("  gold: repo not initialized")
+        return 0
+    try:
+        commit: str | None = repo.branch_commit()
+    except GitError as exc:
+        print(f"  gold: cannot resolve curated tip ({exc})")
+        commit = None
+    meta = read_meta(layout, args.pack)
+    if meta is None:
+        print(f"  gold: pack {args.pack!r} absent/unreadable")
+        return 0
+    fresh = commit is not None and meta.curated_sha == commit
+    print(
+        f"  gold: {'FRESH' if fresh else 'STALE'} pack {meta.pack!r} "
+        f"({meta.note_count} notes, ~{meta.est_tokens}/{meta.budget_tokens} tokens) "
+        f"@ {meta.curated_sha[:12]} generated {meta.generated_at}"
+    )
+    if not fresh and commit is not None:
+        print(f"  tip={commit[:12]} — run 'agora gold build'")
+    return 0
+
+
+def _cmd_gold_missing(args: argparse.Namespace) -> int:
+    print("usage: agora gold <build|status> [--repo PATH] [--pack NAME] [--check]")
+    return 2
+
+
 def _cmd_doctor(args: argparse.Namespace) -> int:
     ok = True
     print("agora doctor")
@@ -846,6 +945,10 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
     # ADR-0012 §2 / issue #26: observability — the derived reader-cache state (present/fresh/stale).
     # Reporting only; never affects the health verdict and never crashes on malformed config.
     _doctor_index(layout)
+
+    # ADR-0027 / issue #37: observability — the derived gold-pack state + the §8 scan exclusion.
+    # Reporting only; never affects the health verdict and never crashes on malformed config.
+    _doctor_gold(layout)
 
     print(f"status: {'healthy' if ok else 'unhealthy'}")
     return 0 if ok else 1
@@ -928,6 +1031,37 @@ def _doctor_index(layout: RepoLayout) -> None:
     else:
         state = "stale"
     print(f"  index: enabled={policy.enabled} cache={state}")
+
+
+def _doctor_gold(layout: RepoLayout) -> None:
+    """Print the ADR-0027 gold-pack state (issue #37). Observability only — never crashes.
+
+    Shows whether the default pack is present + fresh (its stamped ``curated_sha`` == the live
+    curated tip) or stale/absent, and confirms the §8 ``_kb/gold/`` harvester scan exclusion. An
+    uninitialized repo / IO issue is noted, never fatal; it never affects the health verdict (an
+    absent pack degrades to no injection, not an error).
+    """
+    from .core.gold import DEFAULT_PACK, read_meta
+
+    repo = Repo(layout)
+    if not repo.is_initialized():
+        print("  gold: repo not initialized (no packs)")
+        return
+    try:
+        commit: str | None = repo.branch_commit()
+    except Exception:  # noqa: BLE001 — a git failure is not a doctor failure here.
+        commit = None
+    try:
+        meta = read_meta(layout, DEFAULT_PACK)
+    except Exception:  # noqa: BLE001 — any read issue → treat as no pack.
+        meta = None
+    if meta is None:
+        state = "absent"
+    elif commit is not None and meta.curated_sha == commit:
+        state = f"fresh ({meta.note_count} notes, ~{meta.est_tokens} tokens)"
+    else:
+        state = "stale"
+    print(f"  gold: pack={state} (harvester scan excludes _kb/gold/, §8)")
 
 
 def _doctor_routing(layout: RepoLayout, default_backend: str | None = None) -> None:

@@ -312,6 +312,11 @@ class Harvester:
                 dry_run=dry_run,
             )
 
+        # ADR-0027 §8 loop telemetry: count incoming candidates that near-duplicate the emitted gold
+        # pack's lines (the reworded-loop signal — ADR-0017 §5 is NOT claimed closed; the verbatim
+        # half is closed by span-drop, this instruments the rest). Best-effort + read-only.
+        scan_notes = scan.notes + self._gold_loop_notes(scan.facts)
+
         if dry_run:
             return ConnectorReport(
                 name=connector.name,
@@ -319,7 +324,7 @@ class Harvester:
                 scope=connector.scope.value,
                 status="ok",
                 facts_found=len(scan.facts),
-                notes=scan.notes,
+                notes=scan_notes,
                 dry_run=True,
                 preview=scan.facts,
             )
@@ -383,5 +388,32 @@ class Harvester:
             facts_found=len(scan.facts),
             written=written,
             deduped=deduped,
-            notes=scan.notes,
+            notes=scan_notes,
+        )
+
+    def _gold_loop_notes(self, facts: tuple[HarvestedFact, ...]) -> tuple[str, ...]:
+        """ADR-0027 §8 loop telemetry: near-duplicate count between the gold pack + incoming facts.
+
+        The reworded loop (ADR-0017 §5) is NOT claimed closed — an agent restating pack content in
+        its own words defeats the verbatim span-drop — so this instruments it: how many incoming
+        harvest candidates look like reworded emissions of the default gold pack. Best-effort +
+        read-only; a missing/unreadable pack or any error yields no note (never perturbs a harvest).
+        """
+        if not facts:
+            return ()
+        try:
+            from agora_kb.core.gold import DEFAULT_PACK, count_near_duplicates, pack_fact_lines
+
+            pack_path = self._layout.gold_pack_path(DEFAULT_PACK)
+            if not pack_path.is_file():
+                return ()
+            pack_lines = pack_fact_lines(pack_path.read_text(encoding="utf-8"))
+            dupes = count_near_duplicates(pack_lines, [f.text for f in facts])
+        except Exception:  # noqa: BLE001 — telemetry is best-effort; never perturb a harvest.
+            return ()
+        if not dupes:
+            return ()
+        return (
+            f"loop telemetry: {dupes} incoming candidate(s) near-duplicate the gold pack "
+            "(reworded-loop signal, ADR-0027 §8)",
         )

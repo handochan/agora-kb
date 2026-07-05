@@ -216,6 +216,31 @@ class AgoraHandlers:
                 "failed": state.counters.failed,
             },
             "failed": self._failed_count(),
+            "gold": self._gold_meta_row(),
+        }
+
+    def _gold_meta_row(self) -> dict[str, object]:
+        """The ADR-0027 gold-pack row for :meth:`status` — a CHEAP meta-sidecar read, NO git.
+
+        Reads only ``_kb/gold/<default>.meta.json`` (never assembles a pack, never resolves the
+        curated tip), so ``kb_status`` and the metrics scrape stay cheap. ``present=False`` when the
+        pack has never been built; freshness-vs-tip is intentionally NOT computed here (that needs a
+        git call) — the dashboard panel (:meth:`gold_status`) and ``agora gold status`` do that.
+        """
+        from agora_kb.core.gold import DEFAULT_PACK, read_meta
+
+        meta = read_meta(self._repo.layout, DEFAULT_PACK)
+        if meta is None:
+            return {"pack": DEFAULT_PACK, "present": False}
+        return {
+            "pack": meta.pack,
+            "present": True,
+            "note_count": meta.note_count,
+            "est_tokens": meta.est_tokens,
+            "budget_tokens": meta.budget_tokens,
+            "generated_at": meta.generated_at,
+            "curated_sha": meta.curated_sha,
+            "harvest_derived_share": meta.harvest_derived_share,
         }
 
     # --- dashboard (meta; read-only — DESIGN §5.3 / ADR-0003) -----------------------------------
@@ -366,6 +391,46 @@ class AgoraHandlers:
                 }
             )
         return {"enabled": enabled, "connectors": connectors}
+
+    def gold_status(self) -> dict[str, object]:
+        """Gold panel (DESIGN §5.3 medallion): the derived pack tier + its freshness vs silver.
+
+        The bronze/silver/gold panel's gold row: reads the ADR-0027 pack meta sidecar and resolves
+        the curated tip to mark the pack FRESH (``curated_sha`` == the live tip) or STALE. Unlike
+        the cheap :meth:`status` gold row (meta-only, no git), this panel may do one ``git
+        rev-parse``. Tolerant: an absent pack → ``present=False``; a git failure →
+        ``fresh=None`` (unknown) rather than crashing the read-only panel. ``bronze`` carries the
+        cheap tier context (inbox backlog already in :meth:`status`; silver lives in the KB-health
+        panel)."""
+        from agora_kb.core.gold import DEFAULT_PACK, read_meta
+
+        base = self.status()
+        meta = read_meta(self._repo.layout, DEFAULT_PACK)
+        gold: dict[str, object] = {"present": meta is not None, "pack": DEFAULT_PACK}
+        if meta is not None:
+            try:
+                commit: str | None = self._repo.branch_commit()
+            except Exception:  # noqa: BLE001 — a git failure leaves freshness unknown, not fatal.
+                commit = None
+            gold.update(
+                {
+                    "pack": meta.pack,
+                    "fresh": None if commit is None else meta.curated_sha == commit,
+                    "note_count": meta.note_count,
+                    "est_tokens": meta.est_tokens,
+                    "budget_tokens": meta.budget_tokens,
+                    "generated_at": meta.generated_at,
+                    "curated_sha": meta.curated_sha[:12],
+                    "harvest_derived_share": meta.harvest_derived_share,
+                }
+            )
+        return {
+            "bronze": {
+                "inbox_depth": base["inbox_depth"],
+                "processed_today": base["processed_today"],
+            },
+            "gold": gold,
+        }
 
     # --- graph (read; web face /graph viz — ADR-0003/0019 §7 / graph-plan) -----------------------
     def graph(

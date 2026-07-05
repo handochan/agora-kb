@@ -332,3 +332,59 @@ def test_polled_fragment_routes_return_partials(tmp_path: Path) -> None:
     assert harvester.status_code == 200
     assert "<!DOCTYPE html>" not in harvester.text
     assert "Harvesting is" in harvester.text
+
+
+# --- gold panel (ADR-0027, issue #37) -----------------------------------------------------------
+def _build_gold(repo: Repo) -> None:
+    from datetime import UTC, datetime
+
+    from agora_kb.core.gold import build_gold
+
+    build_gold(repo, generated_at=datetime.now(UTC))
+
+
+def test_gold_status_absent_before_build(tmp_path: Path) -> None:
+    repo = _init_repo(tmp_path)
+    panel = AgoraHandlers(repo).gold_status()
+    assert panel["gold"] == {"present": False, "pack": "default"}
+    assert "bronze" in panel
+    # kb_status carries the cheap meta-only gold row (present=False, no git).
+    assert AgoraHandlers(repo).status()["gold"] == {"pack": "default", "present": False}
+
+
+def test_gold_status_present_and_fresh_after_build(tmp_path: Path) -> None:
+    repo = _init_repo(tmp_path)
+    _write_corpus(tmp_path)
+    _build_gold(repo)
+    panel = AgoraHandlers(repo).gold_status()
+    gold = panel["gold"]
+    assert gold["present"] is True
+    assert gold["fresh"] is True  # meta.curated_sha == the (init) curated tip
+    assert gold["note_count"] >= 1
+    assert gold["budget_tokens"] == 2000
+    assert gold["harvest_derived_share"] == 0.0
+    # kb_status gold row is present + meta-only (no freshness key, since it does no git).
+    row = AgoraHandlers(repo).status()["gold"]
+    assert row["present"] is True and "fresh" not in row
+
+
+def test_api_dashboard_gold_route(tmp_path: Path) -> None:
+    repo = _init_repo(tmp_path)
+    _write_corpus(tmp_path)
+    _build_gold(repo)
+    resp = _client(tmp_path).get("/api/dashboard/gold")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["gold"]["present"] is True
+
+
+def test_dashboard_page_includes_gold_panel(tmp_path: Path) -> None:
+    repo = _init_repo(tmp_path)
+    _write_corpus(tmp_path)
+    _build_gold(repo)
+    body = _client(tmp_path).get("/dashboard").text
+    assert "Gold context pack" in body
+    assert 'hx-get="/dashboard/gold"' in body
+    # the fragment route renders the pack detail
+    frag = _client(tmp_path).get("/dashboard/gold").text
+    assert "fresh" in frag or "stale" in frag or "No gold pack" in frag

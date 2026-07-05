@@ -266,6 +266,13 @@ outcome is **Adopt**.
   (reserved ADR-0031, prerequisite for `mail:`/`chat:`).
 
 ## Implementation sketch (when adopted; ordered by risk)
+> **Status: Phases A + B SHIPPED in #37** (`core/gold.py`, `layout.gold_*`,
+> `repo.commit_committer_datetime`, `agora gold build|status|--check`, the §8 span-drop +
+> `_kb/gold/` scan exclusion + `agora doctor` line, the `worker.py` finalize best-effort rebuild,
+> the `kb_status` gold row + Prometheus `agora_gold_pack_*` gauges + the bronze/silver/gold
+> dashboard panel, and the §8 acceptance criteria: the near-duplicate shingle counter +
+> harvest-derived-share cap). Phases C–F remain future work.
+
 1. **Phase A (1–3 d) — the assembler + the outbound contract, together.** `core/gold.py`
    (`PackAssembler` + gold-score with commit-anchored decay), the CJK-aware estimator,
    `layout.py` `gold_dir`/`gold_pack_path` (traversal-guarded, mirroring `layout.py:142`),

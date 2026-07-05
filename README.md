@@ -120,8 +120,34 @@ runs URL/PDF/office extractors and writes the result through the inbox (the cura
 writer of `raw/`; ADR-0020), a first-class JSON API under `/api/*`, an interactive **`/graph`**
 knowledge graph (plus a per-note local/backlink graph; canvas drag/zoom/click → the note, vendored
 MIT force-graph, no Node — ADR-0021), a read-only **`/dashboard`**
-(KB health · curator · harvester status, HTMX-polled), and a Prometheus **`/metrics`** endpoint for
-external scraping. It binds to `127.0.0.1` by default and ships no authentication — keep it local.
+(KB health · curator · harvester · gold-pack status, HTMX-polled), and a Prometheus **`/metrics`**
+endpoint for external scraping. It binds to `127.0.0.1` by default and ships no authentication — keep
+it local.
+
+**Gold context packs (ADR-0027).** Above the searchable wiki, Agora assembles a **gold** tier: a
+small, token-budgeted, byte-stable slice of your highest-value theme notes, meant to be injected at
+agent session start (the CLAUDE.md-style standing context every CLI agent wants). It is a *pure,
+deterministic function of (curated commit, pack spec)* — reader-class code assembles verbatim summary
+lines; no LLM runs, nothing writes the wiki. The curator rebuilds it after each consolidation (it is
+never staler than the wiki), or build it explicitly:
+
+```bash
+uv run agora gold build --repo ~/my-kb      # → _kb/gold/default.md (+ .meta.json sidecar)
+uv run agora gold status --repo ~/my-kb     # presence + freshness vs the curated tip
+uv run agora gold build --check --repo ~/my-kb   # CI: verify byte-identical rebuild (exit 1 if drifted)
+```
+
+**Consume it pull-only** — add a one-line include to your agent config (the include itself is your
+standing consent; Agora never writes agent config dirs):
+
+```
+@~/my-kb/_kb/gold/default.md
+```
+
+Every pack is wrapped in an `<!-- agora:pack … -->` sentinel span that the harvester drops whole, so
+an injected pack round-trips to **zero** re-harvested facts, and harvest-origin notes are excluded
+from packs — gold can never become a prompt-injection amplifier (ADR-0027 §8). The MCP `kb_context`
+tool and web `/api/gold` consumption channels are a deferred follow-up (Phase C).
 
 ## Documentation
 

@@ -234,6 +234,44 @@ bump, never replayed in recovery) so it is best-effort + rebuildable, never an i
 each writer load-then-saves so neither clobbers the other. The connector name is sanitized to a safe filename
 (`file:claude-code` → `file-claude-code.json`, path-traversal-guarded).
 
+## 6a. Gold context pack + meta sidecar — `_kb/gold/<pack>.md` + `_kb/gold/<pack>.meta.json`
+
+A derived, git-ignored **context pack**: a small, token-budgeted, byte-stable slice of the wiki
+assembled for injection into agents ([ADR-0027](adr/0027-gold-context-packs.md), #37). v1 ships one
+implicit zero-config `default` pack. The pack **body** is a pure function of `(curated commit, pack
+spec)` and carries ONLY the `curated_sha` in its header (byte-identical rebuild is a regression-tested
+contract — prompt-cache economics depend on stable bytes), so the wall-clock `generated_at`/age and
+all provenance live in the sidecar:
+
+```json
+{
+  "schema_version": 1,
+  "pack": "default",
+  "curated_sha": "<full hex>",
+  "spec_hash": "<hex over budget/estimator/weights/algorithm-version>",
+  "generated_at": "2026-07-05T03:00:12Z",
+  "estimator": "cjk-v1",
+  "note_count": 42,
+  "est_tokens": 1873,
+  "budget_tokens": 2000,
+  "reference_instant": "2026-07-05T02:59:40Z",
+  "harvest_derived_share": 0.0,
+  "inputs": [{"path": "wiki/…/x.md", "content_sha256": "<hex>", "score": 0.71}]
+}
+```
+
+Like the harvester cursor (§6) and reader cache (ADR-0012 §2), the pack is **derived, rebuildable,
+never an integrity control**: a missing/corrupt sidecar reads as "no pack" and degrades to no
+injection (never a crash). The `(curated_sha, spec_hash)` pair is the invalidation key
+(fresh iff `curated_sha` == the live curated tip). Selection is a NEW deterministic gold-score
+(structural centrality + commit-anchored recency + status/confidence bucket + provenance density);
+harvest-origin notes are **default-excluded** (anti-injection). `reference_instant` records the
+curated commit's committer timestamp that anchored recency decay (determinism audit). The
+curator alone rebuilds it in finalize (best-effort, happy-path only, swallow+log — never perturbs a
+publish); faces gain their first non-inbox `_kb/` write here (the lazy read rebuild), bounded to
+these derived bytes. Every emitted pack is wrapped in the normative `<!-- agora:pack … -->` …
+`<!-- agora:pack:end … -->` sentinel (ADR-0027 §8) and the harvester drops the whole span.
+
 ## 7. Provenance & loop prevention
 
 Every wiki note records where its claims came from (`sources:` in note frontmatter, per the KB schema),

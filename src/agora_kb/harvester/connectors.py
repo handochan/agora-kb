@@ -72,6 +72,20 @@ _H1_RE = re.compile(r"\A#\s")
 # candidate bundle the planning brain reads (defense-in-depth; the curator's diff gate is the real
 # integrity boundary).
 _AGORA_SENTINEL_RE = re.compile(r"<!--\s*agora:[^>]*-->", re.IGNORECASE)
+# A full agora sentinel SPAN — an opening marker THROUGH its matching closing marker, INCLUSIVE
+# (ADR-0027 §8 consumer duty, the NET-NEW half of the outbound loop-break contract). The marker-only
+# strip above leaves the span CONTENT in place, which is insufficient: a harvested gold pack
+# (``agora:pack …`` … ``agora:pack:end …``) would re-enter as facts. So the whole span is removed
+# BEFORE the marker strip runs. The opener requires whitespace after ``pack`` (``agora:pack\s``) so
+# it matches only the true opener, never the ``:end`` closer; ``.*?`` reaches the FIRST real closer,
+# the producer's assembly-time neutralization (``gold._neutralize_sentinels``) defangs any forged
+# early closer so a hostile summary line cannot terminate the span early. The body-region family
+# (``agora:body:start`` … ``agora:body:end``) is covered symmetrically.
+_AGORA_SPAN_RE = re.compile(
+    r"<!--\s*agora:pack\s[^>]*-->.*?<!--\s*agora:pack:end\b[^>]*-->"
+    r"|<!--\s*agora:body:start\b[^>]*-->.*?<!--\s*agora:body:end\b[^>]*-->",
+    re.IGNORECASE | re.DOTALL,
+)
 # Glob magic characters: the "base root" is the longest leading path prefix free of these chars.
 _GLOB_MAGIC = set("*?[")
 
@@ -500,6 +514,11 @@ class FileConnector:
             if not _within(resolved, resolved_root):
                 notes.append(f"skipped {raw!r}: resolves outside {root} (symlink-escape guard)")
                 continue
+            if _is_within_gold(resolved):
+                # ADR-0027 §8 path exclusion: a derived gold pack under _kb/gold/ is Agora's OWN
+                # emission — harvesting it would close the loop. Skip it whole, regardless of glob.
+                notes.append(f"skipped {raw!r}: excluded gold-pack path (_kb/gold/, ADR-0027 §8)")
+                continue
             if not resolved.is_file():
                 continue
             try:
@@ -516,7 +535,10 @@ class FileConnector:
                 notes.append(f"{raw!r} was not valid UTF-8; decoded with replacement")
             except OSError:
                 continue
-            out.append((resolved, text))
+            # Strip whole agora sentinel SPANS from the file text BEFORE segmentation (ADR-0027 §8):
+            # a pack spans multiple markdown blocks, so a per-fact strip would miss its bullets; the
+            # no-op hash then also covers span-free text, so a pack edit never re-triggers harvest.
+            out.append((resolved, _strip_sentinel_spans(text)))
         if not had_raw:
             # Distinguish a genuine zero-match from "matched but all skipped" (a safety/size skip
             # already emitted its own, unambiguous note) so the security signal is not muddied.
@@ -593,15 +615,26 @@ def _segment(text: str) -> list[str]:
     return blocks
 
 
+def _strip_sentinel_spans(text: str) -> str:
+    """Remove whole agora sentinel SPANS (open marker → close marker inclusive) — ADR-0027 §8.
+
+    The NET-NEW consumer duty: a harvested gold pack (or a body-region span) is removed ENTIRELY so
+    it contributes zero facts, closing the verbatim half of the loop (ADR-0027 §8, ADR-0017
+    §5). This runs BEFORE the marker-only :func:`_neutralize` strip.
+    """
+    return _AGORA_SPAN_RE.sub("", text)
+
+
 def _neutralize(text: str) -> str:
     """Strip agora structural sentinels from untrusted harvested text (defense-in-depth, ADR-0017).
 
-    Removes the curator's body-region marker comments (``<!-- agora:body:… -->``) so a poisoned
-    memory bullet cannot inject a fake region into the candidate bundle. The candidate text is
-    already treated as untrusted DATA by the planning prompt (INGEST-CONTRACT §8) and the curator's
-    deterministic diff gate is the real integrity boundary; this is a cheap extra layer.
+    First removes whole agora SPANS (:func:`_strip_sentinel_spans`, ADR-0027 §8 — a pack/body span
+    is dropped content-and-all), THEN strips any residual lone marker comments (``<!-- agora: -->``)
+    a poisoned memory bullet cannot inject a fake region into the candidate bundle. The candidate
+    text is already treated as untrusted DATA by the planning prompt (INGEST-CONTRACT §8) and the
+    curator's deterministic diff gate is the real integrity boundary; this is a cheap extra layer.
     """
-    return _AGORA_SENTINEL_RE.sub("", text)
+    return _AGORA_SENTINEL_RE.sub("", _strip_sentinel_spans(text))
 
 
 def _clean_link_path(raw: str) -> str | None:
@@ -753,3 +786,14 @@ def _within(path: Path, root: Path) -> bool:
         return True
     except ValueError:
         return False
+
+
+def _is_within_gold(path: Path) -> bool:
+    """True iff ``path`` lives under a ``_kb/gold/`` directory (the ADR-0027 §8 scan exclusion).
+
+    Matches consecutive path parts ``_kb`` then ``gold`` anywhere in the resolved path, so a gold
+    pack a connector's glob covers is excluded from harvesting regardless of where the repo
+    is checked out.
+    """
+    parts = path.parts
+    return any(parts[i] == "_kb" and parts[i + 1] == "gold" for i in range(len(parts) - 1))

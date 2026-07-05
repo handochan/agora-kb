@@ -1,0 +1,40 @@
+{# Gold-pack panel fragment (DESIGN §5.3 medallion / ADR-0027, issue #37). The pack is a derived,
+   rebuildable tier; this reads its meta sidecar only (cheap, no assemble). Freshness = curation
+   cadence (decision 6): a pack is stale only until the next curator run rebuilds it. #}
+<p class="medallion muted">
+  bronze (inbox {{ panel.bronze.inbox_depth }}, processed today {{ panel.bronze.processed_today }})
+  → silver (curated wiki — see KB health) → gold (below)
+</p>
+
+{% if panel.gold.present %}
+  <table class="gold">
+    <tbody>
+      <tr><th>Pack</th><td class="mono">{{ panel.gold.pack }}</td></tr>
+      <tr>
+        <th>Freshness</th>
+        <td>
+          {% if panel.gold.fresh is none %}
+            <span class="warn">unknown</span>
+          {% elif panel.gold.fresh %}
+            <strong class="ok">fresh</strong>
+          {% else %}
+            <strong class="warn">stale</strong>
+          {% endif %}
+          <span class="mono">@ {{ panel.gold.curated_sha }}</span>
+        </td>
+      </tr>
+      <tr><th>Notes</th><td>{{ panel.gold.note_count }}</td></tr>
+      <tr>
+        <th>Size</th>
+        <td>~{{ panel.gold.est_tokens }} / {{ panel.gold.budget_tokens }} tokens</td>
+      </tr>
+      <tr>
+        <th>Harvest-derived</th>
+        <td>{{ (panel.gold.harvest_derived_share * 100) | round(0) | int }}%</td>
+      </tr>
+      <tr><th>Built</th><td class="mono">{{ panel.gold.generated_at }}</td></tr>
+    </tbody>
+  </table>
+{% else %}
+  <p class="empty">No gold pack built yet (run <code>agora gold build</code> or curate).</p>
+{% endif %}

@@ -23,7 +23,7 @@ extra installed; a missing dependency surfaces as a clear HTTP 503 with an insta
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 from agora_kb.core import Repo
@@ -181,6 +181,55 @@ class AgoraCollector:
         yield accepted
         yield rejected
         yield last_scan
+
+        # --- gold pack gauges (ADR-0027 / #37) ---------------------------------------------------
+        # Cheap: the `gold` row is read from the pack's meta sidecar (no assemble, no git — the
+        # status() row is meta-only). Age is derived from the recorded build instant at scrape time
+        # (freshness = curation cadence, ADR-0027 decision 6); everything is omitted when no pack
+        # has been built yet.
+        gold = status["gold"]
+        if isinstance(gold, dict) and gold.get("present"):
+            pack = str(gold.get("pack", "default"))
+            note_count = GaugeMetricFamily(
+                "agora_gold_pack_note_count",
+                "Notes assembled into a gold context pack.",
+                labels=["pack"],
+            )
+            note_count.add_metric([pack], float(gold["note_count"]))  # type: ignore[arg-type]
+            yield note_count
+            est_tokens = GaugeMetricFamily(
+                "agora_gold_pack_est_tokens",
+                "Estimated token size of a gold context pack (script-aware estimator).",
+                labels=["pack"],
+            )
+            est_tokens.add_metric([pack], float(gold["est_tokens"]))  # type: ignore[arg-type]
+            yield est_tokens
+            harvest_share = GaugeMetricFamily(
+                "agora_gold_pack_harvest_derived_share",
+                "Fraction of a gold pack that is harvest-derived (ADR-0027 §8 cap telemetry).",
+                labels=["pack"],
+            )
+            harvest_share.add_metric(
+                [pack],
+                float(gold["harvest_derived_share"]),  # type: ignore[arg-type]
+            )
+            yield harvest_share
+            generated = _iso_to_epoch(gold.get("generated_at"))  # type: ignore[arg-type]
+            if generated is not None:
+                gen_ts = GaugeMetricFamily(
+                    "agora_gold_pack_generated_timestamp_seconds",
+                    "Unix time a gold pack was last built.",
+                    labels=["pack"],
+                )
+                gen_ts.add_metric([pack], generated)
+                yield gen_ts
+                age = GaugeMetricFamily(
+                    "agora_gold_pack_age_seconds",
+                    "Seconds since a gold pack was last built (freshness = curation cadence).",
+                    labels=["pack"],
+                )
+                age.add_metric([pack], max(0.0, datetime.now(UTC).timestamp() - generated))
+                yield age
 
 
 def render_latest(repo: Repo) -> tuple[bytes, str]:

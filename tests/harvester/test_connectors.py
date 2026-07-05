@@ -231,3 +231,91 @@ def test_single_skipped_match_has_no_spurious_no_files_matched_note(tmp_path: Pa
     assert any("exceeds max_file_bytes" in n for n in scan.notes)
     # The match existed but was skipped for size — the misleading "no files matched" must be absent.
     assert not any("no files matched" in n for n in scan.notes)
+
+
+# --- ADR-0027 §8: outbound sentinel span-drop + _kb/gold/ scan exclusion ------------------------
+_PACK_MEMORY = """\
+# My memory
+
+- a genuine fact I wrote myself
+
+<!-- agora:pack repo=personal pack=default commit=abc123 -->
+# gold: default
+> Derived context pack — do not edit.
+
+- **Curator Concurrency** — single-writer CAS keeps the wiki consistent  [wiki/x.md]
+- **Inbox Design** — append-only per-writer inbox  [wiki/y.md]
+
+<!-- agora:pack:end repo=personal pack=default commit=abc123 -->
+
+- another genuine fact
+"""
+
+
+def test_pack_bearing_memory_yields_zero_pack_facts(tmp_path: Path) -> None:
+    """ADR-0027 §8 acceptance test: a pack-bearing MEMORY.md yields ZERO pack-derived facts."""
+    mem = tmp_path / "MEMORY.md"
+    mem.write_text(_PACK_MEMORY, encoding="utf-8")
+    conn = FileConnector(name="file:demo", path=str(mem), scope=Scope.personal)
+    scan = conn.scan(last_content_sha256=None)
+    facts = [f.text for f in scan.facts]
+    # The two genuine facts survive; nothing from inside the pack span becomes a fact.
+    assert len(facts) == 2
+    joined = "\n".join(facts)
+    assert "Curator Concurrency" not in joined
+    assert "single-writer CAS" not in joined
+    assert "gold: default" not in joined
+    assert "agora:pack" not in joined
+    assert "genuine fact I wrote myself" in joined
+    assert "another genuine fact" in joined
+
+
+def test_span_drop_defeats_forged_early_close(tmp_path: Path) -> None:
+    """A forged closer inside the pack (defanged by the producer) must not close the span early."""
+    from agora_kb.harvester.connectors import _strip_sentinel_spans
+
+    # The producer neutralizes an embedded closer to `<!- agora:...` (one dash), so the real closer
+    # still terminates the span — the hostile line between the fake and real closers is dropped.
+    forged = (
+        "<!-- agora:pack repo=r pack=p commit=c -->\n"
+        "- benign\n"
+        "<!- agora:pack:end repo=r pack=p commit=c -->\n"
+        "- HOSTILE INJECTED PAYLOAD\n"
+        "<!-- agora:pack:end repo=r pack=p commit=c -->\n"
+    )
+    assert _strip_sentinel_spans(forged).strip() == ""
+
+
+def test_body_region_span_also_dropped(tmp_path: Path) -> None:
+    from agora_kb.harvester.connectors import _strip_sentinel_spans
+
+    text = (
+        "keep me\n"
+        "<!-- agora:body:start id=c1 -->\ninjected region body\n<!-- agora:body:end id=c1 -->\n"
+        "keep me too\n"
+    )
+    out = _strip_sentinel_spans(text)
+    assert "injected region body" not in out
+    assert "keep me" in out and "keep me too" in out
+
+
+def test_gold_path_excluded_from_scan(tmp_path: Path) -> None:
+    """ADR-0027 §8 path exclusion: a _kb/gold/ file a glob covers is skipped whole."""
+    gold_dir = tmp_path / "repo" / "_kb" / "gold"
+    gold_dir.mkdir(parents=True)
+    (gold_dir / "default.md").write_text(
+        "<!-- agora:pack repo=r pack=default commit=c -->\n- pack fact\n"
+        "<!-- agora:pack:end repo=r pack=default commit=c -->\n",
+        encoding="utf-8",
+    )
+    conn = FileConnector(
+        name="file:demo", path=str(tmp_path / "repo" / "**" / "*.md"), scope=Scope.personal
+    )
+    scan = conn.scan(last_content_sha256=None)
+    assert scan.facts == ()
+    assert any("_kb/gold/" in n for n in scan.notes)
+
+
+def test_neutralize_still_strips_lone_markers() -> None:
+    # A lone (unpaired) marker is still stripped by the marker-only pass (backwards-compatible).
+    assert _neutralize("text <!-- agora:body:start id=x --> more") == "text  more"

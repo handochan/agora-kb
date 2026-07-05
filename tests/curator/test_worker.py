@@ -270,6 +270,38 @@ def test_finalize_rebuilds_index_cache_after_publish(tmp_path: Path) -> None:
     assert Wiki(layout).query("curator concurrency").status == "ok"
 
 
+def test_finalize_rebuilds_gold_pack_after_publish(tmp_path: Path) -> None:
+    """ADR-0027 §2a / issue #37: a successful (synced) publish rebuilds the derived gold pack.
+
+    The pack is built best-effort in finalize AFTER the owner working copy is synced to the new
+    curated tip, so it is present, fresh (its sidecar stamped with the published commit), and no
+    ``gold_unbuilt`` signal is raised on the happy path. The published theme appears in the pack.
+    """
+    from agora_kb.core.gold import read_meta
+
+    repo = _init_repo(tmp_path)
+    layout = repo.layout
+    inbox = Inbox(layout)
+    e1 = _write_capture(inbox, text="One curator advances the branch under a lock.", second=10)
+    _seed_raw(repo, e1)
+    backend = FakeBackend(
+        _create_theme_plan("ignored", "c1", e1),
+        prose={region_sentinel_id("ignored", "c1"): "The single curator holds a per-repo flock."},
+    )
+
+    report = _run(repo, backend)
+
+    assert report.status == "published"
+    assert "gold_unbuilt" not in report.counts
+    pack_path = layout.gold_pack_path("default")
+    assert pack_path.is_file()
+    meta = read_meta(layout)
+    assert meta is not None
+    assert meta.curated_sha == report.published_commit
+    # The freshly-curated theme is in the pack (it is an active, non-harvest theme).
+    assert "Curator concurrency model" in pack_path.read_text(encoding="utf-8")
+
+
 def test_routed_backend_runs_plan_and_author_on_distinct_brains(tmp_path: Path) -> None:
     """ADR-0015: a :class:`RoutedBackend` runs PASS-1 on the ``plan`` brain and PASS-2 on the
     ``author`` brain, and the worker publishes EXACTLY as for a single backend — proving routing is
@@ -421,6 +453,10 @@ def test_sync_failure_after_publish_does_not_unpublish_or_unfinalize(tmp_path: P
     # cache is written for this run (the read path full-scans until a later synced run rebuilds it).
     assert report.counts.get("index_cache_unbuilt") == 1
     assert not layout.index_notes_path().is_file()
+    # ADR-0027 / #37: gold rebuild is skipped for the same reason (the `not synced` short-circuit),
+    # surfaced as gold_unbuilt with no pack written (a later synced run rebuilds it).
+    assert report.counts.get("gold_unbuilt") == 1
+    assert not layout.gold_pack_path("default").is_file()
     # state + manifest reflect a finalized publish (the sync failure un-did neither).
     state = StateStore(layout).load()
     assert state.published_runs[report.run_id] == new_tip

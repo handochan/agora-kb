@@ -133,6 +133,40 @@ class RepoLayout:
         return self.kb_dir / "index"
 
     @property
+    def gold_dir(self) -> Path:
+        """Derived gold context-pack directory ``_kb/gold/`` (ADR-0027, issue #37).
+
+        Git-ignored, NEVER canonical, a pure function of ``(curated commit, pack spec)`` and fully
+        rebuildable from the wiki (invariant #1) — same derived-state posture as ``_kb/harvest/``
+        (cursor) and ``_kb/index/`` (reader cache), DATA-MODEL §6. Holds one ``<pack>.md`` pack plus
+        its ``<pack>.meta.json`` sidecar per pack. Not created here (this module only computes
+        paths); the writer mkdirs before writing.
+        """
+        return self.kb_dir / "gold"
+
+    def gold_pack_path(self, pack: str) -> Path:
+        """Path of one gold pack ``_kb/gold/<pack>.md`` (ADR-0027 decision 3, issue #37).
+
+        ``pack`` is the pack name (v1 ships an implicit ``default`` pack). It is validated as a safe
+        single path component (:func:`safe_path_component`) BEFORE the extension is appended, so a
+        malformed/hostile pack name can never escape ``_kb/gold/`` — the same path-traversal guard
+        the inbox / harvest / index namespaces use (DESIGN §7).
+        """
+        stem = safe_path_component(pack)
+        return self.gold_dir / f"{stem}.md"
+
+    def gold_meta_path(self, pack: str) -> Path:
+        """Path of a gold pack's sidecar meta ``_kb/gold/<pack>.meta.json`` (ADR-0027 decision 3).
+
+        The sidecar carries the wall-clock ``generated_at``/age, the ``(curated_sha, spec_hash)``
+        invalidation key, and the per-input provenance — everything the byte-identical pack body
+        must NOT carry so its bytes stay stable on rebuild (prompt-cache economics). ``pack`` is
+        validated as a safe path component (as in :meth:`gold_pack_path`) before the extension.
+        """
+        stem = safe_path_component(pack)
+        return self.gold_dir / f"{stem}.meta.json"
+
+    @property
     def state_file(self) -> Path:
         return self.kb_dir / "state.json"
 

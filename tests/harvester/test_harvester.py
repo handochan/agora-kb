@@ -398,3 +398,45 @@ def test_followed_same_sibling_dedupes_through_inbox(tmp_path: Path) -> None:
     cr = report.connectors[0]
     assert cr.written == 1 and cr.deduped == 1
     assert len(_read_inbox(layout)) == 1
+
+
+def test_gold_loop_telemetry_counts_pack_echo(tmp_path: Path) -> None:
+    """ADR-0027 §8 loop telemetry: an incoming candidate echoing a gold-pack line is counted.
+
+    Span-drop closes the VERBATIM-span half (a whole pack span → zero facts); a lone pack BULLET
+    copied into an agent's memory is not a span, so it re-enters as a candidate — the near-duplicate
+    (shingle) counter instruments exactly that. A note is surfaced; it never blocks the harvest.
+    """
+    layout = RepoLayout(tmp_path)
+    pack = layout.gold_pack_path("default")
+    pack.parent.mkdir(parents=True, exist_ok=True)
+    pack.write_text(
+        "<!-- agora:pack repo=personal pack=default commit=c -->\n"
+        "# gold: default\n"
+        "- **Curator Concurrency** — single-writer CAS keeps the wiki consistent  [wiki/x.md]\n"
+        "<!-- agora:pack:end repo=personal pack=default commit=c -->\n",
+        encoding="utf-8",
+    )
+    policy = HarvestPolicy(enabled=True, scope_lock="personal", repo_kind="personal")
+    line = "- **Curator Concurrency** — single-writer CAS keeps the wiki consistent  [wiki/x.md]"
+    conn = FakeConnector("file:a", "a", Scope.personal, [_fact(line)])
+    report = Harvester(layout).run([conn], policy=policy, now=FIXED)
+    assert any("loop telemetry" in n for n in report.connectors[0].notes)
+
+
+def test_gold_loop_telemetry_silent_when_no_echo(tmp_path: Path) -> None:
+    layout = RepoLayout(tmp_path)
+    pack = layout.gold_pack_path("default")
+    pack.parent.mkdir(parents=True, exist_ok=True)
+    pack.write_text(
+        "<!-- agora:pack repo=personal pack=default commit=c -->\n"
+        "- **Curator Concurrency** — single-writer CAS keeps the wiki consistent  [wiki/x.md]\n"
+        "<!-- agora:pack:end repo=personal pack=default commit=c -->\n",
+        encoding="utf-8",
+    )
+    policy = HarvestPolicy(enabled=True, scope_lock="personal", repo_kind="personal")
+    conn = FakeConnector(
+        "file:a", "a", Scope.personal, [_fact("- an entirely unrelated observation about widgets")]
+    )
+    report = Harvester(layout).run([conn], policy=policy, now=FIXED)
+    assert not any("loop telemetry" in n for n in report.connectors[0].notes)
