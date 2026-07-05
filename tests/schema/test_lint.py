@@ -920,3 +920,12 @@ def test_lint_max_orphans_under_threshold_no_finding(tmp_path: Path) -> None:
     # 1 orphan <= max_orphans=5 → no finding.
     result = lint(layout, taxonomy=_TAXONOMY, run_date=RUN_DATE, max_orphans=5)
     assert all(f.code != "L2-1" for f in result.findings)
+
+
+def test_lint_max_orphans_exact_boundary_no_finding(tmp_path: Path) -> None:
+    """orphans == max_orphans does NOT emit: 'exceed' is strictly-greater (locks `>` vs a `>=` slip;
+    max_orphans is the max ALLOWED, so a count equal to it is within budget)."""
+    layout = _valid_repo(tmp_path)
+    _add_orphan_theme(layout)  # exactly 1 orphan
+    result = lint(layout, taxonomy=_TAXONOMY, run_date=RUN_DATE, max_orphans=1)
+    assert all(f.code != "L2-1" for f in result.findings)

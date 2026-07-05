@@ -23,6 +23,7 @@ from pathlib import Path
 
 import pytest
 
+import agora_kb.curator.worker as worker_mod
 from agora_kb.core import frontmatter
 from agora_kb.core.ids import new_event_id
 from agora_kb.core.inbox import Inbox
@@ -133,6 +134,55 @@ def _run(repo: Repo, backend: Backend, *, now: datetime = NOW) -> RunReport:
         now=now,
         taxonomy=TAXONOMY,
     )
+
+
+def test_run_forwards_related_k_and_max_orphans_to_bundle_and_lint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """worker.run threads related_k → build_bundle and max_orphans → lint (the shared seam all three
+    faces feed through run→_run_locked). Locks the forwarding so a dropped kwarg cannot silently
+    revert an operator's curator.limits.related_k / curator.lint.max_orphans to the default."""
+    repo = _init_repo(tmp_path)
+    layout = repo.layout
+    inbox = Inbox(layout)
+    e1 = _write_capture(inbox, text="One curator advances the branch under a lock.", second=10)
+    _seed_raw(repo, e1)
+
+    backend = FakeBackend(
+        _create_theme_plan("ignored", "c1", e1),
+        prose={region_sentinel_id("ignored", "c1"): "The single curator holds a per-repo flock."},
+    )
+
+    seen_related: list[int] = []
+    seen_orphans: list[int | None] = []
+    orig_bundle = worker_mod.build_bundle
+    orig_lint = worker_mod.lint
+
+    def bundle_spy(*args, **kwargs):  # type: ignore[no-untyped-def]
+        seen_related.append(kwargs.get("related_k"))
+        return orig_bundle(*args, **kwargs)
+
+    def lint_spy(*args, **kwargs):  # type: ignore[no-untyped-def]
+        seen_orphans.append(kwargs.get("max_orphans"))
+        return orig_lint(*args, **kwargs)
+
+    monkeypatch.setattr(worker_mod, "build_bundle", bundle_spy)
+    monkeypatch.setattr(worker_mod, "lint", lint_spy)
+
+    report = run(
+        repo,
+        backend=backend,
+        state_store=StateStore(layout),
+        now=NOW,
+        taxonomy=TAXONOMY,
+        related_k=3,
+        max_orphans=0,
+    )
+    assert (
+        report.status == "published"
+    )  # the run reached BOTH sinks (bundle before, lint after apply)
+    assert seen_related == [3]  # build_bundle received the operator's related_k, not the default 8
+    assert seen_orphans == [0]  # lint received the operator's max_orphans, not the default None
 
 
 # --- (1) HAPPY PATH -----------------------------------------------------------------------------

@@ -499,6 +499,46 @@ def test_watch_once_runs_when_threshold_met(
 
 
 @requires_git
+def test_watch_threads_curator_thresholds_into_worker_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The `agora watch` tick reads curator.limits.related_k / curator.lint.max_orphans from
+    repo.yaml and forwards them into worker.run — locks the face glue, not just the worker seam."""
+    import agora_kb.cli as cli_mod
+
+    target = tmp_path / "kb"
+    layout = _init_stub_repo(target)
+    repo_yaml = layout.kb_dir / "repo.yaml"
+    doc = yaml.safe_load(repo_yaml.read_text(encoding="utf-8"))
+    doc["curator"]["triggers"]["threshold"] = 1  # one backlog item makes the tick consolidate
+    doc["curator"]["limits"] = {"related_k": 5}
+    doc["curator"]["lint"] = {"max_orphans": 7}
+    repo_yaml.write_text(yaml.safe_dump(doc, sort_keys=False), encoding="utf-8")
+
+    Inbox(layout).write(
+        text="One curator advances the branch under a lock.",
+        writer="dochan",
+        source="claude-code",
+        domain="ai-tech",
+        now=datetime(2026, 6, 13, 2, 40, 10, tzinfo=UTC),
+    )
+
+    seen: dict[str, object] = {}
+    orig_run = cli_mod.run
+
+    def run_spy(*args, **kwargs):  # type: ignore[no-untyped-def]
+        seen.update(kwargs)
+        return orig_run(*args, **kwargs)
+
+    monkeypatch.setattr(cli_mod, "run", run_spy)
+    capsys.readouterr()
+
+    assert main(["watch", "--repo", str(target), "--once"]) == 0
+    assert seen.get("related_k") == 5  # the watch face forwarded repo.yaml's related_k
+    assert seen.get("max_orphans") == 7  # ...and max_orphans
+
+
+@requires_git
 def test_watch_once_runs_on_cron_due(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     """A cron matching every minute fires `watch --once` (reason=cron) with a backlog present."""
     target = tmp_path / "kb"
