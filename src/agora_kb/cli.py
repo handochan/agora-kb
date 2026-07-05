@@ -718,7 +718,6 @@ def _cmd_index_build(args: argparse.Namespace) -> int:
 
     Explicit operator action: builds regardless of the ``index.enabled`` READ-path kill-switch
     (that flag gates whether the read path CONSUMES the cache, not whether one may build it).
-    Only builds the optional FTS5 prefilter when ``index.fts5: on`` and FTS5 is available.
     """
     from .core.wiki import build_cache
 
@@ -733,12 +732,11 @@ def _cmd_index_build(args: argparse.Namespace) -> int:
         return 1
     print(f"index: built {result.note_count} notes at commit {result.curated_commit[:12]}")
     print(f"  notes cache: {result.notes_path}")
-    print(f"  fts5 prefilter: {'built' if result.fts_built else 'off'}")
     return 0
 
 
 def _cmd_index_status(args: argparse.Namespace) -> int:
-    """``agora index status``: report cache presence, freshness vs curated tip, accelerators."""
+    """``agora index status``: report cache presence + freshness vs the curated tip."""
     from .core import index_cache
 
     repo = Repo.resolve(args.repo)
@@ -754,12 +752,11 @@ def _cmd_index_status(args: argparse.Namespace) -> int:
         commit = None
     try:
         policy = load_index_policy(layout)
-        print(f"  enabled={policy.enabled} fts5={policy.fts5} ripgrep={policy.ripgrep}")
+        print(f"  enabled={policy.enabled}")
     except ConfigError as exc:
         print(f"  config: ERROR ({exc})")
     try:
         notes_path = layout.index_notes_path()
-        fts_path = layout.index_fts_path()
     except Exception as exc:  # noqa: BLE001 — an unsafe repo name means no usable cache path.
         print(f"  cache: unavailable ({exc})")
         return 0
@@ -772,11 +769,6 @@ def _cmd_index_status(args: argparse.Namespace) -> int:
         cached = payload.curated_commit[:12]
         tip = commit[:12] if commit else "?"
         print(f"  cache: STALE ({len(payload.notes)} notes; cache={cached} tip={tip})")
-    print(
-        f"  fts5 db: {'present' if fts_path.is_file() else 'absent'}; "
-        f"fts5 supported={index_cache.probe_fts5()}; "
-        f"ripgrep={'available' if index_cache.ripgrep_available() else 'absent'}"
-    )
     return 0
 
 
@@ -784,19 +776,18 @@ def _cmd_index_clear(args: argparse.Namespace) -> int:
     """``agora index clear``: remove the reader-cache artifacts (rebuilt on next build/curate)."""
     layout = RepoLayout(Path(args.repo))
     try:
-        paths = [layout.index_notes_path(), layout.index_fts_path()]
+        notes_path = layout.index_notes_path()
     except Exception as exc:  # noqa: BLE001 — unsafe repo name → no cache path to clear.
         print(f"index: no cache to clear ({exc})")
         return 0
-    removed: list[str] = []
-    for p in paths:
-        try:
-            if p.is_file():
-                p.unlink()
-                removed.append(p.name)
-        except OSError as exc:
-            print(f"index: could not remove {p} ({exc})")
-    print(f"index: cleared {', '.join(removed) if removed else 'nothing (no cache present)'}")
+    try:
+        if notes_path.is_file():
+            notes_path.unlink()
+            print(f"index: cleared {notes_path.name}")
+        else:
+            print("index: cleared nothing (no cache present)")
+    except OSError as exc:
+        print(f"index: could not remove {notes_path} ({exc})")
     return 0
 
 
@@ -906,11 +897,10 @@ def _doctor_connectors(layout: RepoLayout) -> None:
 def _doctor_index(layout: RepoLayout) -> None:
     """Print the ADR-0012 §2 reader-cache state (issue #26). Observability only — never crashes.
 
-    Shows the ``index.enabled`` kill-switch, whether the cache is present + fresh (its stamped
-    ``curated_commit`` == the live curated tip) or stale/absent, and — for any opted-in accelerator
-    (``index.fts5``/``index.ripgrep`` == ``on``) — whether it is actually available on this host. A
-    malformed ``repo.yaml`` or an uninitialized repo is noted, never fatal; it never affects the
-    health verdict (a missing cache degrades to a full scan, not an error).
+    Shows the ``index.enabled`` kill-switch and whether the cache is present + fresh (its stamped
+    ``curated_commit`` == the live curated tip) or stale/absent. A malformed ``repo.yaml`` or an
+    uninitialized repo is noted, never fatal; it never affects the health verdict (a missing cache
+    degrades to a full scan, not an error).
     """
     from .core import index_cache
 
@@ -937,13 +927,7 @@ def _doctor_index(layout: RepoLayout) -> None:
         state = f"fresh ({len(payload.notes)} notes)"
     else:
         state = "stale"
-    accel: list[str] = []
-    if policy.fts5 == "on":
-        accel.append(f"fts5={'ok' if index_cache.probe_fts5() else 'unavailable'}")
-    if policy.ripgrep == "on":
-        accel.append(f"ripgrep={'ok' if index_cache.ripgrep_available() else 'unavailable'}")
-    suffix = f" [{' '.join(accel)}]" if accel else ""
-    print(f"  index: enabled={policy.enabled} cache={state}{suffix}")
+    print(f"  index: enabled={policy.enabled} cache={state}")
 
 
 def _doctor_routing(layout: RepoLayout, default_backend: str | None = None) -> None:

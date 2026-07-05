@@ -1,13 +1,15 @@
 """Tests for the ADR-0012 §2/§9 derived reader cache (issue #26).
 
-The load-bearing contract is BYTE-IDENTICAL query output whether the cache is absent, present, or
-built with any of the three prefilters (in-memory inverted index / FTS5 / ripgrep). The pure-Python
-scan stays the oracle; the cache only skips re-parsing unchanged files and prunes the scoring loop.
+The load-bearing contract is BYTE-IDENTICAL query output whether the cache is absent or present. The
+pure-Python scan stays the oracle; the cache only skips re-parsing unchanged files and prunes the
+scoring loop via the exact in-memory inverted index (the ADR-0012 §9 FTS5/ripgrep candidate
+accelerators are deferred to a load-avoiding reader — issue #28).
 
 The fixture is a git-initialized repo (``branch_commit()`` must resolve to key the cache) carrying
-the ADR-0012 §10 corpus PLUS a note whose title is derived from its basename (no H1, no frontmatter
-``title:``) — the case that a ripgrep content-prefilter alone would miss and that the exact
-title-token union in ``_lexical_candidate_paths`` must recover (parity guard for that fix).
+the ADR-0012 §10 corpus PLUS a basename-derived-title note and an abutting-links note whose only
+lexical token is TOKENIZER-SYNTHESIZED — cases a raw-bytes accelerator would miss but the exact
+inverted index (fed the tokenizer output) returns, guarding against the parity class the adversarial
+review found in the deferred ripgrep prefilter.
 """
 
 from __future__ import annotations
@@ -44,17 +46,25 @@ INBOX_DESIGN = (
     "The inbox is append-only and per-writer namespaced.\n"
 )
 # A note with NO H1 and NO frontmatter title: its title tokens come from the BASENAME
-# ("zephyrquux topic"), which are ABSENT from the file text — the ripgrep-content gap the
-# title-token union must recover so ripgrep parity holds.
+# ("zephyrquux topic"), which are ABSENT from the file text — proves the exact inverted index
+# (built from field_tokens) returns it even though a raw-bytes accelerator could not.
 BASENAME_TITLE_NOTE = "---\nstatus: active\n---\n\nSome body prose without the rare term.\n"
 
-# Query battery: a hit, a not_found, a heading match, a lexical match, and the basename-title term.
+# An orphan note with ABUTTING links: _strip_link_punctuation concatenates the labels into the
+# SYNTHESIZED body token "zebraquux" (no literal substring in the file) — proves the inverted index
+# (fed the tokenizer OUTPUT) is exact where a raw-bytes prefilter would under-approximate (the class
+# of bug the adversarial review found in the now-deferred ripgrep prefilter).
+SYNTH_TOKEN_NOTE = "---\nstatus: active\n---\n# Synth\n\nSee [zebra](x.md)[quux](y.md) here.\n"
+
+# Query battery: a hit, a not_found, a heading match, a lexical match, a basename-title term, and a
+# tokenizer-synthesized term.
 QUERIES = [
     "curator concurrency control",
     "quantum biology photosynthesis",
     "compare swap",
     "inbox append-only",
     "zephyrquux",
+    "zebraquux",
 ]
 
 
@@ -83,6 +93,7 @@ def _write_corpus(root: Path) -> None:
     (themes / "curator-concurrency.md").write_text(CURATOR_CONCURRENCY, encoding="utf-8")
     (themes / "inbox-design.md").write_text(INBOX_DESIGN, encoding="utf-8")
     (themes / "zephyrquux-topic.md").write_text(BASENAME_TITLE_NOTE, encoding="utf-8")
+    (themes / "synth-token.md").write_text(SYNTH_TOKEN_NOTE, encoding="utf-8")
 
 
 def _repo(tmp_path: Path, *, name: str = "personal") -> Repo:
@@ -201,39 +212,26 @@ def test_rebuild_is_byte_identical_same_and_cross_clone(tmp_path: Path) -> None:
     assert clone_repo.layout.index_notes_path().read_bytes() == first
 
 
-@pytest.mark.parametrize(
-    ("fts5", "ripgrep", "disable_probe"),
-    [
-        ("off", "off", False),  # in-memory inverted index (default)
-        ("on", "off", False),  # FTS5 prefilter (if available on host)
-        ("off", "on", False),  # ripgrep prefilter (if available on host)
-        ("on", "on", True),  # both requested but UNAVAILABLE → inverted fallback
-    ],
-)
-def test_prefilter_parity_matrix(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fts5: str, ripgrep: str, disable_probe: bool
-) -> None:
+def test_inverted_prefilter_is_exact_for_synthesized_and_basename_tokens(tmp_path: Path) -> None:
+    """The candidate prefilter must return notes matched only by a TOKENIZER-SYNTHESIZED token or a
+    BASENAME-derived title token — the exactness a raw-bytes accelerator lacks (the class of parity
+    bug the adversarial review found in the deferred ripgrep prefilter). Guarded via cache parity:
+    build the cache (uses the prefilter) and assert it equals the uncached scan AND returns the
+    two notes whose only lexical evidence is such a token.
+    """
     repo = _repo(tmp_path)
-    baseline = _results(repo.layout)  # oracle: no cache
-    if disable_probe:
-        monkeypatch.setattr(index_cache, "probe_fts5", lambda: False)
-        monkeypatch.setattr(index_cache, "ripgrep_available", lambda: False)
-    _set_index_policy(repo.root, fts5=fts5, ripgrep=ripgrep)
-    build_cache(repo)  # builds fts.sqlite when fts5=on AND available
-    got = _results(repo.layout)
-    for q in QUERIES:
-        assert got[q] == baseline[q], f"prefilter (fts5={fts5} rg={ripgrep}) changed {q!r}"
+    baseline = _results(repo.layout)  # uncached oracle
 
+    # "zebraquux" exists ONLY as a synthesized body token (abutting link labels), not as file bytes;
+    # "zephyrquux" exists ONLY as a basename-derived title token — neither is a literal substring.
+    for q, note in (("zebraquux", "synth-token.md"), ("zephyrquux", "zephyrquux-topic.md")):
+        assert baseline[q].status == "ok", f"{q!r} should be found by the exact scan"
+        assert any(h.path.endswith(note) for h in baseline[q].hits)
 
-def test_fts5_operator_injection_is_defanged(tmp_path: Path) -> None:
-    repo = _repo(tmp_path)
-    if not index_cache.probe_fts5():
-        pytest.skip("FTS5 unavailable on this host")
-    q = "curator OR NEAR concurrency"  # tokens [curator, near, concurrency]; unquoted = FTS ops
-    baseline = Wiki(repo.layout).query(q)  # uncached oracle (no cache yet)
-    _set_index_policy(repo.root, fts5="on")
     build_cache(repo)
-    assert Wiki(repo.layout).query(q) == baseline  # phrase-quoting defangs the operators
+    cached = _results(repo.layout)
+    for q in QUERIES:
+        assert cached[q] == baseline[q], f"prefilter changed query output for {q!r}"
 
 
 # --- freshness gates -----------------------------------------------------------------------------
@@ -366,8 +364,10 @@ def test_rebuild_index_cache_helper_enabled_disabled_and_failure(
 def test_load_index_policy_defaults_and_validation(tmp_path: Path) -> None:
     repo = _repo(tmp_path)
     layout = repo.layout
-    assert load_index_policy(layout) == IndexPolicy(enabled=True, fts5="off", ripgrep="off")
-    _set_index_policy(repo.root, fts5="bogus")
+    assert load_index_policy(layout) == IndexPolicy(enabled=True)
+    # a non-boolean enabled must surface loudly (never silently take the default)
+    (repo.root / "_kb").mkdir(exist_ok=True)
+    (repo.root / "_kb" / "repo.yaml").write_text("index:\n  enabled: notabool\n", encoding="utf-8")
     with pytest.raises(ConfigError):
         load_index_policy(layout)
 
@@ -375,7 +375,7 @@ def test_load_index_policy_defaults_and_validation(tmp_path: Path) -> None:
 def test_index_paths_are_guarded_and_under_kb_index(tmp_path: Path) -> None:
     layout = RepoLayout(tmp_path / "myrepo")
     assert layout.index_notes_path() == layout.kb_dir / "index" / "myrepo.notes.json"
-    assert layout.index_fts_path() == layout.kb_dir / "index" / "myrepo.fts.sqlite"
+    assert layout.index_cache_dir == layout.kb_dir / "index"
     # explicit repo arg is validated as a safe path component
     with pytest.raises(InvalidWriterError):
         layout.index_notes_path("../escape")

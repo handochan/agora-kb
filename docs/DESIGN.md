@@ -107,8 +107,8 @@ repo's own `AGENTS.md`/`SCHEMA.md`, tool-agnostic via symlinks `CLAUDE.md`/`QWEN
     failed/                            terminal failures + separate error records
     harvest/<connector>.json           per-connector harvester cursor (last scan, hash, proposed;
                                        DATA-MODEL §6, ADR-0007)
-    index/<repo>.notes.json            derived query READER cache (+ optional .fts.sqlite FTS5
-                                       prefilter); rebuildable, never canonical (ADR-0012 §2, #26)
+    index/<repo>.notes.json            derived query READER cache (parsed-note + inverted index);
+                                       rebuildable, never canonical (ADR-0012 §2, #26)
     state.json                         curator state: counters, last_run, published runs
     curator.lock                       flock held during a consolidation run
 ```

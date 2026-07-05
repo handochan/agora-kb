@@ -336,50 +336,38 @@ def load_harvest_policy(layout: RepoLayout) -> HarvestPolicy:
     return HarvestPolicy(enabled=enabled, scope_lock=scope_lock, repo_kind=kind)
 
 
-# --- derived reader-cache config (ADR-0012 §2/§9, issue #26) ------------------------------------
-
-_ACCEL_VALUES = ("off", "on")
+# --- derived reader-cache config (ADR-0012 §2, issue #26) ---------------------------------------
 
 
 class IndexPolicy(BaseModel):
     """The repo's reader-cache policy, from ``_kb/repo.yaml`` ``index:`` (DATA-MODEL §3).
 
     A SEPARATE model from :class:`RepoConfig` (which is ``extra='forbid'``), same posture as
-    :class:`HarvestPolicy`. ``enabled`` (default ``True``) is the kill-switch: when off, the
-    read path always does today's full pure-Python scan. ``fts5``/``ripgrep`` (default ``"off"``)
-    opt in to the optional candidate PREFILTERs (ADR-0012 §9); off by default because in the
-    current architecture the scorer already loads every note (repo-wide IDF), so the exact in-memory
-    inverted index built from the cached ``field_tokens`` is free and fastest — the accelerators add
-    IO without avoiding the note load, and exist for the ADR §9 parity contract and future
-    load-avoiding designs. All three prefilters over-approximate alike, so output is unchanged.
+    :class:`HarvestPolicy`. ``enabled`` (default ``True``) is the kill-switch: when off the
+    read path always does today's full pure-Python scan. The reader's candidate prefilter is the
+    exact in-memory inverted index built from the loaded ``field_tokens`` (free + correct in the
+    current all-notes-loaded architecture); the optional FTS5/ripgrep candidate accelerators
+    (ADR-0012 §9) are deferred to a future load-avoiding reader (issue #28), so there is no
+    accelerator flag to configure here.
     """
 
     model_config = ConfigDict(extra="forbid")
 
     enabled: bool = True
-    fts5: str = "off"
-    ripgrep: str = "off"
 
 
 def load_index_policy(layout: RepoLayout) -> IndexPolicy:
     """Load the ``index:`` policy from ``_kb/repo.yaml`` (DATA-MODEL §3); defaults when absent.
 
-    Read via the same raw-mapping ``.get()`` path as :func:`load_harvest_policy`.
-    use (NOT by constructing ``RepoConfig``, which is ``extra='forbid'`` and would reject an
-    ``index:`` key). A missing file / ``index:`` block yields the defaults (cache on, accelerators
-    off). An explicit but out-of-set ``index.fts5`` / ``index.ripgrep`` raises :class:`ConfigError`
-    (a typo must surface, never silently take a default) — mirroring :func:`load_harvest_policy`.
+    Read via the same raw-mapping ``.get()`` path as :func:`load_harvest_policy` (NOT via
+    ``RepoConfig``, ``extra='forbid'`` — it would reject ``index:``). A missing file /
+    ``index:`` block yields the default (cache on). An explicit but non-boolean ``index.enabled``
+    raises :class:`ConfigError` (a typo must surface, never silently take a default).
     """
     raw = _read_yaml_mapping(repo_config_path(layout))
     index = _sub_mapping(raw.get("index"))
     enabled = _opt_bool(index.get("enabled"), True, key="index.enabled")
-    fts5 = _opt_str(index.get("fts5")) or "off"
-    if fts5 not in _ACCEL_VALUES:
-        raise ConfigError(f"index.fts5 must be one of {list(_ACCEL_VALUES)}, got {fts5!r}")
-    ripgrep = _opt_str(index.get("ripgrep")) or "off"
-    if ripgrep not in _ACCEL_VALUES:
-        raise ConfigError(f"index.ripgrep must be one of {list(_ACCEL_VALUES)}, got {ripgrep!r}")
-    return IndexPolicy(enabled=enabled, fts5=fts5, ripgrep=ripgrep)
+    return IndexPolicy(enabled=enabled)
 
 
 @dataclass(frozen=True)

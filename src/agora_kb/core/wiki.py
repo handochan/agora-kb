@@ -2,14 +2,14 @@
 
 ``core.wiki`` is the ONLY component that computes a :class:`SearchHit` field. It is a pure-Python
 stdlib scorer — the oracle and test reference — so retrieval is fully deterministic and reproducible
-without any model, sqlite, or external dependency. FTS5 / ripgrep are (per the ADR) prefilter-only
-accelerators that may over-approximate the candidate set but never change output.
+without any model, sqlite, or external dependency.
 
 Issue #26 wires the ADR-0012 §2 derived READER cache (git-ignored ``_kb/index/``, NEVER canonical,
 fully rebuildable from the markdown at the curated commit — invariant #1): a per-file
 content-addressed parsed-note cache that skips re-parsing unchanged notes, plus an exact in-memory
-inverted-index candidate prefilter (with optional FTS5/ripgrep behind :mod:`core.index_cache`,
-ADR-0012 §9). The full pure-Python scan remains the oracle AND the crash-proof fallback: a missing,
+inverted-index candidate prefilter (:mod:`core.index_cache`; the optional FTS5/ripgrep candidate
+accelerators of ADR-0012 §9 are deferred — the exact inverted index is free while all notes are
+loaded). The full pure-Python scan remains the oracle AND the crash-proof fallback: a missing,
 stale (``curated_commit`` mismatch), schema-bumped, corrupt, or locked cache silently degrades to a
 scan. The cache is written ONLY by deterministic worker/CLI code (never the sandboxed backend,
 never in the ADR-0008 INGEST allowlist); the read path opens it strictly read-only (invariant #2).
@@ -542,7 +542,7 @@ class Wiki:
         # Candidate PREFILTER (ADR-0012 §0a/§9): restrict scoring to (BFS-reached ∪ lexical) notes.
         # Provably output-identical — a note that is neither seeded/reached NOR carries a q-token in
         # any field has lex==0 AND d_moc!=0, so it always fails the §6 gate (see _frontier).
-        lexical_paths = self._lexical_candidate_paths(notes, q_tokens, policy)
+        lexical_paths = self._lexical_candidate_paths(notes, q_tokens)
         candidates = self._frontier(notes, by_basename, seeds, lexical_paths)
 
         # repo-wide BM25F statistics (IDF + per-field avgdl), computed over ALL notes.
@@ -617,9 +617,9 @@ class Wiki:
     def _index_policy(self) -> IndexPolicy:
         """Load the repo's ``index:`` cache policy; NEVER raise out of the read path.
 
-        A malformed ``index:`` block (e.g. a typo'd ``fts5`` value) is surfaced loudly by the CLI
+        A malformed ``index:`` block (e.g. a non-boolean ``enabled``) is surfaced loudly by the CLI
         (``agora index`` / ``agora doctor``), but ``kb_query`` must never crash on config, so here a
-        config error degrades to the defaults (cache on, accelerators off).
+        config error degrades to the default (cache on).
         """
         from ..config import IndexPolicy, load_index_policy
 
@@ -698,12 +698,19 @@ class Wiki:
         for rel, basename, is_index, path in self._iter_note_files():
             text = _read_tolerant(path)
             entry = entries.get(rel)
+            reuse: _Note | None = None
             if entry is not None and entry["sha"] == index_cache.source_digest(text):
-                notes.append(_note_from_dict(entry["note"]))
-            else:
-                notes.append(
-                    _parse_note(path=rel, basename=basename, is_index=is_index, raw_text=text)
-                )
+                try:
+                    reuse = _note_from_dict(entry["note"])
+                except (KeyError, TypeError, ValueError):
+                    # A structurally-corrupt cached inner note (valid envelope, bad body) must not
+                    # crash the query: re-parse just this file (self-healing fallback).
+                    reuse = None
+            notes.append(
+                reuse
+                if reuse is not None
+                else _parse_note(path=rel, basename=basename, is_index=is_index, raw_text=text)
+            )
         return notes
 
     def _usable_cache_entries(self) -> dict[str, dict] | None:
@@ -725,36 +732,18 @@ class Wiki:
             return None
         return payload.notes
 
-    def _lexical_candidate_paths(
-        self, notes: list[_Note], q_tokens: list[str], policy: IndexPolicy
-    ) -> set[str]:
-        """Note paths that could match lexically (ADR-0012 §9 prefilter; over-approx allowed).
+    def _lexical_candidate_paths(self, notes: list[_Note], q_tokens: list[str]) -> set[str]:
+        """Note paths that could match lexically — the EXACT candidate prefilter (ADR-0012 §9).
 
-        Default = the EXACT in-memory inverted index built from the loaded ``field_tokens`` (free —
-        the notes are already parsed). Optional FTS5 (opt-in, ``index.fts5: on``) uses the
-        commit-stamped prefilter DB. Optional ripgrep (opt-in, ``index.ripgrep: on``) matches file
-        CONTENT and is UNIONED with the exact title-token matches from ``field_tokens`` — a title
-        derived from a basename (no H1 / no frontmatter ``title:``) is absent from the file text, so
-        ripgrep alone is not a superset. Any accelerator failure falls back to the next option.
+        Built as an in-memory inverted index over the already-loaded ``field_tokens`` (free — the
+        notes are parsed for scoring anyway). EXACT: a path is returned iff a q-token appears in
+        some field, i.e. the notes that can have ``lex > 0``, so ``_frontier`` can drop every
+        other unreached note with byte-identical output (ADR-0012 §0a). Because it is fed the
+        tokenizer's OUTPUT, it also catches tokens SYNTHESIZED from abutting link labels / kebab-tag
+        splits that a raw-bytes accelerator would miss. The FTS5/ripgrep candidate accelerators are
+        deferred (see :mod:`core.index_cache`): they add parity risk for no candidate-loading saving
+        while every note is loaded.
         """
-        q_set = set(q_tokens)
-        if policy.fts5 == "on" and index_cache.probe_fts5():
-            commit = self._curated_commit()
-            if commit is not None:
-                try:
-                    fts_path: Path | None = self.layout.index_fts_path()
-                except InvalidWriterError:
-                    fts_path = None
-                if fts_path is not None:
-                    cands = index_cache.fts5_candidates(fts_path, q_tokens, expected_commit=commit)
-                    if cands is not None:
-                        return cands
-        if policy.ripgrep == "on" and index_cache.ripgrep_available():
-            cands = index_cache.ripgrep_candidates(
-                self.layout.wiki_dir, self.layout.index_file, q_tokens
-            )
-            if cands is not None:
-                return cands | {n.path for n in notes if q_set & set(n.field_tokens["title"])}
         idx = index_cache.build_inverted_index({n.path: n.field_tokens for n in notes})
         return index_cache.inverted_candidates(idx, q_tokens)
 
@@ -1269,34 +1258,29 @@ class IndexBuildResult:
     note_count: int
     curated_commit: str
     notes_path: Path
-    fts_built: bool
 
 
 def build_cache(repo: Repo) -> IndexBuildResult:
     """Deterministically (re)build the ADR-0012 §2 reader cache for ``repo`` from its markdown.
 
     Reader/worker-class code ONLY — never the sandboxed backend, never in the ADR-0008 INGEST
-    allowlist (invariant #2 / C10). Parses ``index.md`` + ``wiki/**`` from the OWNER working
-    tree and writes ``_kb/index/<repo>.notes.json`` (per-file ``source_digest`` + serialized parse
-    with ``indeg`` excluded), stamped with the curated-branch-tip sha. Only when ``index.fts5: on``
-    AND FTS5 is available does it also build the optional commit-stamped ``<repo>.fts.sqlite``
-    prefilter. Raises :class:`GitError` if the repo has no curated tip to stamp. The build is
-    independent of ``index.enabled`` (that flag gates the READ path); callers that should honor the
-    kill-switch check it before calling (the worker does; ``agora index build`` is an explicit act).
+    allowlist (invariant #2 / C10). Parses ``index.md`` + ``wiki/**`` from the owner tree and
+    writes ``_kb/index/<repo>.notes.json`` (per-file ``source_digest`` + serialized parse with
+    ``indeg`` excluded), stamped with the curated tip sha. Raises :class:`GitError` if the repo
+    has no curated tip to stamp. The build is independent of ``index.enabled`` (that flag gates the
+    READ path); callers that should honor the kill-switch check it before calling (the worker does;
+    ``agora index build`` is an explicit act).
     """
-    from ..config import load_index_policy
-
     layout = repo.layout
-    policy = load_index_policy(layout)
     commit = repo.branch_commit()
     wiki = Wiki(layout)
-    notes: list[_Note] = []
     notes_payload: dict[str, dict] = {}
+    count = 0
     for rel, basename, is_index, path in wiki._iter_note_files():
         text = _read_tolerant(path)
         note = _parse_note(path=rel, basename=basename, is_index=is_index, raw_text=text)
-        notes.append(note)
         notes_payload[rel] = {"sha": index_cache.source_digest(text), "note": _note_to_dict(note)}
+        count += 1
     payload = index_cache.CachePayload(
         cache_schema_version=index_cache.CACHE_SCHEMA_VERSION,
         curated_commit=commit,
@@ -1304,14 +1288,4 @@ def build_cache(repo: Repo) -> IndexBuildResult:
     )
     notes_path = layout.index_notes_path()
     index_cache.write_payload(notes_path, payload)
-    fts_built = False
-    if policy.fts5 == "on" and index_cache.probe_fts5():
-        rows = sorted((n.path, index_cache.norm_tokens_row(n.field_tokens)) for n in notes)
-        index_cache.build_fts5(layout.index_fts_path(), rows, curated_commit=commit)
-        fts_built = True
-    return IndexBuildResult(
-        note_count=len(notes),
-        curated_commit=commit,
-        notes_path=notes_path,
-        fts_built=fts_built,
-    )
+    return IndexBuildResult(note_count=count, curated_commit=commit, notes_path=notes_path)

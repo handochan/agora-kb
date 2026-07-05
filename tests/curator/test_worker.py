@@ -415,6 +415,12 @@ def test_sync_failure_after_publish_does_not_unpublish_or_unfinalize(tmp_path: P
     assert repo.branch_commit() == new_tip  # durable: the curated ref advanced
     # The stuck working copy is surfaced as an observable signal, not silently swallowed.
     assert report.counts.get("owner_working_copy_unsynced") == 1
+    # ADR-0012 §2 / #26: because the working copy is UNSYNCED, the index rebuild is skipped (the
+    # `not synced` short-circuit never calls rebuild_index_cache; building from the stale tree
+    # would stamp new_commit onto base_commit content). Surfaced as index_cache_unbuilt, no
+    # cache is written for this run (the read path full-scans until a later synced run rebuilds it).
+    assert report.counts.get("index_cache_unbuilt") == 1
+    assert not layout.index_notes_path().is_file()
     # state + manifest reflect a finalized publish (the sync failure un-did neither).
     state = StateStore(layout).load()
     assert state.published_runs[report.run_id] == new_tip

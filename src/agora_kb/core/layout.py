@@ -173,13 +173,3 @@ class RepoLayout:
         """
         stem = safe_path_component(repo if repo is not None else self.root.name)
         return self.index_cache_dir / f"{stem}.notes.json"
-
-    def index_fts_path(self, repo: str | None = None) -> Path:
-        """Path of the OPTIONAL FTS5 prefilter cache ``_kb/index/<repo>.fts.sqlite`` (ADR-0012 §9).
-
-        Same traversal guard as :meth:`index_notes_path`. This is a candidate prefilter only (never
-        a scorer, ADR-0012 §0a); it may be absent (readers fall back to the in-memory inverted index
-        or a full scan).
-        """
-        stem = safe_path_component(repo if repo is not None else self.root.name)
-        return self.index_cache_dir / f"{stem}.fts.sqlite"
