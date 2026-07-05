@@ -44,13 +44,10 @@ from ..core.hashing import content_sha256
 from ..core.layout import RepoLayout
 from ..core.repo import Repo
 from ..core.wiki import Wiki
+from .constants import DEFAULT_RELATED_K
 from .manifest import RunManifest
 
 __all__ = ["Candidate", "BundleResult", "build_bundle"]
-
-# Per-candidate top-k related notes pre-fetched via core.read (§1.1; repo.yaml curator.limits
-# related_k default 8, §1.3). Pinned here as the deterministic default; tuning lives in repo.yaml.
-_RELATED_K = 8
 
 # Worst-case ordering for the per-candidate kind/confidence roll-up (§1: "kind/confidence are the
 # worst-case across merged events"). A LOWER rank is worse, so a tier-2 group's value is the min.
@@ -139,7 +136,7 @@ def build_bundle(layout: RepoLayout, repo: Repo, manifest: RunManifest) -> Bundl
     for cand in candidates:
         # §1.1: retrieve-then-decide. Pre-fetch the SAME deterministic core.read used by kb_query
         # over the current wiki; the backend never holds a search tool (sandbox, ADR-0008).
-        result = wiki.query(cand.text, limit=_RELATED_K)
+        result = wiki.query(cand.text, limit=DEFAULT_RELATED_K)
         related_path = related_dir / f"{cand.candidate_id}.json"
         related_path.write_text(_to_json(result.model_dump(mode="json")), encoding="utf-8")
 

@@ -46,6 +46,7 @@ from typing import TYPE_CHECKING
 
 from .apply import body_sentinels
 from .backends import BackendRegistry, BackendResult, BackendSpec, run_backend
+from .constants import DEFAULT_BODY_BYTE_BOUND
 from .isolation import (
     BackendIsolation,
     SandboxUnavailable,
@@ -191,11 +192,6 @@ _OP_INSTRUCTIONS = {
 }
 _DEFAULT_OP_INSTRUCTION = "Write the body for this region grounded only in the source facts above."
 
-# Default PASS-2 body byte bound (INGEST-CONTRACT §1.3 / DATA-MODEL §3 curator.limits
-# body_byte_bound). Surfaced to the model as the {n_bytes} ceiling; the worker's §4.2 check is the
-# authoritative enforcement.
-_DEFAULT_BODY_BYTE_BOUND = 8192
-
 _START_SENTINEL_RE = re.compile(r"\A<!-- agora:body:start id=(?P<cid>.+) -->\Z")
 
 
@@ -223,7 +219,7 @@ class SubprocessBackend:
         self,
         spec: BackendSpec,
         *,
-        body_byte_bound: int = _DEFAULT_BODY_BYTE_BOUND,
+        body_byte_bound: int = DEFAULT_BODY_BYTE_BOUND,
         isolation: BackendIsolation | None = None,
     ) -> None:
         self._spec = spec

@@ -36,6 +36,15 @@ SCHEMA_SYMLINKS: frozenset[str] = frozenset({"CLAUDE.md", "QWEN.md", "GEMINI.md"
 # default 3). Pinned here until a structured repo.yaml curator-config reader lands.
 DEFAULT_MAX_ATTEMPTS = 3
 
+# §1.3 default PASS-2 body byte ceiling surfaced to the model as the ``{n_bytes}`` prompt hint
+# (``repo.yaml curator.limits.body_byte_bound``). The worker's §4.2 check is the AUTHORITATIVE
+# enforcement; this only bounds the hint. Default; operator tuning via load_repo_config.
+DEFAULT_BODY_BYTE_BOUND = 8192
+
+# §1.3 default related-notes retrieval breadth for the bundle — the per-candidate
+# ``wiki.query(limit=…)`` fan-out (``repo.yaml curator.related_k``). Default; tuning via config.
+DEFAULT_RELATED_K = 8
+
 
 def is_allowlisted_path(rel_path: str) -> bool:
     """True iff ``rel_path`` (POSIX, repo-relative) is within the canonical §4.0 ALLOWLIST.
