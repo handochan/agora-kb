@@ -108,31 +108,32 @@ curator:
     max_events_per_run: 32          # planned; default unbounded — caps the per-run claim, not a 2nd writer
 ```
 
-**(a′) Repo-global curation thresholds — `curator.limits.body_byte_bound` / `curator.lint.max_orphans`
-/ `curator.related_k`** (WIRED in **Phase 3.5**, ADR-0022 step 2 — no longer silently ignored). These
-promote three previously-hardcoded/inert tunables (ADR-0011 §1.3) to operator config, resolved
-**repo-globally**:
+**(a′) Repo-global curation thresholds — `curator.limits.body_byte_bound` / `curator.limits.related_k`
+/ `curator.lint.max_orphans`** (WIRED in **Phase 3.5**, ADR-0022 step 2 — no longer silently ignored).
+These promote three previously-hardcoded/inert tunables (ADR-0011 §1.3) to operator config, resolved
+**repo-globally**, using the SAME nesting the full DATA-MODEL §3 example already shows:
 
 - `curator.limits.body_byte_bound` (default `8192`) — the `{n_bytes}` body ceiling surfaced to the
   brain (authoritative §4.2 enforcement is unchanged).
+- `curator.limits.related_k` (default `8`) — the `wiki.query(limit=…)` breadth for the bundle's
+  related-notes fetch.
 - `curator.lint.max_orphans` (default **absent ⇒ check skipped**, byte-identical to today) — when set,
   `lint` emits **one `warning`-severity** `L2-1` finding if the whole-tree orphan-theme count exceeds
   it; a warning never flips `LintResult.ok`, so it does not break the §4.4 gate or the dashboard.
-- `curator.related_k` (default `8`) — the `wiki.query(limit=…)` breadth for the bundle's related-notes
-  fetch.
 
-The nesting is **intentionally asymmetric** and follows the established ADR-0011 namespaces
-(`curator.limits.*` for size/count bounds, `curator.lint.*` for lint tunables); `related_k` is a flat
-`curator.` key because it is neither a limit nor a lint concern. **These are the repo-global bases that
-the per-domain block (b) below overrides** — the per-domain block uses *flat* keys **inside** its
+The nesting follows the established ADR-0011 namespaces — `curator.limits.*` for the two size/breadth
+knobs, `curator.lint.*` for the orphan (lint) knob. **These are the repo-global bases that the
+per-domain block (b) below overrides** — the per-domain block uses *flat* keys **inside** its
 `curator.domains.<domain>` map, distinct from this repo-global nesting; do not copy the flat per-domain
 shape into `curator.limits:` (mis-nested keys load without effect per §3).
 
 ```yaml
 curator:
-  limits: { body_byte_bound: 8192 }   # WIRED (Phase 3.5)
-  lint:   { max_orphans: 5 }          # WIRED (Phase 3.5) — opt-in; absent ⇒ orphan check skipped
-  related_k: 8                        # WIRED (Phase 3.5) — flat, not under limits/lint
+  limits:
+    body_byte_bound: 8192   # WIRED (Phase 3.5)
+    related_k: 8            # WIRED (Phase 3.5)
+  lint:
+    max_orphans: 5          # WIRED (Phase 3.5) — opt-in; absent ⇒ orphan check skipped
 ```
 
 **(b) Per-domain curation override — `curator.domains.<domain>`** (planned, ADR-0022 *Proposed* —

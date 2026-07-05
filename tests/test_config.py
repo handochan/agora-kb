@@ -26,7 +26,11 @@ from agora_kb.config import (
     write_default_repo_config,
 )
 from agora_kb.core.layout import RepoLayout
-from agora_kb.curator.constants import DEFAULT_MAX_ATTEMPTS
+from agora_kb.curator.constants import (
+    DEFAULT_BODY_BYTE_BOUND,
+    DEFAULT_MAX_ATTEMPTS,
+    DEFAULT_RELATED_K,
+)
 
 
 def _layout(tmp_path: Path) -> RepoLayout:
@@ -177,6 +181,10 @@ harvest:
     assert cfg.triggers.threshold == 10
     assert cfg.triggers.idle_minutes == 30
     assert cfg.triggers.cron == "0 3 * * *"
+    # ADR-0022 step 2: the repo-global thresholds in this §3 example are now WIRED (were ignored).
+    assert cfg.body_byte_bound == 8192
+    assert cfg.related_k == 8
+    assert cfg.max_orphans == 0
 
 
 # --- (5) backend registry: absent -> None; malformed -> raise -----------------------------------
@@ -237,6 +245,65 @@ def test_out_of_range_max_attempts_raises(tmp_path: Path) -> None:
     _write_repo_yaml(layout, "name: r\ncurator:\n  max_attempts: 0\n")
     with pytest.raises(ValueError):
         load_repo_config(layout)
+
+
+# --- (4b) repo-global curator thresholds (ADR-0022 step 2) ---------------------------------------
+
+
+def test_curator_thresholds_default_when_absent(tmp_path: Path) -> None:
+    """No threshold keys → the curator/constants defaults; max_orphans stays None (check off)."""
+    layout = _layout(tmp_path)
+    _write_repo_yaml(layout, "name: r\ncurator:\n  backend: qwen\n")
+    cfg = load_repo_config(layout)
+    assert cfg.body_byte_bound == DEFAULT_BODY_BYTE_BOUND
+    assert cfg.related_k == DEFAULT_RELATED_K
+    assert cfg.max_orphans is None
+
+
+def test_curator_thresholds_parsed(tmp_path: Path) -> None:
+    layout = _layout(tmp_path)
+    _write_repo_yaml(
+        layout,
+        "name: r\ncurator:\n  limits:\n    body_byte_bound: 4096\n    related_k: 3\n"
+        "  lint:\n    max_orphans: 5\n",
+    )
+    cfg = load_repo_config(layout)
+    assert cfg.body_byte_bound == 4096
+    assert cfg.related_k == 3
+    assert cfg.max_orphans == 5
+
+
+def test_curator_threshold_malformed_raises(tmp_path: Path) -> None:
+    layout = _layout(tmp_path)
+    _write_repo_yaml(layout, "name: r\ncurator:\n  limits:\n    body_byte_bound: huge\n")
+    with pytest.raises(ConfigError) as exc:
+        load_repo_config(layout)
+    assert "curator.limits.body_byte_bound" in str(exc.value)
+
+
+def test_curator_related_k_zero_out_of_range_raises(tmp_path: Path) -> None:
+    layout = _layout(tmp_path)
+    # related_k: 0 violates the RepoConfig ge=1 bound (pydantic ValidationError).
+    _write_repo_yaml(layout, "name: r\ncurator:\n  limits:\n    related_k: 0\n")
+    with pytest.raises(ValueError):
+        load_repo_config(layout)
+
+
+def test_curator_max_orphans_negative_out_of_range_raises(tmp_path: Path) -> None:
+    layout = _layout(tmp_path)
+    # max_orphans: -1 violates the RepoConfig ge=0 bound (pydantic ValidationError).
+    _write_repo_yaml(layout, "name: r\ncurator:\n  lint:\n    max_orphans: -1\n")
+    with pytest.raises(ValueError):
+        load_repo_config(layout)
+
+
+def test_curator_threshold_mis_nested_key_silently_ignored(tmp_path: Path) -> None:
+    """The loader hand-maps via raw.get(), so a threshold key under the wrong parent (or a flat
+    curator.related_k, which is NOT the repo-global shape) loads without effect — defaults hold."""
+    layout = _layout(tmp_path)
+    _write_repo_yaml(layout, "name: r\ncurator:\n  related_k: 3\n  unknown_key: 9\n")
+    cfg = load_repo_config(layout)  # no raise (extra='forbid' is bypassed by the hand-map)
+    assert cfg.related_k == DEFAULT_RELATED_K  # flat curator.related_k is NOT consumed
 
 
 def test_malformed_repo_yaml_raises_config_error(tmp_path: Path) -> None:

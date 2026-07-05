@@ -283,7 +283,8 @@ Sequenced so the cheap no-loss work lands first and the integrity-sensitive lane
    `kb_schema.md` prompt; gated candidates unchanged. Deterministic (zero-model) test: an unclassifiable
    non-gated capture is NEVER DROPped.
 2. **Repo-global threshold wiring (M).** Parse `curator.limits.body_byte_bound` /
-   `curator.lint.max_orphans` / `curator.related_k` in `load_repo_config` (today silently ignored) and
+   `curator.limits.related_k` / `curator.lint.max_orphans` in `load_repo_config` (today silently
+   ignored; nesting matches the DATA-MODEL §3 example) and
    thread them (`SubprocessBackend(body_byte_bound=…)` replacing the hardcoded `_DEFAULT_BODY_BYTE_BOUND
    = 8192`; `lint`; `bundle` related fetch replacing `_RELATED_K = 8`). No per-domain yet.
 3. **Structured domain entry (M).** Extend `Taxonomy` + `emit_schema` rendering + the **three** list-only

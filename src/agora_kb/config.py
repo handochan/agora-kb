@@ -37,7 +37,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from .core.layout import RepoLayout
 from .curator import BackendRegistry, TriggerConfig
-from .curator.constants import DEFAULT_MAX_ATTEMPTS
+from .curator.constants import DEFAULT_BODY_BYTE_BOUND, DEFAULT_MAX_ATTEMPTS, DEFAULT_RELATED_K
 from .schema import Taxonomy
 
 __all__ = [
@@ -74,6 +74,9 @@ _DEFAULT_KIND = "personal"
 # Reuse the single source of truth for the §5.1 retry budget (curator/constants.py) so RepoConfig's
 # default can never silently drift from the worker's actual DEFAULT_MAX_ATTEMPTS.
 _DEFAULT_MAX_ATTEMPTS = DEFAULT_MAX_ATTEMPTS
+# Same SSOT reuse for the §1.3 repo-global tuning thresholds (ADR-0022 step 2).
+_DEFAULT_BODY_BYTE_BOUND = DEFAULT_BODY_BYTE_BOUND
+_DEFAULT_RELATED_K = DEFAULT_RELATED_K
 # The OSS default brain (ADR-0005 / INGEST-CONTRACT §8: local Qwen via Ollama, zero API cost). Only
 # a NAME here; the executable/argv binding lives in adapters.yaml (DATA-MODEL §8).
 _DEFAULT_BACKEND = "qwen"
@@ -114,6 +117,15 @@ class RepoConfig(BaseModel):
     # restricted fallback (network egress + out-of-worktree writes are NOT prevented, forced
     # review-mode). Read from ``curator.allow_reduced_isolation`` (DATA-MODEL §3 curator policy).
     allow_reduced_isolation: bool = False
+    # §1.3 repo-global curator tuning surfaces (ADR-0022 step 2 / DATA-MODEL §3.1).
+    # ``body_byte_bound`` is the ``{n_bytes}`` PASS-2 prompt hint; ``related_k`` is the bundle's
+    # ``wiki.query`` breadth; ``max_orphans`` (``None`` ⇒ orphan check SKIPPED, byte-identical to
+    # today) gates a WARNING-only ``L2-1`` lint finding when the whole-tree orphan-theme count
+    # exceeds it. Read from ``curator.limits.body_byte_bound`` / ``curator.limits.related_k`` /
+    # ``curator.lint.max_orphans`` — the DATA-MODEL §3 repo-global nesting.
+    body_byte_bound: int = Field(default=_DEFAULT_BODY_BYTE_BOUND, ge=1)
+    related_k: int = Field(default=_DEFAULT_RELATED_K, ge=1)
+    max_orphans: int | None = Field(default=None, ge=0)
 
 
 def repo_config_path(layout: RepoLayout) -> Path:
@@ -149,6 +161,26 @@ def load_repo_config(layout: RepoLayout) -> RepoConfig:
     )
     triggers = _build_triggers(curator.get("triggers"))
 
+    # §1.3 repo-global tuning thresholds (ADR-0022 step 2). Nesting matches the DATA-MODEL §3
+    # example already in the docs/tests: the two size/breadth knobs under curator.limits, orphan
+    # under curator.lint. max_orphans stays None (check skipped) unless set → lint byte-identical.
+    limits = _sub_mapping(curator.get("limits"))
+    body_byte_bound = _opt_int(
+        limits.get("body_byte_bound"),
+        _DEFAULT_BODY_BYTE_BOUND,
+        key="curator.limits.body_byte_bound",
+    )
+    related_k = _opt_int(
+        limits.get("related_k"), _DEFAULT_RELATED_K, key="curator.limits.related_k"
+    )
+    lint_cfg = _sub_mapping(curator.get("lint"))
+    raw_orphans = lint_cfg.get("max_orphans")
+    max_orphans = (
+        _opt_int(raw_orphans, 0, key="curator.lint.max_orphans")
+        if raw_orphans is not None
+        else None
+    )
+
     taxonomy = _load_taxonomy(
         layout,
         repo_domains=repo_domains,
@@ -163,6 +195,9 @@ def load_repo_config(layout: RepoLayout) -> RepoConfig:
         default_backend=default_backend,
         max_attempts=max_attempts,
         allow_reduced_isolation=allow_reduced_isolation,
+        body_byte_bound=body_byte_bound,
+        related_k=related_k,
+        max_orphans=max_orphans,
     )
 
 
