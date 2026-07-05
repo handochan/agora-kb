@@ -610,6 +610,16 @@ def _run_locked(
         # operator/dashboard signal that the working copy needs manual attention.
         counts = {**counts, "owner_working_copy_unsynced": 1}
 
+    # ADR-0012 §2 / #26: refresh the derived reader cache best-effort AFTER the working copy is
+    # synced to the new curated tip (so the parsed on-disk tree == new_commit and the stamped commit
+    # matches what the read path rglobs). Mirrors the ADR-0017 §7 cursor posture: the run is already
+    # published, so a rebuild failure only DEGRADES the read path (silent full-scan fallback) and is
+    # surfaced, never aborting finalize. When UNSYNCED we skip the build entirely (building from the
+    # un-advanced base_commit tree would stamp new_commit onto stale content) and mark it unbuilt;
+    # `and` short-circuits so rebuild_index_cache is not called in that case.
+    if not synced or not rebuild_index_cache(repo):
+        counts = {**counts, "index_cache_unbuilt": 1}
+
     return RunReport(run_id=run_id, status="published", published_commit=new_commit, counts=counts)
 
 
@@ -895,6 +905,30 @@ def _sync_owner_working_copy(repo: Repo, run_id: str) -> bool:
         )
         return False
     return True
+
+
+def rebuild_index_cache(repo: Repo) -> bool:
+    """Best-effort rebuild of the ADR-0012 §2 derived reader cache after a publish (issue #26).
+
+    Deterministic, non-sandboxed reader/worker code — NEVER the sandboxed curator backend, NEVER in
+    the ADR-0008 INGEST allowlist (invariant #2 / contract C10). Honors the ``index.enabled``
+    kill-switch. NEVER raises: the run is ALREADY published in git, so a cache parse/IO failure must
+    only DEGRADE (the read path silently full-scans) and be surfaced as a signal, exactly the
+    ADR-0017 §7 harvest-cursor swallow+log posture — it must not perturb a durable publish. Returns
+    ``True`` when the cache was rebuilt OR intentionally disabled (nothing to flag); ``False`` only
+    on a genuine failure, so the caller can raise an observable ``index_cache_unbuilt`` signal.
+    """
+    from ..config import load_index_policy
+    from ..core.wiki import build_cache
+
+    try:
+        if not load_index_policy(repo.layout).enabled:
+            return True  # intentionally off — not a failure, nothing to surface.
+        build_cache(repo)
+        return True
+    except Exception as exc:  # noqa: BLE001 — derived + rebuildable; must not abort finalize.
+        _logger.warning("index cache rebuild failed (rebuildable, run already published): %s", exc)
+        return False
 
 
 def _new_run_id(now: datetime) -> str:

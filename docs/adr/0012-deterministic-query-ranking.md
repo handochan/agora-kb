@@ -165,6 +165,37 @@ stdlib YAML-subset reader for `key: scalar` / `key: [list]`; unknown keys ignore
   ≠ the current curated commit (stale), or the file is locked/unreadable, the reader silently falls back
   to a full pure-Python scan of the committed markdown — it never blocks, never errors.
 
+> **As-built (issue #26, 2026-07-05 — an implementation of this Accepted ADR; NO new ADR).** The cache
+> shipped with three invariant-preserving refinements of the sketch above:
+> - **Single folded artifact.** `_kb/index/<repo>.notes.json` carries its meta INLINE
+>   (`{cache_schema_version, curated_commit, notes: {<path>: {sha, note}}}`) rather than a separate
+>   `.meta.json` — one atomic read/write, no cross-file race.
+> - **`source_digest`, not `content_sha256`, is the per-file gate.** The §2 "content_sha256" is
+>   realized as a sha256 over the EXACT tolerant-decoded parser input: the shared
+>   `core.hashing.content_sha256` normalizes NFC/CRLF/trailing-whitespace for DEDUP and would wrongly
+>   equate two byte-divergent notes that parse differently (e.g. CRLF changes `raw_lines`), so a cache
+>   keyed on it could serve a stale parse. `source_digest` is a strict refinement (equal digest ⇒
+>   identical parser input ⇒ identical parse), preserving the byte-identical-vs-scan contract. A
+>   `CACHE_SCHEMA_VERSION` integer in the payload invalidates the whole cache on any
+>   parser/tokenizer/serialization change (the cached `field_tokens`/`headings`/`outlinks` are derived).
+> - **`indeg`/`d_moc` are NOT persisted** — recomputed globally at load, so a partial cache is
+>   byte-identical to a full scan (a stored global degree would be a stale-global bug).
+>
+> - **Candidate prefilter = the EXACT in-memory inverted index** over the already-loaded
+>   `field_tokens` (free — the notes are parsed for scoring anyway). It is exact even for tokens the
+>   tokenizer SYNTHESIZES (abutting link labels → one token, kebab-tag splits) — precisely the case a
+>   raw-bytes accelerator under-approximates. The §9 candidate accelerators (**FTS5**, **ripgrep**)
+>   are **DEFERRED to a future load-avoiding reader** (issue #28 scale): while every note is loaded
+>   for repo-wide IDF, an over-approximating external accelerator offers no candidate-loading saving
+>   and only adds parity risk (ripgrep can't see synthesized tokens; a committed-snapshot FTS DB
+>   under-approximates a diverged working tree). So `_kb/repo.yaml` `index:` has only the `enabled`
+>   kill-switch — no accelerator flag — at v1.
+>
+> Writers: deterministic worker-finalize (synced-only, best-effort, swallow+log — mirrors ADR-0017 §7)
+> + `agora index build`; the read path opens the cache strictly read-only and full-scans on any
+> miss/stale/corrupt/schema-bump. Byte-identical output vs the uncached scan is regression-tested.
+> Surfaced by `agora index status` + an `agora doctor` line.
+
 **Optional FTS5 prefilter** (probe once at startup with `CREATE VIRTUAL TABLE … fts5(…)` in `:memory:`;
 on `OperationalError` set fts5=unavailable). **The FTS5 table is populated with the Python `tokenize()`
 output, NOT raw markdown**, so tokenizer divergence is impossible:
@@ -508,19 +539,22 @@ returned hits.
   never written by the sandboxed curator backend and not in the ADR-0008 INGEST allowlist; the read path
   is read-only and falls back to a pure-Python scan — honoring invariant #2, ADR-0008, and contract C10,
   with no multi-writer race across concurrent `kb_query` callers.
-- **(status, 2026-06-24 — issue #26 search performance at scale):** the §2/§9 derived READER cache
-  (`_kb/index/<repo>.notes.json` + the OPTIONAL `_kb/index/<repo>.fts.sqlite` FTS5 prefilter +
-  `_kb/index/<repo>.meta.json`) was specified here but never built (Phase-1 ships the pure-Python scan
-  only). Issue #26 now IMPLEMENTS that cache so query stays fast as the KB grows. **This is an
-  implementation of this already-Accepted ADR — it needs NO new ADR**, and it does not relax any
+- **(status, 2026-07-05 — issue #26 SHIPPED):** the §2/§9 derived READER cache
+  (`_kb/index/<repo>.notes.json`, meta folded IN per the §2 as-built note) was specified here but not
+  built in Phase-1 (which ships the pure-Python scan only). Issue #26 now IMPLEMENTS that cache so
+  query stays fast as the KB grows. **This is an implementation of this already-Accepted ADR — it
+  needs NO new ADR**, and it does not relax any
   invariant here: the cache stays git-ignored, NEVER canonical, and fully rebuildable from the curated
-  commit (invariant #1, keyed on curated-commit-SHA + per-file `content_sha256` per §2); it is
-  materialized by deterministic worker/reader code ONLY — NEVER by the sandboxed curator backend and NOT
-  in the ADR-0008 INGEST allowlist (invariant #2 / contract C10); the FTS5 table remains a candidate
-  PREFILTER over `tokenize()` output (`tokenize='ascii'`, CPython-bundled), never a scorer, and the
-  pure-Python BM25F oracle (§0a/§4) stays the sole source of every `SearchHit` field (§9). Semantic/vector
-  search (ROADMAP "explicitly deferred") stays DEFERRED until corporate volume (issue #28) proves lexical
-  + navigation insufficient at scale — it is NOT in scope for #26.
+  commit (invariant #1, keyed on curated-commit-SHA + a per-file `source_digest` — the §2 as-built
+  refinement of `content_sha256`); it is materialized by deterministic worker/reader code ONLY —
+  NEVER by the sandboxed curator backend and NOT in the ADR-0008 INGEST allowlist (invariant #2 /
+  contract C10); the candidate prefilter is the EXACT in-memory inverted index over `tokenize()`
+  output, and the pure-Python BM25F oracle (§0a/§4) stays the sole source of every `SearchHit` field.
+  The §9 **FTS5/ripgrep candidate accelerators are DEFERRED** (see the §2 as-built note): while every
+  note is loaded for repo-wide IDF the exact inverted index is free, so an external over-approximating
+  accelerator adds parity risk for no candidate-loading saving — they belong to a load-avoiding reader
+  (issue #28). Semantic/vector search (ROADMAP "explicitly deferred") likewise stays DEFERRED until
+  corporate volume (issue #28) proves lexical + navigation insufficient — NOT in scope for #26.
 - **+** Cache invalidation keyed on curated-commit-SHA + per-file `content_sha256` only means any clone of
   the same commit rebuilds an identical cache (invariant #1); mtime/size are a non-correctness fast-path
   hint that can never cause a silent cache/markdown mismatch.
