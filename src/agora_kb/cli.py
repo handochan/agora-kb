@@ -40,11 +40,13 @@ from .config import (
     load_backend_registry,
     load_connector_specs,
     load_harvest_policy,
+    load_index_policy,
     load_repo_config,
     write_default_adapters_yaml,
     write_default_repo_config,
 )
 from .core import Inbox, Repo, RepoLayout, StateStore
+from .core.repo import GitError
 from .curator import evaluate
 from .curator.cron import is_cron_due
 from .curator.isolation import SandboxUnavailable, select_backend_isolation
@@ -157,6 +159,28 @@ def build_parser() -> argparse.ArgumentParser:
         help="report what WOULD be harvested without writing to the inbox or advancing any cursor",
     )
     p_harvest.set_defaults(func=_cmd_harvest)
+
+    # index (group) — the ADR-0012 §2 derived query reader cache (build/status/clear). Issue #26.
+    p_index = sub.add_parser(
+        "index", help="manage the derived query reader cache (_kb/index/, ADR-0012 §2)"
+    )
+    index_sub = p_index.add_subparsers(dest="index_command", metavar="<subcommand>")
+    p_index_build = index_sub.add_parser(
+        "build", help="(re)build the reader cache from the curated markdown"
+    )
+    p_index_build.add_argument("--repo", default=".", help="repo root (default: .)")
+    p_index_build.set_defaults(func=_cmd_index_build)
+    p_index_status = index_sub.add_parser(
+        "status", help="show cache presence, freshness vs the curated tip, and accelerators"
+    )
+    p_index_status.add_argument("--repo", default=".", help="repo root (default: .)")
+    p_index_status.set_defaults(func=_cmd_index_status)
+    p_index_clear = index_sub.add_parser(
+        "clear", help="remove the cache artifacts (rebuilt on the next build / curate)"
+    )
+    p_index_clear.add_argument("--repo", default=".", help="repo root (default: .)")
+    p_index_clear.set_defaults(func=_cmd_index_clear)
+    p_index.set_defaults(func=_cmd_index_missing)
 
     # watch — the in-process scheduler loop (cron + threshold + idle).
     p_watch = sub.add_parser(
@@ -689,6 +713,98 @@ def _cmd_web(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_index_build(args: argparse.Namespace) -> int:
+    """``agora index build``: deterministically (re)build the ADR-0012 §2 reader cache.
+
+    Explicit operator action: builds regardless of the ``index.enabled`` READ-path kill-switch
+    (that flag gates whether the read path CONSUMES the cache, not whether one may build it).
+    Only builds the optional FTS5 prefilter when ``index.fts5: on`` and FTS5 is available.
+    """
+    from .core.wiki import build_cache
+
+    repo = Repo.resolve(args.repo)
+    if not repo.is_initialized():
+        print(f"repo {repo.root}: not initialized (run 'agora repo init')")
+        return 1
+    try:
+        result = build_cache(repo)
+    except (ConfigError, GitError) as exc:
+        print(f"index: could not build ({exc})")
+        return 1
+    print(f"index: built {result.note_count} notes at commit {result.curated_commit[:12]}")
+    print(f"  notes cache: {result.notes_path}")
+    print(f"  fts5 prefilter: {'built' if result.fts_built else 'off'}")
+    return 0
+
+
+def _cmd_index_status(args: argparse.Namespace) -> int:
+    """``agora index status``: report cache presence, freshness vs curated tip, accelerators."""
+    from .core import index_cache
+
+    repo = Repo.resolve(args.repo)
+    layout = repo.layout
+    print(f"repo: {layout.root}")
+    if not repo.is_initialized():
+        print("  index: repo not initialized")
+        return 0
+    try:
+        commit: str | None = repo.branch_commit()
+    except GitError as exc:
+        print(f"  index: cannot resolve curated tip ({exc})")
+        commit = None
+    try:
+        policy = load_index_policy(layout)
+        print(f"  enabled={policy.enabled} fts5={policy.fts5} ripgrep={policy.ripgrep}")
+    except ConfigError as exc:
+        print(f"  config: ERROR ({exc})")
+    try:
+        notes_path = layout.index_notes_path()
+        fts_path = layout.index_fts_path()
+    except Exception as exc:  # noqa: BLE001 — an unsafe repo name means no usable cache path.
+        print(f"  cache: unavailable ({exc})")
+        return 0
+    payload = index_cache.read_payload(notes_path)
+    if payload is None:
+        print(f"  cache: absent/unreadable ({notes_path})")
+    elif commit is not None and payload.curated_commit == commit:
+        print(f"  cache: FRESH ({len(payload.notes)} notes) @ {payload.curated_commit[:12]}")
+    else:
+        cached = payload.curated_commit[:12]
+        tip = commit[:12] if commit else "?"
+        print(f"  cache: STALE ({len(payload.notes)} notes; cache={cached} tip={tip})")
+    print(
+        f"  fts5 db: {'present' if fts_path.is_file() else 'absent'}; "
+        f"fts5 supported={index_cache.probe_fts5()}; "
+        f"ripgrep={'available' if index_cache.ripgrep_available() else 'absent'}"
+    )
+    return 0
+
+
+def _cmd_index_clear(args: argparse.Namespace) -> int:
+    """``agora index clear``: remove the reader-cache artifacts (rebuilt on next build/curate)."""
+    layout = RepoLayout(Path(args.repo))
+    try:
+        paths = [layout.index_notes_path(), layout.index_fts_path()]
+    except Exception as exc:  # noqa: BLE001 — unsafe repo name → no cache path to clear.
+        print(f"index: no cache to clear ({exc})")
+        return 0
+    removed: list[str] = []
+    for p in paths:
+        try:
+            if p.is_file():
+                p.unlink()
+                removed.append(p.name)
+        except OSError as exc:
+            print(f"index: could not remove {p} ({exc})")
+    print(f"index: cleared {', '.join(removed) if removed else 'nothing (no cache present)'}")
+    return 0
+
+
+def _cmd_index_missing(args: argparse.Namespace) -> int:
+    print("usage: agora index <build|status|clear> [--repo PATH]")
+    return 2
+
+
 def _cmd_doctor(args: argparse.Namespace) -> int:
     ok = True
     print("agora doctor")
@@ -736,6 +852,10 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
     # Reporting only; never affects the health verdict and never crashes on malformed config.
     _doctor_connectors(layout)
 
+    # ADR-0012 §2 / issue #26: observability — the derived reader-cache state (present/fresh/stale).
+    # Reporting only; never affects the health verdict and never crashes on malformed config.
+    _doctor_index(layout)
+
     print(f"status: {'healthy' if ok else 'unhealthy'}")
     return 0 if ok else 1
 
@@ -781,6 +901,49 @@ def _doctor_connectors(layout: RepoLayout) -> None:
         except Exception as exc:  # noqa: BLE001 — a bad connector name must not crash doctor.
             counters = f"cursor unreadable ({exc})"
         print(f"    {spec.name} (scope={spec.scope}): {counters}")
+
+
+def _doctor_index(layout: RepoLayout) -> None:
+    """Print the ADR-0012 §2 reader-cache state (issue #26). Observability only — never crashes.
+
+    Shows the ``index.enabled`` kill-switch, whether the cache is present + fresh (its stamped
+    ``curated_commit`` == the live curated tip) or stale/absent, and — for any opted-in accelerator
+    (``index.fts5``/``index.ripgrep`` == ``on``) — whether it is actually available on this host. A
+    malformed ``repo.yaml`` or an uninitialized repo is noted, never fatal; it never affects the
+    health verdict (a missing cache degrades to a full scan, not an error).
+    """
+    from .core import index_cache
+
+    try:
+        policy = load_index_policy(layout)
+    except Exception as exc:  # noqa: BLE001 — doctor must never crash on a malformed repo.yaml.
+        print(f"  index: repo.yaml present but unreadable ({exc})")
+        return
+    repo = Repo(layout)
+    if not repo.is_initialized():
+        print(f"  index: enabled={policy.enabled} (repo not initialized — read path full-scans)")
+        return
+    try:
+        commit: str | None = repo.branch_commit()
+    except Exception:  # noqa: BLE001 — a git failure is not a doctor failure here.
+        commit = None
+    try:
+        payload = index_cache.read_payload(layout.index_notes_path())
+    except Exception:  # noqa: BLE001 — an unsafe repo name / IO issue → treat as no cache.
+        payload = None
+    if payload is None:
+        state = "absent"
+    elif commit is not None and payload.curated_commit == commit:
+        state = f"fresh ({len(payload.notes)} notes)"
+    else:
+        state = "stale"
+    accel: list[str] = []
+    if policy.fts5 == "on":
+        accel.append(f"fts5={'ok' if index_cache.probe_fts5() else 'unavailable'}")
+    if policy.ripgrep == "on":
+        accel.append(f"ripgrep={'ok' if index_cache.ripgrep_available() else 'unavailable'}")
+    suffix = f" [{' '.join(accel)}]" if accel else ""
+    print(f"  index: enabled={policy.enabled} cache={state}{suffix}")
 
 
 def _doctor_routing(layout: RepoLayout, default_backend: str | None = None) -> None:

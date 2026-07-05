@@ -176,9 +176,13 @@ Mutable engine state. JSON (single small file; rewritten atomically under the lo
 
 `event_keys` is a bounded delivery-idempotency cache and may be rebuilt from retained events.
 `published_runs` lets recovery finalize a committed run without invoking the backend twice. Separately,
-`_kb/index/` is a recognized read-side query cache (ADR-0012): it is the reader's rebuildable index, always
-reconstructable from the markdown at the curated commit, and is never canonical (the sandboxed curator
-backend does not write it).
+`_kb/index/<repo>.notes.json` (+ an OPTIONAL `_kb/index/<repo>.fts.sqlite` FTS5 prefilter) is the
+read-side query cache — **IMPLEMENTED in issue #26** (ADR-0012 §2 as-built): a parsed-note cache with
+its meta folded in, keyed on the curated-commit sha + a per-file `source_digest` (a strict refinement
+of `content_sha256` over the exact parser input), always reconstructable from the markdown at the
+curated commit and never canonical. It is written ONLY by deterministic worker-finalize + `agora index
+build` (never the sandboxed curator backend; not in the ADR-0008 INGEST allowlist), and the read path
+opens it read-only, falling back to a full pure-Python scan when it is absent/stale/schema-bumped/corrupt.
 
 ## 5. Curator run manifest — `_kb/processing/<run-id>/run.json`
 

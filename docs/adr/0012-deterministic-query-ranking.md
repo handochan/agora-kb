@@ -165,6 +165,31 @@ stdlib YAML-subset reader for `key: scalar` / `key: [list]`; unknown keys ignore
   ≠ the current curated commit (stale), or the file is locked/unreadable, the reader silently falls back
   to a full pure-Python scan of the committed markdown — it never blocks, never errors.
 
+> **As-built (issue #26, 2026-07-05 — an implementation of this Accepted ADR; NO new ADR).** The cache
+> shipped with three invariant-preserving refinements of the sketch above:
+> - **Single folded artifact.** `_kb/index/<repo>.notes.json` carries its meta INLINE
+>   (`{cache_schema_version, curated_commit, notes: {<path>: {sha, note}}}`) rather than a separate
+>   `.meta.json` — one atomic read/write, no cross-file race. The optional FTS5 prefilter stays a
+>   separate `_kb/index/<repo>.fts.sqlite`, commit-stamped so a partial rebuild (notes.json refreshed,
+>   sqlite not) is detected and the reader falls back.
+> - **`source_digest`, not `content_sha256`, is the per-file gate.** The §2 "content_sha256" is
+>   realized as a sha256 over the EXACT tolerant-decoded parser input: the shared
+>   `core.hashing.content_sha256` normalizes NFC/CRLF/trailing-whitespace for DEDUP and would wrongly
+>   equate two byte-divergent notes that parse differently (e.g. CRLF changes `raw_lines`), so a cache
+>   keyed on it could serve a stale parse. `source_digest` is a strict refinement (equal digest ⇒
+>   identical parser input ⇒ identical parse), preserving the byte-identical-vs-scan contract. A
+>   `CACHE_SCHEMA_VERSION` integer in the payload invalidates the whole cache on any
+>   parser/tokenizer/serialization change (the cached `field_tokens`/`headings`/`outlinks` are derived).
+> - **`indeg`/`d_moc` are NOT persisted** — recomputed globally at load, so a partial cache is
+>   byte-identical to a full scan (a stored global degree would be a stale-global bug).
+>
+> Writers: deterministic worker-finalize (synced-only, best-effort, swallow+log — mirrors ADR-0017 §7)
+> + `agora index build`; the read path opens the cache strictly read-only. Prefilters: the exact
+> in-memory inverted index (default, free from the already-loaded `field_tokens`) with FTS5/ripgrep as
+> opt-in `_kb/repo.yaml` `index.{fts5,ripgrep}: on` accelerators — all over-approximate identically, so
+> output is byte-identical across them (regression-tested). Surfaced by `agora index status` +
+> an `agora doctor` line.
+
 **Optional FTS5 prefilter** (probe once at startup with `CREATE VIRTUAL TABLE … fts5(…)` in `:memory:`;
 on `OperationalError` set fts5=unavailable). **The FTS5 table is populated with the Python `tokenize()`
 output, NOT raw markdown**, so tokenizer divergence is impossible:
@@ -508,11 +533,12 @@ returned hits.
   never written by the sandboxed curator backend and not in the ADR-0008 INGEST allowlist; the read path
   is read-only and falls back to a pure-Python scan — honoring invariant #2, ADR-0008, and contract C10,
   with no multi-writer race across concurrent `kb_query` callers.
-- **(status, 2026-06-24 — issue #26 search performance at scale):** the §2/§9 derived READER cache
-  (`_kb/index/<repo>.notes.json` + the OPTIONAL `_kb/index/<repo>.fts.sqlite` FTS5 prefilter +
-  `_kb/index/<repo>.meta.json`) was specified here but never built (Phase-1 ships the pure-Python scan
-  only). Issue #26 now IMPLEMENTS that cache so query stays fast as the KB grows. **This is an
-  implementation of this already-Accepted ADR — it needs NO new ADR**, and it does not relax any
+- **(status, 2026-07-05 — issue #26 SHIPPED):** the §2/§9 derived READER cache
+  (`_kb/index/<repo>.notes.json`, meta folded IN per the §2 as-built note, + the OPTIONAL
+  `_kb/index/<repo>.fts.sqlite` FTS5 prefilter) was specified here but not built in Phase-1 (which
+  ships the pure-Python scan only). Issue #26 now IMPLEMENTS that cache so query stays fast as the KB
+  grows. **This is an implementation of this already-Accepted ADR — it needs NO new ADR**, and it does
+  not relax any
   invariant here: the cache stays git-ignored, NEVER canonical, and fully rebuildable from the curated
   commit (invariant #1, keyed on curated-commit-SHA + per-file `content_sha256` per §2); it is
   materialized by deterministic worker/reader code ONLY — NEVER by the sandboxed curator backend and NOT

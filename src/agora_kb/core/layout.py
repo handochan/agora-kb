@@ -122,6 +122,16 @@ class RepoLayout:
         return self.kb_dir / "harvest"
 
     @property
+    def index_cache_dir(self) -> Path:
+        """Derived READER cache directory ``_kb/index/`` (ADR-0012 §2, issue #26).
+
+        Git-ignored, NEVER canonical, fully rebuildable from the markdown at the curated commit
+        (invariant #1). Holds one parsed-note cache + optional FTS5 prefilter per repo. Not created
+        here (this module only computes paths); the deterministic writer mkdirs before it writes.
+        """
+        return self.kb_dir / "index"
+
+    @property
     def state_file(self) -> Path:
         return self.kb_dir / "state.json"
 
@@ -150,3 +160,26 @@ class RepoLayout:
         """
         stem = safe_path_component(connector.replace(":", "-"))
         return self.harvest_dir / f"{stem}.json"
+
+    # --- derived reader cache addressing (ADR-0012 §2, issue #26) --------------------------------
+    def index_notes_path(self, repo: str | None = None) -> Path:
+        """Path of the parsed-note cache ``_kb/index/<repo>.notes.json`` (ADR-0012 §2, issue #26).
+
+        ``repo`` defaults to the repo directory name (the ``SearchHit.repo`` identity). It is run
+        through :func:`safe_path_component` BEFORE the extension is appended, so an unusual repo dir
+        name can never escape ``_kb/index/`` (the same traversal guard the inbox/harvest namespaces
+        use, DESIGN §7). A name that is not a safe component raises :class:`InvalidWriterError`; the
+        read path treats that as "no cache" and falls back to a full scan (query never crashes).
+        """
+        stem = safe_path_component(repo if repo is not None else self.root.name)
+        return self.index_cache_dir / f"{stem}.notes.json"
+
+    def index_fts_path(self, repo: str | None = None) -> Path:
+        """Path of the OPTIONAL FTS5 prefilter cache ``_kb/index/<repo>.fts.sqlite`` (ADR-0012 §9).
+
+        Same traversal guard as :meth:`index_notes_path`. This is a candidate prefilter only (never
+        a scorer, ADR-0012 §0a); it may be absent (readers fall back to the in-memory inverted index
+        or a full scan).
+        """
+        stem = safe_path_component(repo if repo is not None else self.root.name)
+        return self.index_cache_dir / f"{stem}.fts.sqlite"

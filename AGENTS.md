@@ -39,7 +39,8 @@ edits the shared wiki. Repo = tenant boundary. See [`docs/ARCHITECTURE.md`](docs
 ## Layout
 ```
 src/agora_kb/
-  core/        single internal API: inbox(write) · wiki(read) · repo/tenant · state
+  core/        single internal API: inbox(write) · wiki(read) + index_cache.py (the ADR-0012 §2
+               derived query reader cache, _kb/index/, issue #26) · repo/tenant · state
   curator/     sleep-time consolidation worker + backends (BackendRegistry, per-act plan/author
                routing — ADR-0015) + triggers + isolation/ (OS sandbox)
   adapters/    curator-brain shims invoked via adapters.yaml argv: ollama_brain.py
@@ -59,8 +60,8 @@ src/agora_kb/
                graph.js — no Node/CDN)
   schema/      the KB wiki schema (AGENTS.md template emitted into each knowledge repo) + lint
   config.py    load config (adapters.yaml, repo.yaml, triggers + harvest policy + connector specs)
-  cli.py       `agora` entry point
-               (repo init · import · status · curate · harvest · watch · serve · web · doctor)
+  cli.py       `agora` entry point (repo init · import · status · curate · harvest · index · watch ·
+               serve · web · doctor)
   # --- not yet implemented (later phases) ---
   auth/        (Phase 4+ — stub) authn/authz (tokens, OpenFGA/Forgejo delegation)
 docs/          DESIGN, ARCHITECTURE, DATA-MODEL, ROADMAP, INGEST-CONTRACT, adr/

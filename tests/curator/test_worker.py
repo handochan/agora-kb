@@ -235,6 +235,41 @@ def test_happy_path_publishes_theme_advances_ref_and_finalizes(tmp_path: Path) -
     assert manifest.published_commit == new_tip
 
 
+def test_finalize_rebuilds_index_cache_after_publish(tmp_path: Path) -> None:
+    """ADR-0012 §2 / issue #26: a successful (synced) publish rebuilds the derived reader cache.
+
+    The cache is built best-effort in finalize AFTER the owner working copy is synced to the new
+    curated tip, so it is present, fresh (stamped with the published commit), and no
+    ``index_cache_unbuilt`` signal is raised on the happy path.
+    """
+    from agora_kb.core import index_cache
+    from agora_kb.core.wiki import Wiki
+
+    repo = _init_repo(tmp_path)
+    layout = repo.layout
+    inbox = Inbox(layout)
+    e1 = _write_capture(inbox, text="One curator advances the branch under a lock.", second=10)
+    _seed_raw(repo, e1)
+    backend = FakeBackend(
+        _create_theme_plan("ignored", "c1", e1),
+        prose={region_sentinel_id("ignored", "c1"): "The single curator holds a per-repo flock."},
+    )
+
+    report = _run(repo, backend)
+
+    assert report.status == "published"
+    assert "index_cache_unbuilt" not in report.counts
+    assert "owner_working_copy_unsynced" not in report.counts
+    cache_path = layout.index_notes_path()
+    assert cache_path.is_file()
+    payload = index_cache.read_payload(cache_path)
+    assert payload is not None
+    assert payload.curated_commit == report.published_commit
+    # the freshly-published theme is in the cache and query returns it via the cache path
+    assert any(p.endswith("curator-concurrency.md") for p in payload.notes)
+    assert Wiki(layout).query("curator concurrency").status == "ok"
+
+
 def test_routed_backend_runs_plan_and_author_on_distinct_brains(tmp_path: Path) -> None:
     """ADR-0015: a :class:`RoutedBackend` runs PASS-1 on the ``plan`` brain and PASS-2 on the
     ``author`` brain, and the worker publishes EXACTLY as for a single backend — proving routing is
