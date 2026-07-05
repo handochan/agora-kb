@@ -14,13 +14,17 @@ import json
 from datetime import UTC, datetime
 from pathlib import Path
 
+import pytest
+
 from agora_kb.core.inbox import Inbox
 from agora_kb.core.layout import RepoLayout
 from agora_kb.core.models import Confidence, Kind
 from agora_kb.core.repo import Repo
 from agora_kb.core.state import CuratorState
+from agora_kb.curator import bundle
 from agora_kb.curator.bundle import build_bundle
 from agora_kb.curator.claim import claim, curator_lock
+from agora_kb.curator.constants import DEFAULT_RELATED_K
 from agora_kb.curator.manifest import RunManifest
 
 RUN_ID = "2026-06-13T03-00-00.000Z--7f31ab"
@@ -241,6 +245,30 @@ def test_candidates_json_and_related_written(tmp_path: Path) -> None:
         related = _read_json(bundle_dir / "related" / f"{cid}.json")
         assert related["status"] in {"ok", "not_found"}
         assert isinstance(related["hits"], list)
+
+
+def test_build_bundle_threads_related_k(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The repo-global related_k reaches wiki.query(limit=…); default = DEFAULT_RELATED_K."""
+    layout = RepoLayout(tmp_path)
+    inbox = Inbox(layout)
+    _write(inbox, text="a fact worth relating", second=10)
+    manifest = _claim(layout)
+
+    seen: list[int | None] = []
+    orig = bundle.Wiki.query
+
+    def spy(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+        seen.append(kwargs.get("limit"))
+        return orig(self, *args, **kwargs)
+
+    monkeypatch.setattr(bundle.Wiki, "query", spy)
+
+    build_bundle(layout, Repo(layout), manifest, related_k=3)
+    assert seen == [3]  # one candidate → one query at the operator's breadth
+
+    seen.clear()
+    build_bundle(layout, Repo(layout), manifest)  # default
+    assert seen == [DEFAULT_RELATED_K]
 
 
 def test_schema_and_taxonomy_copied_into_bundle(tmp_path: Path) -> None:

@@ -98,7 +98,13 @@ class BundleResult:
     provenance: dict[str, list[dict[str, object]]]
 
 
-def build_bundle(layout: RepoLayout, repo: Repo, manifest: RunManifest) -> BundleResult:
+def build_bundle(
+    layout: RepoLayout,
+    repo: Repo,
+    manifest: RunManifest,
+    *,
+    related_k: int = DEFAULT_RELATED_K,
+) -> BundleResult:
     """Build the read-only input bundle for ``manifest``'s claimed events (ADR-0011 §1, §5 tier-2).
 
     DETERMINISTIC and pure-read: parses the immutable ``processing/<run-id>/events/`` files, applies
@@ -136,7 +142,7 @@ def build_bundle(layout: RepoLayout, repo: Repo, manifest: RunManifest) -> Bundl
     for cand in candidates:
         # §1.1: retrieve-then-decide. Pre-fetch the SAME deterministic core.read used by kb_query
         # over the current wiki; the backend never holds a search tool (sandbox, ADR-0008).
-        result = wiki.query(cand.text, limit=DEFAULT_RELATED_K)
+        result = wiki.query(cand.text, limit=related_k)
         related_path = related_dir / f"{cand.candidate_id}.json"
         related_path.write_text(_to_json(result.model_dump(mode="json")), encoding="utf-8")
 

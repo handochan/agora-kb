@@ -761,6 +761,7 @@ class AgoraHandlers:
             now=_now(),
             taxonomy=cfg.taxonomy,
             max_attempts=cfg.max_attempts,
+            related_k=cfg.related_k,
         )
         return {
             "status": report.status,
