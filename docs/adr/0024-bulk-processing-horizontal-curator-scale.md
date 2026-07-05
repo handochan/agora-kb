@@ -1,6 +1,6 @@
 # ADR-0024 — Bulk knowledge processing & horizontal curator scale (shard by repo)
 
-**Status:** Proposed · 2026-06-24
+**Status:** Accepted · 2026-07-05 (Step-0 ratified, #36) · Proposed 2026-06-24
 
 Extends [ADR-0002](0002-cqrs-single-writer-curator.md) (CQRS + exactly one curator per repo) and
 [ADR-0006](0006-repo-as-tenant-boundary.md) (repo = tenant boundary; the natural sharding axis).

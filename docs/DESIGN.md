@@ -116,6 +116,16 @@ operational spool; it is durable on the repo owner's storage but is not canonica
 indexes/state are rebuildable from retained events and git history. Schemas are in
 [DATA-MODEL.md](DATA-MODEL.md).
 
+**Medallion tiers (vocabulary, ratified 2026-07-05).** In data-platform terms Agora is a three-tier
+pipeline: **bronze** = the ingress concept (the append-only `_kb/inbox/` spool + the immutable
+`raw/`/`assets/` captures), **silver** = the curated `wiki/` SSOT, **gold** = derived, always-fresh
+context packs assembled from the wiki for injection into agents ([ADR-0027](adr/0027-gold-context-packs.md)).
+Medallion words are a docs/vocabulary overlay; the code keeps the `inbox`/`raw`/`wiki`/`gold` names.
+**Source assets are never-lossy:** an original captured file (pdf/pptx/…) is retained under
+`raw/`/`assets/` and linked from every note it feeds (`raw_ref`/`sources:`), and the curator's
+provenance union keeps that link even when the note's *content* deduplicates — no asset is ever
+dropped from the KB (ADR-0020 amend, tracked separately).
+
 ## 4. The curator (sleep-time consolidation)
 
 A background worker, one per repo, triggered by **cron** + **threshold** (inbox depth ≥ N) + **idle**
@@ -346,6 +356,19 @@ External editors are read/browse tools by default. Direct edits to `wiki/` are u
 curator owns the branch; human contributions use `kb_remember`/upload, or a review-mode PR that the
 repo owner imports. This preserves the single-writer invariant.
 
+**Personal + team compose at read time, not by merging** ([ADR-0030](adr/README.md), Phase-4-coupled).
+Connecting to a team does not spin up a second Agora or merge repos: personal and team stay separate
+git repos, each with its own single-writer curator. A client-side scope profile
+(`~/.agora/profile.yaml`, outside every repo) lists the repos the caller reads, and queries/gold packs
+are *composed* at read time — team sections plus a personal overlay — so the agent experiences one
+memory while writes never cross a tenant boundary.
+
+**Deployment topology (V12).** Exactly **one curation home per repo** — the machine or always-on host
+that runs its curator/`watch`; every other environment (laptops, cloud sessions, CI) is a *face* that
+reaches the repo over the network (MCP / HTTP) or via a fetch-only clone with lazy gold rebuild (safe
+because a pack is a pure function of the curated commit). The Phase-4 HTTP inbox API doubles as the
+personal multi-device write path.
+
 **Access control, OSS, two tiers:**
 1. **Delegate to the git host (Forgejo/Gitea):** repos, teams, roles, and PRs already exist there;
    Agora authorizes via the host's tokens/API → no ACL to reinvent. Best starting point.
@@ -388,3 +411,48 @@ markdown-first philosophy of Basic Memory, Khoj, and the Karpathy LLM-wiki patte
 **The gap Agora fills:** no mature OSS project combines *markdown wiki × queue + sleep-time
 consolidation + MCP × local-LLM × multi-tenant teams + memory harvesting*. That intersection — a
 self-hostable, fully-OSS, multi-tenant shared-memory hub — is Agora.
+
+## 10. Vision extensions & ecosystem posture (Step-0 ratified 2026-07-05)
+
+Ratified in the Step-0 session (issue #36) and recorded here as SSOT; each item is realized by an ADR
+in the spine below. The framing: Agora is a **knowledge orchestrator + knowledge platform** — a
+medallion pipeline (§3) whose curator is the transform stage, whose harvester connectors are the
+extract stage, and whose gold packs are the serving layer that keeps every agent's memory fresh.
+
+**ADR spine.** [0027](adr/0027-gold-context-packs.md) gold packs + the single normative outbound
+sentinel/loop-break contract (Accepted). Reserved: **0028** LLM `DISTILL` curator act
+(evidence-triggered); **0029** connector ecosystem — the exec "CWP" wire + registration UX + injection
+re-consent (evidence-triggered); **0030** federation / team composition + promotion airlock
+(Phase-4-coupled); **0031** retention / right-to-delete (a hard prerequisite for `mail:`/`chat:`
+connectors).
+
+**Plane law (V7).** Agora is the **memory plane**; a companion execution runtime (e.g. aelix) is the
+**execution plane** (task boards, self-improving skills); "hermes" is a flagship **distribution
+profile**, not a codebase. Agora never stores mutable task state; an execution runtime never stores
+canonical knowledge. Integrations are bridges — the first is `agora-bridge-<runtime>`, *first among
+equals, never privileged* (invariant 6).
+
+**Single-registry rule (V8).** `adapters.yaml` is the one registry for brains and connectors. A
+runtime's extension marketplace distributes *authoring* artifacts only — never a parallel runtime
+registry.
+
+**Schema/versioning rule (V9).** Every vision ADR carries a `schema_version` impact clause
+(none / additive / bump); an `agora repo upgrade` command ships before the first feature that adds
+curator-visible vocabulary. Posture: new binary on an old repo = read-works / write-warns; old binary
+on a new repo = fail-loud.
+
+**Consumption reaches restricted environments (Q3).** Because corporate hosts often block MCP, the
+file-`@include` channel is first-class: a per-agent memory-path map (e.g. `CLAUDE.md`,
+`.github/copilot-instructions.md`, `.cursor/rules`) receives a sentinel-fenced, refresh-only gold-pack
+region written only on the user's explicit `agora link <agent>` (standing consent; never a silent
+write into an agent config dir — the reserved-[ADR-0026](adr/README.md) posture holds). Tier-1 target agents: Claude
+Code, Codex, Antigravity CLI, OpenCode, GitHub Copilot, Pi, Qwen, aelix — tested integrations, not
+hard-coded (invariant 6).
+
+**Ratified defaults.** Gold pack default budget = **2000 tokens** (V3; a reversible config default);
+harvest-origin and contested notes are default-excluded from packs. Corporate-source harvesters
+(`mail:`/`chat:` against employer tenants) default to a **team/org repo**, not a personal one, and the
+OSS no-admin-consent path (`imap:` / local export) is the default route (V5). Gold freshness =
+curation cadence (eventual consistency, §2.2); tighter freshness is bought by running the curator more
+often, decided after a one-day curator-economics measurement (V4). Bridge repo location/name is
+deferred to bridge Phase A (issue #38).

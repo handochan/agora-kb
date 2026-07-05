@@ -1,6 +1,6 @@
 # ADR-0025 — Web-face operator config, multi-upload, broadened extensions
 
-**Status:** Proposed · 2026-06-24 · covers issue [#29]
+**Status:** Accepted · 2026-07-05 (Step-0 ratified, #36; shipped in PR #33) · Proposed 2026-06-24 · covers issue [#29]
 
 Extends [ADR-0019](0019-web-face-stack.md) (web-face stack: API-first FastAPI + server-rendered
 HTMX; §5 "charts are the single bolt-on"; §7 SPA-island triggers) and [ADR-0020](0020-web-upload-write-path.md)
