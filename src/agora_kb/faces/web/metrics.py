@@ -169,15 +169,14 @@ class AgoraCollector:
             labels=["connector"],
         )
         # Facts carrying >=1 redaction, labelled by connector AND secret/PII class (ADR-0023
-        # decision 5). Metadata-only — the label is the CLASS NAME, never the secret. DORMANT until
-        # the session connector (#25) adds the persisted HarvestCursor.redacted source; until then
-        # harvester_status() supplies no 'redacted' key, so this emits NO samples (an honest 0),
-        # mirroring the accepted/rejected deferred-0 precedent above.
+        # decision 5). Metadata-only — the label is the CLASS NAME, never the secret. The persisted
+        # HarvestCursor.redacted source is LIVE (#25): harvester_status() supplies the per-connector
+        # 'redacted' map, so a connector that redacts (session:) emits real samples; one that never
+        # redacts (file:) supplies {} and emits nothing (an honest 0).
         redacted = CounterMetricFamily(
             "agora_harvester_redacted",
             "Facts with >=1 redaction, by connector and secret/PII class (metadata-only; never "
-            "the secret). Write-path wiring lands with the session connector (#25); dormant "
-            "until then.",
+            "the secret).",
             labels=["connector", "class"],
         )
         for conn in connectors:  # type: ignore[union-attr]

@@ -245,7 +245,8 @@ Per-connector position, so each scan only emits new/changed facts.
   "source_path": "/Users/handochan/.claude/.../MEMORY.md",
   "last_scan": "2026-06-13T02:00:00Z",
   "last_content_sha256": "<hex>",
-  "proposed": 24, "accepted": 17, "rejected": 7
+  "proposed": 24, "accepted": 17, "rejected": 7,
+  "redacted": { "jwt": 2, "aws_access_key_id": 1 }
 }
 ```
 
@@ -266,12 +267,15 @@ bump, never replayed in recovery) so it is best-effort + rebuildable, never an i
 each writer load-then-saves so neither clobbers the other. The connector name is sanitized to a safe filename
 (`file:claude-code` → `file-claude-code.json`, path-traversal-guarded).
 
-**Staged (deferred to #25):** a `redacted: {<class>: <count>}` map — facts with ≥1 redaction, per
-secret/PII class — is authorized as a decision-5-mandated observability field (ADR-0023 "Redaction v1
-policy" addendum §6). It is NOT present yet: #39 landed the redactor + a **dormant**
-`agora_harvester_redacted{connector,class}` metric (no samples until this field feeds it); #25 adds the
-field, bumps it beside `proposed` at the connector boundary, and updates this section + the
-`HarvestCursor` docstring's "no unbounded extension" note when it lands.
+**`redacted` (ADR-0023 addendum §6, landed #25):** a `redacted: {<class>: <count>}` map — facts with
+≥1 redaction, per secret/PII class — authorized as a decision-5-mandated observability field (the
+one addition beyond the original §6 fields; the ADR redaction mandate is its authorizing ADR). It is
+**harvester-owned**, bumped once per class per WRITTEN fact beside `proposed` at the connector
+boundary (a deduped/pending fact is not re-counted, so it tracks new content like `proposed`), and
+feeds the `agora_harvester_redacted{connector,class}` Prometheus family (dormant until #25 — #39
+landed the redactor + the metric shell). The `file:` connector never redacts (its write path stays
+byte-identical, #39), so its `redacted` stays `{}` — an honest 0. Metadata only: a class name +
+count, never the secret. No `schema_version` impact (git-ignored `_kb/` state only).
 
 ## 6a. Gold context pack + meta sidecar — `_kb/gold/<pack>.md` + `_kb/gold/<pack>.meta.json`
 

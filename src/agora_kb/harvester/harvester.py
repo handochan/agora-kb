@@ -34,7 +34,7 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, field_serializer, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_validator
 
 from agora_kb.config import ConnectorSpec, HarvestPolicy
 from agora_kb.core.atomicio import atomic_write_text
@@ -99,12 +99,20 @@ def check_scope(connector_scope: Scope, policy: HarvestPolicy) -> None:
 class HarvestCursor(BaseModel):
     """Per-connector scan position — ``_kb/harvest/<connector>.json`` (DATA-MODEL §6).
 
-    Held to EXACTLY the documented §6 fields (no unbounded extension — ADR-0017). The harvester
-    writes ``connector`` / ``source_path`` / ``last_scan`` / ``last_content_sha256`` / ``proposed``;
-    ``accepted`` / ``rejected`` are the curator's, bumped at finalize from the run's
-    harvested-candidate dispositions (ADR-0011 / ADR-0017 §7). They are PRESERVED across harvester
-    saves so the harvester never clobbers the curator's increments (and vice versa — the curator
-    re-loads then increments via the atomic :class:`CursorStore`).
+    Held to the documented §6 fields (no *unbounded* extension — ADR-0017). The harvester writes
+    ``connector`` / ``source_path`` / ``last_scan`` / ``last_content_sha256`` / ``proposed`` (and
+    ``redacted`` — see below); ``accepted`` / ``rejected`` are the curator's, bumped at finalize
+    from the run's harvested-candidate dispositions (ADR-0011 / ADR-0017 §7). They are PRESERVED
+    across harvester saves so the harvester never clobbers the curator's increments (and vice versa
+    — the curator re-loads then increments via the atomic :class:`CursorStore`).
+
+    ``redacted`` (a ``{class: count}`` map — facts with ≥1 redaction, per secret/PII class) is the
+    ONE authorized addition beyond the original §6 fields: a decision-5-mandated observability
+    source for the ``agora_harvester_redacted{connector,class}`` metric (ADR-0023 "Redaction v1
+    policy" addendum §6 is the authorizing ADR). It is harvester-owned, bumped once per class per
+    written fact beside ``proposed`` at the connector boundary; the ``file:`` connector never
+    redacts, so it stays ``{}`` there (an honest 0). No ``schema_version`` impact (git-ignored
+    ``_kb/`` state only).
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -116,6 +124,7 @@ class HarvestCursor(BaseModel):
     proposed: int = 0
     accepted: int = 0
     rejected: int = 0
+    redacted: dict[str, int] = Field(default_factory=dict)
 
     @field_validator("last_scan")
     @classmethod
@@ -227,26 +236,34 @@ def build_connectors(specs: list[ConnectorSpec]) -> list[Connector]:
 def _redaction_preview(
     facts: tuple[HarvestedFact, ...],
 ) -> tuple[tuple[HarvestedFact, ...], tuple[str, ...]]:
-    """Redact each dry-run preview fact; return (redacted facts, metadata-only notes).
+    """Return (preview-safe facts, metadata-only notes) for the ``--dry-run`` redaction preview.
 
     Read-only: this runs ONLY in the ``--dry-run`` branch (which never touches the inbox or a
-    cursor), so the shipped write path stays byte-identical — the live write-path redaction lands
-    with the session connector (#25). The preview text is REDACTED so ``agora harvest --dry-run``
-    never prints a secret to the terminal (ADR-0023 decision 5: the preview counts + classifies,
-    it NEVER logs the secret). The note carries the class name + integer count only.
+    cursor). Two fact shapes reach it, and NEITHER ever prints a secret (ADR-0023 decision 5 — the
+    preview counts + classifies, never logs the secret):
+
+    * A fact **already redacted at the connector boundary** (the ``session:`` connector — it carries
+      ``redaction_hits`` and its ``text`` is the redacted text over which ``fact_key`` was taken).
+      Its counts come from the reported hits — re-scanning would be a no-op (redact is idempotent).
+    * An **un-redacted** fact (the ``file:`` connector, whose live write path stays byte-identical,
+      #39). The PREVIEW ONLY is courtesy-redacted so the terminal never shows a secret; the live
+      write path is untouched.
     """
     previewed: list[HarvestedFact] = []
     counts: dict[str, int] = {}
     n_facts = 0
     for fact in facts:
+        if fact.redaction_hits:
+            n_facts += 1
+            for hit in fact.redaction_hits:
+                counts[hit.cls] = counts.get(hit.cls, 0) + hit.count
+            previewed.append(fact)  # text is already the redacted text
+            continue
         result = redact(fact.text, policy=DEFAULT_POLICY)
         if result.redacted:
             n_facts += 1
             for hit in result.hits:
                 counts[hit.cls] = counts.get(hit.cls, 0) + hit.count
-            # Only ``text`` is redacted; ``fact_key`` stays the raw-derived content_sha256 (the CLI
-            # prints a 12-char prefix — a weak whole-line SHA, not the secret). Moving fact_key over
-            # the redacted text lands with the live write path (#25, ADR-0023 addendum §2).
             previewed.append(replace(fact, text=result.text))
         else:
             previewed.append(fact)
@@ -255,6 +272,18 @@ def _redaction_preview(
     breakdown = ", ".join(f"{cls} x{counts[cls]}" for cls in sorted(counts))
     note = f"would redact {n_facts} fact(s) before persistence: {breakdown}"
     return tuple(previewed), (note,)
+
+
+def _redaction_written_notes(counts: dict[str, int]) -> tuple[str, ...]:
+    """A metadata-only note summarizing redactions applied on the WRITE path (ADR-0023 §6).
+
+    ``counts`` is per-class facts-with-redaction (the same tally bumped into ``cursor.redacted``) —
+    a class name + integer count, NEVER the secret. Empty ``counts`` yields no note.
+    """
+    if not counts:
+        return ()
+    breakdown = ", ".join(f"{cls} x{counts[cls]}" for cls in sorted(counts))
+    return (f"redacted secret/PII from written fact(s): {breakdown}",)
 
 
 class Harvester:
@@ -387,6 +416,13 @@ class Harvester:
             target = f"team:{repo_name}"
         written = 0
         deduped = 0
+        # ADR-0023 §6: facts-with-redaction, per secret/PII class — bumped ONCE per class per
+        # WRITTEN fact (a deduped/pending fact is not re-counted, so the counter tracks new content
+        # like ``proposed``, never inflating on a re-flood). The fact arrives already-redacted from
+        # the connector boundary (fact.text / fact.fact_key are over the REDACTED text — addendum
+        # §2), so this only tallies what the connector reported in ``redaction_hits``; ``file:``
+        # facts carry none, keeping their write path byte-identical (#39).
+        redacted_counts: dict[str, int] = {}
         for fact in scan.facts:
             receipt = self._inbox.write(
                 text=fact.text,
@@ -402,6 +438,8 @@ class Harvester:
             )
             if receipt.queued:
                 written += 1
+                for hit in fact.redaction_hits:
+                    redacted_counts[hit.cls] = redacted_counts.get(hit.cls, 0) + 1
             else:
                 deduped += 1
 
@@ -415,6 +453,8 @@ class Harvester:
         if scan.content_sha256 is not None:
             cursor.last_content_sha256 = scan.content_sha256
         cursor.proposed += written
+        for cls, n in redacted_counts.items():
+            cursor.redacted[cls] = cursor.redacted.get(cls, 0) + n
         self._cursors.save(cursor)
 
         return ConnectorReport(
@@ -425,7 +465,7 @@ class Harvester:
             facts_found=len(scan.facts),
             written=written,
             deduped=deduped,
-            notes=scan_notes,
+            notes=scan_notes + _redaction_written_notes(redacted_counts),
         )
 
     def _gold_loop_notes(self, facts: tuple[HarvestedFact, ...]) -> tuple[str, ...]:
