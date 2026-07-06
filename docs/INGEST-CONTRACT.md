@@ -47,6 +47,14 @@ repo's `AGENTS.md`/`SCHEMA.md` under an `INGEST` section.
   (§7 below; happy-path-only mirror of the state-counter bump, per-harvested-event granularity).
 - [ADR-0018 — Harvester link-following](adr/0018-harvester-link-following.md): opt-in following of a
   candidate's `[Title](sibling.md)` pointer.
+- [ADR-0023 — Context-harvester connectors](adr/0023-context-harvester-connectors.md): extends the
+  harvester (ADR-0007/0017) to session/working-context sources behind the same `Connector` seam.
+  Session-derived candidates get the SAME `is_gated` treatment (§6) — but a raw transcript's far worse
+  signal-to-noise makes **reliable DROP a validation requirement** before a session source is relied
+  upon (decision 3), and per-turn role attribution is **flattened** + agora sentinels stripped so a
+  transcript turn cannot impersonate engine structure in the candidate bundle the planning brain reads
+  (§7/§8). A connector-boundary `core/redact.py` pass (decision 5) runs BEFORE the immutable inbox
+  write, so a pasted secret never persists (invariant #3 — the inbox is un-scrubbable).
 
 ---
 ## 0. Where INGEST sits in the transactional loop (ADR-0008 step 5, expanded)

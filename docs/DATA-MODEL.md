@@ -253,7 +253,11 @@ The cursor is a derived, git-ignored performance optimization (rebuildable from 
 never an integrity control: a missing/corrupt cursor loads fresh and the scan re-reads from scratch
 (the candidate gate absorbs any re-flood). `last_content_sha256` is the whole-source fast no-op (an
 unchanged file emits nothing); pending-delivery idempotency reuses the inbox `event_key`
-(ADR-0017 §4). **Counter ownership (ADR-0017 §7):** the harvester writes `connector` / `source_path`
+(ADR-0017 §4). **Per-connector-type cursor semantics (ADR-0023 §8):** `file:` / `dir:` / `session:`
+set `last_content_sha256` to the **whole-source hash** (re-read on any byte change; the candidate
+gate + `event_key` idempotency absorb the re-flood), and `git:` hashes the concatenated since-cursor
+commit payloads. There is **no** per-file-offset or per-commit-SHA cursor field — that would be a §6
+schema change requiring its own ADR (ADR-0023 decision 8) and is premature for v1. **Counter ownership (ADR-0017 §7):** the harvester writes `connector` / `source_path`
 / `last_scan` / `last_content_sha256` / `proposed`; the curator owns `accepted` / `rejected`, bumped
 at finalize from each run's harvested-candidate dispositions (ADR-0011 / ADR-0017 §7 — `accepted` +=
 `MERGE_INTO_THEME`/`MARK_CONTESTED`, `rejected` += `DROP`, `NOOP` skipped, per harvested provenance
