@@ -170,6 +170,45 @@ class Connector(Protocol):
         """Return facts new/changed since ``last_content_sha256`` plus the new whole-source hash."""
 
 
+def _parse_connector_agent(name: str, prefix: str) -> str:
+    """Validate a ``<prefix><agent>`` connector key → the safe ``<agent>`` token (ADR-0017).
+
+    Shared by the ``file:`` and ``session:`` connectors so this identity boundary lives in ONE
+    place. The agent becomes BOTH the inbox source suffix (``harvest:<agent>``) AND the writer
+    namespace (``harvest-<agent>``); both are validated to a safe path component so neither can
+    escape the inbox/cursor namespace (the loose ``models._HARVEST_RE`` alone is NOT sufficient, and
+    the 8-char ``harvest-`` prefix can push a long-but-valid agent past ``_WRITER_MAX``). Raises
+    :class:`ConnectorError` on a bad prefix or an unsafe token.
+    """
+    if not name.startswith(prefix) or len(name) <= len(prefix):
+        kind = prefix.rstrip(":")
+        raise ConnectorError(
+            f"{kind} connector name must be '{prefix}<agent>' (e.g. {prefix}claude-code), "
+            f"got {name!r}"
+        )
+    agent = name[len(prefix) :]
+    try:
+        validate_writer(agent)
+        validate_writer(f"harvest-{agent}")
+    except ValueError as exc:
+        raise ConnectorError(f"connector {name!r}: unsafe agent token {agent!r} ({exc})") from exc
+    return agent
+
+
+def _require_source_path(name: str, path: str) -> None:
+    """Validate a connector ``path`` is a non-empty absolute/``~``-rooted source locator (ADR-0017).
+
+    The absolute/``~``-rooted requirement makes the symlink-escape containment root a stable
+    declared tree, not the ambient process CWD at scan time. Raises :class:`ConnectorError` if not.
+    """
+    if not isinstance(path, str) or not path.strip():
+        raise ConnectorError(f"connector {name!r}: 'path' must be a non-empty string")
+    if not os.path.isabs(os.path.expanduser(path)):
+        raise ConnectorError(
+            f"connector {name!r}: 'path' must be absolute or ~-rooted (got {path!r})"
+        )
+
+
 class FileConnector:
     """Diff a markdown ``MEMORY.md`` memory file into candidate facts (ADR-0007, DESIGN §6).
 
@@ -201,33 +240,8 @@ class FileConnector:
         follow_links: bool = False,
         max_followed: int = 256,
     ) -> None:
-        if not name.startswith("file:") or len(name) <= len("file:"):
-            raise ConnectorError(
-                f"file connector name must be 'file:<agent>' (e.g. file:claude-code), got {name!r}"
-            )
-        agent = name[len("file:") :]
-        # The agent becomes BOTH the inbox source suffix ('harvest:<agent>') AND the writer
-        # namespace ('harvest-<agent>'); validate it ONCE to a safe path component so neither can
-        # escape the inbox/cursor namespace (the loose models._HARVEST_RE alone is NOT sufficient
-        # — ADR-0017).
-        try:
-            validate_writer(agent)
-            # The DERIVED inbox writer ('harvest-<agent>') must ALSO be a safe component — the
-            # 8-char prefix can push a long-but-valid agent past _WRITER_MAX. Reject it loudly at
-            # build time rather than as an uncaught error mid-write (ADR-0017).
-            validate_writer(f"harvest-{agent}")
-        except ValueError as exc:
-            raise ConnectorError(
-                f"connector {name!r}: unsafe agent token {agent!r} ({exc})"
-            ) from exc
-        if not isinstance(path, str) or not path.strip():
-            raise ConnectorError(f"connector {name!r}: 'path' must be a non-empty string")
-        # Require an absolute (or ~-rooted) source path so the symlink-escape containment root is a
-        # stable declared tree, not the ambient process CWD at scan time (ADR-0017 path-safety).
-        if not os.path.isabs(os.path.expanduser(path)):
-            raise ConnectorError(
-                f"connector {name!r}: 'path' must be absolute or ~-rooted (got {path!r})"
-            )
+        agent = _parse_connector_agent(name, "file:")
+        _require_source_path(name, path)
         self._name = name
         self._agent = agent
         self._scope = Scope(scope)

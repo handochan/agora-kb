@@ -46,20 +46,19 @@ candidate-gate cost (ADR-0017). Both are why **reliable DROP is a validation req
 
 from __future__ import annotations
 
-import os.path
 import re
 
 from agora_kb.core.hashing import content_sha256
-from agora_kb.core.layout import validate_writer
 from agora_kb.core.redact import DEFAULT_POLICY, RedactionPolicy, redact
 from agora_kb.core.sentinel import strip_sentinel_spans
 
 from .connectors import (
-    ConnectorError,
     ConnectorScan,
     HarvestedFact,
     Scope,
     _neutralize,
+    _parse_connector_agent,
+    _require_source_path,
     _resolve_glob_files,
 )
 from .session_sources import ClaudeCodeJsonlReader, SessionReader
@@ -120,30 +119,10 @@ class SessionConnector:
         max_facts: int = 512,
         max_fact_bytes: int = 4096,
     ) -> None:
-        if not name.startswith("session:") or len(name) <= len("session:"):
-            raise ConnectorError(
-                "session connector name must be 'session:<agent>' (e.g. session:claude-code), "
-                f"got {name!r}"
-            )
-        agent = name[len("session:") :]
-        # The agent becomes BOTH the inbox source suffix ('harvest:<agent>') AND the writer
-        # namespace ('harvest-<agent>'); validate BOTH to a safe path component so neither escapes
-        # the inbox/cursor namespace (identical posture to FileConnector, ADR-0017).
-        try:
-            validate_writer(agent)
-            validate_writer(f"harvest-{agent}")
-        except ValueError as exc:
-            raise ConnectorError(
-                f"connector {name!r}: unsafe agent token {agent!r} ({exc})"
-            ) from exc
-        if not isinstance(path, str) or not path.strip():
-            raise ConnectorError(f"connector {name!r}: 'path' must be a non-empty string")
-        # Require an absolute (or ~-rooted) source path so the symlink-escape containment root is a
-        # stable declared tree, not the ambient process CWD at scan time (ADR-0017 path safety).
-        if not os.path.isabs(os.path.expanduser(path)):
-            raise ConnectorError(
-                f"connector {name!r}: 'path' must be absolute or ~-rooted (got {path!r})"
-            )
+        # Identity + path validation is the shared connector boundary (ADR-0017) — same helper the
+        # file: connector uses, so the safe-agent / absolute-path rules never drift between the two.
+        agent = _parse_connector_agent(name, "session:")
+        _require_source_path(name, path)
         self._name = name
         self._agent = agent
         self._scope = Scope(scope)
