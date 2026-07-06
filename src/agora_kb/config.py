@@ -36,6 +36,7 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field
 
 from .core.layout import RepoLayout
+from .core.redact import DEFAULT_ON_CLASSES, KNOWN_CLASSES, RedactionPolicy
 from .curator import BackendRegistry, TriggerConfig
 from .curator.constants import DEFAULT_BODY_BYTE_BOUND, DEFAULT_MAX_ATTEMPTS, DEFAULT_RELATED_K
 from .schema import Taxonomy
@@ -49,6 +50,8 @@ __all__ = [
     "load_backend_registry",
     "HarvestPolicy",
     "load_harvest_policy",
+    "RedactSettings",
+    "load_redact_policy",
     "IndexPolicy",
     "load_index_policy",
     "ConnectorSpec",
@@ -369,6 +372,66 @@ def load_harvest_policy(layout: RepoLayout) -> HarvestPolicy:
     if kind is not None and kind not in _SCOPE_VALUES:
         raise ConfigError(f"repo kind must be one of {list(_SCOPE_VALUES)}, got {kind!r}")
     return HarvestPolicy(enabled=enabled, scope_lock=scope_lock, repo_kind=kind)
+
+
+# --- connector-boundary redaction config (ADR-0023 decision 5 / addendum §5, issue #25) ---------
+
+
+@dataclass(frozen=True)
+class RedactSettings:
+    """Resolved ``harvest.redact`` config: the kill-switch + the effective :class:`RedactionPolicy`.
+
+    A frozen value (like :class:`ConnectorSpec`) so this config seam stays free of harvester state.
+    ``enabled`` (default ``True``) is the kill-switch: when off, the ``session:`` connector performs
+    NO redaction (the operator's explicit escape hatch, accepting the un-scrubbable-inbox risk).
+    ``policy`` is the :class:`~agora_kb.core.redact.RedactionPolicy` the connector applies at its
+    boundary before the immutable inbox write; the structural default-on tier
+    (:data:`~agora_kb.core.redact.DEFAULT_ON_CLASSES`) is ALWAYS present when enabled — config only
+    *widens* it (``pii`` extra classes, ``deny`` literals) or *narrowly suppresses* it (``allow``
+    literals), never drops a structural class (ADR-0023 addendum §5).
+    """
+
+    enabled: bool
+    policy: RedactionPolicy
+
+
+def load_redact_policy(layout: RepoLayout) -> RedactSettings:
+    """Load ``harvest.redact`` from ``_kb/repo.yaml`` (ADR-0023 addendum §5); defaults when absent.
+
+    Fail-loud, mirroring :func:`load_harvest_policy`: read via the same raw-mapping ``.get()`` path
+    (NOT by constructing an ``extra='forbid'`` model). A missing file / ``redact:`` block yields the
+    secure default — redaction ENABLED with the Balanced-9 structural tier
+    (:data:`~agora_kb.core.redact.DEFAULT_ON_CLASSES`) and empty allow/deny, so a ``session:``
+    connector redacts out of the box. Keys:
+
+    * ``enabled`` (bool, default ``True``) — the kill-switch.
+    * ``pii`` (list of class names) — EXTRA classes to enable beyond the structural default-on set
+      (e.g. the opt-in ``generic_assigned_secret``). Each MUST be in
+      :data:`~agora_kb.core.redact.KNOWN_CLASSES` or it raises :class:`ConfigError` — a typo in a
+      privacy-relevant policy must surface, never silently take a default.
+    * ``allow`` (list of literals) — secrets NEVER redacted (a documented sample credential).
+    * ``deny`` (list of literals) — extra literals ALWAYS redacted.
+
+    The structural tier is never dropped: the effective class set is
+    ``DEFAULT_ON_CLASSES | set(pii)`` — ``pii`` can only ADD.
+    """
+    raw = _read_yaml_mapping(repo_config_path(layout))
+    harvest = _sub_mapping(raw.get("harvest"))
+    redact = _sub_mapping(harvest.get("redact"))
+    enabled = _opt_bool(redact.get("enabled"), True, key="harvest.redact.enabled")
+    pii = _str_list(redact.get("pii"))
+    unknown = [c for c in pii if c not in KNOWN_CLASSES]
+    if unknown:
+        raise ConfigError(
+            f"harvest.redact.pii: unknown redaction class(es) {unknown}; "
+            f"known classes are {sorted(KNOWN_CLASSES)}"
+        )
+    policy = RedactionPolicy(
+        classes=DEFAULT_ON_CLASSES | frozenset(pii),
+        allow=tuple(_str_list(redact.get("allow"))),
+        deny=tuple(_str_list(redact.get("deny"))),
+    )
+    return RedactSettings(enabled=enabled, policy=policy)
 
 
 # --- derived reader-cache config (ADR-0012 §2, issue #26) ---------------------------------------

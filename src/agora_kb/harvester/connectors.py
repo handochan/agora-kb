@@ -41,6 +41,7 @@ from typing import Protocol, runtime_checkable
 
 from agora_kb.core.hashing import content_sha256
 from agora_kb.core.layout import validate_writer
+from agora_kb.core.redact import RedactionHit
 from agora_kb.core.sentinel import strip_agora_sentinels, strip_sentinel_spans
 
 # The ADR-0027 §8 sentinel grammar + its consumer-duty strippers now live canonically in
@@ -107,12 +108,21 @@ class HarvestedFact:
     only (ADR-0018 D5), so the inbox keys collapse identical sibling bodies even when ``text``
     differs. ``domain`` / ``tags`` are optional curator hints (the file connector supplies neither;
     they are carried for future connectors).
+
+    ``redaction_hits`` records the per-class secret/PII matches a connector redacted from ``text``
+    **before** ``text`` / ``fact_key`` were computed (ADR-0023 decision 5 / addendum §2 — so
+    ``fact_key`` is a hash of the REDACTED text, never the raw secret). It is empty for a connector
+    that does not redact (the ``file:`` connector — its write path stays byte-identical, #39); the
+    orchestrator bumps ``HarvestCursor.redacted`` from these hits (once per class per written fact,
+    §6) and the ``--dry-run`` preview reads them instead of re-scanning. Metadata only — a
+    :class:`~agora_kb.core.redact.RedactionHit` carries a class name + count, never the secret.
     """
 
     text: str
     fact_key: str
     domain: str | None = None
     tags: tuple[str, ...] = ()
+    redaction_hits: tuple[RedactionHit, ...] = ()
 
 
 @dataclass(frozen=True)

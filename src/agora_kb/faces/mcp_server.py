@@ -389,6 +389,10 @@ class AgoraHandlers:
                     "proposed": cursor.proposed,
                     "accepted": cursor.accepted,
                     "rejected": cursor.rejected,
+                    # ADR-0023 §6: {class: count} facts-with-redaction, the source the Prometheus
+                    # agora_harvester_redacted{connector,class} family reads (metadata-only — a
+                    # class name + count, never the secret). {} for one that does not redact.
+                    "redacted": dict(cursor.redacted),
                 }
             )
         return {"enabled": enabled, "connectors": connectors}

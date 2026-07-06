@@ -1001,6 +1001,10 @@ def _doctor_connectors(layout: RepoLayout) -> None:
                 f"last_scan={last} proposed={cursor.proposed} "
                 f"accepted={cursor.accepted} rejected={cursor.rejected}"
             )
+            if cursor.redacted:
+                # ADR-0023 §6: per-class facts-with-redaction (metadata-only; never the secret).
+                breakdown = ", ".join(f"{c}={cursor.redacted[c]}" for c in sorted(cursor.redacted))
+                counters += f" redacted={{{breakdown}}}"
         except Exception as exc:  # noqa: BLE001 — a bad connector name must not crash doctor.
             counters = f"cursor unreadable ({exc})"
         print(f"    {spec.name} (scope={spec.scope}): {counters}")
