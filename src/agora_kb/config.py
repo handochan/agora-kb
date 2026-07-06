@@ -299,14 +299,17 @@ def write_default_adapters_yaml(layout: RepoLayout, *, model: str | None = None)
     # default. The BackendRegistry ignores this block; the harvester's loader (load_connector_specs)
     # reads it. Uncomment + point at a real memory file to start harvesting into gated candidates.
     text += (
-        "\n# READ adapters — memory harvester connectors (ADR-0007; opt-in, also needs\n"
+        "\n# READ adapters — context harvester connectors (ADR-0007/0023; opt-in, also needs\n"
         "# repo.yaml harvest.enabled: true). scope guards privacy (personal feeds only a personal\n"
         "# repo). follow_links (ADR-0018, default off) follows a bullet's [Title](sibling.md)\n"
-        "# and harvests the sibling's content instead of the thin one-line summary.\n"
-        "# Uncomment + point at a real memory file to enable harvesting.\n"
+        "# and harvests the sibling's content instead of the thin one-line summary. A session:\n"
+        "# connector (ADR-0023) distills agent SESSION transcripts (assistant reflections with a\n"
+        "# durable-knowledge marker); it redacts secrets at its boundary per harvest.redact\n"
+        "# (default on). Uncomment + point at a real source to enable harvesting.\n"
         "# connectors:\n"
         '#   file:claude-code: { path: "~/.claude/**/MEMORY.md", scope: personal }\n'
         '#   file:hermes: { path: "~/.hermes/MEMORY.md", scope: personal, follow_links: true }\n'
+        '#   session:claude-code: { path: "~/.claude/projects/**/*.jsonl", scope: personal }\n'
     )
     path.write_text(text, encoding="utf-8")
     return path

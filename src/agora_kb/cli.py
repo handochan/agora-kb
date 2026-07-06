@@ -41,6 +41,7 @@ from .config import (
     load_connector_specs,
     load_harvest_policy,
     load_index_policy,
+    load_redact_policy,
     load_repo_config,
     write_default_adapters_yaml,
     write_default_repo_config,
@@ -537,6 +538,7 @@ def _cmd_harvest(args: argparse.Namespace) -> int:
     now = datetime.now(UTC)
     try:
         policy = load_harvest_policy(layout)
+        redact = load_redact_policy(layout)
         repo_name = load_repo_config(layout).name
         specs = load_connector_specs(layout.root / "adapters.yaml")
     except ConfigError as exc:
@@ -556,7 +558,7 @@ def _cmd_harvest(args: argparse.Namespace) -> int:
         return 1
 
     try:
-        connectors = build_connectors(specs)
+        connectors = build_connectors(specs, redact=redact)
     except (ConnectorError, ValueError) as exc:
         print(f"{_PROG} harvest: {exc}", file=sys.stderr)
         return 1
