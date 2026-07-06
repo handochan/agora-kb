@@ -302,14 +302,16 @@ sources and propose candidate knowledge. Originally a *memory* harvester (agent 
 seam generalizes to any **work-context source** behind the **same triad** — candidate gate +
 fail-closed scope lock + provenance — with **no core change** (each source is an ADR-0004 read-adapter).
 
-> **Status (Phase 2, shipped — ADR-0007/0017/0018).** Implemented and CLI-exposed via
-> `agora harvest [--dry-run] [--connector NAME]` over a `FileConnector` (the only Phase-2 connector).
+> **Status (shipped — ADR-0007/0017/0018/0023).** Implemented and CLI-exposed via
+> `agora harvest [--dry-run] [--connector NAME]` over a `FileConnector` and a `SessionConnector`.
 > Opt-in: disabled unless `harvest.enabled` is set in `_kb/repo.yaml`, with `connectors:` declared in
 > `adapters.yaml`; `agora doctor` lists the configured connectors. Opt-in **link-following** follows a
-> pointer bullet's `[Title](sibling.md)` to harvest the sibling's content (ADR-0018). The API
-> connectors (Letta, mem0) remain Phase 5. The broader work-context source classes below are
-> **Proposed** (issues #25/#28), pending **ADR-0023** (context-harvester connectors: taxonomy,
-> OSS paths, safety envelope); only *memory files* ship today.
+> pointer bullet's `[Title](sibling.md)` to harvest the sibling's content (ADR-0018). The **`session:`
+> connector** (agent transcripts → deterministically-distilled candidates, with connector-boundary
+> secret redaction before the immutable inbox write) is **shipped** (#25, ADR-0023 Accepted). The API
+> connectors (Letta, mem0) remain Phase 5; the remaining work-context classes below
+> (`dir:`/`git:`/`mail:`/`chat:`/`calendar:`) are **Proposed** (#28) under the same ADR-0023
+> taxonomy / OSS-paths / safety envelope.
 
 **Source classes** — all flow through the one triad and map to `source=harvest:<agent>` (no new inbox
 `source` enum member; the parametric `harvest:<agent>` form already covers every class):
@@ -319,7 +321,7 @@ fail-closed scope lock + provenance — with **no core change** (each source is 
 | Agent memory files | `file:<agent>` (`letta:`/`mem0:` API) | `MEMORY.md`-shaped markdown glob | **shipped** (file); Letta/mem0 Phase 5 |
 | Local working folders | `dir:<agent>` | filesystem walk | Proposed (ADR-0023) |
 | Git repos | `git:<agent>` | plain git (commit/diff) | Proposed (ADR-0023) |
-| Agent sessions | `session:<agent>` | transcript glob (e.g. `~/.claude/projects/**/*.jsonl`) | Proposed (#25, ADR-0023) |
+| Agent sessions | `session:<agent>` | transcript glob (e.g. `~/.claude/projects/**/*.jsonl`) | **shipped** (#25, ADR-0023) |
 | Mail | `mail:<agent>` | IMAP/JMAP (Gmail/Graph optional) | Proposed (ADR-0023) |
 | Chat | `chat:<agent>` | Matrix (Slack/Teams optional) | Proposed (ADR-0023) |
 | Calendar | `calendar:<agent>` | CalDAV (Google/MS optional) | Proposed (ADR-0023) |

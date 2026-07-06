@@ -45,11 +45,14 @@ adapters/             WRITE-adapter brain shims invoked via the adapters.yaml ar
   cli_agent_brain.py  `agora-cli-brain` (ADR-0016): drives ANY headless CLI agent (claude/codex/…)
                       as a pure text generator; the CLI argv follows a `--` separator
 
-harvester/            READ adapters: pull from other agents' memory systems → gated candidates (ADR-0007/0017/0018).
+harvester/            READ adapters: pull from other agents' memory + working-context sources → gated candidates (ADR-0007/0017/0018/0023).
   connectors.py       Connector protocol + FileConnector (segment a markdown memory file, scan since
-                      cursor, opt-in link-following — ADR-0018)
-  harvester.py        orchestrator: fail-closed scope gate (privacy) + §6 cursor + write kind=candidate/confidence=low
-  # Phase 5 (planned, not yet shipped): letta/mem0 API connectors (DATA-MODEL §8)
+                      cursor, opt-in link-following — ADR-0018) + shared path-safe glob resolver
+  session_sources.py  SessionReader seam + ClaudeCodeJsonlReader (parse a transcript → flat-role turns; ADR-0023)
+  session_connector.py SessionConnector: distill session transcripts (assistant marker reflections),
+                      redact secrets at the connector boundary before the hash (ADR-0023, #25)
+  harvester.py        orchestrator: fail-closed scope gate (privacy) + §6 cursor (incl. redacted) + write kind=candidate/confidence=low
+  # Phase 5 (planned, not yet shipped): letta/mem0 API connectors; dir:/git:/mail:/chat:/calendar: (#28, DATA-MODEL §8)
 
 ingest/               INPUT adapters: uploads → markdown in raw/.
   base.py             Extractor protocol (bytes|url → markdown + metadata)
@@ -132,10 +135,12 @@ capture body, not a separate raw/ write.
 
 ### 3.3 Harvest — pull candidates
 ```
-harvester (agora harvest) → for each connector:
+harvester (agora harvest) → for each connector (file: memory | session: transcript, ADR-0017/0023):
   ├─ check_scope (HARD pre-write gate: personal source → personal repo only, fail-closed)
-  └─ connector.scan(since cursor) → for each new/changed memory fact:
+  └─ connector.scan(since cursor) → for each new/changed fact (distilled + sentinel-neutralized;
+       session: also redacts secrets at the connector boundary BEFORE fact_key — invariant #3):
        core.write(target=<scope-bound repo>, item{source=harvest:<agent>, kind=candidate, confidence=low})
+       (bump §6 cursor: proposed; redacted{class} for facts a connector redacted)
 ```
 
 ### 3.4 Consolidate (curator) — single writer

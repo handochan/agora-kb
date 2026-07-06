@@ -205,9 +205,16 @@ Gated on / co-developed with Phase-4 multi-tenancy where a source is team/shared
       domain, invariant #4). `is_gated` candidates can NEVER mint a domain (extend `plan.py` check-10).
       Sequence the deterministic+prompt parts early (repo-global first); per-domain brain routing later
       (gated behind ADR-0015 per-domain split).
-- [ ] **#25 (read side) session connector + #28 (personal) local/work-context connectors.** Reframe the
+- [~] **#25 (read side) session connector + #28 (personal) local/work-context connectors.**
+      **#25 session connector SHIPPED (ADR-0023 Accepted):** `session:<agent>` distills agent
+      transcripts (assistant marker reflections, deterministic + model-free) into gated candidates,
+      redacting secrets at the connector boundary before the immutable inbox write (the live
+      `core/redact.py` wiring + `harvest.redact.{enabled,pii,allow,deny}` config +
+      `HarvestCursor.redacted` counter deferred from #39 all landed here); the `SessionReader` seam
+      (`ClaudeCodeJsonlReader`) keeps it tool-agnostic. **#28 (`dir:`/`git:`/`mail:`/`chat:`/`calendar:`)
+      still Proposed** under the same ADR-0023 envelope. Reframe the
       harvester (ADR-0007, DESIGN §6) from "agent MEMORY files" to "agent memory AND working-context
-      sources" via **ADR-0023 — context-harvester connectors** (Proposed) — same gate/scope/provenance,
+      sources" via **ADR-0023 — context-harvester connectors** — same gate/scope/provenance,
       no new core path (orchestrator/cursor/gate/scope reused; only `build_connectors` gains type
       branches behind the existing ADR-0004 Connector Protocol). Reserve the connector-type grammar
       `<type>:<agent>` beyond `file:`: `session:<agent>` (e.g. `session:claude-code`,

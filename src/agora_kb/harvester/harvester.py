@@ -36,14 +36,15 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_validator
 
-from agora_kb.config import ConnectorSpec, HarvestPolicy
+from agora_kb.config import ConnectorSpec, HarvestPolicy, RedactSettings
 from agora_kb.core.atomicio import atomic_write_text
 from agora_kb.core.inbox import Inbox
 from agora_kb.core.layout import RepoLayout, validate_writer
 from agora_kb.core.models import Confidence, Kind
-from agora_kb.core.redact import DEFAULT_POLICY, redact
+from agora_kb.core.redact import DEFAULT_POLICY, RedactionPolicy, redact
 
 from .connectors import Connector, ConnectorError, FileConnector, HarvestedFact, Scope
+from .session_connector import SessionConnector
 
 __all__ = [
     "ScopeViolation",
@@ -207,13 +208,28 @@ class HarvestReport:
         return sum(c.written for c in self.connectors)
 
 
-def build_connectors(specs: list[ConnectorSpec]) -> list[Connector]:
+def build_connectors(
+    specs: list[ConnectorSpec], *, redact: RedactSettings | None = None
+) -> list[Connector]:
     """Turn parsed :class:`ConnectorSpec`\\ s into live connectors (ADR-0004 read-adapter seam).
 
-    Only ``file:`` connectors are implemented in this phase; an unknown connector type (a future
-    ``letta:`` / ``mem0:`` key, DATA-MODEL §8) raises :class:`ConnectorError` (FAIL LOUD — never a
-    silent skip). Each connector validates its own identity/path at construction.
+    ``file:`` (ADR-0017) and ``session:`` (ADR-0023, issue #25) connectors are implemented; an
+    unknown connector type (a future ``dir:`` / ``git:`` / ``letta:`` / ``mem0:`` key, DATA-MODEL
+    §8) raises :class:`ConnectorError` (FAIL LOUD — never a silent skip). Each connector validates
+    its own identity/path at construction.
+
+    ``redact`` is the resolved repo-global ``harvest.redact`` policy
+    (:func:`config.load_redact_policy`) the ``session:`` connector applies at its boundary before
+    persistence. When ``redact`` is ``None`` the secure default (redaction ON, Balanced-9 structural
+    tier) applies; when the kill-switch is off (``redact.enabled is False``) the session connector
+    is built with NO redaction policy — the operator's explicit escape hatch (ADR-0023 addendum §5).
+    ``file:`` connectors never redact
+    (byte-identical write path, #39), so ``redact`` does not touch them.
     """
+    if redact is not None and not redact.enabled:
+        session_policy: RedactionPolicy | None = None  # kill-switch off
+    else:
+        session_policy = redact.policy if redact is not None else DEFAULT_POLICY
     connectors: list[Connector] = []
     for spec in specs:
         if spec.name.startswith("file:"):
@@ -225,10 +241,19 @@ def build_connectors(specs: list[ConnectorSpec]) -> list[Connector]:
                     follow_links=spec.follow_links,
                 )
             )
+        elif spec.name.startswith("session:"):
+            connectors.append(
+                SessionConnector(
+                    name=spec.name,
+                    path=spec.path or "",
+                    scope=Scope(spec.scope),
+                    redact_policy=session_policy,
+                )
+            )
         else:
             raise ConnectorError(
-                f"unsupported connector type for {spec.name!r}: only 'file:' connectors are "
-                "implemented in this phase (Letta/mem0 API connectors are deferred, DATA-MODEL §8)"
+                f"unsupported connector type for {spec.name!r}: only 'file:' and 'session:' "
+                "connectors are implemented (dir:/git:/letta:/mem0: are deferred, DATA-MODEL §8)"
             )
     return connectors
 
