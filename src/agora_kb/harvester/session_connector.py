@@ -16,12 +16,14 @@ Pipeline (all deterministic + model-free — the curator's two acts stay the onl
    :class:`~agora_kb.harvester.session_sources.ClaudeCodeJsonlReader`) into flat-role turn records
    — role attribution FLATTENED so a transcript turn cannot impersonate engine structure (ADR-0023
    §7).
-3. **Distill (precision-first salience).** Emits one candidate per **assistant** reflection
-   paragraph carrying an explicit durable-knowledge marker (lesson / gotcha / root-cause / the-fix /
-   TIL / note-to-self / …). Deliberately low-recall: the harvester is a pure transform and a raw
-   transcript has a far worse signal-to-noise ratio than a ``MEMORY.md``, so v1 keeps precision high
-   and leaves an LLM digest for higher recall as an explicit opt-in future stage (ADR-0023 O1/C).
-   User turns (highest-PII, request-shaped) are deferred.
+3. **Distill (precision-first salience).** Whole agora sentinel SPANS are dropped from each
+   assistant turn BEFORE paragraph-splitting (ADR-0027 §8 consumer duty — the loop-break's verbatim
+   half: a gold pack the agent echoed contributes ZERO facts), then one candidate is emitted per
+   **assistant** reflection paragraph carrying an explicit durable-knowledge marker (lesson / gotcha
+   / root-cause / the-fix / TIL / note-to-self / …). Deliberately low-recall: the harvester is a
+   pure transform and a raw transcript has a far worse signal-to-noise ratio than a ``MEMORY.md``,
+   so v1 keeps precision high and leaves an LLM digest for higher recall as an explicit opt-in
+   future stage (ADR-0023 O1/C). User turns (highest-PII, request-shaped) are deferred.
 4. **Neutralize + redact BEFORE the hash.** Each fact body is sentinel-stripped
    (:func:`~agora_kb.harvester.connectors._neutralize`) and then run through
    :func:`agora_kb.core.redact.redact` at this connector boundary — so ``fact_key`` is a
@@ -50,6 +52,7 @@ import re
 from agora_kb.core.hashing import content_sha256
 from agora_kb.core.layout import validate_writer
 from agora_kb.core.redact import DEFAULT_POLICY, RedactionPolicy, redact
+from agora_kb.core.sentinel import strip_sentinel_spans
 
 from .connectors import (
     ConnectorError,
@@ -231,7 +234,12 @@ class SessionConnector:
             # durable knowledge; user turns are request-shaped + highest-PII — both deferred.
             if turn.role != "assistant":
                 continue
-            for para in _paragraphs(turn.text):
+            # Drop whole agora sentinel SPANS from the WHOLE turn BEFORE splitting into paragraphs
+            # (ADR-0027 §8 consumer duty — the loop-break's verbatim half): a gold pack the agent
+            # echoed spans multiple paragraphs, so a per-paragraph strip (in _neutralize) would miss
+            # it. Stripping the span here removes the pack content-and-all so it contributes ZERO
+            # facts — mirroring FileConnector's whole-file span strip before segmentation.
+            for para in _paragraphs(strip_sentinel_spans(turn.text)):
                 if _SALIENCE_RE.search(para):
                     yield para
 
