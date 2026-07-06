@@ -483,72 +483,99 @@ class FileConnector:
             return None
 
     def _resolve_matches(self, notes: list[str]) -> list[tuple[Path, str]]:
-        """Expand the glob safely and read each matched file; return ``(path, text)`` pairs.
+        """Expand the glob safely + read each match, then strip agora sentinel SPANS (ADR-0027 §8).
 
-        Path safety (untrusted-input posture): ``~`` is expanded, the non-wildcard base root is
-        resolved, and every match must resolve *within* that root (symlink-escape guard). Non-files,
-        oversized files, and out-of-root matches are skipped with a note; the match count is capped.
+        Delegates the untrusted-input path safety to the shared :func:`_resolve_glob_files` (so the
+        symlink-escape / gold-exclusion / size+count guards live in ONE place, reused by the
+        ``session:`` connector), then strips whole agora sentinel spans from each file text BEFORE
+        segmentation: a pack spans multiple markdown blocks, so a per-fact strip would miss its
+        bullets; the no-op hash then also covers span-free text, so a pack edit never re-triggers
+        harvest.
         """
-        pattern = os.path.expanduser(self._path)
-        root = _glob_base_root(pattern)
-        try:
-            resolved_root = root.resolve()
-        except OSError:
-            notes.append(f"cannot resolve base root for {self._path!r}")
-            return []
-
-        out: list[tuple[Path, str]] = []
-        had_raw = False
-        # iglob (lazy) + early-stop bounds the directory walk by max_files — a hostile/large tree
-        # reachable from the base root cannot force a full eager enumeration (ADR-0017 path-safety).
-        for raw in _glob.iglob(pattern, recursive=True):
-            had_raw = True
-            if len(out) >= self._max_files:
-                notes.append(f"reached max_files={self._max_files}; remaining matches skipped")
-                break
-            p = Path(raw)
-            try:
-                resolved = p.resolve()
-            except OSError:
-                continue
-            if not _within(resolved, resolved_root):
-                notes.append(f"skipped {raw!r}: resolves outside {root} (symlink-escape guard)")
-                continue
-            if _is_within_gold(resolved):
-                # ADR-0027 §8 path exclusion: a derived gold pack under _kb/gold/ is Agora's OWN
-                # emission — harvesting it would close the loop. Skip it whole, regardless of glob.
-                notes.append(f"skipped {raw!r}: excluded gold-pack path (_kb/gold/, ADR-0027 §8)")
-                continue
-            if not resolved.is_file():
-                continue
-            try:
-                size = resolved.stat().st_size
-            except OSError:
-                continue
-            if size > self._max_file_bytes:
-                notes.append(f"skipped {raw!r}: {size} bytes exceeds max_file_bytes")
-                continue
-            try:
-                text = resolved.read_text(encoding="utf-8")
-            except UnicodeDecodeError:
-                text = resolved.read_bytes().decode("utf-8", errors="replace")
-                notes.append(f"{raw!r} was not valid UTF-8; decoded with replacement")
-            except OSError:
-                continue
-            # Strip whole agora sentinel SPANS from the file text BEFORE segmentation (ADR-0027 §8):
-            # a pack spans multiple markdown blocks, so a per-fact strip would miss its bullets; the
-            # no-op hash then also covers span-free text, so a pack edit never re-triggers harvest.
-            out.append((resolved, _strip_sentinel_spans(text)))
-        if not had_raw:
-            # Distinguish a genuine zero-match from "matched but all skipped" (a safety/size skip
-            # already emitted its own, unambiguous note) so the security signal is not muddied.
-            notes.append(f"no files matched {self._path!r}")
-        # Sort the (bounded) kept set for a deterministic combined-source hash when cap is unhit.
-        out.sort(key=lambda pt: str(pt[0]))
-        return out
+        return [
+            (path, _strip_sentinel_spans(text))
+            for path, text in _resolve_glob_files(
+                self._path,
+                max_files=self._max_files,
+                max_file_bytes=self._max_file_bytes,
+                notes=notes,
+            )
+        ]
 
 
 # --- module-level helpers (pure) ---------------------------------------------------------------
+
+
+def _resolve_glob_files(
+    pattern_raw: str, *, max_files: int, max_file_bytes: int, notes: list[str]
+) -> list[tuple[Path, str]]:
+    """Safely expand a ``~``/glob and read each match; return sorted ``(resolved_path, raw_text)``.
+
+    The shared untrusted-input glob resolver for the file-shaped connectors (``file:`` +
+    ``session:`` — ADR-0017 path safety / ADR-0023). ``~`` is expanded, the non-wildcard base root
+    is resolved, and every match must resolve *within* that root (symlink-escape guard so a ``**``
+    cannot follow a symlink out to ``~/.ssh`` or another tenant's tree); non-files, oversized,
+    out-of-root matches, and ``_kb/gold/`` packs (ADR-0027 §8 loop exclusion) are skipped with a
+    note; the match count is capped, and ``iglob`` is lazy so a hostile/large tree cannot force an
+    eager
+    enumeration. Returns the RAW file bytes (UTF-8, replacement-decoded on bad bytes) sorted by path
+    for a deterministic combined-source hash — the caller applies its own post-processing
+    (``FileConnector`` strips sentinel spans; the session connector parses JSONL). A genuine
+    zero-match emits the ``no files matched`` note (distinct from a matched-but-all-skipped safety
+    signal).
+    """
+    pattern = os.path.expanduser(pattern_raw)
+    root = _glob_base_root(pattern)
+    try:
+        resolved_root = root.resolve()
+    except OSError:
+        notes.append(f"cannot resolve base root for {pattern_raw!r}")
+        return []
+
+    out: list[tuple[Path, str]] = []
+    had_raw = False
+    for raw in _glob.iglob(pattern, recursive=True):
+        had_raw = True
+        if len(out) >= max_files:
+            notes.append(f"reached max_files={max_files}; remaining matches skipped")
+            break
+        p = Path(raw)
+        try:
+            resolved = p.resolve()
+        except OSError:
+            continue
+        if not _within(resolved, resolved_root):
+            notes.append(f"skipped {raw!r}: resolves outside {root} (symlink-escape guard)")
+            continue
+        if _is_within_gold(resolved):
+            # ADR-0027 §8 path exclusion: a derived gold pack under _kb/gold/ is Agora's OWN
+            # emission — harvesting it would close the loop. Skip it whole, regardless of glob.
+            notes.append(f"skipped {raw!r}: excluded gold-pack path (_kb/gold/, ADR-0027 §8)")
+            continue
+        if not resolved.is_file():
+            continue
+        try:
+            size = resolved.stat().st_size
+        except OSError:
+            continue
+        if size > max_file_bytes:
+            notes.append(f"skipped {raw!r}: {size} bytes exceeds max_file_bytes")
+            continue
+        try:
+            text = resolved.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            text = resolved.read_bytes().decode("utf-8", errors="replace")
+            notes.append(f"{raw!r} was not valid UTF-8; decoded with replacement")
+        except OSError:
+            continue
+        out.append((resolved, text))
+    if not had_raw:
+        # Distinguish a genuine zero-match from "matched but all skipped" (a safety/size skip
+        # already emitted its own, unambiguous note) so the security signal is not muddied.
+        notes.append(f"no files matched {pattern_raw!r}")
+    # Sort the (bounded) kept set for a deterministic combined-source hash when cap is unhit.
+    out.sort(key=lambda pt: str(pt[0]))
+    return out
 
 
 def _segment(text: str) -> list[str]:
