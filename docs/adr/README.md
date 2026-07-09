@@ -37,4 +37,8 @@ Format: lightweight [MADR](https://adr.github.io/madr/)-style.
 <!-- 0028 reserved: LLM `DISTILL` curator act (→ wiki/digests/, one new closed-vocab op) — evidence-triggered per 0027, not yet authored. -->
 <!-- 0029 reserved: connector ecosystem — CWP exec wire, registration UX, enablement re-consent / injection opt-in (extending 0023) — evidence-triggered, not yet authored. -->
 <!-- 0030 reserved: federation / team-audience pack composition — Phase-4-coupled, not yet authored. -->
-<!-- 0031 reserved: retention — hard prerequisite for mail:/chat: connectors, not yet authored. -->
+<!-- 0031 reserved: retention — hard prerequisite for mail:/chat: connectors, not yet authored. Candidate scope: bronze crypto-shred (per-subject envelope keys) + tamper-evident erasure ledger — see docs/notes/retrieval-vs-vectordb.md §1/§4. -->
+<!-- 0032 reserved: semantic embedding tier as a strictly-additive tail — derived, git-ignored, rebuildable; opt-in, default off; keeps every lexically-answerable query byte-identical; SUPERSEDES 0012 §11 "no embeddings". Exploratory (docs/notes/retrieval-vs-vectordb.md), evidence-triggered (#28), not yet authored. -->
+<!-- 0033 reserved: pending read tier / read-your-own-write overlay — model-free additive "pending" band over inbox∪processing on the read path only (no write-time upsert). Exploratory (docs/notes/retrieval-vs-vectordb.md), not yet authored. -->
+<!-- 0034 reserved: bulk map-parallel curation — MAP-AUTHOR (PASS-2) fan-out now, MAP-PLAN sharding gated by 0024 §3 saturation; extends 0024. Exploratory (docs/notes/retrieval-vs-vectordb.md), not yet authored (#27). -->
+<!-- 0035 reserved: hybrid tri-signal fusion {sparse, dense, curated-structural} + metadata-filter constraint — layers on 0032; #28-triggered (ANN/SQLite dead weight below scale). Exploratory (docs/notes/retrieval-vs-vectordb.md), not yet authored (#28). -->
