@@ -412,7 +412,10 @@ L1-10. The `recorded <run_date>` in the callout uses the injected `run_date`, ne
 
 Naming rules:
 
-- **Filenames are kebab-case slugs** of the title. One note per file. `.md` extension.
+- **Filenames are kebab-case slugs** of the title. One note per file. `.md` extension. A title that
+  yields no usable ASCII slug (e.g. purely Korean) takes the deterministic **`note-<sha8>`** fallback
+  basename (first 8 hex chars of the candidate's canonical content hash); the original-language
+  meaning stays in `title:`/`summary:`, never the filename (ADR-0022 addendum, #57).
 - **Basenames are globally unique within the repo.** Only `index.md` is named `index`.
 - **Domain MOC** = `<domain>-moc.md` (basename `<domain>-moc`).
 - **Theme** basename = the kebab-case `<slug>`; this slug IS the globally-unique basename.
@@ -632,6 +635,10 @@ You perform EXACTLY two acts:
 "Brain-set" anywhere in this schema means **brain-DECIDED in the plan, worker-MATERIALIZED**. There is NO
 post-AUTHOR code pass that mutates wiki files; derived facts (`orphan` / `stale`) are computed at read
 time, never written (§2.6, §3.3).
+
+Prose fields (`title`, `summary`, note bodies) follow the repo's configured output language when the
+operator sets one (`repo.yaml` `curator.language` — the engine injects a `LANGUAGE:` directive into
+both pass prompts); slug / domain / tag tokens always keep the ASCII rules of §4 regardless (#57).
 
 ### 7.1 PASS 1 — the PLAN (`plan.json`)
 

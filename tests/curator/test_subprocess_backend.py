@@ -19,6 +19,7 @@ from pathlib import Path
 
 import pytest
 
+from agora_kb.curator import subprocess_backend as sb
 from agora_kb.curator.apply import body_sentinels
 from agora_kb.curator.backends import BackendSpec
 from agora_kb.curator.subprocess_backend import BackendUnavailableError, SubprocessBackend
@@ -241,3 +242,61 @@ def test_author_missing_executable_raises_backend_unavailable(tmp_path: Path) ->
 
     with pytest.raises(BackendUnavailableError):
         backend.author(tmp_path, {"wiki/x.md": ["c1"]}, {})
+
+
+# --- #57 output-language directive (repo.yaml curator.language) ---------------------------------
+
+
+def test_plan_prompt_byte_identical_without_language(tmp_path: Path) -> None:
+    """language=None (the default) keeps the PASS-1 prompt byte-identical to _PASS1_PROMPT."""
+    capture = tmp_path / "cap.txt"
+    backend = SubprocessBackend(_stdin_capture_spec(capture))
+
+    backend.plan(tmp_path)
+
+    prompt = capture.read_text(encoding="utf-8").rstrip("\0")
+    assert prompt == sb._PASS1_PROMPT
+    assert "LANGUAGE:" not in prompt
+
+
+def test_plan_prompt_language_directive_appended(tmp_path: Path) -> None:
+    """language='ko' appends exactly ONE directive line to PASS-1 (nothing else moves)."""
+    capture = tmp_path / "cap.txt"
+    backend = SubprocessBackend(_stdin_capture_spec(capture), language="ko")
+
+    backend.plan(tmp_path)
+
+    prompt = capture.read_text(encoding="utf-8").rstrip("\0")
+    expected = sb._PASS1_PROMPT + sb._LANGUAGE_DIRECTIVE_TEMPLATE.format(language="ko") + "\n"
+    assert prompt == expected
+    assert "in ko;" in prompt  # prose in the repo language...
+    assert "ASCII rules" in prompt  # ...but slug/domain/tag tokens stay schema-ASCII.
+
+
+def test_pass2_prompts_carry_language_directive_when_set(tmp_path: Path) -> None:
+    """Both PASS-2 variants (grounded + minimal fallback) carry the directive when language set."""
+    capture = tmp_path / "cap.txt"
+    backend = SubprocessBackend(_stdin_capture_spec(capture), language="ko")
+    region = AuthorRegion(op="CREATE_THEME", title="T", summary="s", source_text="src facts")
+
+    # r--c1 has grounded context; r--c2 falls back to the minimal prompt.
+    backend.author(tmp_path, {"wiki/x.md": ["r--c1", "r--c2"]}, {"r--c1": region})
+
+    prompts = [p for p in capture.read_text(encoding="utf-8").split("\0") if p]
+    assert len(prompts) == 2
+    for prompt in prompts:
+        assert "LANGUAGE: write every summary, title, and body in ko" in prompt
+
+
+def test_pass2_prompts_have_no_directive_without_language(tmp_path: Path) -> None:
+    """language=None leaves both PASS-2 prompt variants free of any LANGUAGE line."""
+    capture = tmp_path / "cap.txt"
+    backend = SubprocessBackend(_stdin_capture_spec(capture))
+    region = AuthorRegion(op="CREATE_THEME", title="T", summary="s", source_text="src facts")
+
+    backend.author(tmp_path, {"wiki/x.md": ["r--c1", "r--c2"]}, {"r--c1": region})
+
+    prompts = [p for p in capture.read_text(encoding="utf-8").split("\0") if p]
+    assert len(prompts) == 2
+    for prompt in prompts:
+        assert "LANGUAGE:" not in prompt

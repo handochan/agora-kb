@@ -129,6 +129,11 @@ class RepoConfig(BaseModel):
     body_byte_bound: int = Field(default=_DEFAULT_BODY_BYTE_BOUND, ge=1)
     related_k: int = Field(default=_DEFAULT_RELATED_K, ge=1)
     max_orphans: int | None = Field(default=None, ge=0)
+    # #57 repo output language (``curator.language``, e.g. ``"ko"``). ``None`` (the default) keeps
+    # BOTH pass prompts byte-identical to the pre-#57 bytes; when set, one output-language directive
+    # line is appended to the PASS-1/PASS-2 prompts (prose in this language, slug/domain/tag tokens
+    # keep the schema's ASCII rules). Per-repo for now; per-domain arrives with #24.
+    language: str | None = None
 
 
 def repo_config_path(layout: RepoLayout) -> Path:
@@ -163,6 +168,11 @@ def load_repo_config(layout: RepoLayout) -> RepoConfig:
         curator.get("allow_reduced_isolation"), False, key="curator.allow_reduced_isolation"
     )
     triggers = _build_triggers(curator.get("triggers"))
+    # #57: optional repo output language (same explicit-field mapping style as ``backend`` above;
+    # absent/empty → None → prompts stay byte-identical). Fail-loud on a non-string: language
+    # codes collide with the YAML 1.1 boolean trap (``language: no`` — Norwegian — parses as
+    # False), so a tolerant None here would silently drop the operator's stated policy.
+    language = _opt_str_loud(curator.get("language"), key="curator.language")
 
     # §1.3 repo-global tuning thresholds (ADR-0022 step 2). Nesting matches the DATA-MODEL §3
     # example already in the docs/tests: the two size/breadth knobs under curator.limits, orphan
@@ -201,6 +211,7 @@ def load_repo_config(layout: RepoLayout) -> RepoConfig:
         body_byte_bound=body_byte_bound,
         related_k=related_k,
         max_orphans=max_orphans,
+        language=language,
     )
 
 
@@ -783,6 +794,27 @@ def _sub_mapping(value: object) -> dict[str, object]:
 
 def _opt_str(value: object) -> str | None:
     return value if isinstance(value, str) and value else None
+
+
+def _opt_str_loud(value: object, *, key: str) -> str | None:
+    """Like :func:`_opt_str`, but a SUPPLIED non-string raises :class:`ConfigError` (fail-loud).
+
+    Guards the YAML 1.1 boolean trap for keys whose legitimate values collide with it:
+    ``curator.language: no`` (Norwegian, ISO 639-1) parses as ``False`` under pyyaml and would be
+    silently ignored by the tolerant ``_opt_str`` — the operator's stated policy must never be
+    silently replaced (the same principle as ``_opt_int``/``_opt_bool`` below). Absent (``None``)
+    and empty-string still read as unset.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise ConfigError(
+            f"{key} must be a string, got boolean {value!r} — YAML 1.1 reads unquoted "
+            f'no/yes/on/off as booleans; quote the value (e.g. "no")'
+        )
+    if not isinstance(value, str):
+        raise ConfigError(f"{key} must be a string, got {value!r}")
+    return value or None
 
 
 def _opt_int(value: object, default: int, *, key: str = "value") -> int:

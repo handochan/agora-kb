@@ -273,6 +273,37 @@ def test_curator_thresholds_parsed(tmp_path: Path) -> None:
     assert cfg.max_orphans == 5
 
 
+def test_curator_language_default_none(tmp_path: Path) -> None:
+    """(#57) No curator.language key → None (prompts stay byte-identical downstream)."""
+    layout = _layout(tmp_path)
+    _write_repo_yaml(layout, "name: r\ncurator:\n  backend: qwen\n")
+    assert load_repo_config(layout).language is None
+
+
+def test_curator_language_parsed(tmp_path: Path) -> None:
+    """(#57) curator.language: ko is read via the explicit-field mapping like curator.backend."""
+    layout = _layout(tmp_path)
+    _write_repo_yaml(layout, "name: r\ncurator:\n  language: ko\n")
+    assert load_repo_config(layout).language == "ko"
+
+
+def test_curator_language_yaml_bool_trap_fails_loud(tmp_path: Path) -> None:
+    """(#57) `language: no` (Norwegian) is a YAML 1.1 boolean → fail-loud, never a silent None."""
+    layout = _layout(tmp_path)
+    _write_repo_yaml(layout, "name: r\ncurator:\n  language: no\n")
+    with pytest.raises(ConfigError) as exc:
+        load_repo_config(layout)
+    assert "curator.language" in str(exc.value)
+    assert "quote" in str(exc.value)  # the message tells the operator the actual fix
+
+
+def test_curator_language_quoted_no_is_norwegian(tmp_path: Path) -> None:
+    """(#57) A QUOTED "no" survives YAML 1.1 and reads as the string language code."""
+    layout = _layout(tmp_path)
+    _write_repo_yaml(layout, 'name: r\ncurator:\n  language: "no"\n')
+    assert load_repo_config(layout).language == "no"
+
+
 def test_curator_threshold_malformed_raises(tmp_path: Path) -> None:
     layout = _layout(tmp_path)
     _write_repo_yaml(layout, "name: r\ncurator:\n  limits:\n    body_byte_bound: huge\n")

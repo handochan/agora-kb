@@ -333,3 +333,61 @@ Remember to add the `0022` row to `docs/adr/README.md` (href byte-identical to
 reflect the structured domain shape in `docs/DATA-MODEL.md` §3 / ADR-0010 §5, the no-drop policy +
 repo-kind-aware default in `docs/DESIGN.md` §4 / INGEST-CONTRACT, and the per-domain item in
 `docs/ROADMAP.md` (Phase 3.5 catch-all floor; Phase 4/5 governed creation).
+
+## Addendum — Non-ASCII (Korean) no-loss: `note-<sha8>` filename fallback (#57, landed 2026-07-24)
+
+§A's no-loss floor rescued only the *domain* leg of "never drop a fact merely for failing to
+classify it"; the *slug* leg still leaked: `_slugify` is ASCII-only by design (it must satisfy
+`plan.py`'s PATH/ALLOWLIST safe-token regex, which is a **path-safety** boundary, not a style
+choice), so a purely-Korean CREATE_THEME seed slugified to `""` and step 4 silently downgraded the
+capture to DROP. Issue **#57** closed that sibling hole; this addendum records the settled policy —
+including the strategy-umbrella **decision 5** (Korean filename policy: `note-<sha8>` vs a
+transliteration table), resolved here in favor of the hash fallback.
+
+### 1. Basenames: deterministic `note-<sha8>` fallback (decision 5 resolved)
+
+The CREATE_THEME seeds are tried IN ORDER — model `basename` → model `title` → capture text — and
+the first that slugifies non-empty wins (a Korean basename alongside an ASCII title still gets the
+meaningful title slug). Only when EVERY seed slugifies empty does `normalize_plan` reach the
+fallback — and it no longer DROPs: the note is named
+`note-` + the first 8 hex chars of the candidate's canonical `content_sha256` (DATA-MODEL §11.2 —
+the hash `bundle.py` already stamps into `candidates.json`, reused as the single source; recomputed
+from the candidate text via `core.hashing.content_sha256` only when the field is absent, which
+yields the same bytes). The existing `-2` uniqueness suffix loop applies to fallback slugs
+unchanged.
+
+**Transliteration table rejected.** A romanization table is a *versioned artifact*: any table
+revision (or engine/library drift) renames future notes for identical input — a nondeterminism
+class the deterministic-curator contract cannot carry — and Korean romanization is genuinely
+ambiguous (McCune-Reischauer vs RR vs ad-hoc). The sha fallback is a pure function of the canonical
+content bytes: deterministic across runs/implementations, ASCII slug-safe by construction, and it
+leaves `plan.py`'s path-safety regex byte-identical (widening that regex was explicitly rejected —
+it guards path traversal, not aesthetics). The Korean *meaning* is preserved where it belongs:
+`title:`/`summary:` are arbitrary strings, search indexes the body, and links resolve by basename —
+an opaque ASCII filename is harmless (the Obsidian/Zettelkasten "id filename + human title"
+pattern).
+
+### 2. Aliases: skip + count, NOT hash-substituted
+
+An un-slugifiable alias is **skipped and counted** (`normalize_plan` `stats` out-param →
+`run_plan`'s `$AGORA_BRAIN_DEBUG` record `aliases_skipped_unslugifiable` + one stderr warning),
+never silently discarded as before — and never hash-substituted: a `note-<sha8>`-style alias has
+zero search/link value, and *preserving* Korean aliases verbatim would require widening the closed
+alias/basename token grammar (a schema change with LINT L1-15 uniqueness and path implications),
+which is out of scope here. The plan schema itself stays a closed set — the count rides diagnostic
+channels only.
+
+### 3. Companions in the same change (#57)
+
+The repo-language prompt directive (`repo.yaml` `curator.language`, `None` → both pass prompts
+byte-identical; set → one LANGUAGE line in PASS-1/PASS-2: prose in the repo language, slug/domain/
+tag tokens keep the schema's ASCII rules; per-domain arrives with #24) and the fallback-summary
+sentence/어절-boundary truncation (`_truncate_summary`, replacing the mid-sentence `text[:200]`
+hard cut; brain-supplied summaries untouched, and a `limit // 4` floor keeps a degenerate early
+boundary from collapsing the summary below the old hard cut) landed alongside. The shim paths that
+REBUILD the PASS-2 prompt (the CLI-agent `text_only` template and the minimal fallback) re-attach
+the worker's LANGUAGE line from the stdin prompt, so the directive reaches every brain family —
+unset stays byte-identical. `curator.language` is read fail-loud (a non-string raises
+`ConfigError`): `language: no` (Norwegian) is a YAML 1.1 boolean unless quoted, and the operator's
+stated policy must never be silently dropped. Neither alters any integrity gate: the shim stays
+outside the boundary and the worker re-grades everything.

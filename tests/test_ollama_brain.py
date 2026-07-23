@@ -13,6 +13,7 @@ import json
 import pytest
 
 from agora_kb.adapters import ollama_brain as ob
+from agora_kb.core.hashing import content_sha256
 from agora_kb.curator.plan import Plan, validate_plan
 
 RUN_ID = "2026-06-13T03-00-00.000Z--7f31ab"
@@ -860,6 +861,398 @@ def test_normalize_plan_colliding_alias_dropped() -> None:
     assert by_id["c2"]["aliases"] == ["bar-nickname"]
 
 
+# --- #57: Korean no-loss — hash-fallback basename, alias skip count, summary boundary cut ------
+
+
+def _normalize_one(
+    raw: dict,
+    candidates: list[dict],
+    *,
+    live_basenames: set[str] | None = None,
+    stats: dict[str, int] | None = None,
+) -> dict:
+    """Run :func:`normalize_plan` with the module defaults used across this section."""
+    plan_dict = ob.normalize_plan(
+        raw,
+        candidates=candidates,
+        allowed_tags=ALLOWED_TAGS,
+        domains=DOMAINS,
+        live_basenames=live_basenames or set(),
+        live_theme_basenames=set(),
+        run_id=RUN_ID,
+        stats=stats,
+    )
+    return plan_dict
+
+
+def test_normalize_plan_korean_seed_survives_with_hash_fallback() -> None:
+    """(#57 a) A purely-Korean CREATE_THEME seed is NOT dropped: note-<sha8> fallback basename."""
+    text = "한국어 지식은 큐레이션 중에 소실되면 안 된다"
+    candidates = [_candidate("c1", text=text, event_id=E1, gated=False, domain="ai-tech")]
+    raw = {
+        "dispositions": [
+            {
+                "candidate_id": "c1",
+                "op": "CREATE_THEME",
+                "domain": "ai-tech",
+                "title": "한국어 지식 보존",
+                "summary": "한국어 요약.",
+                "reason": "새 테마",
+            }
+        ]
+    }
+    plan_dict = _normalize_one(raw, candidates)
+    disp = plan_dict["dispositions"][0]
+    assert disp["op"] == "CREATE_THEME"  # NOT DROP (the pre-#57 behavior)
+    assert disp["basename"] == f"note-{content_sha256(text)[:8]}"
+    # The Korean meaning is preserved in title:/summary: (arbitrary strings), never the filename.
+    assert disp["title"] == "한국어 지식 보존"
+    assert disp["summary"] == "한국어 요약."
+
+    # The fallback basename passes the REAL §4.1 validator — path-safety regex untouched.
+    plan = Plan.from_json(json.dumps(plan_dict))
+    errors = validate_plan(
+        plan,
+        manifest_event_ids={E1},
+        allowed_tags=ALLOWED_TAGS,
+        domains=DOMAINS,
+        live_basenames=set(),
+        theme_basenames=set(),
+        gated_candidate_ids=set(),
+    )
+    assert errors == [], errors
+
+
+def test_normalize_plan_hash_fallback_reuses_candidate_content_sha256() -> None:
+    """(#57 a) The candidates.json ``content_sha256`` field is the single hash source."""
+    sha = "ab" * 32  # a well-formed 64-hex canonical hash, deliberately != content_sha256(text)
+    candidate = _candidate("c1", text="한글", event_id=E1, gated=False, domain="ai-tech")
+    candidate["content_sha256"] = sha
+    raw = {
+        "dispositions": [
+            {"candidate_id": "c1", "op": "CREATE_THEME", "domain": "ai-tech", "reason": "x"}
+        ]
+    }
+    disp = _normalize_one(raw, [candidate])["dispositions"][0]
+    assert disp["basename"] == f"note-{sha[:8]}"  # field reused verbatim, not recomputed
+
+
+def test_normalize_plan_hash_fallback_same_text_twice_gets_suffix() -> None:
+    """(#57 b) Same text twice → same fallback slug + the existing -2 uniqueness suffix."""
+    text = "같은 한국어 본문"
+    candidates = [
+        _candidate("c1", text=text, event_id=E1, gated=False, domain="ai-tech"),
+        _candidate("c2", text=text, event_id=E2, gated=False, domain="ai-tech"),
+    ]
+    raw = {
+        "dispositions": [
+            {"candidate_id": "c1", "op": "CREATE_THEME", "domain": "ai-tech", "reason": "x"},
+            {"candidate_id": "c2", "op": "CREATE_THEME", "domain": "ai-tech", "reason": "x"},
+        ]
+    }
+    by_id = {d["candidate_id"]: d for d in _normalize_one(raw, candidates)["dispositions"]}
+    base = f"note-{content_sha256(text)[:8]}"
+    assert by_id["c1"]["basename"] == base
+    assert by_id["c2"]["basename"] == f"{base}-2"  # existing collision loop rides the fallback
+
+
+def test_normalize_plan_hash_fallback_title_falls_back_to_text_not_hash() -> None:
+    """(#57 a) With no model title, the fallback title derives from the TEXT, not note-<sha8>."""
+    text = "한국어 문장 하나"
+    candidates = [_candidate("c1", text=text, event_id=E1, gated=False, domain="ai-tech")]
+    raw = {
+        "dispositions": [
+            {"candidate_id": "c1", "op": "CREATE_THEME", "domain": "ai-tech", "reason": "x"}
+        ]
+    }
+    disp = _normalize_one(raw, candidates)["dispositions"][0]
+    assert disp["basename"].startswith("note-")
+    assert disp["title"] == "한국어 문장 하나"  # _title_from(text); capitalize() is a Hangul no-op
+
+
+def test_normalize_plan_ascii_seed_path_byte_identical() -> None:
+    """(#57 c) An ASCII seed keeps the exact pre-#57 slug path (no hash fallback involvement)."""
+    candidates = [
+        _candidate("c1", text="Mutexes guard shared state", event_id=E1, gated=False, domain=None)
+    ]
+    raw = {
+        "dispositions": [
+            {
+                "candidate_id": "c1",
+                "op": "CREATE_THEME",
+                "domain": "ai-tech",
+                "title": "Mutex Basics",
+                "summary": "About mutexes.",
+                "reason": "x",
+            }
+        ]
+    }
+    disp = _normalize_one(raw, candidates)["dispositions"][0]
+    assert disp["basename"] == "mutex-basics"  # slugified seed, exactly as before
+    assert disp["summary"] == "About mutexes."  # brain-given summary path unchanged
+    assert not disp["basename"].startswith("note-")
+
+
+def test_normalize_plan_korean_basename_ascii_title_uses_title_slug() -> None:
+    """(#57 review) A Korean basename + ASCII title takes the TITLE slug, not the hash fallback."""
+    candidates = [_candidate("c1", text="한글 본문", event_id=E1, gated=False, domain="ai-tech")]
+    raw = {
+        "dispositions": [
+            {
+                "candidate_id": "c1",
+                "op": "CREATE_THEME",
+                "domain": "ai-tech",
+                "basename": "한글이름",
+                "title": "Clean Ascii Title",
+                "reason": "x",
+            }
+        ]
+    }
+    disp = _normalize_one(raw, candidates)["dispositions"][0]
+    assert disp["basename"] == "clean-ascii-title"  # next seed in the chain, not note-<sha8>
+    assert disp["title"] == "Clean Ascii Title"
+
+
+def test_normalize_plan_korean_basename_and_title_falls_to_ascii_text() -> None:
+    """(#57 review) With Korean basename AND title, the capture TEXT is the last slug seed."""
+    candidates = [
+        _candidate("c1", text="Mutexes guard state", event_id=E1, gated=False, domain="ai-tech")
+    ]
+    raw = {
+        "dispositions": [
+            {
+                "candidate_id": "c1",
+                "op": "CREATE_THEME",
+                "domain": "ai-tech",
+                "basename": "한글이름",
+                "title": "한글 제목",
+                "reason": "x",
+            }
+        ]
+    }
+    disp = _normalize_one(raw, candidates)["dispositions"][0]
+    assert disp["basename"] == "mutexes-guard-state"
+    assert not disp["basename"].startswith("note-")
+
+
+def test_normalize_plan_mixed_korean_ascii_seed_keeps_residual_ascii_slug() -> None:
+    """(#57 review) A MIXED Korean/ASCII seed keeps its residual-ASCII slug (pre-#57 path lock)."""
+    candidates = [_candidate("c1", text="한글 본문", event_id=E1, gated=False, domain="ai-tech")]
+    raw = {
+        "dispositions": [
+            {
+                "candidate_id": "c1",
+                "op": "CREATE_THEME",
+                "domain": "ai-tech",
+                "basename": "에이전트 Memory 설계",
+                "reason": "x",
+            }
+        ]
+    }
+    disp = _normalize_one(raw, candidates)["dispositions"][0]
+    assert disp["basename"] == "memory"  # residual ASCII survives _slugify — no hash fallback
+    assert not disp["basename"].startswith("note-")
+
+
+def test_normalize_plan_brain_summary_over_limit_is_never_truncated() -> None:
+    """(#57 review) A brain-SUPPLIED summary is preserved verbatim even past 200 chars.
+
+    _truncate_summary applies ONLY to the fallback (brain gave none); this locks the invariant so
+    a future "consistency" refactor cannot silently start clipping brain-authored summaries.
+    """
+    long_summary = "브레인이 직접 쓴 아주 긴 요약. " * 20  # well past _SUMMARY_MAX_CHARS
+    assert len(long_summary) > 200
+    candidates = [_candidate("c1", text="본문", event_id=E1, gated=False, domain="ai-tech")]
+    raw = {
+        "dispositions": [
+            {
+                "candidate_id": "c1",
+                "op": "CREATE_THEME",
+                "domain": "ai-tech",
+                "title": "Title",
+                "summary": long_summary,
+                "reason": "x",
+            }
+        ]
+    }
+    disp = _normalize_one(raw, candidates)["dispositions"][0]
+    assert disp["summary"] == long_summary.strip()  # verbatim (stripped), NOT boundary-cut
+    assert len(disp["summary"]) > 200
+
+
+def test_normalize_plan_unslugifiable_alias_skipped_and_counted() -> None:
+    """(#57 d) A Korean alias is skipped (no hash alias) and counted via the stats out-param."""
+    candidates = [
+        _candidate("c1", text="Foo Thing", event_id=E1, gated=False, domain="ai-tech"),
+    ]
+    raw = {
+        "dispositions": [
+            {
+                "candidate_id": "c1",
+                "op": "CREATE_THEME",
+                "domain": "ai-tech",
+                "title": "Foo Thing",
+                "aliases": ["한글별칭", "또다른한글", "Clean Alias"],
+                "reason": "x",
+            }
+        ]
+    }
+    stats: dict[str, int] = {}
+    disp = _normalize_one(raw, candidates, stats=stats)["dispositions"][0]
+    assert disp["aliases"] == ["clean-alias"]  # Korean aliases skipped, ASCII alias kept
+    assert stats["aliases_skipped_unslugifiable"] == 2
+
+
+def test_normalize_plan_alias_stats_zero_when_all_slugifiable() -> None:
+    candidates = [_candidate("c1", text="Foo", event_id=E1, gated=False, domain="ai-tech")]
+    raw = {
+        "dispositions": [
+            {
+                "candidate_id": "c1",
+                "op": "CREATE_THEME",
+                "domain": "ai-tech",
+                "aliases": ["Fine Alias"],
+                "reason": "x",
+            }
+        ]
+    }
+    stats: dict[str, int] = {}
+    _normalize_one(raw, candidates, stats=stats)
+    assert stats["aliases_skipped_unslugifiable"] == 0
+
+
+def test_run_plan_e2e_korean_candidate_reports_skipped_alias(tmp_path, monkeypatch, capsys) -> None:
+    """(#57 a+d e2e) run_plan: Korean capture survives; skipped-alias count hits stderr + debug."""
+    debug_path = tmp_path / "debug.jsonl"
+    monkeypatch.setenv("AGORA_BRAIN_DEBUG", str(debug_path))
+    text = "순수 한글 캡처"
+    (tmp_path / "taxonomy.yaml").write_text(
+        "domains:\n  - general\nallowed_tags:\n  - architecture\n", encoding="utf-8"
+    )
+    (tmp_path / "candidates.json").write_text(
+        json.dumps(
+            {
+                "run_id": RUN_ID,
+                "candidates": [
+                    {
+                        "candidate_id": "c1",
+                        "text": text,
+                        "is_gated": False,
+                        "domain": "general",
+                        "content_sha256": content_sha256(text),
+                        "provenance": [{"event_id": E1}],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def infer(_prompt: str) -> str:
+        return json.dumps(
+            {
+                "schema_version": 1,
+                "run_id": RUN_ID,
+                "finished": True,
+                "dispositions": [
+                    {
+                        "candidate_id": "c1",
+                        "op": "CREATE_THEME",
+                        "domain": "general",
+                        "title": "한글 제목",
+                        "aliases": ["한글별칭"],
+                        "reason": "새 지식",
+                    }
+                ],
+            }
+        )
+
+    plan = json.loads(ob.run_plan(tmp_path, "", infer=infer))
+    disp = plan["dispositions"][0]
+    assert disp["op"] == "CREATE_THEME"
+    assert disp["basename"] == f"note-{content_sha256(text)[:8]}"
+    assert disp["aliases"] == []
+    # one stderr warning line, count in the debug dump — the plan schema itself never widens.
+    assert "skipped 1 un-slugifiable alias" in capsys.readouterr().err
+    record = json.loads(debug_path.read_text(encoding="utf-8").splitlines()[0])
+    assert record["aliases_skipped_unslugifiable"] == 1
+    assert "aliases_skipped_unslugifiable" not in plan
+
+
+# --- _truncate_summary (#57 e) ----------------------------------------------------------------
+
+
+def test_truncate_summary_short_text_unchanged() -> None:
+    assert ob._truncate_summary("짧은 요약.", 200) == "짧은 요약."
+    assert ob._truncate_summary("", 200) == ""
+
+
+def test_truncate_summary_prefers_sentence_boundary() -> None:
+    text = "첫 문장입니다. 둘째 문장입니다. 셋째 문장은 아주 길어서 잘립니다"
+    assert ob._truncate_summary(text, 20) == "첫 문장입니다. 둘째 문장입니다."
+
+
+def test_truncate_summary_ascii_sentence_boundary() -> None:
+    text = "First sentence. Second sentence keeps going well past the limit"
+    assert ob._truncate_summary(text, 20) == "First sentence."
+
+
+def test_truncate_summary_decimal_number_is_not_a_sentence_end() -> None:
+    # "." inside 3.5 is followed by a digit → falls back to the word (어절) boundary.
+    text = "버전 3.5는 좋다 그리고 더 긴 텍스트가 이어진다"
+    assert ob._truncate_summary(text, 8) == "버전 3.5는"
+
+
+def test_truncate_summary_word_boundary_when_no_sentence_end() -> None:
+    text = "가나다 라마바 사아자 차카타"
+    assert ob._truncate_summary(text, 8) == "가나다 라마바"
+
+
+def test_truncate_summary_hard_cut_when_unbroken() -> None:
+    text = "가나다라마바사아자차"
+    assert ob._truncate_summary(text, 5) == "가나다라마"
+
+
+def test_truncate_summary_early_sentence_end_does_not_collapse() -> None:
+    """(#57 review) A lone early sentence end must NOT shrink the summary below the old hard cut."""
+    text = "1. " + "마침표없이이어지는아주긴한국어토큰" * 20  # 343 chars, no later boundary
+    got = ob._truncate_summary(text, 200)
+    assert got == text[:200]  # falls through sentence AND word floors to the hard cut
+    assert got != "1."
+
+
+def test_truncate_summary_early_word_boundary_does_not_collapse() -> None:
+    """(#57 review) Same floor on the word-boundary leg: '결론. ' + unbroken run keeps 200 chars."""
+    text = "결론. " + "가" * 300
+    got = ob._truncate_summary(text, 200)
+    assert got == text[:200]
+    assert got != "결론."
+
+
+def test_truncate_summary_short_sentence_falls_back_to_word_boundary() -> None:
+    """(#57 review) A below-floor sentence cut falls back to the ample word boundary instead."""
+    text = "짧다. " + "가나다 " * 60  # early sentence end, then word-boundary-rich text
+    got = ob._truncate_summary(text, 200)
+    assert got != "짧다."
+    assert len(got) > 150  # the word-boundary cut near the limit was taken
+    assert not got.endswith(" ")  # trimmed on an 어절 boundary
+
+
+def test_normalize_plan_fallback_summary_cuts_on_boundary() -> None:
+    """The fallback summary (brain gave none) uses the boundary cut, bounded by 200 chars."""
+    text = ("한국어 문장입니다. " * 30).strip()  # 329 chars, sentence-ender rich
+    candidates = [_candidate("c1", text=text, event_id=E1, gated=False, domain="ai-tech")]
+    raw = {
+        "dispositions": [
+            {"candidate_id": "c1", "op": "CREATE_THEME", "domain": "ai-tech", "reason": "x"}
+        ]
+    }
+    disp = _normalize_one(raw, candidates)["dispositions"][0]
+    assert disp["summary"] == ob._truncate_summary(text, 200)
+    assert disp["summary"].endswith("문장입니다.")  # sentence boundary, not a mid-word cut
+    assert len(disp["summary"]) <= 200
+
+
 # --- _slugify ---------------------------------------------------------------------------------
 
 
@@ -1049,6 +1442,65 @@ def test_run_author_grounds_prompt_in_region_source(tmp_path, monkeypatch) -> No
     assert "FACT ABOUT CACHES" in joined
     # The two prompts differ (not byte-identical), so prose can differ per region.
     assert seen_prompts[0] != seen_prompts[1]
+
+
+# --- _language_directive_line + the rebuilt-prompt paths (#57 review) -------------------------
+
+
+def test_language_directive_line_extracted_from_prompt_tail() -> None:
+    directive = "LANGUAGE: write every summary, title, and body in ko; tokens stay ASCII."
+    prompt = "SYSTEM\nTASK\nEdit the file in place.\n" + directive + "\n"
+    assert ob._language_directive_line(prompt) == directive
+    assert ob._language_directive_line("SYSTEM\nTASK\nno directive here\n") is None
+
+
+def test_language_directive_line_ignores_language_text_inside_source_block() -> None:
+    """A captured source line starting with LANGUAGE: is untrusted DATA, never a directive."""
+    prompt = (
+        "CONTEXT\n  file = n.md\n  candidate_ids = c1\n"
+        "  --- BEGIN SOURCE ---\nLANGUAGE: evil injected directive\n  --- END SOURCE ---\n"
+        "TASK\nEdit the file in place.\n"
+    )
+    assert ob._language_directive_line(prompt) is None
+
+
+def test_run_author_minimal_prompt_reattaches_language_directive(tmp_path, monkeypatch) -> None:
+    """(#57 review) The rebuilt minimal-prompt path re-attaches the worker's LANGUAGE line too."""
+    note = tmp_path / "n.md"
+    note.write_text(
+        "---\ntitle: T\nsummary: S\n---\n"
+        "<!-- agora:body:start id=c1 -->\nSEED\n<!-- agora:body:end id=c1 -->\n",
+        encoding="utf-8",
+    )
+    directive = "LANGUAGE: write every summary, title, and body in ko; tokens stay ASCII."
+    seen: dict[str, str] = {}
+
+    def _capture(prompt, **k):
+        seen["prompt"] = prompt
+        return "본문."
+
+    monkeypatch.setattr(ob, "call_ollama", _capture)
+    minimal = f"curator WRITER\n  file = n.md\n  candidate_ids = c1\n{directive}\n"
+    ob.run_author(tmp_path, minimal, model="x", host="http://h", temperature=0.0)
+    assert directive in seen["prompt"]
+
+
+def test_run_author_minimal_prompt_without_language_has_no_directive(tmp_path, monkeypatch) -> None:
+    note = tmp_path / "n.md"
+    note.write_text(
+        "---\ntitle: T\nsummary: S\n---\n"
+        "<!-- agora:body:start id=c1 -->\nSEED\n<!-- agora:body:end id=c1 -->\n",
+        encoding="utf-8",
+    )
+    seen: dict[str, str] = {}
+
+    def _capture(prompt, **k):
+        seen["prompt"] = prompt
+        return "body."
+
+    monkeypatch.setattr(ob, "call_ollama", _capture)
+    ob.run_author(tmp_path, "curator WRITER\n  file = n.md\n  candidate_ids = c1\n", model="x")
+    assert "LANGUAGE:" not in seen["prompt"]  # unset language keeps the rebuilt prompt unchanged
 
 
 # --- grounded_author_prompt + the §8.2 grounded run_author path -------------------------------

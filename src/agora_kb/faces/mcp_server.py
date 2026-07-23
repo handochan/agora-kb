@@ -740,6 +740,7 @@ class AgoraHandlers:
             default_backend=cfg.default_backend,
             allow_reduced_isolation=cfg.allow_reduced_isolation,
             body_byte_bound=cfg.body_byte_bound,
+            language=cfg.language,
         )
         if backend is None:
             return {
@@ -781,6 +782,7 @@ class AgoraHandlers:
         default_backend: str | None = None,
         allow_reduced_isolation: bool = False,
         body_byte_bound: int = DEFAULT_BODY_BYTE_BOUND,
+        language: str | None = None,
     ) -> RoutedBackend | SubprocessBackend | None:
         """Resolve the configured WRITE-adapter(s) into a worker backend, or ``None``.
 
@@ -806,6 +808,7 @@ class AgoraHandlers:
             allow_reduced_isolation=allow_reduced_isolation,
             default_backend=default_backend,
             body_byte_bound=body_byte_bound,
+            language=language,
             report=None,
         )
 
