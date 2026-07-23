@@ -449,6 +449,7 @@ def _cmd_curate(args: argparse.Namespace) -> int:
         override=args.backend,
         allow_reduced_isolation=cfg.allow_reduced_isolation,
         body_byte_bound=cfg.body_byte_bound,
+        language=cfg.language,
     )
     if backend is None:
         return 1
@@ -477,6 +478,7 @@ def _build_backend(
     override: str | None = None,
     allow_reduced_isolation: bool = False,
     body_byte_bound: int = DEFAULT_BODY_BYTE_BOUND,
+    language: str | None = None,
 ) -> RoutedBackend | SubprocessBackend | None:
     """Resolve the configured WRITE-adapter(s) into a worker backend, or print why not.
 
@@ -515,6 +517,7 @@ def _build_backend(
         default_backend=default_backend,
         override=override,
         body_byte_bound=body_byte_bound,
+        language=language,
         report=lambda msg: print(f"{_PROG} curate: {msg}", file=sys.stderr),
     )
 
@@ -672,6 +675,7 @@ def _watch_tick(repo: Repo) -> None:
         default_backend=cfg.default_backend,
         allow_reduced_isolation=cfg.allow_reduced_isolation,
         body_byte_bound=cfg.body_byte_bound,
+        language=cfg.language,
     )
     if backend is None:
         print(f"{stamp} due ({decision.reason}) but no usable backend — skipping this tick")

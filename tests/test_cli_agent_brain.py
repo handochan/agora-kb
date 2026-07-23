@@ -227,4 +227,42 @@ def test_run_author_text_only_minimal_prompt_grounds_in_region_body(tmp_path) ->
     assert "SEEDED REGION BODY TEXT here." in sent  # grounded in the region's seeded body
     assert "file = n.md" not in sent  # the worker control lines never leak to the agent
     assert "candidate_ids = c1" not in sent
+    assert "LANGUAGE:" not in sent  # no curator.language → the rebuilt prompt stays directive-free
     assert "Generated prose." in note.read_text(encoding="utf-8")
+
+
+def test_run_author_text_only_reattaches_language_directive(tmp_path) -> None:
+    """(#57 review) curator.language must reach the CLI-agent PASS-2: the text_only path REBUILDS
+    the prompt from the SOURCE block, so the worker-appended LANGUAGE line has to be re-attached —
+    without this the repo-language contract silently drops for every CLI brain."""
+    from agora_kb.adapters.ollama_brain import run_author
+
+    note = tmp_path / "n.md"
+    note.write_text(
+        "---\ntitle: T\nsummary: S\n---\n"
+        "<!-- agora:body:start id=c1 -->\nPLACEHOLDER\n<!-- agora:body:end id=c1 -->\n",
+        encoding="utf-8",
+    )
+    directive = (
+        "LANGUAGE: write every summary, title, and body in ko; slug / domain / tag tokens "
+        "still follow the schema's ASCII rules."
+    )
+    grounded = (
+        "SYSTEM curator WRITER\n  file = n.md\n  candidate_ids = c1\n"
+        "  --- BEGIN SOURCE ---\nThe single curator holds a per-repo flock.\n  --- END SOURCE ---\n"
+        "Edit the file in place, writing ONLY inside this region's markers.\n"
+        f"{directive}\n"  # SubprocessBackend appends the directive AFTER the TASK block
+    )
+    seen: dict[str, str] = {}
+
+    def _infer(prompt: str) -> str:
+        seen["prompt"] = prompt
+        return "국문 본문."
+
+    run_author(tmp_path, grounded, infer=_infer, model_label="claude", text_only=True)
+
+    sent = seen["prompt"]
+    assert "TEXT GENERATOR" in sent  # still the strict prose-only contract
+    assert "per-repo flock" in sent  # still grounded in the verbatim §8.2 SOURCE
+    assert directive in sent  # the worker's LANGUAGE line rides the rebuilt prompt
+    assert "국문 본문." in note.read_text(encoding="utf-8")

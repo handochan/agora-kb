@@ -175,6 +175,23 @@ content, and do NOT create headings that imply a SEPARATE note should exist. Do 
 imply other notes. Edit the file in place, writing ONLY inside this region's markers.
 """
 
+# Output-language directive (#57): ONE line appended to BOTH pass prompts when repo.yaml sets
+# ``curator.language``. Unset (None) keeps every prompt BYTE-IDENTICAL to the pre-#57 bytes, so the
+# default path (and its goldens) never move. Prose fields follow the repo language; slug/domain/tag
+# tokens keep the schema's ASCII rules (plan.py's path-safety regex is untouched).
+_LANGUAGE_DIRECTIVE_TEMPLATE = (
+    "LANGUAGE: write every summary, title, and body in {language}; slug / domain / tag tokens "
+    "still follow the schema's ASCII rules."
+)
+
+
+def _with_language_directive(prompt: str, language: str | None) -> str:
+    """Append the one-line #57 output-language directive; ``None``/empty → ``prompt`` unchanged."""
+    if not language:
+        return prompt
+    return prompt + _LANGUAGE_DIRECTIVE_TEMPLATE.format(language=language) + "\n"
+
+
 # Op-aware instruction woven into the grounded prompt (§8.2): each op authors a different shape.
 _OP_INSTRUCTIONS = {
     "CREATE_THEME": (
@@ -221,9 +238,13 @@ class SubprocessBackend:
         *,
         body_byte_bound: int = DEFAULT_BODY_BYTE_BOUND,
         isolation: BackendIsolation | None = None,
+        language: str | None = None,
     ) -> None:
         self._spec = spec
         self._body_byte_bound = body_byte_bound
+        # #57 output language (repo.yaml ``curator.language``): None/empty → every prompt stays
+        # byte-identical; set → one LANGUAGE directive line is appended to both pass prompts.
+        self._language = language if language and language.strip() else None
         # ADR-0013 confinement adapter (None → unconfined). The worker/CLI injects this ONLY for a
         # ``network: 'none'`` backend (the file-writing PASS-2 step is then run inside the sandbox);
         # for the default loopback Ollama brain it stays None and inference happens OUTSIDE the
@@ -245,7 +266,8 @@ class SubprocessBackend:
         returned STDOUT is handed verbatim to :func:`agora_kb.curator.plan.Plan.from_json` by the
         worker; a non-zero exit or missing executable becomes a clear error so PLAN parse fails.
         """
-        result = self._invoke(worktree=bundle_dir, prompt=_PASS1_PROMPT, confine=False)
+        prompt = _with_language_directive(_PASS1_PROMPT, self._language)
+        result = self._invoke(worktree=bundle_dir, prompt=prompt, confine=False)
         if result.returncode != 0:
             raise BackendUnavailableError(
                 f"PLAN backend {self._spec.name!r} exited {result.returncode}: "
@@ -291,22 +313,24 @@ class SubprocessBackend:
         control lines the Ollama shim parses.
         """
         if region is None:
-            return _PASS2_PROMPT_TEMPLATE.format(
+            prompt = _PASS2_PROMPT_TEMPLATE.format(
                 note_path=rel_path,
                 candidate_ids=sentinel_id,
                 n_bytes=self._body_byte_bound,
             )
-        op_instruction = _OP_INSTRUCTIONS.get(region.op, _DEFAULT_OP_INSTRUCTION)
-        return _PASS2_GROUNDED_PROMPT_TEMPLATE.format(
-            note_path=rel_path,
-            candidate_ids=sentinel_id,
-            op=region.op,
-            title=region.title or "(none)",
-            summary=region.summary or "(none)",
-            source_text=region.source_text or "(no source text)",
-            op_instruction=op_instruction,
-            n_bytes=self._body_byte_bound,
-        )
+        else:
+            op_instruction = _OP_INSTRUCTIONS.get(region.op, _DEFAULT_OP_INSTRUCTION)
+            prompt = _PASS2_GROUNDED_PROMPT_TEMPLATE.format(
+                note_path=rel_path,
+                candidate_ids=sentinel_id,
+                op=region.op,
+                title=region.title or "(none)",
+                summary=region.summary or "(none)",
+                source_text=region.source_text or "(no source text)",
+                op_instruction=op_instruction,
+                n_bytes=self._body_byte_bound,
+            )
+        return _with_language_directive(prompt, self._language)
 
     def _invoke(self, *, worktree: Path, prompt: str, confine: bool) -> BackendResult:
         """Spawn the backend; confine it inside the ADR-0013 sandbox when ``confine`` applies.
@@ -470,6 +494,7 @@ def build_routed_backend(
     default_backend: str | None = None,
     override: str | None = None,
     body_byte_bound: int = DEFAULT_BODY_BYTE_BOUND,
+    language: str | None = None,
     report: Callable[[str], None] | None = None,
 ) -> RoutedBackend | SubprocessBackend | None:
     """Build the curator backend for a run, honoring ADR-0015 per-act ``routing``.
@@ -487,6 +512,10 @@ def build_routed_backend(
       adapter ONLY for a ``network: 'none'`` spec (per-act: ``plan`` and ``author`` may differ);
     - returns a plain :class:`SubprocessBackend` when both acts resolve to the SAME spec (the
       no-routing / single-brain path — byte-for-byte today's object), else a :class:`RoutedBackend`.
+
+    ``language`` (repo.yaml ``curator.language``, #57) is threaded into every built backend: when
+    set, one output-language directive line is appended to both pass prompts; ``None`` (the
+    default) keeps the prompts byte-identical.
 
     Returns ``None`` (after calling ``report`` with a clear message, if provided) when the override
     names an unknown backend, or when a ``network: 'none'`` act has no usable OS sandbox and
@@ -513,7 +542,9 @@ def build_routed_backend(
                     f"usable OS sandbox is available: {exc}"
                 )
                 return None
-        return SubprocessBackend(spec, isolation=isolation, body_byte_bound=body_byte_bound)
+        return SubprocessBackend(
+            spec, isolation=isolation, body_byte_bound=body_byte_bound, language=language
+        )
 
     try:
         if override is not None:
