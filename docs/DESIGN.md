@@ -415,6 +415,12 @@ personal multi-device write path.
 Transport for teams: **MCP Streamable HTTP** with **OAuth 2.1 + PKCE** (or tokens + Tailscale for
 small private teams). AuthN via Keycloak/Authentik/Ory.
 
+> The concrete authn/authz decisions — Phase-4 Forgejo-delegated identity + the repo-permission
+> mirror (repo = the **only** security boundary; per-domain ACL demoted to a convenience filter),
+> the Phase-5 OAuth 2.1/OpenFGA triggers, and the per-surface rollout — are specified in
+> [ADR-0036](adr/0036-authn-authz.md) (**Proposed**, #69); where this section's prose and that ADR
+> differ, the ADR governs once Accepted.
+
 ## 8. Fully-OSS bill of materials
 
 Core must run with **zero proprietary dependencies**; proprietary agents are optional plugins.
