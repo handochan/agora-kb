@@ -82,8 +82,9 @@ uv run agora import ~/existing-vault ~/my-kb --domain general
 uv run agora serve --repo ~/my-kb
 ```
 
-Register the stdio server with any MCP client and the six tools — `kb_remember`, `kb_query`,
-`kb_read`, `kb_neighbors`, `kb_status`, `kb_curate` — appear to the agent:
+Register the stdio server with any MCP client and the seven tools — `kb_remember`, `kb_query`,
+`kb_read`, `kb_neighbors`, `kb_context`, `kb_status`, `kb_curate` — appear to the agent (plus the
+`agora://gold/{pack}` resource and the `gold_context` prompt for the gold pack, ADR-0027):
 
 ```bash
 # Claude Code (other MCP clients: point them at `agora serve --repo ~/my-kb` over stdio)
@@ -148,8 +149,13 @@ standing consent; Agora never writes agent config dirs):
 
 Every pack is wrapped in an `<!-- agora:pack … -->` sentinel span that the harvester drops whole, so
 an injected pack round-trips to **zero** re-harvested facts, and harvest-origin notes are excluded
-from packs — gold can never become a prompt-injection amplifier (ADR-0027 §8). The MCP `kb_context`
-tool and web `/api/gold` consumption channels are a deferred follow-up (Phase C).
+from packs — gold can never become a prompt-injection amplifier (ADR-0027 §8). Agents without
+filesystem access consume the same pack over MCP — the **`kb_context`** tool (plus the
+`agora://gold/{pack}` resource and `gold_context` prompt) — and any HTTP client over
+**`GET /api/gold/{pack}`** on the web face; every channel serves the built pack **byte-identically**
+and answers a not-yet-built pack with actionable build guidance — the tool and prompt return it in
+the response, the resource and web route carry it in an explicit error (`ResourceError` / HTTP 404)
+(Phase C, #40). All of it is pull-only: nothing auto-injects a pack anywhere.
 
 **Backup (`agora sync`, push-only).** The KB is a plain git repo, but nothing pushes it anywhere by
 default — a lost disk would be a lost KB. Configure a backup remote in `_kb/repo.yaml` and push the

@@ -1,10 +1,12 @@
-"""MCP server face — the 6 agent tools over the core API (DESIGN §5.1).
+"""MCP server face — the 7 agent tools over the core API (DESIGN §5.1).
 
 This is the **agent-facing** face: a single FastMCP registration that exposes ``kb_remember`` /
-``kb_query`` / ``kb_read`` / ``kb_neighbors`` / ``kb_status`` / ``kb_curate`` to every MCP client
-(Claude Code, Codex, Qwen, Hermes, …). It is a thin face: it adds no concurrency, provenance, or
-access-control logic of its own — those are properties of the core (DESIGN §2.1). Each tool
-delegates straight to the core API (or an already-shipped read handler below):
+``kb_query`` / ``kb_read`` / ``kb_neighbors`` / ``kb_context`` / ``kb_status`` / ``kb_curate`` to
+every MCP client (Claude Code, Codex, Qwen, Hermes, …), plus the ``agora://gold/{pack}`` resource
+and the ``gold_context`` prompt (the ADR-0027 Phase-C gold consumption channels, #40). It is a thin
+face: it adds no concurrency, provenance, or access-control logic of its own — those are properties
+of the core (DESIGN §2.1). Each tool delegates straight to the core API (or an already-shipped read
+handler below):
 
 - ``kb_remember``  → :meth:`agora_kb.core.inbox.Inbox.write` (the only write path; non-blocking).
 - ``kb_query``     → :meth:`agora_kb.core.wiki.Wiki.query` (the deterministic, model-free read
@@ -13,6 +15,9 @@ delegates straight to the core API (or an already-shipped read handler below):
   verbatim — body + frontmatter + outgoing links; #58).
 - ``kb_neighbors`` → :meth:`AgoraHandlers.graph` (the ADR-0021 local ego-graph around a note,
   ``depth`` clamped by the existing cap; #58).
+- ``kb_context``   → :meth:`AgoraHandlers.gold_pack` (the built ADR-0027 gold pack, served
+  byte-identically from ``_kb/gold/``; the same handler backs the ``agora://gold/{pack}`` resource,
+  the ``gold_context`` prompt, and the web ``GET /api/gold/{pack}``; #40).
 - ``kb_status``    → :class:`agora_kb.core.state.StateStore` + live inbox/failed counts (meta
   face).
 - ``kb_curate``    → :func:`agora_kb.curator.worker.recover` + :func:`agora_kb.curator.worker.run`
@@ -31,10 +36,12 @@ Wiring only: both delegate to handlers the web face already ships, the core is u
 a tool call into a core-API call and shaping a JSON-serializable result — lives in
 :class:`AgoraHandlers`, which has no dependency on a live MCP transport and is unit-testable
 directly. :func:`build_server` is the only transport-aware part: it constructs the handlers and
-registers six thin tool wrappers that call them — one-line delegation, except that ``kb_read`` /
-``kb_neighbors`` keep their not-found shaping in the closure (#58). So the handler logic is
-exercised by ordinary unit tests with no server I/O, the wiring by a single smoke test, and the
-closure-only shaping by real-Client tests (``tests/faces/test_mcp_read_tools.py``).
+registers seven thin tool wrappers (plus the gold resource/prompt) that call them — one-line
+delegation, except that ``kb_read`` / ``kb_neighbors`` keep their not-found shaping in the closure
+(#58) and the gold resource/prompt shape their not-built outcome in the closure (#40). So the
+handler logic is exercised by ordinary unit tests with no server I/O, the wiring by a single smoke
+test, and the closure-only shaping by real-Client tests (``tests/faces/test_mcp_read_tools.py``,
+``tests/faces/test_gold_consumption.py``).
 
 The ``writer`` identity is **server configuration** (the connecting agent's identity), not a tool
 argument — a client cannot spoof another writer's inbox namespace (tenant isolation, invariant 5).
@@ -83,7 +90,7 @@ MAX_GRAPH_DEPTH = 3  # clamp default for the local ego-graph depth (ADR-0025)
 
 
 class AgoraHandlers:
-    """Transport-free handlers for the 6 MCP tools (DESIGN §5.1).
+    """Transport-free handlers for the 7 MCP tools (DESIGN §5.1).
 
     Construct with the repo and the connecting writer identity; each method maps a tool call to a
     core-API call and returns a plain, JSON-serializable ``dict``. No FastMCP / transport types
@@ -461,6 +468,84 @@ class AgoraHandlers:
             },
             "gold": gold,
         }
+
+    # --- gold consumption (read; ADR-0027 Phase C, issue #40) -----------------------------------
+    def gold_pack(self, pack: str = "default") -> dict[str, object]:
+        """Serve one BUILT gold context pack — the single shared Phase-C consumption handler.
+
+        The ADR-0019/0021 two-face lock: the MCP channels (``kb_context`` tool,
+        ``agora://gold/{pack}`` resource, ``gold_context`` prompt) and the web face
+        (``GET /api/gold/{pack}``) all wrap THIS method — no face ships its own read. It serves the
+        built artifact at ``_kb/gold/<pack>.md`` **byte-identically** and never (re)assembles a
+        pack: assembly stays with the producer (``agora gold build`` + the worker finalize rebuild,
+        ADR-0027 decisions 2/3/7 ROLE RULE) so the byte-identical / prompt-cache contract holds on
+        the serve path. Pull-only, on-request — nothing is auto-injected (the injection opt-in
+        posture, ADR-0027 decision 7 / #40).
+
+        Three statuses, never an exception:
+
+        - ``ok``: ``text`` is the exact pack file content; ``meta`` carries the sidecar fields
+          (``None`` if the sidecar is absent/corrupt — the pack bytes are the contract, the meta is
+          advisory).
+        - ``not_built``: no built pack file — ``note`` says how to build one and ``packs`` lists
+          the packs that DO exist.
+        - ``invalid_name``: ``pack`` is not a safe single path component (the same
+          :func:`~agora_kb.core.layout.safe_path_component` traversal guard the layout uses), so
+          nothing outside ``_kb/gold/`` is ever read.
+        """
+        from agora_kb.core.gold import read_meta
+        from agora_kb.core.layout import InvalidWriterError
+
+        try:
+            pack_path = self._repo.layout.gold_pack_path(pack)
+        except InvalidWriterError:
+            return {
+                "status": "invalid_name",
+                "pack": pack,
+                "packs": self._built_packs(),
+                "note": (
+                    f"invalid pack name {pack!r}: a pack name is a single safe filename token "
+                    "(alphanumeric, then alphanumerics/._-), never a path. Built packs: see "
+                    "'packs'."
+                ),
+            }
+        try:
+            # read_bytes().decode(), NOT read_text(): Path.read_text (3.12: no newline= param)
+            # applies universal-newline translation, which would silently rewrite \r\n / \r in an
+            # out-of-band-written pack and break the byte-identical serving contract above.
+            text = pack_path.read_bytes().decode("utf-8")
+        except (OSError, UnicodeDecodeError):
+            return {
+                "status": "not_built",
+                "pack": pack,
+                "packs": self._built_packs(),
+                "note": (
+                    f"gold pack {pack!r} has not been built (or is unreadable): run "
+                    "'agora gold build' — or let the next curator run rebuild it — then retry "
+                    "(ADR-0027)."
+                ),
+            }
+        meta = read_meta(self._repo.layout, pack)
+        meta_row: dict[str, object] | None = None
+        if meta is not None:
+            meta_row = {
+                "curated_sha": meta.curated_sha,
+                "spec_hash": meta.spec_hash,
+                "generated_at": meta.generated_at,
+                "estimator": meta.estimator,
+                "note_count": meta.note_count,
+                "est_tokens": meta.est_tokens,
+                "budget_tokens": meta.budget_tokens,
+                "harvest_derived_share": meta.harvest_derived_share,
+            }
+        return {"status": "ok", "pack": pack, "text": text, "meta": meta_row}
+
+    def _built_packs(self) -> list[str]:
+        """Sorted stems of the packs that exist under ``_kb/gold/`` (``[]`` when none/absent)."""
+        gold_dir = self._repo.layout.gold_dir
+        if not gold_dir.is_dir():
+            return []
+        return sorted(p.stem for p in gold_dir.glob("*.md"))
 
     # --- graph (read; web face /graph viz — ADR-0003/0019 §7 / graph-plan) -----------------------
     def graph(
@@ -899,15 +984,20 @@ def _iso_z(value: datetime) -> str:
 
 
 def build_server(*, repo_path: Path, writer: str = DEFAULT_WRITER) -> FastMCP:
-    """Construct the FastMCP server: build handlers over ``repo_path`` and register the 6 tools.
+    """Construct the FastMCP server: build handlers over ``repo_path`` and register the 7 tools.
 
     The returned :class:`fastmcp.FastMCP` instance has ``kb_remember`` / ``kb_query`` /
-    ``kb_read`` / ``kb_neighbors`` / ``kb_status`` / ``kb_curate`` registered. Each tool delegates
-    to an :class:`AgoraHandlers` method that holds the transport-free, unit-testable logic; the
-    ``kb_read`` / ``kb_neighbors`` wrappers additionally shape their not-found responses in the
-    closure (#58), covered over a real Client by ``tests/faces/test_mcp_read_tools.py``.
+    ``kb_read`` / ``kb_neighbors`` / ``kb_context`` / ``kb_status`` / ``kb_curate`` registered,
+    plus the ``agora://gold/{pack}`` resource and the ``gold_context`` prompt (all three gold
+    channels wrap the SAME :meth:`AgoraHandlers.gold_pack` — ADR-0027 Phase C, #40). Each tool
+    delegates to an :class:`AgoraHandlers` method that holds the transport-free, unit-testable
+    logic; the ``kb_read`` / ``kb_neighbors`` wrappers additionally shape their not-found responses
+    in the closure (#58), covered over a real Client by ``tests/faces/test_mcp_read_tools.py``, and
+    the gold resource/prompt shape their not-built outcome in the closure (#40, covered by
+    ``tests/faces/test_gold_consumption.py``).
     """
     from fastmcp import FastMCP
+    from fastmcp.exceptions import ResourceError
 
     repo = Repo.resolve(repo_path)
     handlers = AgoraHandlers(repo, writer=writer)
@@ -975,6 +1065,50 @@ def build_server(*, repo_path: Path, writer: str = DEFAULT_WRITER) -> FastMCP:
                 "returned by a kb_query hit or a kb_neighbors node id."
             )
         return result
+
+    @mcp.tool
+    def kb_context(pack: str = "default") -> dict[str, object]:
+        """Fetch the standing gold context pack: a small, token-budgeted, byte-stable slice of the
+        curated wiki, assembled at a curated commit (ADR-0027).
+
+        Complementary to the retrieval tools: kb_context is STANDING context — broad, stable,
+        prompt-cache-friendly, suited to session start — while kb_query answers a specific question
+        with cited evidence and kb_read opens one cited note. The ``text`` is served byte-identical
+        to the built ``_kb/gold/<pack>.md`` artifact and is wrapped in trusted
+        ``<!-- agora:pack ... -->`` / ``<!-- agora:pack:end ... -->`` sentinel markers — keep them
+        intact when injecting: they are the ADR-0027 §8 loop-break contract that lets harvesters
+        span-drop a re-ingested pack. Pull-only, on-request — nothing is ever auto-injected.
+        Returns ``status: "not_built"`` with build guidance (and the packs that DO exist) when the
+        pack has not been built yet. A ``scopes`` parameter is reserved as a future additive
+        extension (federation, reserved ADR-0030) and is not accepted in v0.1.
+        """
+        return handlers.gold_pack(pack)
+
+    @mcp.resource("agora://gold/{pack}")
+    def gold_pack_resource(pack: str) -> str:
+        """One gold context pack, byte-identical to the built ``_kb/gold/<pack>.md`` (ADR-0027).
+
+        The resource form of ``kb_context`` for clients that attach context as resources — the same
+        :meth:`AgoraHandlers.gold_pack` read. A not-built (or invalid) pack raises a clear
+        :class:`~fastmcp.exceptions.ResourceError` carrying the build guidance rather than serving
+        placeholder bytes (the resource contract is the pack text itself, byte-identical).
+        """
+        payload = handlers.gold_pack(pack)
+        if payload["status"] != "ok":
+            raise ResourceError(str(payload["note"]))
+        return str(payload["text"])
+
+    @mcp.prompt
+    def gold_context(pack: str = "default") -> str:
+        """Inject the gold context pack into the conversation (the ADR-0027 prompt channel).
+
+        Returns the built pack text VERBATIM (byte-identical, sentinel markers intact) so invoking
+        the prompt is exactly the opt-in, human-triggered injection ADR-0027 decision 7 describes.
+        When the pack is not built, the prompt returns the actionable build-guidance note instead
+        (a prompt is a conversation aid — a hard error would be less useful than the remedy).
+        """
+        payload = handlers.gold_pack(pack)
+        return str(payload["text"] if payload["status"] == "ok" else payload["note"])
 
     @mcp.tool
     def kb_status() -> dict[str, object]:

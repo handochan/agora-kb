@@ -275,7 +275,8 @@ outcome is **Adopt**.
 > `_kb/gold/` scan exclusion + `agora doctor` line, the `worker.py` finalize best-effort rebuild,
 > the `kb_status` gold row + Prometheus `agora_gold_pack_*` gauges + the bronze/silver/gold
 > dashboard panel, and the §8 acceptance criteria: the near-duplicate shingle counter +
-> harvest-derived-share cap). Phases C–F remain future work.
+> harvest-derived-share cap). **Phase C SHIPPED in #40** (the MCP + web consumption channels —
+> see the addendum below). Phases D–F remain future work.
 
 1. **Phase A (1–3 d) — the assembler + the outbound contract, together.** `core/gold.py`
    (`PackAssembler` + gold-score with commit-anchored decay), the CJK-aware estimator,
@@ -300,3 +301,49 @@ outcome is **Adopt**.
 6. **Phase F (evidence-triggered; reserved ADR-0028) — the `DISTILL` curator act** →
    `wiki/digests/` via one new closed-vocab op; trigger = packs chronically overflow budget on
    summary lines alone.
+
+---
+
+## Addendum — Phase C landed (2026-07-25, #40): the MCP + web consumption channels
+
+Append-only record of the Phase-C landing; the body above is unchanged.
+
+**What shipped.** One shared, transport-free read handler — `AgoraHandlers.gold_pack(pack)`
+(`faces/mcp_server.py`) — behind four thin wrappers, the ADR-0019/0021 two-face lock (a test
+asserts MCP and web return the identical payload):
+
+- the **`kb_context(pack)`** MCP tool (decision 7 channel 2) — its description teaches what the
+  pack is (standing, byte-stable, sentinel-wrapped trusted context) and its relation to
+  `kb_query`/`kb_read` (standing context vs per-question retrieval vs opening one note);
+- the **`agora://gold/{pack}`** resource — the pack text verbatim; not-built raises a
+  `ResourceError` carrying the build guidance (the resource contract is the pack bytes, never a
+  placeholder);
+- the **`gold_context`** prompt — the pack text verbatim; not-built returns the guidance note (a
+  prompt is a conversation aid, so the remedy beats a hard error);
+- **`GET /api/gold/{pack}`** in the web face (`{status, pack, text, meta}`); not-built / invalid
+  name → 404 with the actionable note. API-first only — no new UI page.
+
+**Serving posture (recorded decisions).**
+
+- **Byte-identical serving, no assembly on the serve path.** Every channel serves the built
+  `_kb/gold/<pack>.md` artifact verbatim (regression-tested `served bytes == file bytes`); the
+  decision-3 byte-identical / prompt-cache contract therefore holds through consumption. The
+  decision-2(b) lazy `ensure_pack()`-on-read is **NOT implemented by this landing** — faces stay
+  read-only and the "first face write" widening in the Consequences remains **unexercised**.
+  An absent pack yields an explicit `not_built` response (build guidance + the packs that do
+  exist), never an in-face rebuild; staleness stays surfaced (meta `curated_sha`, `kb_status`,
+  the Prometheus gauges — all pre-existing, unchanged here) and governed by curation cadence
+  (decision 6) + `agora gold build` + the worker finalize rebuild. If a future landing implements
+  2(b), it exercises the already-recorded widening; nothing here forecloses it.
+- **`scopes` is not accepted in v0.1.** Decision 7 makes `scopes` a *future additive* parameter
+  owned by reserved ADR-0030 (federation); with ADR-0030 unwritten there is no semantic to honor,
+  and adding the parameter later is non-breaking. Not accepting it (rather than accept-and-ignore)
+  keeps the tool surface honest.
+- **Pack-name input is traversal-guarded** at the handler (`safe_path_component` via
+  `layout.gold_pack_path`) — an unsafe name is refused before any path is built and the response
+  lists the packs that exist.
+- **Opt-in posture intact.** These are pull-only, on-request channels — nothing auto-injects a
+  pack anywhere (the #40 default-on gate concerns bridge-side injection, not these channels).
+
+**Phase D (the `agora-bridge-aelix` reference bridge) remains future work** — a separate repo,
+zero agora-core changes (the decision-7 ROLE RULE is the test), deferred until aelix is available.
