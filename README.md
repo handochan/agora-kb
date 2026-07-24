@@ -126,7 +126,7 @@ MIT force-graph, no Node — ADR-0021), a read-only **`/dashboard`**
 (KB health · curator · harvester · gold-pack status, HTMX-polled), and a Prometheus **`/metrics`**
 endpoint for external scraping. It binds to `127.0.0.1` by default and ships no authentication — keep
 it local. The upload surface is hardened for the day you do share it (the team-deployment guide,
-issue #68): server-side URL fetches are SSRF-guarded (private/loopback/link-local/metadata targets
+[`docs/DEPLOY-TEAM.md`](docs/DEPLOY-TEAM.md)): server-side URL fetches are SSRF-guarded (private/loopback/link-local/metadata targets
 and redirects into them are refused) and can be disabled outright with `web.upload.url_enabled:
 false`, and zip-based uploads (docx/xlsx/pptx/epub) are capped against decompression bombs via
 `web.upload.max_uncompressed_bytes` (ADR-0025 appendix). Behind an **authenticating reverse proxy**,
@@ -196,7 +196,8 @@ units that start them at login/boot, restart them when they exit, and capture lo
 [`deploy/README.md`](deploy/README.md) for the install steps. Two rules baked into the examples:
 the web unit binds `127.0.0.1` **only** (the web face has no auth/TLS), and **harvest needs its
 own scheduled unit** — the `agora watch` loop evaluates only the curation triggers and never runs
-harvest.
+harvest. Sharing one KB with a small team (single hub, reverse proxy, SSH MCP writes, read-only
+clones) is covered by [`docs/DEPLOY-TEAM.md`](docs/DEPLOY-TEAM.md) (issue #68).
 
 ## Documentation
 

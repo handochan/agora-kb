@@ -107,6 +107,10 @@ curl -s http://127.0.0.1:8000/api/status | head -1
 
 ## Per-user identity behind a reverse proxy (`web.identity`, issue #67)
 
+> Deploying for a **team**? The full hub topology (reverse proxy, SSH MCP writes, read-only
+> clones, secrets) is [`docs/DEPLOY-TEAM.md`](../docs/DEPLOY-TEAM.md) (issue #68) — the snippets
+> below are the building blocks its §2 references.
+
 For a **team** deployment fronted by an authenticating reverse proxy, set in the knowledge repo's
 `_kb/repo.yaml`:
 
