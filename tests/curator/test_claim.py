@@ -176,3 +176,129 @@ def test_claim_dedups_against_prior_run_state(tmp_path: Path) -> None:
     # The keyed event with a fresh key (no prior state) would still be claimable: sanity-check that
     # an un-recorded key is NOT dropped.
     assert eid  # referenced to keep the fixture meaningful
+
+
+# --- max_candidates cap (INGEST-CONTRACT §1.3, ADR-0024 OD-3a / #60) ----------------------------
+RUN_ID_2 = "2026-06-13T03-05-00.000Z--7f31ac"
+RUN_ID_3 = "2026-06-13T03-10-00.000Z--7f31ad"
+
+
+def test_claim_caps_fifo_head_and_leaves_remainder_in_inbox(tmp_path: Path) -> None:
+    """An over-cap backlog claims exactly the FIFO head; the rest stays in the inbox untouched."""
+    layout = RepoLayout(tmp_path)
+    inbox = Inbox(layout)
+    ids = [_write(inbox, text=f"fact {i}", second=10 + i) for i in range(5)]
+    originals = {eid: layout.inbox_item_path("dochan", eid).read_text("utf-8") for eid in ids}
+
+    with curator_lock(layout):
+        manifest = claim(
+            layout,
+            base_commit=BASE,
+            run_id=RUN_ID,
+            started=STARTED,
+            state=CuratorState(),
+            max_candidates=2,
+        )
+
+    assert manifest is not None
+    # Exactly the 2-candidate FIFO head is claimed (5 distinct bodies = 5 candidate groups).
+    assert manifest.event_ids == (ids[0], ids[1])
+    assert _claimed_event_files(layout) == sorted(f"{e}.md" for e in ids[:2])
+    # The remainder stays in the inbox BYTE-FOR-BYTE (no move, no rewrite — append-only intact).
+    assert inbox.depth() == 3
+    for eid in ids[2:]:
+        assert layout.inbox_item_path("dochan", eid).read_text("utf-8") == originals[eid]
+
+
+def test_claim_cap_fifo_continuity_across_runs(tmp_path: Path) -> None:
+    """The next claim picks up EXACTLY where the capped head stopped — FIFO across runs."""
+    layout = RepoLayout(tmp_path)
+    inbox = Inbox(layout)
+    ids = [_write(inbox, text=f"fact {i}", second=10 + i) for i in range(5)]
+
+    def _claim(run_id: str) -> tuple[str, ...]:
+        with curator_lock(layout):
+            manifest = claim(
+                layout,
+                base_commit=BASE,
+                run_id=run_id,
+                started=STARTED,
+                state=CuratorState(),
+                max_candidates=2,
+            )
+        return manifest.event_ids if manifest is not None else ()
+
+    assert _claim(RUN_ID) == (ids[0], ids[1])
+    assert _claim(RUN_ID_2) == (ids[2], ids[3])
+    assert _claim(RUN_ID_3) == (ids[4],)
+    assert inbox.depth() == 0
+
+
+def test_claim_cap_counts_candidates_not_events(tmp_path: Path) -> None:
+    """The capped unit is the tier-2 content GROUP: byte-equivalent duplicates in the head ride
+    along without consuming a cap slot (they collapse into one candidate at bundle time)."""
+    layout = RepoLayout(tmp_path)
+    inbox = Inbox(layout)
+    e_a1 = _write(inbox, text="same body", second=10)
+    e_b = _write(inbox, text="other body", second=11)
+    e_a2 = _write(inbox, text="same body", second=12)  # duplicate of group A, after group B
+    e_c = _write(inbox, text="third body", second=13)  # would open group 3 -> the FIFO cut
+
+    with curator_lock(layout):
+        manifest = claim(
+            layout,
+            base_commit=BASE,
+            run_id=RUN_ID,
+            started=STARTED,
+            state=CuratorState(),
+            max_candidates=2,
+        )
+
+    assert manifest is not None
+    # 3 events claimed but only 2 DISTINCT content groups; the 3rd group's event stays queued.
+    assert manifest.event_ids == (e_a1, e_b, e_a2)
+    assert inbox.depth() == 1
+    assert layout.inbox_item_path("dochan", e_c).exists()
+
+
+def test_claim_default_cap_leaves_small_inbox_identical(tmp_path: Path) -> None:
+    """No explicit cap → the documented default 32: a small inbox claims whole, byte-identical."""
+    layout = RepoLayout(tmp_path)
+    inbox = Inbox(layout)
+    ids = [_write(inbox, text=f"fact {i}", second=10 + i) for i in range(3)]
+
+    with curator_lock(layout):
+        manifest = claim(
+            layout, base_commit=BASE, run_id=RUN_ID, started=STARTED, state=CuratorState()
+        )
+
+    assert manifest is not None
+    assert manifest.event_ids == tuple(ids)
+    assert inbox.depth() == 0
+
+
+@pytest.mark.parametrize("bad_cap", [0, -1])
+def test_claim_rejects_non_positive_cap_fail_loud(tmp_path: Path, bad_cap: int) -> None:
+    """``max_candidates < 1`` raises ValueError BEFORE any side effect (the docstring's
+    "the cap can never turn a non-empty selection into a no-op" invariant is enforced in code,
+    not just by the config-side ``ge=1`` bound): no manifest, no processing dir, inbox untouched."""
+    layout = RepoLayout(tmp_path)
+    inbox = Inbox(layout)
+    e1 = _write(inbox, text="one fact", second=10)
+
+    with curator_lock(layout):
+        with pytest.raises(ValueError, match="max_candidates"):
+            claim(
+                layout,
+                base_commit=BASE,
+                run_id=RUN_ID,
+                started=STARTED,
+                state=CuratorState(),
+                max_candidates=bad_cap,
+            )
+
+    # Fail-loud left NOTHING behind: no empty phase='claimed' ghost run for recover() to walk.
+    assert not manifest_path(layout, RUN_ID).exists()
+    assert not (layout.processing_dir / RUN_ID).exists()
+    assert inbox.depth() == 1
+    assert layout.inbox_item_path("dochan", e1).exists()

@@ -1919,3 +1919,197 @@ def test_free_text_capture_publishes_with_engine_materialized_raw_source(tmp_pat
             RepoLayout(published), taxonomy=TAXONOMY, run_date=RUN_DATE, run_id=report.run_id
         )
         assert result.ok, [f for f in result.findings]
+
+
+# --- max_candidates_per_run cap e2e (INGEST-CONTRACT §1.3, ADR-0024 OD-3a / #60) ----------------
+
+
+class _DropAllBackend:
+    """A :class:`Backend` whose PASS-1 reads the REAL ``bundle/candidates.json`` and DROPs all.
+
+    Unlike :class:`FakeBackend` (a canned plan), this fake derives its plan from the bundle the
+    worker actually materialized — the SAME read surface ``run_plan`` (ollama_brain PASS-1)
+    consumes — and records each run's candidate count, so the claim cap's effect on the REAL
+    PASS-1 input size is assertable end-to-end. DROP needs no prose and no raw/ seed.
+    """
+
+    def __init__(self) -> None:
+        self.bundle_sizes: list[int] = []
+
+    def plan(self, bundle_dir: Path) -> str:
+        doc = json.loads((bundle_dir / "candidates.json").read_text(encoding="utf-8"))
+        cands = doc["candidates"]
+        self.bundle_sizes.append(len(cands))
+        dispositions = [
+            {
+                "candidate_id": c["candidate_id"],
+                "event_ids": [p["event_id"] for p in c["provenance"]],
+                "op": "DROP",
+                "needs_prose": False,
+                "reason": "cap e2e",
+            }
+            for c in cands
+        ]
+        return json.dumps(
+            {
+                "schema_version": 1,
+                "run_id": doc["run_id"],
+                "finished": True,
+                "dispositions": dispositions,
+            }
+        )
+
+    def author(
+        self,
+        worktree: Path,
+        needs_prose: dict[str, list[str]],
+        context: dict[str, AuthorRegion],
+    ) -> None:  # pragma: no cover — a DROP-only plan never reaches PASS 2
+        raise AssertionError("a DROP-only plan never needs prose")
+
+
+def test_cap_bounds_bundle_and_drains_backlog_fifo(tmp_path: Path) -> None:
+    """(#60 e2e) An over-cap backlog is consumed in capped FIFO slices across successive runs:
+    each run's PLAN pass sees at most ``max_candidates`` candidates in the REAL bundle, the
+    remainder stays in the inbox for the next trigger, and the batch shape is observable on the
+    RunReport counts + ``state.json`` ``last_batch``."""
+    from agora_kb.core.state import LastBatch
+
+    repo = _init_repo(tmp_path)
+    layout = repo.layout
+    inbox = Inbox(layout)
+    for i in range(5):
+        _write_capture(inbox, text=f"distinct fact {i}", second=10 + i)
+
+    backend = _DropAllBackend()
+    store = StateStore(layout)
+
+    def _capped_run(minute: int) -> RunReport:
+        return run(
+            repo,
+            backend=backend,
+            state_store=store,
+            now=datetime(2026, 6, 13, 3, minute, 0, tzinfo=UTC),
+            taxonomy=TAXONOMY,
+            max_candidates=2,
+        )
+
+    # Run 1: exactly the 2-candidate FIFO head is claimed/bundled; 3 events stay queued.
+    report1 = _capped_run(0)
+    assert report1.status == "published"
+    assert backend.bundle_sizes == [2]
+    assert report1.counts["claimed"] == 2
+    assert report1.counts["candidates"] == 2
+    assert report1.counts["inbox_remaining"] == 3
+    assert report1.counts["DROP"] == 2
+    assert inbox.depth() == 3
+    # The batch shape is persisted for the dashboard/metrics (#60 observability).
+    assert store.load().last_batch == LastBatch(claimed=2, candidates=2, cap=2, inbox_remaining=3)
+
+    # Runs 2-3: the next triggers naturally continue FIFO over the remainder (2 then 1).
+    report2 = _capped_run(10)
+    assert report2.status == "published"
+    assert backend.bundle_sizes == [2, 2]
+    assert report2.counts["inbox_remaining"] == 1
+    report3 = _capped_run(20)
+    assert report3.status == "published"
+    assert backend.bundle_sizes == [2, 2, 1]
+    assert report3.counts["claimed"] == 1
+    assert report3.counts["inbox_remaining"] == 0
+    assert inbox.depth() == 0
+    assert store.load().last_batch == LastBatch(claimed=1, candidates=1, cap=2, inbox_remaining=0)
+
+    # Run 4: the backlog is drained — a plain noop, no phantom fourth bundle.
+    report4 = _capped_run(30)
+    assert report4.status == "noop"
+    assert report4.counts == {"claimed": 0}
+    assert backend.bundle_sizes == [2, 2, 1]
+
+
+def test_default_cap_leaves_small_run_report_shape_intact(tmp_path: Path) -> None:
+    """(#60) With no explicit cap (default 32) a small inbox claims whole — and the new
+    observability keys report the uncapped shape on the happy path."""
+    repo = _init_repo(tmp_path)
+    inbox = Inbox(repo.layout)
+    e1 = _write_capture(inbox, text="One curator advances the branch under a lock.", second=10)
+    _seed_raw(repo, e1)
+    backend = FakeBackend(
+        _create_theme_plan("ignored", "c1", e1),
+        prose={region_sentinel_id("ignored", "c1"): "The single curator holds a per-repo flock."},
+    )
+
+    report = _run(repo, backend)
+
+    assert report.status == "published"
+    assert report.counts["claimed"] == 1
+    assert report.counts["candidates"] == 1
+    assert report.counts["inbox_remaining"] == 0
+    from agora_kb.core.state import LastBatch
+
+    assert StateStore(repo.layout).load().last_batch == LastBatch(
+        claimed=1, candidates=1, cap=32, inbox_remaining=0
+    )
+
+
+def test_recovery_clears_stale_last_batch_when_state_save_never_landed(tmp_path: Path) -> None:
+    """(#60) ``last_batch`` is a point-in-time label for the LAST published run. A crash in the
+    CAS-success window (ref advanced, state never saved) leaves the PREVIOUS run's shape in
+    ``state.json``; recovery cannot recompute the crashed run's shape (candidates/cap went down
+    with the process), so ``_finalize_recovered`` must CLEAR ``last_batch`` — the gauges then omit,
+    exactly like never-run — instead of labeling run N-1's shape as run N's. A re-walked
+    already-finalized manifest (``is_published``) keeps the recorded value."""
+    from agora_kb.core.state import LastBatch
+
+    repo = _init_repo(tmp_path)
+    layout = repo.layout
+    inbox = Inbox(layout)
+
+    # Run 1 publishes normally -> last_batch records run 1's shape.
+    e1 = _write_capture(inbox, text="One curator advances the branch under a lock.", second=10)
+    _seed_raw(repo, e1)
+    r1 = _run(
+        repo,
+        FakeBackend(
+            _create_theme_plan("ignored", "c1", e1),
+            prose={region_sentinel_id("ignored", "c1"): "One curator holds a per-repo flock."},
+        ),
+    )
+    assert r1.status == "published"
+    shape1 = LastBatch(claimed=1, candidates=1, cap=32, inbox_remaining=0)
+    assert StateStore(layout).load().last_batch == shape1
+
+    # recover() re-walks run 1's lingering FINALIZED manifest: is_published -> the recorded
+    # last_batch SURVIVES (a normal restart never wipes the observability signal).
+    recover(repo, state_store=StateStore(layout))
+    assert StateStore(layout).load().last_batch == shape1
+
+    # Run 2 crashes RIGHT AFTER the CAS lands (same interposition as the double-publish test):
+    # manifest 'applied' + published_commit recorded, state (incl. last_batch) never saved.
+    _write_capture(inbox, text="A second distinct fact.", second=20)
+    real_advance = worker_mod._advance
+
+    def faulting_advance(layout_, manifest_, *, phase, prose_complete, published_commit=None):  # type: ignore[no-untyped-def]
+        if phase == "published":
+            raise RuntimeError("simulated crash right after CAS, before finalize")
+        return real_advance(
+            layout_,
+            manifest_,
+            phase=phase,
+            prose_complete=prose_complete,
+            published_commit=published_commit,
+        )
+
+    worker_mod._advance = faulting_advance  # type: ignore[assignment]
+    try:
+        with pytest.raises(RuntimeError, match="simulated crash"):
+            _run(repo, _DropAllBackend(), now=datetime(2026, 6, 13, 4, 0, 0, tzinfo=UTC))
+    finally:
+        worker_mod._advance = real_advance  # type: ignore[assignment]
+
+    # Recovery finalizes run 2: last_commit points at the recovered run, but its batch shape is
+    # unknowable -> last_batch is CLEARED, not left as run 1's shape mislabeled as run 2's.
+    reports = recover(repo, state_store=StateStore(layout))
+    assert any(r.status == "recovered" for r in reports)
+    state = StateStore(layout).load()
+    assert state.last_commit == repo.branch_commit()
+    assert state.last_batch is None

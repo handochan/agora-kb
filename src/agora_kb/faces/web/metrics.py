@@ -126,6 +126,36 @@ class AgoraCollector:
             dispositions.add_metric([op], float(counters[op]))  # type: ignore[index]
         yield dispositions
 
+        # --- last-run batch shape (#60 / ADR-0024 §3; omitted when never run / pre-#60 state) ----
+        # Cheap: read from the state.json `last_batch` the worker records at finalize — batch size
+        # per run vs the wired §1.3 max_candidates_per_run cap, plus the queue depth left right
+        # after the claim (claimed==candidates==cap with a big remainder ⇒ capped backlog drain).
+        batch = status["last_batch"]
+        if isinstance(batch, dict):
+            yield GaugeMetricFamily(
+                "agora_last_run_claimed_events",
+                "Inbox events claimed by the last published curator run.",
+                value=float(batch["claimed"]),
+            )
+            yield GaugeMetricFamily(
+                "agora_last_run_candidates",
+                "Post-dedup candidates bundled by the last published curator run (the capped "
+                "unit, INGEST-CONTRACT §1.3).",
+                value=float(batch["candidates"]),
+            )
+            yield GaugeMetricFamily(
+                "agora_max_candidates_per_run",
+                "The curator.limits.max_candidates_per_run cap in effect for the last "
+                "published run.",
+                value=float(batch["cap"]),
+            )
+            yield GaugeMetricFamily(
+                "agora_last_run_inbox_remaining",
+                "Inbox events left un-claimed right after the last published run's FIFO claim "
+                "(the remainder the next trigger picks up).",
+                value=float(batch["inbox_remaining"]),
+            )
+
         # --- last consolidation (unix timestamp gauge; omitted when never run) -------------------
         last_run = _iso_to_epoch(status["last_consolidation"])  # type: ignore[arg-type]
         if last_run is not None:

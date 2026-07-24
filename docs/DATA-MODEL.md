@@ -79,33 +79,37 @@ see §8), NOT in `repo.yaml`. The earlier `curator.routing` PRE-PLAN-signal desi
 (per-op / per-tier routing reserved as future work).
 
 What `load_repo_config` actually parses today: `name`, `kind`, `domains`/`schema_version` (taxonomy),
-and under `curator:` only `backend`, `max_attempts`, `allow_reduced_isolation`, and `triggers`; plus
-the `harvest:` block (`enabled`, `scope_lock`). Any other keys (e.g. a forward-looking
-`curator.limits` / `curator.lint` / top-level `health` from the ADR-0011 design) are **silently
-ignored** — they are not yet wired, so they neither take effect nor break loading.
-### 3.1 Forward-looking config shapes (silently-ignored-until-wired)
+and under `curator:` — `backend`, `max_attempts`, `allow_reduced_isolation`, `triggers`, `language`
+(#57), plus the Phase-3.5 tunables `limits.{body_byte_bound, related_k, max_candidates_per_run}` and
+`lint.max_orphans` (ADR-0022 step 2 / ADR-0024 OD-3a — see §3.1 (a)/(a′)). The `harvest:` block is
+read from the same file by its own loaders (`enabled`/`scope_lock` via `load_harvest_policy`,
+`redact` via `load_redact_policy` — separate models on purpose, so the opt-in read-side policy never
+couples into the `extra='forbid'` curator config). Unknown / not-yet-wired keys (e.g. the per-domain
+`curator.domains.<domain>` block or top-level `health` from the ADR-0011 design) are **silently
+ignored** — they neither take effect nor break loading.
+### 3.1 Forward-looking config shapes (per-item status: WIRED or planned)
 
-The following keys are **planned, not yet parsed** — they follow the §3 convention above (unknown
-keys load without effect and never break `load_repo_config`) and are recorded here so an implementer
-has a fixed target. Each points to the ADR that governs the behavior; none is presented as settled
-v1 behavior.
+The following keys were designed here ahead of their implementation and follow the §3 convention
+above (unknown keys load without effect and never break `load_repo_config`); they are recorded so an
+implementer has a fixed target. Status is marked **per item** — a **WIRED** item documents the
+settled, parsed shape; a *planned* item points to the ADR that governs the future behavior.
 
-**(a) Bounded-batch claim cap — `curator.limits.max_events_per_run`** (default: unbounded,
-back-compat). Caps how many events `claim()` pulls per run (today `claim()`/`_fifo_snapshot` is
-whole-inbox, uncapped); the remainder stays in the inbox for the next trigger. This is **intra-repo
-pipelining** (smaller, more frequent single-writer runs to bound prompt/context cost), **NOT a
-second writer** — the per-repo single-writer CAS+flock remains the throughput ceiling by design
-(#27, ADR-0024 *Proposed*; ROADMAP Phase 3.5; formalizes the existing `curator.limits` stub
-referenced in `bundle.py`/`apply.py`). It pairs with the already-documented sibling
-`curator.limits.max_candidates_per_run` (INGEST-CONTRACT §1.3, default 32) — note BOTH are currently
-**documented-but-not-yet-wired** (`load_repo_config` parses no `curator.limits` today), so neither is
-enforced pre-implementation; ADR-0024 must reconcile them (event cap slices the FIFO head pre-dedup;
-candidate cap bounds the post-dedup bundle).
+**(a) Bounded-batch claim cap** — RESOLVED by ADR-0024 **OD-3a** (#60, Phase 3.5): the
+already-documented `curator.limits.max_candidates_per_run` (INGEST-CONTRACT §1.3, default 32) is now
+**WIRED** — `load_repo_config` parses it and `claim()` enforces it at the FIFO claim, counting
+DISTINCT tier-2 content groups (candidates, the unit that drives PASS-1 prompt size) and claiming
+only the contiguous FIFO head that fits; the remainder stays in the inbox for the next trigger. This
+is **intra-repo pipelining** (smaller, more frequent single-writer runs to bound prompt/context
+cost), **NOT a second writer** — the per-repo single-writer CAS+flock remains the throughput ceiling
+by design (#27/#60, ADR-0024; ROADMAP Phase 3.5). Per OD-3a a sibling pre-dedup
+`curator.limits.max_events_per_run` was **NOT introduced** (one cap only; an event-level claim-cost
+cap would come back only under ADR-0024 OD-3c's stated interaction if claim cost — not bundle cost —
+is ever shown to dominate).
 
 ```yaml
 curator:
   limits:
-    max_events_per_run: 32          # planned; default unbounded — caps the per-run claim, not a 2nd writer
+    max_candidates_per_run: 32      # wired (#60): FIFO-head claim cap in candidates, not a 2nd writer
 ```
 
 **(a′) Repo-global curation thresholds — `curator.limits.body_byte_bound` / `curator.limits.related_k`
@@ -197,11 +201,20 @@ Mutable engine state. JSON (single small file; rewritten atomically under the lo
   "last_run": "2026-06-13T03:00:12Z",
   "last_commit": "705f4a4",
   "counters": { "ingested": 142, "merged": 38, "dropped": 11, "failed": 2 },
+  "last_batch": { "claimed": 12, "candidates": 8, "cap": 8, "inbox_remaining": 4 },
   "event_keys": { "dochan:<event_key>": "<event-id>" },
   "published_runs": { "<run-id>": "<commit-sha>" }
 }
 ```
 
+`last_batch` (#60, ADR-0024 §3) records the last published run's claim/bundle shape — events
+claimed, tier-2 candidates, the `max_candidates_per_run` cap in effect, and the inbox depth left
+right after the claim — so the dashboard/`/metrics` can surface batch-size-vs-cap pressure without
+re-reading run manifests (absent/`null` in a pre-#60 state.json; the field is additive). Crash
+recovery does NOT recompute it: finalizing a run whose happy-path state save never landed CLEARS
+`last_batch` back to `null` (the crashed run's shape is unknowable, so recovery clears rather than
+mislabels the previous run's shape as the recovered run's — the same best-effort posture as the
+un-replayed counters).
 `event_keys` is a bounded delivery-idempotency cache and may be rebuilt from retained events.
 `published_runs` lets recovery finalize a committed run without invoking the backend twice. Separately,
 `_kb/index/<repo>.notes.json` is the read-side query cache — **IMPLEMENTED in issue #26** (ADR-0012 §2

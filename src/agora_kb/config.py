@@ -38,7 +38,12 @@ from pydantic import BaseModel, ConfigDict, Field
 from .core.layout import RepoLayout
 from .core.redact import DEFAULT_ON_CLASSES, KNOWN_CLASSES, RedactionPolicy
 from .curator import BackendRegistry, TriggerConfig
-from .curator.constants import DEFAULT_BODY_BYTE_BOUND, DEFAULT_MAX_ATTEMPTS, DEFAULT_RELATED_K
+from .curator.constants import (
+    DEFAULT_BODY_BYTE_BOUND,
+    DEFAULT_MAX_ATTEMPTS,
+    DEFAULT_MAX_CANDIDATES_PER_RUN,
+    DEFAULT_RELATED_K,
+)
 from .schema import Taxonomy
 
 __all__ = [
@@ -79,9 +84,10 @@ _DEFAULT_KIND = "personal"
 # Reuse the single source of truth for the §5.1 retry budget (curator/constants.py) so RepoConfig's
 # default can never silently drift from the worker's actual DEFAULT_MAX_ATTEMPTS.
 _DEFAULT_MAX_ATTEMPTS = DEFAULT_MAX_ATTEMPTS
-# Same SSOT reuse for the §1.3 repo-global tuning thresholds (ADR-0022 step 2).
+# Same SSOT reuse for the §1.3 repo-global tuning thresholds (ADR-0022 step 2 / ADR-0024 OD-3a).
 _DEFAULT_BODY_BYTE_BOUND = DEFAULT_BODY_BYTE_BOUND
 _DEFAULT_RELATED_K = DEFAULT_RELATED_K
+_DEFAULT_MAX_CANDIDATES_PER_RUN = DEFAULT_MAX_CANDIDATES_PER_RUN
 # The OSS default brain (ADR-0005 / INGEST-CONTRACT §8: local Qwen via Ollama, zero API cost). Only
 # a NAME here; the executable/argv binding lives in adapters.yaml (DATA-MODEL §8).
 _DEFAULT_BACKEND = "qwen"
@@ -122,14 +128,18 @@ class RepoConfig(BaseModel):
     # restricted fallback (network egress + out-of-worktree writes are NOT prevented, forced
     # review-mode). Read from ``curator.allow_reduced_isolation`` (DATA-MODEL §3 curator policy).
     allow_reduced_isolation: bool = False
-    # §1.3 repo-global curator tuning surfaces (ADR-0022 step 2 / DATA-MODEL §3.1).
+    # §1.3 repo-global curator tuning surfaces (ADR-0022 step 2 / ADR-0024 OD-3a / DATA-MODEL §3.1).
     # ``body_byte_bound`` is the ``{n_bytes}`` PASS-2 prompt hint; ``related_k`` is the bundle's
-    # ``wiki.query`` breadth; ``max_orphans`` (``None`` ⇒ orphan check SKIPPED, byte-identical to
+    # ``wiki.query`` breadth; ``max_candidates_per_run`` is the per-run candidate cap the FIFO claim
+    # enforces (distinct tier-2 content groups per snapshot; the remainder stays in the inbox for
+    # the next trigger, #60); ``max_orphans`` (``None`` ⇒ orphan check SKIPPED, byte-identical to
     # today) gates a WARNING-only ``L2-1`` lint finding when the whole-tree orphan-theme count
     # exceeds it. Read from ``curator.limits.body_byte_bound`` / ``curator.limits.related_k`` /
-    # ``curator.lint.max_orphans`` — the DATA-MODEL §3 repo-global nesting.
+    # ``curator.limits.max_candidates_per_run`` / ``curator.lint.max_orphans`` — the DATA-MODEL §3
+    # repo-global nesting.
     body_byte_bound: int = Field(default=_DEFAULT_BODY_BYTE_BOUND, ge=1)
     related_k: int = Field(default=_DEFAULT_RELATED_K, ge=1)
+    max_candidates_per_run: int = Field(default=_DEFAULT_MAX_CANDIDATES_PER_RUN, ge=1)
     max_orphans: int | None = Field(default=None, ge=0)
     # #57 repo output language (``curator.language``, e.g. ``"ko"``). ``None`` (the default) keeps
     # BOTH pass prompts byte-identical to the pre-#57 bytes; when set, one output-language directive
@@ -188,6 +198,13 @@ def load_repo_config(layout: RepoLayout) -> RepoConfig:
     related_k = _opt_int(
         limits.get("related_k"), _DEFAULT_RELATED_K, key="curator.limits.related_k"
     )
+    # #60 / ADR-0024 OD-3a: the already-documented INGEST-CONTRACT §1.3 per-run candidate cap
+    # (default 32) — the FIFO claim caps the snapshot; NO sibling max_events_per_run is introduced.
+    max_candidates_per_run = _opt_int(
+        limits.get("max_candidates_per_run"),
+        _DEFAULT_MAX_CANDIDATES_PER_RUN,
+        key="curator.limits.max_candidates_per_run",
+    )
     lint_cfg = _sub_mapping(curator.get("lint"))
     raw_orphans = lint_cfg.get("max_orphans")
     max_orphans = (
@@ -212,6 +229,7 @@ def load_repo_config(layout: RepoLayout) -> RepoConfig:
         allow_reduced_isolation=allow_reduced_isolation,
         body_byte_bound=body_byte_bound,
         related_k=related_k,
+        max_candidates_per_run=max_candidates_per_run,
         max_orphans=max_orphans,
         language=language,
     )

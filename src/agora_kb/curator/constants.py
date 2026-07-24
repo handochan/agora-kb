@@ -45,6 +45,14 @@ DEFAULT_BODY_BYTE_BOUND = 8192
 # ``wiki.query(limit=…)`` fan-out (``repo.yaml curator.related_k``). Default; tuning via config.
 DEFAULT_RELATED_K = 8
 
+# §1.3 default per-run candidate cap (``repo.yaml curator.limits.max_candidates_per_run``): the
+# FIFO claim caps the snapshot at this many DISTINCT tier-2 content groups (post-dedup candidates,
+# the unit PASS-1 adjudicates) so one harvest surge can never build an unbounded plan prompt; the
+# remainder stays in the inbox for the next trigger (ADR-0024 OD-3a, #60). 32 is the documented
+# contract default (frontier-model sized); small local models want lower (≤8B: 8-12, 30B-A3B:
+# 16-24 — INGEST-CONTRACT §1.3). Default; operator tuning via load_repo_config.
+DEFAULT_MAX_CANDIDATES_PER_RUN = 32
+
 
 def is_allowlisted_path(rel_path: str) -> bool:
     """True iff ``rel_path`` (POSIX, repo-relative) is within the canonical §4.0 ALLOWLIST.

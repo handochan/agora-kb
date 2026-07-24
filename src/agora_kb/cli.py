@@ -475,6 +475,7 @@ def _cmd_curate(args: argparse.Namespace) -> int:
         taxonomy=cfg.taxonomy,
         max_attempts=cfg.max_attempts,
         related_k=cfg.related_k,
+        max_candidates=cfg.max_candidates_per_run,
         max_orphans=cfg.max_orphans,
     )
     counts = ", ".join(f"{op}={n}" for op, n in sorted(report.counts.items())) or "-"
@@ -817,6 +818,7 @@ def _watch_tick(repo: Repo) -> None:
         taxonomy=cfg.taxonomy,
         max_attempts=cfg.max_attempts,
         related_k=cfg.related_k,
+        max_candidates=cfg.max_candidates_per_run,
         max_orphans=cfg.max_orphans,
     )
     counts = ", ".join(f"{op}={n}" for op, n in sorted(report.counts.items())) or "-"

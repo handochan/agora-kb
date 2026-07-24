@@ -31,6 +31,7 @@ from agora_kb.core.layout import RepoLayout
 from agora_kb.curator.constants import (
     DEFAULT_BODY_BYTE_BOUND,
     DEFAULT_MAX_ATTEMPTS,
+    DEFAULT_MAX_CANDIDATES_PER_RUN,
     DEFAULT_RELATED_K,
 )
 
@@ -159,6 +160,7 @@ curator:
   limits:
     body_byte_bound: 8192
     related_k: 8
+    max_candidates_per_run: 32
   lint:
     max_orphans: 0
   max_attempts: 5
@@ -186,6 +188,8 @@ harvest:
     # ADR-0022 step 2: the repo-global thresholds in this §3 example are now WIRED (were ignored).
     assert cfg.body_byte_bound == 8192
     assert cfg.related_k == 8
+    # ADR-0024 OD-3a (#60): the §1.3 per-run candidate cap in this example is now WIRED too.
+    assert cfg.max_candidates_per_run == 32
     assert cfg.max_orphans == 0
 
 
@@ -259,6 +263,8 @@ def test_curator_thresholds_default_when_absent(tmp_path: Path) -> None:
     cfg = load_repo_config(layout)
     assert cfg.body_byte_bound == DEFAULT_BODY_BYTE_BOUND
     assert cfg.related_k == DEFAULT_RELATED_K
+    # #60 / ADR-0024 OD-3a: absent cap → the documented INGEST-CONTRACT §1.3 default (32).
+    assert cfg.max_candidates_per_run == DEFAULT_MAX_CANDIDATES_PER_RUN == 32
     assert cfg.max_orphans is None
 
 
@@ -267,11 +273,13 @@ def test_curator_thresholds_parsed(tmp_path: Path) -> None:
     _write_repo_yaml(
         layout,
         "name: r\ncurator:\n  limits:\n    body_byte_bound: 4096\n    related_k: 3\n"
+        "    max_candidates_per_run: 12\n"
         "  lint:\n    max_orphans: 5\n",
     )
     cfg = load_repo_config(layout)
     assert cfg.body_byte_bound == 4096
     assert cfg.related_k == 3
+    assert cfg.max_candidates_per_run == 12
     assert cfg.max_orphans == 5
 
 
@@ -320,6 +328,24 @@ def test_curator_related_k_zero_out_of_range_raises(tmp_path: Path) -> None:
     _write_repo_yaml(layout, "name: r\ncurator:\n  limits:\n    related_k: 0\n")
     with pytest.raises(ValueError):
         load_repo_config(layout)
+
+
+def test_curator_max_candidates_per_run_zero_out_of_range_raises(tmp_path: Path) -> None:
+    layout = _layout(tmp_path)
+    # max_candidates_per_run: 0 violates the RepoConfig ge=1 bound (pydantic ValidationError) —
+    # an "unbounded" cap does not exist; the contract default is 32 (#60 / ADR-0024 OD-3a).
+    _write_repo_yaml(layout, "name: r\ncurator:\n  limits:\n    max_candidates_per_run: 0\n")
+    with pytest.raises(ValueError):
+        load_repo_config(layout)
+
+
+def test_curator_max_candidates_per_run_malformed_raises(tmp_path: Path) -> None:
+    layout = _layout(tmp_path)
+    # A non-integer cap fails LOUD with the full key path (mirrors body_byte_bound above).
+    _write_repo_yaml(layout, "name: r\ncurator:\n  limits:\n    max_candidates_per_run: lots\n")
+    with pytest.raises(ConfigError) as exc:
+        load_repo_config(layout)
+    assert "curator.limits.max_candidates_per_run" in str(exc.value)
 
 
 def test_curator_max_orphans_negative_out_of_range_raises(tmp_path: Path) -> None:

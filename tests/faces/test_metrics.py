@@ -30,6 +30,8 @@ def _init_repo(tmp_path: Path) -> Repo:
 
 def _plant_state(repo: Repo) -> None:
     """Plant state.json counters + last_run so the cumulative-counter / timestamp families fire."""
+    from agora_kb.core.state import LastBatch
+
     store = StateStore(repo.layout)
     state = store.load()
     state.counters.ingested = 5
@@ -37,6 +39,8 @@ def _plant_state(repo: Repo) -> None:
     state.counters.dropped = 2
     state.counters.failed = 1
     state.mark_run(datetime(2026, 6, 21, 3, 0, 12, tzinfo=UTC), commit="deadbeef")
+    # #60: the last-run batch shape (claim cap observability) the batch gauges read.
+    state.last_batch = LastBatch(claimed=12, candidates=8, cap=8, inbox_remaining=4)
     store.save(state)
 
 
@@ -122,6 +126,12 @@ def test_collector_renders_expected_families(tmp_path: Path) -> None:
     # Active backend info-metric (value 1, the brain name in the label).
     assert 'agora_active_backend_info{backend="qwen"} 1.0' in text
 
+    # Last-run batch shape gauges (#60: batch size per run + cap + post-claim queue depth).
+    assert "agora_last_run_claimed_events 12.0" in text
+    assert "agora_last_run_candidates 8.0" in text
+    assert "agora_max_candidates_per_run 8.0" in text
+    assert "agora_last_run_inbox_remaining 4.0" in text
+
     # Per-connector harvester counters: proposed>0; accepted/rejected the REAL deferred 0 (no fake).
     assert 'agora_harvester_proposed_total{connector="file:claude-code"} 7.0' in text
     assert 'agora_harvester_accepted_total{connector="file:claude-code"} 0.0' in text
@@ -164,6 +174,11 @@ def test_collector_robust_to_empty_repo(tmp_path: Path) -> None:
     assert 'agora_curator_dispositions_total{op="ingested"} 0.0' in text
     # Never run → the last-consolidation sample is OMITTED entirely (not faked as 0).
     assert "agora_last_consolidation_timestamp_seconds" not in text
+    # Never run → no batch shape either: the #60 gauges are OMITTED, never faked as 0.
+    assert "agora_last_run_claimed_events" not in text
+    assert "agora_last_run_candidates" not in text
+    assert "agora_max_candidates_per_run" not in text
+    assert "agora_last_run_inbox_remaining" not in text
     # No adapters.yaml → null backend → the info metric is omitted.
     assert "agora_active_backend_info" not in text
     # No connectors → the harvester family HELP/TYPE may appear but carries no samples.

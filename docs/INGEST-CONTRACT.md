@@ -175,7 +175,27 @@ implementations produce identical bundles.
 `load_repo_config` and threaded through `worker.run` → `build_routed_backend`/`build_bundle` at every
 run site; `curator.lint.max_orphans` (default absent ⇒ check off) adds a warning-only `L2-1` lint
 signal. Defaults reproduce the prior constants, so a repo setting none of them is byte-identical.
-`max_candidates_per_run` stays unwired (deferred to #27 / ADR-0024).
+
+**Wired (#60, ADR-0024 OD-3a addendum):** `curator.limits.max_candidates_per_run` (default 32) is now
+parsed by `load_repo_config` and threaded through `worker.run` → `claim()` at every run site. The cap is
+enforced AT THE CLAIM, per the wording above ("the FIFO claim caps the snapshot"): after tier-1 dedup,
+`claim()` counts DISTINCT canonical `content_sha256` groups — exactly what tier-2 collapses to, i.e. the
+candidate, the unit that drives PASS-1 prompt size — and claims the longest contiguous FIFO **head** whose
+distinct-group count fits the cap. A byte-equivalent duplicate inside the head rides along without costing a
+cap slot (it collapses at tier-2 with its provenance unioned). Everything past the cut stays untouched in
+the inbox — no file moves — so the next trigger naturally continues FIFO (append-only, single-writer, and
+"snapshot = sole event universe" are all byte-for-byte preserved; the manifest simply covers a shorter
+head). Per OD-3a, NO sibling `max_events_per_run` is introduced — one cap, this one. Observability: the run
+log line + `RunReport.counts` (`claimed`/`candidates`/`inbox_remaining`) + `state.json last_batch` →
+`/metrics` gauges (`agora_last_run_claimed_events`, `agora_last_run_candidates`,
+`agora_max_candidates_per_run`, `agora_last_run_inbox_remaining`).
+
+**Sizing the cap for small local models:** the contract default 32 is a frontier-model number. A small
+model's *effective* attention collapses well before its nominal context window, and an oversized PASS-1
+prompt degrades plan quality silently (no error — just worse keep/merge/drop calls). Practical starting
+points: **≤8B dense (e.g. Qwen 7/8B): 8–12**; **~30B MoE (e.g. 30B-A3B): 16–24**; frontier/API brains: the
+default 32. A capped backlog is not lost — it drains across successive triggers in FIFO slices. These bands
+are heuristics pending the #44 batch sweep's empirical calibration.
 
 ---
 ## 2. EDIT-OPERATION SEMANTICS — closed vocabulary (the PLAN)
@@ -547,8 +567,8 @@ any team/corporate-shared source is sequenced after Phase-4 multi-tenancy, ROADM
 - **Optional pre-gate digest for firehose volume.** High-volume/low-signal sources (mail/chat/sessions) MAY be
   summarized or clustered into fewer candidate facts **before the inbox** — as a connector-side reduction or a
   separate pre-curation digest adapter step (ADR-0004 read-adapter) — so the per-run bundle cap
-  (§1.3 `max_candidates_per_run`, default 32 — documented but not yet wired in `load_repo_config`, same status
-  as the proposed `curator.limits.max_events_per_run`, so it is not an enforced ceiling pre-implementation) and
+  (§1.3 `max_candidates_per_run`, default 32 — WIRED since #60 / ADR-0024 OD-3a: the FIFO claim enforces it,
+  the un-claimed remainder drains across later runs, so a firehose is bounded per-run but still all queued) and
   the curator's keep/merge/drop gate are not overwhelmed by a raw stream. This is purely a **read-side
   transform**: the integrity boundary is unchanged — the digested facts still enter as untrusted, still go
   through the candidate gate, and the curator still adjudicates keep/merge/drop. Summarization NEVER substitutes

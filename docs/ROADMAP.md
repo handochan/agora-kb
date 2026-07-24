@@ -151,16 +151,15 @@ Low-risk, repo-local, OSS-safe; lands post-Phase-3 with no invariant change.
       BM25F stays the oracle. This is an **implementation of the already-Accepted ADR-0012, not a new
       ADR**. Rebuildable-from-markdown is a hard requirement; **semantic/vector** stays deferred (see
       below), with #28 corporate volume as the explicit future trigger.
-- [ ] **#27 (part) bounded-batch claim + throughput observability.** Wire a claim cap in `repo.yaml`
-      `curator.limits` (today documented-but-UNWIRED — `load_repo_config` does not parse `curator.limits`,
-      DATA-MODEL §3) to cap how many events `claim()` pulls per run, leaving the remainder for the next
-      trigger. Reconcile against the already-specified `max_candidates_per_run` (INGEST-CONTRACT §1.3,
-      default 32, likewise unwired): either wire that existing key (note: the contract already documents
-      32, not unbounded) or justify a distinct event-level `max_events_per_run` that slices the FIFO head
-      *pre-dedup* while the candidate cap bounds the *post-dedup* bundle — to be settled in ADR-0024. This
-      is **intra-repo pipelining (smaller, more frequent runs), NOT a second writer** — single-writer
-      CAS+flock stays the ceiling. Surface per-run throughput + CAS-conflict rate on the
-      dashboard/metrics.
+- [x] **#27 (part) bounded-batch claim + batch observability — DONE via #60 (ADR-0024 OD-3a addendum,
+      Phase 3.5).** The already-specified `max_candidates_per_run` (INGEST-CONTRACT §1.3, default 32) is
+      WIRED: `load_repo_config` parses it and `claim()` slices the FIFO head at that many distinct
+      tier-2 content groups (candidates), leaving the remainder in the inbox for the next trigger; per
+      OD-3a **no** sibling `max_events_per_run` was introduced. **Intra-repo pipelining, NOT a second
+      writer** — single-writer CAS+flock stays the ceiling. Batch size/cap/queue-remaining surface on
+      the run log, `RunReport.counts`, `state.json last_batch`, and `/metrics` gauges; small-model cap
+      guidance (≤8B: 8–12, 30B-A3B: 16–24) documented in §1.3, calibrated later by #44. The
+      CAS-conflict-rate metric remains with the rest of #27.
 - [x] **#23 (floor) no-loss catch-all + repo-global thresholds — DONE (ADR-0022 step 1/2, Phase 3.5).**
       "No matching domain" no longer defaults to DROP: an unclassifiable non-gated basename op is routed
       to the deterministic catch-all — the **first declared domain `domains[0]`** (default repo →
@@ -255,7 +254,7 @@ Gated on / co-developed with Phase-4 multi-tenancy where a source is team/shared
       (commit/diff), local folders (`dir:`), meetings (file/extractor); (3) safety = ADR-0007 triad
       **plus** connector-boundary PII/secret redaction (`core/redact.py`) **plus** a pre-gate
       summarization/clustering stage so high-volume/low-signal sources don't overwhelm the per-run bundle
-      cap (INGEST-CONTRACT §1.3 `max_candidates_per_run=32`, itself documented-but-not-yet-wired) —
+      cap (INGEST-CONTRACT §1.3 `max_candidates_per_run=32`, wired at the FIFO claim since #60) —
       summarization is a read-side transform, the gate still adjudicates; (4) team/corporate-shared scope
       deferred to Phase-4 multi-tenancy. **Letta/mem0 API connectors are one member of this broader
       connector family** (was the only Phase-5 connector listed). **How the collected context is USED**

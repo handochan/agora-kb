@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 from agora_kb.core.layout import RepoLayout
-from agora_kb.core.state import Counters, CuratorState, StateStore
+from agora_kb.core.state import Counters, CuratorState, LastBatch, StateStore
 
 
 @pytest.fixture()
@@ -38,6 +38,36 @@ def test_save_then_load_roundtrip(store: StateStore) -> None:
     s.record_published_run("run-1", "abc1234")
     store.save(s)
     assert store.load() == s
+
+
+def test_last_batch_roundtrip(store: StateStore) -> None:
+    """(#60) The per-run batch shape persists and loads; a fresh state carries None."""
+    assert store.load().last_batch is None
+    s = CuratorState()
+    s.last_batch = LastBatch(claimed=3, candidates=2, cap=2, inbox_remaining=7)
+    store.save(s)
+    loaded = store.load()
+    assert loaded.last_batch == LastBatch(claimed=3, candidates=2, cap=2, inbox_remaining=7)
+
+
+def test_pre_batch_state_json_loads_with_none(store: StateStore) -> None:
+    """(#60) A pre-#60 state.json (no last_batch key) loads unchanged — the field is additive."""
+    store.path.parent.mkdir(parents=True, exist_ok=True)
+    store.path.write_text(
+        json.dumps(
+            {
+                "last_run": "2026-06-13T03:00:12Z",
+                "last_commit": "705f4a4",
+                "counters": {"ingested": 1, "merged": 0, "dropped": 0, "failed": 0},
+                "event_keys": {},
+                "published_runs": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    loaded = store.load()
+    assert loaded.last_batch is None
+    assert loaded.counters.ingested == 1
 
 
 def test_last_run_serialized_as_z(store: StateStore) -> None:
