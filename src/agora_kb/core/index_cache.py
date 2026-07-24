@@ -59,7 +59,9 @@ __all__ = [
 
 # Bump on ANY change to the serialized note shape, the tokenizer, or the parser
 # (see the module docstring).
-CACHE_SCHEMA_VERSION = 1
+# 2: issue #56 (ADR-0012 addendum) — NFC + CJK-bigram tokenizer, and aliases/summary joined
+#    field_tokens; a v1 cache carries stale derived tokens, so the whole cache is invalidated.
+CACHE_SCHEMA_VERSION = 2
 
 
 def source_digest(text: str) -> str:
@@ -171,8 +173,9 @@ def build_inverted_index(
 ) -> dict[str, set[str]]:
     """Build ``token -> {paths}`` from every note's per-field tokens (EXACT candidate selector).
 
-    A path is indexed under a token iff that token appears in ANY of the note's four fields — the
-    exact condition under which the note can have ``lex > 0`` (ADR-0012 §4), so the resulting
+    A path is indexed under a token iff that token appears in ANY of the note's scoring fields
+    (the six-field ``_FIELDS`` set since the #56 addendum) — the exact condition under which the
+    note can have ``lex > 0`` (ADR-0012 §4), so the resulting
     candidate set is precisely the set of notes that could pass the lexical branch of the §6 gate.
     Because it is fed the tokenizer's OUTPUT (including tokens synthesized from abutting link labels
     or kebab-tag splits), it is exact where a raw-bytes accelerator would under-approximate.

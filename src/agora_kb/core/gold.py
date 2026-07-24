@@ -54,6 +54,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from .atomicio import atomic_write_text
+from .cjk import is_cjk as _is_cjk
 from .hashing import content_sha256
 from .wiki import STRUCT_ALPHA, STRUCT_BETA, _is_moc_path
 
@@ -123,30 +124,11 @@ _EMBEDDED_SENTINEL_OPEN = re.compile(r"<!--(\s*agora:)", re.IGNORECASE)
 
 # --- token estimator (CJK-aware, ADR-0027 decision 5) -------------------------------------------
 
-# CJK codepoint ranges: Hangul (syllables + jamo + compatibility), CJK unified ideographs (+Ext A),
-# Hiragana/Katakana, CJK symbols/punctuation, and fullwidth forms. A CJK codepoint counts ≈ 1
-# token/char; other text at bytes/4. The owner's KB is Korean-heavy and plain bytes/4 underestimates
-# CJK by 1.5–3×, so this ships in Phase A (not later) with a Korean-corpus budget-test fixture.
-_CJK_RANGES: tuple[tuple[int, int], ...] = (
-    (0x1100, 0x11FF),  # Hangul Jamo
-    (0x3000, 0x303F),  # CJK symbols and punctuation
-    (0x3040, 0x309F),  # Hiragana
-    (0x30A0, 0x30FF),  # Katakana
-    (0x3130, 0x318F),  # Hangul compatibility jamo
-    (0x3400, 0x4DBF),  # CJK unified ideographs extension A
-    (0x4E00, 0x9FFF),  # CJK unified ideographs
-    (0xAC00, 0xD7A3),  # Hangul syllables
-    (0xF900, 0xFAFF),  # CJK compatibility ideographs
-    (0xFF00, 0xFFEF),  # Halfwidth and fullwidth forms
-)
-
-
-def _is_cjk(codepoint: int) -> bool:
-    """True iff ``codepoint`` falls in a CJK range (1 token/char in the estimator)."""
-    for lo, hi in _CJK_RANGES:
-        if lo <= codepoint <= hi:
-            return True
-    return False
+# The CJK codepoint range table lives in :mod:`core.cjk` (the SINGLE SOURCE shared with the
+# ADR-0012-addendum query tokenizer, issue #56; imported above as ``_is_cjk``). A CJK codepoint
+# counts ≈ 1 token/char; other text at bytes/4. The owner's KB is Korean-heavy and plain bytes/4
+# underestimates CJK by 1.5–3×, so this ships in Phase A (not later) with a Korean-corpus
+# budget-test fixture.
 
 
 def estimate_tokens(text: str) -> int:

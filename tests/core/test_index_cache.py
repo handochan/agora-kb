@@ -166,11 +166,13 @@ def test_read_payload_none_on_absent_corrupt_and_schema_mismatch(tmp_path: Path)
     assert index_cache.read_payload(p) is None  # corrupt
     p.write_text(json.dumps({"cache_schema_version": 999, "curated_commit": "a", "notes": {}}))
     assert index_cache.read_payload(p) is None  # schema mismatch
-    p.write_text(json.dumps({"cache_schema_version": 1, "curated_commit": "a", "notes": []}))
+    current = index_cache.CACHE_SCHEMA_VERSION  # keeps these probes on the SHAPE checks (a stale
+    # literal version would short-circuit at the version gate and make them vacuous)
+    p.write_text(json.dumps({"cache_schema_version": current, "curated_commit": "a", "notes": []}))
     assert index_cache.read_payload(p) is None  # notes must be a dict
     p.write_text(
         json.dumps(
-            {"cache_schema_version": 1, "curated_commit": "a", "notes": {"n.md": {"sha": 1}}}
+            {"cache_schema_version": current, "curated_commit": "a", "notes": {"n.md": {"sha": 1}}}
         )
     )
     assert index_cache.read_payload(p) is None  # malformed entry (sha not str / no note)
@@ -441,3 +443,89 @@ def test_cli_doctor_reports_index_line(tmp_path: Path, capsys: pytest.CaptureFix
     main(["doctor", "--repo", str(repo.root)])
     out = capsys.readouterr().out
     assert "index:" in out and "cache=fresh" in out
+
+
+# --- Korean corpus: cache parity + bigram determinism (issue #56, ADR-0012 addendum) -------------
+
+KO_INDEX_MD = "# personal\n\n- [기술 MOC](wiki/ai-tech/ai-tech-moc.md)\n"
+KO_MOC = (
+    "---\nstatus: active\n---\n# 에이전트 기술\n\n"
+    "- [큐레이터 동시성](themes/curator-concurrency.md) — 단일 작성자 큐레이터가 쓰기를 "
+    "직렬화한다\n"
+    "- [Memory Hub](themes/memory-hub.md) — 크로스 세션 지식 공유\n"
+)
+KO_CURATOR = (
+    "---\nstatus: active\ntags: [concurrency]\n"
+    "summary: 큐레이터가 저장소 잠금으로 쓰기를 직렬화한다\n---\n# 큐레이터 동시성\n\n"
+    "큐레이터는 저장소 잠금을 획득하여 정확히 하나의 작성자만 브랜치를 전진시킨다.\n"
+)
+KO_MEMORY_HUB = (
+    "---\nstatus: active\naliases: [메모리 허브]\ntags: [memory]\n---\n# Memory Hub\n\n"
+    "Agents share one memory hub for cross-session knowledge.\n"
+)
+
+# Hangul probes, a mixed-script probe, an alias-only probe, and a mandatory Korean not_found.
+KO_QUERIES = ["큐레이터 동시성", "큐레이터가", "메모리 허브", "AI에이전트", "양자 생물학 광합성"]
+
+
+def _write_ko_corpus(root: Path) -> None:
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "index.md").write_text(KO_INDEX_MD, encoding="utf-8")
+    themes = root / "wiki" / "ai-tech" / "themes"
+    themes.mkdir(parents=True, exist_ok=True)
+    (root / "wiki" / "ai-tech" / "ai-tech-moc.md").write_text(KO_MOC, encoding="utf-8")
+    (themes / "curator-concurrency.md").write_text(KO_CURATOR, encoding="utf-8")
+    (themes / "memory-hub.md").write_text(KO_MEMORY_HUB, encoding="utf-8")
+
+
+def _ko_repo(tmp_path: Path) -> Repo:
+    root = tmp_path / "personal"
+    _write_ko_corpus(root)
+    (root / ".gitignore").write_text("_kb/\n", encoding="utf-8")
+    _git(root, "init", "-b", "main")
+    _git(root, "add", "-A")
+    _git(root, "commit", "-m", "seed")
+    return Repo.resolve(root)
+
+
+def test_korean_cached_query_byte_identical_to_uncached(tmp_path: Path) -> None:
+    # The #56 parity requirement: CJK-bigram + aliases/summary field_tokens round-trip the cache
+    # (JSON with ensure_ascii=False) with byte-identical query output vs the uncached scan.
+    repo = _ko_repo(tmp_path)
+    layout = repo.layout
+    baseline = {q: Wiki(layout).query(q) for q in KO_QUERIES}
+    assert baseline["큐레이터 동시성"].status == "ok"
+    assert baseline["양자 생물학 광합성"].status == "not_found"
+    # the alias-only note must actually be returned (else alias parity below is vacuous)
+    assert any(h.path.endswith("memory-hub.md") for h in baseline["메모리 허브"].hits)
+
+    build_cache(repo)
+    cached = {q: Wiki(layout).query(q) for q in KO_QUERIES}
+    for q in KO_QUERIES:
+        assert cached[q] == baseline[q], f"cache changed query output for {q!r}"
+
+
+def test_korean_double_index_is_byte_identical(tmp_path: Path) -> None:
+    # Bigram determinism (#56 test (e)): indexing the SAME Korean corpus twice produces
+    # byte-identical cache files — the tokenizer is a pure function of the note bytes.
+    repo = _ko_repo(tmp_path)
+    build_cache(repo)
+    first = repo.layout.index_notes_path().read_bytes()
+    build_cache(repo)
+    assert repo.layout.index_notes_path().read_bytes() == first
+
+
+def test_v1_cache_is_invalidated_by_version_bump(tmp_path: Path) -> None:
+    # A cache written at CACHE_SCHEMA_VERSION=1 (pre-#56: no CJK bigrams, four-field field_tokens)
+    # must be rejected WHOLE by the version gate — its derived tokens are stale even where every
+    # source_digest still matches — and the read path must fall back to a correct full scan.
+    repo = _ko_repo(tmp_path)
+    baseline = Wiki(repo.layout).query("큐레이터 동시성")  # uncached oracle
+    assert baseline.status == "ok"
+    build_cache(repo)
+    path = repo.layout.index_notes_path()
+    doc = json.loads(path.read_text(encoding="utf-8"))
+    doc["cache_schema_version"] = 1
+    path.write_text(json.dumps(doc, ensure_ascii=False), encoding="utf-8")
+    assert index_cache.read_payload(path) is None  # the version gate rejects the v1 cache
+    assert Wiki(repo.layout).query("큐레이터 동시성") == baseline  # scan fallback, correct output
