@@ -5,8 +5,10 @@ Real git integration: skipped if ``git`` is not on PATH.
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -329,3 +331,137 @@ def test_git_error_on_missing_cwd(tmp_path: Path) -> None:
     r = Repo.resolve(tmp_path / "does-not-exist")
     with pytest.raises(GitError):
         r.head_commit()
+
+
+# --- push_backup (push-only git backup, issue #64) ----------------------------------------------
+def _bare_remote(tmp_path: Path, name: str = "remote.git") -> Path:
+    """Create a local bare repo (on branch main) to act as the push destination."""
+    remote = tmp_path / name
+    subprocess.run(
+        ["git", "init", "--bare", "-b", "main", str(remote)], check=True, capture_output=True
+    )
+    return remote
+
+
+def test_push_backup_pushes_curated_branch_to_remote(repo: Repo, tmp_path: Path) -> None:
+    """A real push: the remote's main ends up at the local curated tip (the sha returned)."""
+    remote = _bare_remote(tmp_path)
+
+    sha = repo.push_backup(str(remote))
+
+    assert sha == repo.branch_commit()
+    assert _git(remote, "rev-parse", "refs/heads/main") == sha
+
+
+def test_push_backup_second_push_fast_forwards(repo: Repo, tmp_path: Path) -> None:
+    """A later push after new curated commits fast-forwards the remote (no force involved)."""
+    remote = _bare_remote(tmp_path)
+    repo.push_backup(str(remote))
+    (repo.root / "note.md").write_text("more\n", encoding="utf-8")
+    ahead = repo.commit_all("test: advance", when=WHEN)
+
+    assert repo.push_backup(str(remote)) == ahead
+    assert _git(remote, "rev-parse", "refs/heads/main") == ahead
+
+
+def test_push_backup_unreachable_remote_raises_giterror(repo: Repo, tmp_path: Path) -> None:
+    """A missing/unreachable remote is a GitError (rc + stderr carried), never a raw crash."""
+    with pytest.raises(GitError) as excinfo:
+        repo.push_backup(str(tmp_path / "no-such-remote.git"))
+    assert excinfo.value.returncode not in (None, 0)
+
+
+def test_push_backup_non_fast_forward_is_refused_and_names_issue_46(
+    repo: Repo, tmp_path: Path
+) -> None:
+    """A remote that is AHEAD (another machine pushed) is never forced: the push fails with a
+    message pointing divergence resolution at the #46 multi-machine ADR, and the remote keeps
+    its (newer) tip."""
+    remote = _bare_remote(tmp_path)
+    base = repo.push_backup(str(remote))
+    (repo.root / "note.md").write_text("ahead\n", encoding="utf-8")
+    ahead = repo.commit_all("test: advance", when=WHEN)
+    repo.push_backup(str(remote))  # remote now at `ahead`
+    _git(repo.root, "reset", "--hard", base)  # rewind local behind the remote
+
+    with pytest.raises(GitError) as excinfo:
+        repo.push_backup(str(remote))
+
+    msg = str(excinfo.value)
+    assert "non-fast-forward" in msg
+    assert "#46" in msg  # divergence resolution is the multi-machine ADR's territory
+    assert _git(remote, "rev-parse", "refs/heads/main") == ahead  # remote untouched (no force)
+
+
+def test_push_backup_rejects_malformed_remote_values(repo: Repo) -> None:
+    """Conservative argv sanity: empty, whitespace/control chars, or a leading '-' (which git
+    could read as an option) are rejected BEFORE any git call."""
+    for bad in ("", "origin main", "-", "--force", "a\nb", "a\tb", "a\x00b"):
+        with pytest.raises(ValueError):
+            repo.push_backup(bad)
+
+
+def _fake_git_on_push(tmp_path: Path, body: str) -> Path:
+    """A PATH-front ``git`` shim that intercepts ONLY ``push`` (runs ``body``, indented shell
+    lines); every other subcommand execs the REAL git, so repo plumbing (rev-parse, config)
+    behaves normally. Returns the bin dir to prepend to PATH."""
+    real = shutil.which("git")
+    assert real is not None
+    bin_dir = tmp_path / "fake-bin"
+    bin_dir.mkdir(exist_ok=True)
+    shim = bin_dir / "git"
+    shim.write_text(
+        '#!/bin/sh\nfor a in "$@"; do\n  if [ "$a" = push ]; then\n'
+        f'{body}  fi\ndone\nexec "{real}" "$@"\n',
+        encoding="utf-8",
+    )
+    shim.chmod(0o755)
+    return bin_dir
+
+
+def test_push_backup_is_time_bounded(
+    repo: Repo, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A push that HANGS (an unanswered credential prompt, a TCP blackhole) is killed at the
+    timeout and surfaced as a GitError — never an unbounded block, which under `agora watch`
+    (backup.auto) would stall the curation scheduler itself."""
+    bin_dir = _fake_git_on_push(tmp_path, "    sleep 30\n    exit 1\n")
+    monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ['PATH']}")
+
+    start = time.monotonic()
+    with pytest.raises(GitError, match="timed out"):
+        repo.push_backup(str(tmp_path / "unused-remote.git"), timeout=1.0)
+    assert time.monotonic() - start < 10.0  # bounded — nowhere near the shim's 30s sleep
+
+
+def test_push_backup_non_interactive_env_disables_prompts(
+    repo: Repo, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``interactive=False`` (the watch auto-push) exports a prompt-killing environment — terminal
+    prompts off, askpass neutralized (an ambient GUI helper can otherwise wait forever), ssh in
+    BatchMode — so a needs-credentials push FAILS FAST into the caller's best-effort path. The
+    default (``interactive=True``, `agora sync`) leaves the ambient prompting env untouched."""
+    for var in ("GIT_SSH_COMMAND", "GIT_SSH", "GIT_TERMINAL_PROMPT", "GIT_ASKPASS", "SSH_ASKPASS"):
+        monkeypatch.delenv(var, raising=False)
+    # Make the core.sshCommand probe deterministic on any host: no global/system git config.
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
+    monkeypatch.setenv("GIT_CONFIG_SYSTEM", os.devnull)
+    bin_dir = _fake_git_on_push(
+        tmp_path,
+        '    echo "TERMPROMPT=$GIT_TERMINAL_PROMPT ASKPASS=$GIT_ASKPASS'
+        ' SSHCMD=$GIT_SSH_COMMAND" >&2\n    exit 1\n',
+    )
+    monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ['PATH']}")
+
+    with pytest.raises(GitError) as noninteractive:
+        repo.push_backup(str(tmp_path / "unused-remote.git"), interactive=False)
+    stderr = noninteractive.value.stderr or ""
+    assert "TERMPROMPT=0" in stderr
+    assert f"ASKPASS={os.devnull}" in stderr
+    assert "BatchMode=yes" in stderr
+
+    with pytest.raises(GitError) as interactive:
+        repo.push_backup(str(tmp_path / "unused-remote.git"))
+    ambient = interactive.value.stderr or ""
+    assert "TERMPROMPT=0" not in ambient  # sync's ambient prompting is NOT disabled
+    assert "BatchMode=yes" not in ambient

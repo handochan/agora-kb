@@ -11,6 +11,9 @@ A dependency-light :mod:`argparse` front-end over the core API. Subcommands:
 - ``agora watch [--repo PATH] [--interval N] [--once]`` — the in-process scheduler: loop, evaluating
   the cron + threshold + idle triggers each tick and consolidating when due (``--once`` for a single
   evaluation, e.g. driven by an external system cron / launchd).
+- ``agora sync [--repo PATH]`` — push-only git backup (issue #64): push the curated branch to the
+  ``backup.remote`` configured in ``_kb/repo.yaml`` (fast-forward only, never ``--force``); with no
+  remote configured it is a guided no-op. Pull/fetch/bidirectional is deferred to #46.
 - ``agora serve [--repo PATH] [--writer W]`` — run the MCP stdio server face. The face is imported
   lazily so the rest of the CLI works even when an MCP transport dependency is missing.
 - ``agora web [--repo PATH] [--host H] [--port P] [--writer W] [--user U]`` — run the FastAPI + HTMX
@@ -28,6 +31,7 @@ from __future__ import annotations
 
 import argparse
 import importlib
+import json
 import shutil
 import sys
 import tempfile
@@ -38,6 +42,7 @@ from pathlib import Path
 from .config import (
     ConfigError,
     load_backend_registry,
+    load_backup_policy,
     load_connector_specs,
     load_harvest_policy,
     load_index_policy,
@@ -46,7 +51,7 @@ from .config import (
     write_default_adapters_yaml,
     write_default_repo_config,
 )
-from .core import Inbox, Repo, RepoLayout, StateStore
+from .core import Inbox, Repo, RepoLayout, StateStore, atomic_write_text
 from .core.repo import GitError
 from .curator import evaluate
 from .curator.constants import DEFAULT_BODY_BYTE_BOUND
@@ -203,6 +208,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_gold_status.add_argument("--pack", default="default", help="pack name (default: default)")
     p_gold_status.set_defaults(func=_cmd_gold_status)
     p_gold.set_defaults(func=_cmd_gold_missing)
+
+    # sync — push-only git backup of the curated branch (issue #64).
+    p_sync = sub.add_parser(
+        "sync",
+        help="push the curated branch to the configured backup remote (push-only, issue #64)",
+    )
+    p_sync.add_argument("--repo", default=".", help="repo root (default: .)")
+    p_sync.set_defaults(func=_cmd_sync)
 
     # watch — the in-process scheduler loop (cron + threshold + idle).
     p_watch = sub.add_parser(
@@ -611,6 +624,121 @@ def _cmd_harvest(args: argparse.Namespace) -> int:
     return 1 if had_error else 0
 
 
+def _cmd_sync(args: argparse.Namespace) -> int:
+    """``agora sync``: push the curated branch to the configured backup remote (issue #64).
+
+    STRICTLY PUSH-ONLY, one direction: local curated tip → ``backup.remote`` (a git remote name or
+    URL from ``_kb/repo.yaml``). No pull/fetch code exists in this slice — a non-fast-forward
+    rejection (the remote is ahead: another machine has likely pushed) is reported as a clear error
+    naming issue #46, never forced. With NO remote configured — on an INITIALIZED repo — this is a
+    guided NO-OP success (exit 0), so the command is safe to script unconditionally. A missing or
+    uninitialized ``--repo`` path exits 1 FIRST: a typoed cron path or an unmounted volume must
+    never read as "no remote configured" and report success (that would be silently NOT backing up
+    — the exact failure mode the ``backup:`` config parsing refuses to allow). The outcome
+    (ok/failed + instant) is recorded best-effort in the non-canonical ``_kb/backup.json`` for the
+    ``agora doctor`` line. A push failure exits 1 with a clean message (an explicit operator action
+    reports honestly — the best-effort swallow belongs to the watch tick, not here) but never a
+    traceback.
+    """
+    repo = Repo.resolve(args.repo)
+    layout = repo.layout
+    print(f"repo: {layout.root}")
+    # BEFORE the guided no-op below: a nonexistent/uninitialized path must fail loudly, or a
+    # --repo typo in a cron line reports exit-0 success forever while nothing is ever pushed.
+    if not repo.is_initialized():
+        print(f"{_PROG} sync: repo not initialized (run 'agora repo init')", file=sys.stderr)
+        return 1
+    try:
+        policy = load_backup_policy(layout)
+    except ConfigError as exc:
+        print(f"{_PROG} sync: invalid config — {exc}", file=sys.stderr)
+        return 1
+
+    if policy.remote is None:
+        print(
+            "sync: no backup remote configured — nothing to push. Set backup.remote (a git "
+            "remote name or URL) in _kb/repo.yaml to enable push-only backup (issue #64)."
+        )
+        return 0
+
+    now = datetime.now(UTC)
+    try:
+        sha = repo.push_backup(policy.remote)
+    except (GitError, ValueError) as exc:
+        _record_backup_result(layout, remote=policy.remote, ok=False, when=now, error=str(exc))
+        print(f"{_PROG} sync: push failed — {exc}", file=sys.stderr)
+        return 1
+    _record_backup_result(layout, remote=policy.remote, ok=True, when=now, commit=sha)
+    print(f"sync: pushed {repo.branch} @ {sha[:12]} -> {policy.remote}")
+    return 0
+
+
+def _record_backup_result(
+    layout: RepoLayout,
+    *,
+    remote: str,
+    ok: bool,
+    when: datetime,
+    commit: str | None = None,
+    error: str | None = None,
+) -> None:
+    """Best-effort record of the last backup push into ``_kb/backup.json`` (issue #64).
+
+    The same derived-state posture as the ``_kb/harvest/`` cursors (DATA-MODEL §6): git-ignored,
+    non-canonical, expendable — losing it only blanks the ``agora doctor`` backup line. Written
+    atomically; NEVER raises (an unrecordable result must not turn a successful push — or a
+    best-effort watch push — into a failure).
+    """
+    doc = {
+        "remote": remote,
+        "ok": ok,
+        "at": when.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "commit": commit,
+        "error": error,
+    }
+    try:
+        path = layout.backup_state_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_text(path, json.dumps(doc, indent=2) + "\n", exclusive=False)
+    except OSError:
+        pass
+
+
+def _auto_backup_push(repo: Repo, *, stamp: str) -> None:
+    """Best-effort post-consolidation backup push for the ``agora watch`` tick (issue #64).
+
+    Runs ONLY when ``backup.auto: true`` AND ``backup.remote`` is set — otherwise it returns
+    without a single side effect, keeping the default watch path byte-identical. A push failure
+    NEVER fails (or retries) the curation that just published — the wiki commit is already durable
+    locally; this prints one warning line, records the outcome for ``agora doctor``, and moves on.
+    The push is NON-INTERACTIVE and time-bounded (``interactive=False`` + a tight timeout): an
+    unattended scheduler must never sit on a credential/host-key prompt or a network blackhole —
+    a hang here would stall the ``agora watch`` loop itself, which is the one way a best-effort
+    push could break curation.
+    """
+    layout = repo.layout
+    try:
+        policy = load_backup_policy(layout)
+    except ConfigError as exc:
+        # Surface the typo without disturbing the scheduler; `agora sync` reports it loudly.
+        print(f"{stamp} backup config invalid (skipping push): {exc}")
+        return
+    if not policy.auto or policy.remote is None:
+        return
+    now = datetime.now(UTC)
+    try:
+        # interactive=False: prompts fail fast into the record/warn path below (never a scheduler
+        # stall); 120s bounds even a prompt-free hang (blackhole) to a fraction of push_backup's
+        # operator-facing default.
+        sha = repo.push_backup(policy.remote, interactive=False, timeout=120.0)
+    except (GitError, ValueError) as exc:
+        _record_backup_result(layout, remote=policy.remote, ok=False, when=now, error=str(exc))
+        print(f"{stamp} backup push failed (best-effort; curation unaffected): {exc}")
+        return
+    _record_backup_result(layout, remote=policy.remote, ok=True, when=now, commit=sha)
+    print(f"{stamp} backup pushed: {repo.branch} @ {sha[:12]} -> {policy.remote}")
+
+
 def _cmd_watch(args: argparse.Namespace) -> int:
     """``agora watch``: the in-process curator scheduler (DESIGN §4 — cron + threshold + idle).
 
@@ -696,6 +824,10 @@ def _watch_tick(repo: Repo) -> None:
     print(
         f"{stamp} ran ({decision.reason}): status={report.status} commit={commit} counts={counts}"
     )
+    # Issue #64: best-effort backup push, ONLY after a curation that actually published and ONLY
+    # when backup.auto is opted in (default off → this call is side-effect-free, byte-identical).
+    if report.status == "published":
+        _auto_backup_push(repo, stamp=stamp)
 
 
 def _cmd_serve(args: argparse.Namespace) -> int:
@@ -965,6 +1097,10 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
     # Reporting only; never affects the health verdict and never crashes on malformed config.
     _doctor_gold(layout)
 
+    # Issue #64: observability — push-only backup config + the last recorded push outcome.
+    # Reporting only; never affects the health verdict and never crashes on malformed config.
+    _doctor_backup(layout)
+
     print(f"status: {'healthy' if ok else 'unhealthy'}")
     return 0 if ok else 1
 
@@ -1081,6 +1217,44 @@ def _doctor_gold(layout: RepoLayout) -> None:
     else:
         state = "stale"
     print(f"  gold: pack={state} (harvester scan excludes _kb/gold/, §8)")
+
+
+def _doctor_backup(layout: RepoLayout) -> None:
+    """Print the push-only backup state (issue #64). Observability only — never crashes.
+
+    Shows whether a ``backup.remote`` is configured (+ the ``auto`` flag) and the last recorded
+    push outcome from the non-canonical ``_kb/backup.json`` (absent → ``never``). Never affects
+    the health verdict: an unconfigured backup is a valid — if single-copy — setup, surfaced as
+    information, not ill health; ``agora sync`` reports real push failures loudly.
+    """
+    try:
+        policy = load_backup_policy(layout)
+    except Exception as exc:  # noqa: BLE001 — doctor must never crash on a malformed repo.yaml.
+        print(f"  backup: repo.yaml present but unreadable ({exc})")
+        return
+    if policy.remote is None:
+        print("  backup: no remote configured (push-only backup off — set backup.remote, #64)")
+        return
+    last = "last_push=never"
+    try:
+        raw = json.loads(layout.backup_state_path.read_text(encoding="utf-8"))
+        at = raw.get("at") or "?"
+        if raw.get("ok"):
+            last = f"last_push={at} ok @ {(raw.get('commit') or '')[:12]}"
+        else:
+            # One-line doctor rendering: the FULL error stays in _kb/backup.json; here only its
+            # first line, truncated, so a multi-line git stderr cannot flood the health report.
+            first = str(raw.get("error") or "unknown error").splitlines()[0]
+            if len(first) > 140:
+                first = first[:140].rstrip() + "…"
+            last = f"last_push={at} FAILED ({first})"
+    except OSError:
+        pass  # absent/unreadable file → "never"
+    except (ValueError, AttributeError, IndexError, TypeError):
+        # TypeError included: a corrupted state file (e.g. a non-string "commit") must degrade to
+        # "unreadable", never crash doctor — doctor's whole job is diagnosing broken repos.
+        last = "last_push=unreadable"
+    print(f"  backup: remote={policy.remote} auto={policy.auto} {last}")
 
 
 def _doctor_routing(layout: RepoLayout, default_backend: str | None = None) -> None:

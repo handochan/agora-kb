@@ -54,6 +54,8 @@ __all__ = [
     "load_redact_policy",
     "IndexPolicy",
     "load_index_policy",
+    "BackupPolicy",
+    "load_backup_policy",
     "ConnectorSpec",
     "load_connector_specs",
     "WebConfig",
@@ -480,6 +482,65 @@ def load_index_policy(layout: RepoLayout) -> IndexPolicy:
     index = _sub_mapping(raw.get("index"))
     enabled = _opt_bool(index.get("enabled"), True, key="index.enabled")
     return IndexPolicy(enabled=enabled)
+
+
+# --- push-only git backup config (issue #64) ----------------------------------------------------
+
+
+class BackupPolicy(BaseModel):
+    """The repo's push-only backup policy, from ``_kb/repo.yaml`` ``backup:`` (issue #64).
+
+    A SEPARATE model from :class:`RepoConfig` (which is ``extra='forbid'``), the same posture as
+    :class:`HarvestPolicy` / :class:`IndexPolicy`: backup is an opt-in operational feature, not a
+    curator-integrity input. ``remote`` (default ``None`` — backup OFF, every existing path
+    byte-identical) is the git remote NAME or URL the curated branch is pushed to (``agora sync``).
+    ``auto`` (default ``False``) makes a successful ``agora watch`` tick consolidation push
+    best-effort afterwards — a push failure never fails the curation that triggered it. STRICTLY
+    push-only: no pull/fetch exists anywhere in this slice; reconciling a remote that moved ahead
+    is deferred to the #46 multi-machine topology ADR.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    remote: str | None = None
+    auto: bool = False
+
+
+def load_backup_policy(layout: RepoLayout) -> BackupPolicy:
+    """Load the ``backup:`` policy from ``_kb/repo.yaml`` (issue #64); defaults when absent.
+
+    Read via the same raw-mapping ``.get()`` path as :func:`load_harvest_policy` (NOT via
+    ``RepoConfig``, ``extra='forbid'`` — it would reject ``backup:``). A missing file / ``backup:``
+    block yields the default — no remote, backup off, a complete no-op. Fail-loud on typed
+    mismatches (the #57 ``curator.language`` posture): a SUPPLIED non-string ``backup.remote``
+    (:func:`_opt_str_loud`; a bare YAML-1.1 boolean-trap value must surface, not silently read as
+    unset) or non-boolean ``backup.auto`` raises :class:`ConfigError` — an operator's stated backup
+    destination must never be silently dropped, because a silent default here means silently NOT
+    backing up.
+
+    For the same reason this block is STRICTER than the tolerant ``harvest:``/``index:``/``web:``
+    siblings about its own SHAPE: a present-but-non-mapping ``backup:`` (``backup: origin``) and an
+    unknown key (``remot:`` — a typo that would silently leave ``remote`` unset) both raise
+    :class:`ConfigError`. Those features degrade observably in normal operation; a silently-off
+    backup is discovered only when the disk it was meant to survive is already gone.
+    """
+    raw = _read_yaml_mapping(repo_config_path(layout))
+    block = raw.get("backup")
+    if block is not None and not isinstance(block, dict):
+        raise ConfigError(
+            f"backup: must be a mapping with keys remote/auto, got {type(block).__name__} "
+            f"({block!r}) — a malformed backup block must never silently disable backup"
+        )
+    backup = _sub_mapping(block)
+    unknown = sorted(k for k in backup if k not in ("remote", "auto"))
+    if unknown:
+        raise ConfigError(
+            f"unknown key(s) under backup:: {', '.join(unknown)} (allowed: remote, auto) — "
+            f"a typoed key must never silently disable backup"
+        )
+    remote = _opt_str_loud(backup.get("remote"), key="backup.remote")
+    auto = _opt_bool(backup.get("auto"), False, key="backup.auto")
+    return BackupPolicy(remote=remote, auto=auto)
 
 
 @dataclass(frozen=True)

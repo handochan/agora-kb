@@ -149,6 +149,32 @@ an injected pack round-trips to **zero** re-harvested facts, and harvest-origin 
 from packs — gold can never become a prompt-injection amplifier (ADR-0027 §8). The MCP `kb_context`
 tool and web `/api/gold` consumption channels are a deferred follow-up (Phase C).
 
+**Backup (`agora sync`, push-only).** The KB is a plain git repo, but nothing pushes it anywhere by
+default — a lost disk would be a lost KB. Configure a backup remote in `_kb/repo.yaml` and push the
+curated branch explicitly (or automatically after each successful `agora watch` consolidation):
+
+```yaml
+# _kb/repo.yaml
+backup:
+  remote: git@github.com:you/my-kb-backup.git  # a git remote name or URL (default: none — off)
+  auto: true                                   # push after each successful watch-tick curation
+```
+
+```bash
+uv run agora sync --repo ~/my-kb   # push the curated branch — fast-forward only, never --force
+```
+
+This is **strictly push-only, one direction**: Agora never pulls or fetches. A non-fast-forward
+rejection (the remote is ahead — another machine has pushed) is reported as a clear error and left
+alone; multi-machine topology / bidirectional sync is deferred to issue #46. An auto push is
+best-effort **and non-interactive**: credential/host-key prompts are disabled and the push is
+time-bounded, so an unattended scheduler can never hang on one — use an ssh agent or a credential
+helper (not a prompting flow) with `auto: true`. Its failure never fails the curation that
+triggered it (the result surfaces on the `agora doctor` backup line). **Coverage limits:** `_kb/` is git-ignored, so *uncurated inbox
+events, harvest cursors, and gold packs are NOT protected by the push* — knowledge captured but not
+yet curated can still be lost with the disk (a residual capture→curate window; a separate spool
+backup is a later decision). Run `agora curate` before you rely on a fresh `agora sync`.
+
 ## Documentation
 
 | Doc | What |

@@ -167,6 +167,17 @@ class RepoLayout:
         return self.gold_dir / f"{stem}.meta.json"
 
     @property
+    def backup_state_path(self) -> Path:
+        """Last push-only backup result ``_kb/backup.json`` (issue #64).
+
+        Non-canonical operational metadata (the same derived-state posture as ``_kb/harvest/``
+        cursors, DATA-MODEL §6): the outcome + instant of the last ``agora sync`` / watch-tick
+        backup push, read by the ``agora doctor`` observability line. Expendable — losing it only
+        blanks that line. Not created here (this module only computes paths).
+        """
+        return self.kb_dir / "backup.json"
+
+    @property
     def state_file(self) -> Path:
         return self.kb_dir / "state.json"
 

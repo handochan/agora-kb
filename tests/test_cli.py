@@ -8,7 +8,9 @@ not on PATH.
 
 from __future__ import annotations
 
+import json
 import shutil
+import subprocess
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
@@ -896,3 +898,358 @@ def test_cli_doctor_reports_gold_line(tmp_path: Path, capsys: pytest.CaptureFixt
     main(["doctor", "--repo", str(target)])
     out = capsys.readouterr().out
     assert "gold: pack=fresh" in out and "_kb/gold/" in out
+
+
+# --- sync + auto backup (push-only git backup, issue #64) ----------------------------------------
+def _set_backup(layout: RepoLayout, *, remote: str, auto: bool = False) -> None:
+    """Add a backup: block to an existing _kb/repo.yaml (the issue-#64 opt-in)."""
+    repo_yaml = layout.kb_dir / "repo.yaml"
+    doc = yaml.safe_load(repo_yaml.read_text(encoding="utf-8"))
+    doc["backup"] = {"remote": remote, "auto": auto}
+    repo_yaml.write_text(yaml.safe_dump(doc, sort_keys=False), encoding="utf-8")
+
+
+def _cli_bare_remote(tmp_path: Path) -> Path:
+    remote = tmp_path / "remote.git"
+    subprocess.run(
+        ["git", "init", "--bare", "-b", "main", str(remote)], check=True, capture_output=True
+    )
+    return remote
+
+
+def _rev_parse(git_dir: Path, ref: str) -> str:
+    return subprocess.run(
+        ["git", "rev-parse", ref], cwd=str(git_dir), capture_output=True, text=True, check=True
+    ).stdout.strip()
+
+
+@requires_git
+def test_sync_without_remote_is_a_guided_noop(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """(a) No backup.remote configured → `agora sync` explains how to enable it and exits 0
+    (a no-op success, NOT an error — safe to script unconditionally)."""
+    target = tmp_path / "kb"
+    assert main(["repo", "init", str(target)]) == 0
+    capsys.readouterr()
+
+    assert main(["sync", "--repo", str(target)]) == 0
+
+    captured = capsys.readouterr()
+    assert "no backup remote configured" in captured.out
+    assert "backup.remote" in captured.out
+    assert captured.err == ""
+    assert not (RepoLayout(target).kb_dir / "backup.json").exists()  # nothing recorded
+
+
+@requires_git
+def test_sync_pushes_to_local_bare_remote(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """(b) A configured remote → `agora sync` really pushes: the bare remote's main reaches the
+    local curated tip, and the outcome lands in _kb/backup.json for doctor."""
+    target = tmp_path / "kb"
+    assert main(["repo", "init", str(target)]) == 0
+    layout = RepoLayout(target)
+    remote = _cli_bare_remote(tmp_path)
+    _set_backup(layout, remote=str(remote))
+    capsys.readouterr()
+
+    assert main(["sync", "--repo", str(target)]) == 0
+
+    out = capsys.readouterr().out
+    assert "sync: pushed main @" in out
+    assert _rev_parse(remote, "refs/heads/main") == _rev_parse(target, "HEAD")
+    state = json.loads((layout.kb_dir / "backup.json").read_text(encoding="utf-8"))
+    assert state["ok"] is True
+    assert state["remote"] == str(remote)
+
+
+@requires_git
+def test_sync_push_failure_is_a_clean_error(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """(c) An unreachable remote → exit 1 with a clean stderr message (no traceback), and the
+    failure is recorded for the doctor line."""
+    target = tmp_path / "kb"
+    assert main(["repo", "init", str(target)]) == 0
+    layout = RepoLayout(target)
+    _set_backup(layout, remote=str(tmp_path / "missing-remote.git"))
+    capsys.readouterr()
+
+    assert main(["sync", "--repo", str(target)]) == 1
+
+    err = capsys.readouterr().err
+    assert "sync: push failed" in err
+    state = json.loads((layout.kb_dir / "backup.json").read_text(encoding="utf-8"))
+    assert state["ok"] is False
+
+    # doctor renders the recorded failure as ONE compressed line (first error line only — a
+    # multi-line git stderr must never flood the health report; the full text stays in the file).
+    main(["doctor", "--repo", str(target)])
+    out = capsys.readouterr().out
+    backup_lines = [ln for ln in out.splitlines() if ln.lstrip().startswith("backup: remote=")]
+    assert len(backup_lines) == 1
+    assert "FAILED (" in backup_lines[0]
+
+
+@requires_git
+def test_sync_on_an_uninitialized_repo_path_fails_loudly(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A typoed/unmounted --repo path exits 1 BEFORE the guided no-op: an unreadable repo also
+    reads as "no remote configured", so checking remote first would make a cron'd sync report
+    success forever while never pushing — the silent-not-backing-up failure mode the backup
+    config parsing itself refuses."""
+    missing = tmp_path / "no-such-kb"
+
+    assert main(["sync", "--repo", str(missing)]) == 1
+
+    captured = capsys.readouterr()
+    assert "not initialized" in captured.err
+    assert "no backup remote configured" not in captured.out
+
+
+@requires_git
+def test_watch_auto_backup_pushes_after_published_curation(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """backup.auto=true → a watch tick that PUBLISHES pushes best-effort afterwards; the remote
+    ends at the published curated tip."""
+    target = tmp_path / "kb"
+    layout = _init_stub_repo(target)
+    repo_yaml = layout.kb_dir / "repo.yaml"
+    repo_yaml.write_text(
+        repo_yaml.read_text(encoding="utf-8").replace("threshold: 10", "threshold: 1"),
+        encoding="utf-8",
+    )
+    remote = _cli_bare_remote(tmp_path)
+    _set_backup(layout, remote=str(remote), auto=True)
+    Inbox(layout).write(
+        text="One curator advances the branch under a lock.",
+        writer="dochan",
+        source="claude-code",
+        domain="ai-tech",
+        now=datetime(2026, 6, 13, 2, 40, 10, tzinfo=UTC),
+    )
+    capsys.readouterr()
+
+    assert main(["watch", "--repo", str(target), "--once"]) == 0
+
+    out = capsys.readouterr().out
+    assert "ran (threshold)" in out and "status=published" in out
+    assert "backup pushed: main @" in out
+    assert _rev_parse(remote, "refs/heads/main") == _rev_parse(target, "refs/heads/main")
+
+
+@requires_git
+def test_watch_auto_backup_failure_never_fails_the_curation(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """(c) auto=true + an unreachable remote → the tick still publishes and exits 0; the push
+    failure is one best-effort warning line, not a curation failure."""
+    target = tmp_path / "kb"
+    layout = _init_stub_repo(target)
+    repo_yaml = layout.kb_dir / "repo.yaml"
+    repo_yaml.write_text(
+        repo_yaml.read_text(encoding="utf-8").replace("threshold: 10", "threshold: 1"),
+        encoding="utf-8",
+    )
+    _set_backup(layout, remote=str(tmp_path / "missing-remote.git"), auto=True)
+    Inbox(layout).write(
+        text="One curator advances the branch under a lock.",
+        writer="dochan",
+        source="claude-code",
+        domain="ai-tech",
+        now=datetime(2026, 6, 13, 2, 40, 10, tzinfo=UTC),
+    )
+    capsys.readouterr()
+
+    assert main(["watch", "--repo", str(target), "--once"]) == 0
+
+    out = capsys.readouterr().out
+    assert "status=published" in out  # the curation itself succeeded
+    assert "backup push failed (best-effort; curation unaffected)" in out
+
+
+@requires_git
+def test_watch_auto_backup_skips_a_tick_that_did_not_publish(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The auto push fires ONLY on a published tick: a run that FAILS (brain crash) with
+    backup.auto=true and a live remote produces ZERO backup side effects — no push output, no
+    _kb/backup.json, no branch on the remote. Locks the `status == "published"` gate (a
+    regression to push-on-every-ran-tick would pass every other watch test)."""
+    target = tmp_path / "kb"
+    layout = _init_stub_repo(target)
+    repo_yaml = layout.kb_dir / "repo.yaml"
+    repo_yaml.write_text(
+        repo_yaml.read_text(encoding="utf-8").replace("threshold: 10", "threshold: 1"),
+        encoding="utf-8",
+    )
+    remote = _cli_bare_remote(tmp_path)
+    _set_backup(layout, remote=str(remote), auto=True)
+    # Break the brain AFTER init: the tick still runs, but the consolidation FAILS.
+    (target / "stub_brain.py").write_text("import sys\nsys.exit(1)\n", encoding="utf-8")
+    Inbox(layout).write(
+        text="One curator advances the branch under a lock.",
+        writer="dochan",
+        source="claude-code",
+        domain="ai-tech",
+        now=datetime(2026, 6, 13, 2, 40, 10, tzinfo=UTC),
+    )
+    capsys.readouterr()
+
+    assert main(["watch", "--repo", str(target), "--once"]) == 0
+
+    out = capsys.readouterr().out
+    assert "status=failed" in out  # the tick ran and did NOT publish
+    assert "backup pushed" not in out
+    assert "backup push failed" not in out
+    assert not (layout.kb_dir / "backup.json").exists()
+    probe = subprocess.run(  # the bare remote never received the branch
+        ["git", "rev-parse", "--verify", "refs/heads/main"],
+        cwd=str(remote),
+        capture_output=True,
+        text=True,
+    )
+    assert probe.returncode != 0
+
+
+@requires_git
+def test_watch_auto_push_is_non_interactive_and_time_bounded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The watch tick's auto push must never stall the scheduler: it calls push_backup with
+    interactive=False (credential/host-key prompts fail fast) and a FINITE timeout — locks the
+    call-site wiring of the unattended-push posture."""
+    import agora_kb.cli as cli_mod
+
+    target = tmp_path / "kb"
+    layout = _init_stub_repo(target)
+    repo_yaml = layout.kb_dir / "repo.yaml"
+    repo_yaml.write_text(
+        repo_yaml.read_text(encoding="utf-8").replace("threshold: 10", "threshold: 1"),
+        encoding="utf-8",
+    )
+    _set_backup(layout, remote="git@example.com:me/kb.git", auto=True)
+    Inbox(layout).write(
+        text="One curator advances the branch under a lock.",
+        writer="dochan",
+        source="claude-code",
+        domain="ai-tech",
+        now=datetime(2026, 6, 13, 2, 40, 10, tzinfo=UTC),
+    )
+    seen: dict[str, object] = {}
+
+    def push_spy(self, remote, *, branch=None, timeout=None, interactive=True):  # type: ignore[no-untyped-def]
+        seen.update(remote=remote, timeout=timeout, interactive=interactive)
+        return "f" * 40
+
+    monkeypatch.setattr(cli_mod.Repo, "push_backup", push_spy)
+    capsys.readouterr()
+
+    assert main(["watch", "--repo", str(target), "--once"]) == 0
+
+    assert "status=published" in capsys.readouterr().out
+    assert seen["interactive"] is False
+    assert isinstance(seen["timeout"], float)
+    assert seen["timeout"] <= 300.0
+
+
+@requires_git
+def test_watch_without_backup_config_stays_silent_about_backup(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """(a) With NO backup: block (auto defaults off), a publishing watch tick emits no backup
+    output and records no backup state — the pre-#64 path is undisturbed."""
+    target = tmp_path / "kb"
+    layout = _init_stub_repo(target)
+    repo_yaml = layout.kb_dir / "repo.yaml"
+    repo_yaml.write_text(
+        repo_yaml.read_text(encoding="utf-8").replace("threshold: 10", "threshold: 1"),
+        encoding="utf-8",
+    )
+    Inbox(layout).write(
+        text="One curator advances the branch under a lock.",
+        writer="dochan",
+        source="claude-code",
+        domain="ai-tech",
+        now=datetime(2026, 6, 13, 2, 40, 10, tzinfo=UTC),
+    )
+    capsys.readouterr()
+
+    assert main(["watch", "--repo", str(target), "--once"]) == 0
+
+    out = capsys.readouterr().out
+    assert "status=published" in out
+    # None of the #64 backup markers appear (the tmp_path itself contains "backup", so match the
+    # actual output lines, not the bare word).
+    assert "backup pushed" not in out
+    assert "backup push failed" not in out
+    assert "backup config invalid" not in out
+    assert not (layout.kb_dir / "backup.json").exists()
+
+
+@requires_git
+def test_doctor_prints_the_backup_line(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """`agora doctor` reports backup observability: unconfigured → a clear off note; after a real
+    sync → remote + auto + the last recorded push (never affecting the health verdict)."""
+    target = tmp_path / "kb"
+    assert main(["repo", "init", str(target)]) == 0
+    capsys.readouterr()
+    main(["doctor", "--repo", str(target)])
+    assert "backup: no remote configured" in capsys.readouterr().out
+
+    layout = RepoLayout(target)
+    remote = _cli_bare_remote(tmp_path)
+    _set_backup(layout, remote=str(remote), auto=True)
+    assert main(["sync", "--repo", str(target)]) == 0
+    capsys.readouterr()
+    main(["doctor", "--repo", str(target)])
+    out = capsys.readouterr().out
+    assert f"backup: remote={remote} auto=True" in out
+    assert "last_push=" in out and " ok @ " in out
+
+
+@requires_git
+def test_doctor_backup_line_compresses_and_survives_corrupt_state(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """doctor's backup line stays ONE line under a recorded oversized/multi-line push error (first
+    line only, truncated at 140 chars with '…'), and a corrupted _kb/backup.json — wrong types or
+    broken JSON — degrades to last_push=unreadable, NEVER a doctor crash (doctor's whole job is
+    diagnosing broken repos)."""
+    target = tmp_path / "kb"
+    assert main(["repo", "init", str(target)]) == 0
+    layout = RepoLayout(target)
+    _set_backup(layout, remote="git@example.com:me/kb.git")
+    state = layout.kb_dir / "backup.json"
+    state.parent.mkdir(parents=True, exist_ok=True)
+    state.write_text(
+        json.dumps(
+            {
+                "remote": "git@example.com:me/kb.git",
+                "ok": False,
+                "at": "2026-07-24T00:00:00Z",
+                "commit": None,
+                "error": ("E" * 200) + "\nfatal: second stderr line",
+            }
+        ),
+        encoding="utf-8",
+    )
+    capsys.readouterr()
+
+    main(["doctor", "--repo", str(target)])
+    out = capsys.readouterr().out
+    [line] = [ln for ln in out.splitlines() if ln.lstrip().startswith("backup: remote=")]
+    assert "FAILED (" in line
+    assert "…" in line  # the 140-char truncation fired
+    assert "second stderr line" not in out  # later stderr lines never reach the report
+
+    # Wrong-typed fields (a non-string commit) and non-JSON bytes both degrade, never crash.
+    for corrupt in ('{"ok": true, "commit": 12345}', "{not json"):
+        state.write_text(corrupt, encoding="utf-8")
+        capsys.readouterr()
+        main(["doctor", "--repo", str(target)])
+        assert "last_push=unreadable" in capsys.readouterr().out
