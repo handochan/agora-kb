@@ -1,22 +1,40 @@
-"""MCP server face — the 4 agent tools over the core API (DESIGN §5.1).
+"""MCP server face — the 6 agent tools over the core API (DESIGN §5.1).
 
 This is the **agent-facing** face: a single FastMCP registration that exposes ``kb_remember`` /
-``kb_query`` / ``kb_status`` / ``kb_curate`` to every MCP client (Claude Code, Codex, Qwen,
-Hermes, …). It is a thin face: it adds no concurrency, provenance, or access-control logic of its
-own — those are properties of the core (DESIGN §2.1). Each tool delegates straight to the core API:
+``kb_query`` / ``kb_read`` / ``kb_neighbors`` / ``kb_status`` / ``kb_curate`` to every MCP client
+(Claude Code, Codex, Qwen, Hermes, …). It is a thin face: it adds no concurrency, provenance, or
+access-control logic of its own — those are properties of the core (DESIGN §2.1). Each tool
+delegates straight to the core API (or an already-shipped read handler below):
 
-- ``kb_remember`` → :meth:`agora_kb.core.inbox.Inbox.write` (the only write path; non-blocking).
-- ``kb_query``    → :meth:`agora_kb.core.wiki.Wiki.query` (the deterministic, model-free read path).
-- ``kb_status``   → :class:`agora_kb.core.state.StateStore` + live inbox/failed counts (meta face).
-- ``kb_curate``   → :func:`agora_kb.curator.worker.recover` + :func:`agora_kb.curator.worker.run`
+- ``kb_remember``  → :meth:`agora_kb.core.inbox.Inbox.write` (the only write path; non-blocking).
+- ``kb_query``     → :meth:`agora_kb.core.wiki.Wiki.query` (the deterministic, model-free read
+  path).
+- ``kb_read``      → :meth:`AgoraHandlers.note` (the web face's per-note read payload, reused
+  verbatim — body + frontmatter + outgoing links; #58).
+- ``kb_neighbors`` → :meth:`AgoraHandlers.graph` (the ADR-0021 local ego-graph around a note,
+  ``depth`` clamped by the existing cap; #58).
+- ``kb_status``    → :class:`agora_kb.core.state.StateStore` + live inbox/failed counts (meta
+  face).
+- ``kb_curate``    → :func:`agora_kb.curator.worker.recover` + :func:`agora_kb.curator.worker.run`
   (a real consolidation run against the configured ``adapters.yaml`` backend; see its note below).
+
+**The agentic navigation loop (#58).** ``kb_query`` returns flat hits (path/line/excerpt) —
+citations, not synthesis. ``kb_read`` / ``kb_neighbors`` are its read-side companions: an MCP-only
+agent (no filesystem access) can now OPEN a cited note and WALK its link neighborhood, closing
+DESIGN's "index → ``[[links]]`` → grep" navigation model over pure MCP. The intended loop —
+broad ``kb_query`` → ``kb_read`` a hit → ``kb_neighbors`` to follow links → re-query with sharper
+terms — is spelled out in each tool description so agents learn it from the tool surface itself.
+Wiring only: both delegate to handlers the web face already ships, the core is untouched, and the
+``QueryResult`` / ``SearchHit`` shapes stay frozen (``kb_query`` unchanged).
 
 **Testability split (the architecture this module is built around).** The cognitive part — turning
 a tool call into a core-API call and shaping a JSON-serializable result — lives in
 :class:`AgoraHandlers`, which has no dependency on a live MCP transport and is unit-testable
 directly. :func:`build_server` is the only transport-aware part: it constructs the handlers and
-registers four one-line tool wrappers that call them. So the handler logic is exercised by ordinary
-unit tests with no server I/O, and the wiring is covered by a single smoke test.
+registers six thin tool wrappers that call them — one-line delegation, except that ``kb_read`` /
+``kb_neighbors`` keep their not-found shaping in the closure (#58). So the handler logic is
+exercised by ordinary unit tests with no server I/O, the wiring by a single smoke test, and the
+closure-only shaping by real-Client tests (``tests/faces/test_mcp_read_tools.py``).
 
 The ``writer`` identity is **server configuration** (the connecting agent's identity), not a tool
 argument — a client cannot spoof another writer's inbox namespace (tenant isolation, invariant 5).
@@ -65,7 +83,7 @@ MAX_GRAPH_DEPTH = 3  # clamp default for the local ego-graph depth (ADR-0025)
 
 
 class AgoraHandlers:
-    """Transport-free handlers for the 4 MCP tools (DESIGN §5.1).
+    """Transport-free handlers for the 6 MCP tools (DESIGN §5.1).
 
     Construct with the repo and the connecting writer identity; each method maps a tool call to a
     core-API call and returns a plain, JSON-serializable ``dict``. No FastMCP / transport types
@@ -881,11 +899,13 @@ def _iso_z(value: datetime) -> str:
 
 
 def build_server(*, repo_path: Path, writer: str = DEFAULT_WRITER) -> FastMCP:
-    """Construct the FastMCP server: build handlers over ``repo_path`` and register the 4 tools.
+    """Construct the FastMCP server: build handlers over ``repo_path`` and register the 6 tools.
 
     The returned :class:`fastmcp.FastMCP` instance has ``kb_remember`` / ``kb_query`` /
-    ``kb_status`` / ``kb_curate`` registered. Each tool is a one-line wrapper delegating to an
-    :class:`AgoraHandlers`, keeping all logic transport-free and unit-testable.
+    ``kb_read`` / ``kb_neighbors`` / ``kb_status`` / ``kb_curate`` registered. Each tool delegates
+    to an :class:`AgoraHandlers` method that holds the transport-free, unit-testable logic; the
+    ``kb_read`` / ``kb_neighbors`` wrappers additionally shape their not-found responses in the
+    closure (#58), covered over a real Client by ``tests/faces/test_mcp_read_tools.py``.
     """
     from fastmcp import FastMCP
 
@@ -914,6 +934,47 @@ def build_server(*, repo_path: Path, writer: str = DEFAULT_WRITER) -> FastMCP:
         Hits are ordered citations into ``wiki/`` markdown — navigation, not synthesis.
         """
         return handlers.query(question)
+
+    @mcp.tool
+    def kb_read(path: str) -> dict[str, object]:
+        """Open one wiki note by path: raw markdown body + frontmatter + outgoing link basenames.
+
+        Navigation protocol: kb_query (broad search) -> kb_read (open a hit's ``path``) ->
+        kb_neighbors (follow that note's links) -> kb_query again with sharper terms; repeat —
+        re-querying erases vocabulary mismatch. ``path`` is a kb_query hit's ``path`` or a
+        kb_neighbors node ``id``. An unknown or out-of-repo path returns
+        ``{error: "not_found", ...}`` — never file contents outside the wiki.
+        """
+        payload = handlers.note(path)
+        if payload is None:
+            return {
+                "error": "not_found",
+                "path": path,
+                "note": (
+                    f"no tracked note at path={path!r}: pass a `path` exactly as returned by a "
+                    "kb_query hit or a kb_neighbors node id (e.g. "
+                    "'wiki/<domain>/themes/<name>.md')."
+                ),
+            }
+        return payload
+
+    @mcp.tool
+    def kb_neighbors(path: str, depth: int = 1) -> dict[str, object]:
+        """List a note's link neighborhood (ego-graph): nodes {id, title, ...} + directed edges.
+
+        Navigation protocol: kb_query (broad search) -> kb_read (open a hit's ``path``) ->
+        kb_neighbors (follow links from here) -> kb_query again with sharper terms; repeat. Each
+        node ``id`` is a rel_path that feeds straight back into kb_read. ``depth`` is hops from
+        ``path`` (default 1; clamped server-side — the echoed ``depth`` is the effective value).
+        An unknown ``path`` returns an empty graph with ``center: null`` plus a not-found note.
+        """
+        result = handlers.graph(center=path, depth=depth)
+        if result["center"] is None:
+            result["note"] = (
+                f"no tracked note at path={path!r} — empty graph. Pass a `path` exactly as "
+                "returned by a kb_query hit or a kb_neighbors node id."
+            )
+        return result
 
     @mcp.tool
     def kb_status() -> dict[str, object]:

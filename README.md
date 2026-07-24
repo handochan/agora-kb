@@ -82,8 +82,8 @@ uv run agora import ~/existing-vault ~/my-kb --domain general
 uv run agora serve --repo ~/my-kb
 ```
 
-Register the stdio server with any MCP client and the four tools — `kb_remember`, `kb_query`,
-`kb_status`, `kb_curate` — appear to the agent:
+Register the stdio server with any MCP client and the six tools — `kb_remember`, `kb_query`,
+`kb_read`, `kb_neighbors`, `kb_status`, `kb_curate` — appear to the agent:
 
 ```bash
 # Claude Code (other MCP clients: point them at `agora serve --repo ~/my-kb` over stdio)
@@ -92,7 +92,9 @@ claude mcp add agora-kb -- uv run --directory /path/to/agora-kb agora serve --re
 
 The loop: an agent calls **`kb_remember`** to capture a fact (it lands in the append-only inbox),
 **`kb_curate`** to consolidate the inbox into the wiki with the local model, and **`kb_query`** to
-get cited evidence back. You can drive the same loop from the CLI without an agent —
+get cited evidence back — then **`kb_read`** to open a cited note and **`kb_neighbors`** to walk
+its link neighborhood before re-querying (the agentic navigation loop, no filesystem access
+needed). You can drive the same loop from the CLI without an agent —
 `agora status` (inbox depth + curator state), `agora curate` (one consolidation run), and
 `agora watch` (scheduler loop: cron + threshold + idle triggers).
 

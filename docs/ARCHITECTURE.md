@@ -62,7 +62,8 @@ ingest/               INPUT adapters: uploads → markdown in raw/.
     office.py            markitdown / pandoc (docx, xlsx, pptx)
 
 faces/                The faces over core.
-  mcp_server.py       FastMCP: kb_remember / kb_query / kb_status / kb_curate
+  mcp_server.py       FastMCP: kb_remember / kb_query / kb_read / kb_neighbors / kb_status /
+                      kb_curate (kb_read/kb_neighbors reuse the note()/graph() read handlers, #58)
   web/                FastAPI web face (ADR-0019): API-first JSON API (GET /api/{status,search,notes,
                       notes/{path},graph}, POST /api/upload) + server-rendered HTMX/Jinja2 UI (browse,
                       search, upload, knowledge graph, read-only dashboard); localhost no-auth
