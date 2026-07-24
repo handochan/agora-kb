@@ -89,7 +89,7 @@ schema/               KB wiki schema emitted into each knowledge repo.
   notes.py            note-type helpers (index/moc/theme/daily) + link resolution
   templates/kb_schema.md   the AGENTS.md schema template
 
-cli.py                `agora` entry point: repo init · import · status · curate · harvest · index · gold · watch · serve · web · doctor
+cli.py                `agora` entry point: repo init · import · status · curate · harvest · index · gold · sync · watch · serve · web · doctor
 config.py             load config (adapters.yaml backends/routing + connectors, repo.yaml, triggers, harvest policy)
 ```
 

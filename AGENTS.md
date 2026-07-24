@@ -40,15 +40,19 @@ edits the shared wiki. Repo = tenant boundary. See [`docs/ARCHITECTURE.md`](docs
 ```
 src/agora_kb/
   core/        single internal API: inbox(write) · wiki(read) + index_cache.py (the ADR-0012 §2
-               derived query reader cache, _kb/index/, issue #26) · repo/tenant · state
+               derived query reader cache, _kb/index/, issue #26) + gold.py (ADR-0027 pack
+               assembler, _kb/gold/) + redact.py/sentinel.py (outbound redaction + the §8 sentinel,
+               ADR-0023/0027) · repo/tenant · state
   curator/     sleep-time consolidation worker + backends (BackendRegistry, per-act plan/author
                routing — ADR-0015) + triggers + isolation/ (OS sandbox)
   adapters/    curator-brain shims invoked via adapters.yaml argv: ollama_brain.py
                (agora-ollama-brain, local Qwen) + cli_agent_brain.py (agora-cli-brain — any
                headless CLI agent as a pure text-gen brain, ADR-0016)
   harvester/   read adapters: connectors.py (Connector Protocol + FileConnector, opt-in
-               link-following) + harvester.py (orchestrator, scope gate, cursor) — pull other
-               agents' memory → gated candidates (ADR-0007/0017/0018)
+               link-following) + session_connector.py/session_sources.py (SessionConnector —
+               transcript distillation + connector-boundary redaction, ADR-0023) + harvester.py
+               (orchestrator, scope gate, cursor) — pull other agents' memory/sessions → gated
+               candidates (ADR-0007/0017/0018/0023)
   ingest/      input adapters: vault_import.py (Obsidian/markdown vault normalizer) +
                extractors/ (url/pdf/office → ExtractedDoc; lazy optional `ingest` extra)
   faces/       mcp_server.py (the MCP face — agents; AgoraHandlers also hosts the read-only web
@@ -60,15 +64,16 @@ src/agora_kb/
                graph.js — no Node/CDN)
   schema/      the KB wiki schema (AGENTS.md template emitted into each knowledge repo) + lint
   config.py    load config (adapters.yaml, repo.yaml, triggers + harvest policy + connector specs)
-  cli.py       `agora` entry point (repo init · import · status · curate · harvest · index · watch ·
-               serve · web · doctor)
+  cli.py       `agora` entry point (repo init · import · status · curate · harvest · index · gold ·
+               sync · watch · serve · web · doctor)
   # --- not yet implemented (later phases) ---
   auth/        (Phase 4+ — stub) authn/authz (tokens, OpenFGA/Forgejo delegation)
-docs/          DESIGN, ARCHITECTURE, DATA-MODEL, ROADMAP, INGEST-CONTRACT, adr/
+deploy/        launchd/systemd unit templates for always-on watch/web + harvest schedule (#65)
+docs/          DESIGN, ARCHITECTURE, DATA-MODEL, ROADMAP, INGEST-CONTRACT, DEPLOY-TEAM, adr/
 ```
 
 ## Where to start (current phase)
-The repo has **shipped Phases 1, 2, and 3**.
+The repo has **shipped Phases 1, 2, 3, 3.5, and 3.6**.
 
 **Phase 1** (Personal MVP): the **core API**, the `agora` CLI, the **MCP face** (four tools —
 `kb_remember` / `kb_query` / `kb_status` / `kb_curate`), the local-model curator (Qwen via Ollama)
@@ -97,5 +102,24 @@ and is drawn by a vendored MIT force-graph lib (`web/static/force-graph.min.js` 
 Node/build/CDN) — the first firing of the ADR-0019 §7 per-route-viz escape hatch (ADR-0021; a graph
 DB such as Neo4j was rejected on license/SSOT/overkill grounds).
 
-Next is **Phase 4** (auth + multi-tenancy); see [`docs/ROADMAP.md`](docs/ROADMAP.md). Auth,
-multi-tenancy, original-binary-in-`raw/`, and Letta/mem0 API connectors remain deferred to Phases 4–5.
+**Phase 3.5** (backlog pull-forward — ADRs 0022–0025 + 0027, all Accepted in the 2026-07-05 Step-0
+session, #36): the no-loss catch-all floor (`domains[0]`) + repo-global curator thresholds (#23,
+ADR-0022); the bounded-batch claim cap `max_candidates_per_run` (#60, ADR-0024 OD-3a); the web
+`web:` operator config (`load_web_config`, per-repo in `build_app`) + multi-upload + broadened
+extractor extensions (#29, ADR-0025); the ADR-0012 §2 derived reader cache (#26); the derived
+**gold** context-pack tier `_kb/gold/` + the outbound sentinel/loop-break contract (#37, ADR-0027);
+and the `session:` harvester connector with connector-boundary redaction via `core/redact.py`
+(#25/#39, ADR-0023).
+
+**Phase 3.6** (deployability + retrieval quality, 2026-07-24/25): Korean search + Korean no-loss
+fixes (#56/#57 — CJK-bigram tokenizer/cache v2 + `note-<sha8>` slug fallback); `kb_read`/
+`kb_neighbors` MCP tools (#58); gold Phase-C consumption channels — `kb_context` +
+`agora://gold/{pack}` resource/prompt + `GET /api/gold/{pack}` (#40 agora half); `agora sync`
+push-only remote backup (#64); `deploy/` launchd/systemd packaging (#65); upload hardening — SSRF
+guard + zip-bomb cap + `.epub` (#66/#53); per-user identity threading `web.identity.trusted_header`
+→ `web:<user>` (#67); and the team deployment guide [`docs/DEPLOY-TEAM.md`](docs/DEPLOY-TEAM.md) (#68).
+
+Next is **Phase 4** (auth + multi-tenancy); the gating design debt is the authn/authz ADR (#69).
+See [`docs/ROADMAP.md`](docs/ROADMAP.md) and the GitHub Project "agora dev" board (the live
+backlog SSOT). Auth, multi-tenancy, original-binary-in-`raw/`, and Letta/mem0 API connectors remain
+deferred to Phases 4–5.
