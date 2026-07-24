@@ -1,0 +1,19 @@
+# agora-harvest.service — one `agora harvest` run, activated by agora-harvest.timer (issue #65).
+# Install per deploy/README.md: replace every /ABSOLUTE/PATH/TO/... placeholder, copy BOTH this
+# file and agora-harvest.timer to ~/.config/systemd/user/, then enable the TIMER (not this
+# service): `systemctl --user enable --now agora-harvest.timer`.
+#
+# This unit exists because `agora watch` NEVER runs harvest — the watch loop evaluates only the
+# curation triggers. Harvest is opt-in and fail-closed: with `harvest.enabled: false` (the
+# default) or no `connectors:` configured, each run is a cheap no-op.
+#
+# Type=oneshot with no Restart=: the timer owns the cadence — a failed run is simply retried
+# at the next timer firing (inspect failures via `journalctl --user -u agora-harvest`).
+
+[Unit]
+Description=Agora harvest run (connectors -> gated inbox candidates)
+
+[Service]
+Type=oneshot
+ExecStart=/ABSOLUTE/PATH/TO/uv run --directory /ABSOLUTE/PATH/TO/agora-kb agora harvest --repo /ABSOLUTE/PATH/TO/knowledge-repo
+Environment=PYTHONUNBUFFERED=1

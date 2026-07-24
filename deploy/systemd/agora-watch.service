@@ -1,0 +1,33 @@
+# agora-watch.service — the curator scheduler loop (`agora watch`) as a systemd *user* unit
+# (issue #65). Install per deploy/README.md: replace every /ABSOLUTE/PATH/TO/... placeholder,
+# copy to ~/.config/systemd/user/, then `systemctl --user enable --now agora-watch.service`.
+# For start-at-boot without a login session: `loginctl enable-linger YOUR_USER`.
+#
+# NOTE: `agora watch` evaluates ONLY the curation triggers (cron / threshold / idle) — it NEVER
+# runs `agora harvest`. Enable agora-harvest.timer separately for periodic harvesting.
+#
+# NOTE (#64): if `backup.auto: true` is set in the repo's `_kb/repo.yaml`, the post-curation push
+# runs non-interactively under systemd — it needs an ssh agent or a git credential helper; any
+# prompting credential flow simply fails the push (the curation itself is unaffected).
+# CAVEAT: a systemd *user* unit does NOT inherit SSH_AUTH_SOCK from your login shell, so a
+# running ssh-agent alone is not enough — import it into the user manager
+# (`systemctl --user import-environment SSH_AUTH_SOCK`, or set it via ~/.config/environment.d/),
+# or simpler: use a passphrase-less deploy key / git credential helper.
+#
+# Logs go to journald: `journalctl --user -u agora-watch -f`
+
+[Unit]
+Description=Agora curator scheduler loop (agora watch)
+
+[Service]
+# ExecStart's first token must be an absolute path — find uv with `which uv`
+# (commonly ~/.local/bin/uv).
+ExecStart=/ABSOLUTE/PATH/TO/uv run --directory /ABSOLUTE/PATH/TO/agora-kb agora watch --repo /ABSOLUTE/PATH/TO/knowledge-repo --interval 60
+# Unbuffered stdout: journald gets each tick line immediately (CPython block-buffers a pipe,
+# delaying short tick lines for hours and losing the buffered tail on SIGTERM/crash).
+Environment=PYTHONUNBUFFERED=1
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target

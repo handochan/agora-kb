@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  com.agora.harvest — periodic `agora harvest` as a macOS LaunchAgent (issue #65).
+
+  This unit exists because `agora watch` NEVER runs harvest — the watch loop evaluates only the
+  curation triggers. Without this separate schedule, connectors (e.g. the #25 session connector)
+  only run when you invoke `agora harvest` by hand.
+
+  Harvest is opt-in and fail-closed: with `harvest.enabled: false` (the default) or no
+  `connectors:` configured, each run is a cheap no-op — loading this unit on an unconfigured
+  repo is harmless.
+
+  StartInterval fires the job every N seconds while loaded (3600 = hourly; tune to taste).
+  RunAtLoad additionally runs one harvest right after login/boot. No KeepAlive: this is a
+  short-lived periodic job, not a daemon.
+
+  Replace every /ABSOLUTE/PATH/TO/... placeholder and YOUR_USER, then install per
+  deploy/README.md. Logs: run `mkdir -p /Users/YOUR_USER/Library/Logs/agora` once before loading.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.agora.harvest</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/ABSOLUTE/PATH/TO/uv</string>
+    <string>run</string>
+    <string>--directory</string>
+    <string>/ABSOLUTE/PATH/TO/agora-kb</string>
+    <string>agora</string>
+    <string>harvest</string>
+    <string>--repo</string>
+    <string>/ABSOLUTE/PATH/TO/knowledge-repo</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PYTHONUNBUFFERED</key>
+    <string>1</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StartInterval</key>
+  <integer>3600</integer>
+  <key>StandardOutPath</key>
+  <string>/Users/YOUR_USER/Library/Logs/agora/harvest.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/YOUR_USER/Library/Logs/agora/harvest.err.log</string>
+</dict>
+</plist>

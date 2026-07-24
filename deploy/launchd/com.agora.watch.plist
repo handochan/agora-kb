@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  com.agora.watch — the curator scheduler loop (`agora watch`) as a macOS LaunchAgent (issue #65).
+
+  Replace every /ABSOLUTE/PATH/TO/... placeholder and YOUR_USER, then install per
+  deploy/README.md (copy to ~/Library/LaunchAgents + `launchctl bootstrap gui/$(id -u) ...`).
+  Find your uv binary with `which uv` (commonly ~/.local/bin/uv or /opt/homebrew/bin/uv);
+  launchd does NOT search your shell PATH, so argv[0] must be absolute.
+
+  NOTE: `agora watch` evaluates ONLY the curation triggers (cron / threshold / idle) — it NEVER
+  runs `agora harvest`. Load com.agora.harvest.plist separately for periodic harvesting.
+
+  NOTE (#64): if `backup.auto: true` is set in the repo's `_kb/repo.yaml`, the post-curation push
+  runs non-interactively under launchd — it needs an ssh agent with a Keychain-stored key
+  (ssh-add with the "apple-use-keychain" flag) or a git credential helper. Any prompting
+  credential flow simply fails the push (the curation itself is unaffected; see the
+  `agora doctor` backup line).
+
+  Logs: launchd creates the log FILES but not the directory —
+  run `mkdir -p /Users/YOUR_USER/Library/Logs/agora` once before loading.
+  PYTHONUNBUFFERED=1 keeps each tick line flowing to the log file immediately (stdout to a
+  file is otherwise block-buffered by CPython: hours of delay at one short line per minute,
+  and the buffered tail is lost on SIGTERM or a crash).
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.agora.watch</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/ABSOLUTE/PATH/TO/uv</string>
+    <string>run</string>
+    <string>--directory</string>
+    <string>/ABSOLUTE/PATH/TO/agora-kb</string>
+    <string>agora</string>
+    <string>watch</string>
+    <string>--repo</string>
+    <string>/ABSOLUTE/PATH/TO/knowledge-repo</string>
+    <string>--interval</string>
+    <string>60</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PYTHONUNBUFFERED</key>
+    <string>1</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>/Users/YOUR_USER/Library/Logs/agora/watch.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/YOUR_USER/Library/Logs/agora/watch.err.log</string>
+</dict>
+</plist>

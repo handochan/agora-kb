@@ -1,0 +1,26 @@
+# agora-web.service — the web face (`agora web`) as a systemd *user* unit (issue #65).
+# Install per deploy/README.md: replace every /ABSOLUTE/PATH/TO/... placeholder, copy to
+# ~/.config/systemd/user/, then `systemctl --user enable --now agora-web.service`.
+# For start-at-boot without a login session: `loginctl enable-linger YOUR_USER`.
+# Requires the web extras (web, ingest, metrics): ExecStart passes `--extra` flags so
+# `uv run`'s implicit sync installs them, but run the one-time `uv sync` step from
+# deploy/README.md first so the first unit start does not depend on the network.
+#
+# SECURITY — the bind host below MUST stay 127.0.0.1. The web face ships NO authentication,
+# NO SSRF guard on the URL extractor, and NO TLS (ADR-0019); binding 0.0.0.0 (or any
+# non-loopback address) exposes the whole KB read/write surface to the network.
+# NEVER change the host argument away from 127.0.0.1.
+#
+# Logs go to journald: `journalctl --user -u agora-web -f`
+
+[Unit]
+Description=Agora web face (agora web, loopback only)
+
+[Service]
+ExecStart=/ABSOLUTE/PATH/TO/uv run --directory /ABSOLUTE/PATH/TO/agora-kb --extra web --extra ingest --extra metrics agora web --repo /ABSOLUTE/PATH/TO/knowledge-repo --host 127.0.0.1 --port 8000
+Environment=PYTHONUNBUFFERED=1
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,18 @@
+# agora-harvest.timer — periodic schedule for agora-harvest.service (issue #65).
+# The schedule lives HERE; the command and its /ABSOLUTE/PATH/TO/... placeholders live in
+# agora-harvest.service. Install both files to ~/.config/systemd/user/, then:
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now agora-harvest.timer
+# Verify with `systemctl --user list-timers agora-harvest.timer`.
+
+[Unit]
+Description=Run agora harvest periodically (watch never runs harvest)
+
+[Timer]
+# First run 5 minutes after boot/login, then hourly after each completed run.
+OnBootSec=5min
+OnUnitActiveSec=1h
+Unit=agora-harvest.service
+
+[Install]
+WantedBy=timers.target

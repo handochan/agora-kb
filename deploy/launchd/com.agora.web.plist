@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  com.agora.web — the web face (`agora web`) as a macOS LaunchAgent (issue #65).
+
+  Replace every /ABSOLUTE/PATH/TO/... placeholder and YOUR_USER, then install per
+  deploy/README.md. Requires the web extras (web, ingest, metrics): the argv below passes
+  them to uv run so its implicit sync installs them, but run the one-time uv sync step from
+  deploy/README.md first so the first unit start does not depend on the network.
+
+  SECURITY — the bind host below MUST stay 127.0.0.1. The web face ships NO authentication,
+  NO SSRF guard on the URL extractor, and NO TLS (ADR-0019); binding 0.0.0.0 (or any
+  non-loopback address) exposes the whole KB read/write surface to the network.
+  NEVER change the host argument away from 127.0.0.1.
+
+  Logs: run `mkdir -p /Users/YOUR_USER/Library/Logs/agora` once before loading.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.agora.web</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/ABSOLUTE/PATH/TO/uv</string>
+    <string>run</string>
+    <string>--directory</string>
+    <string>/ABSOLUTE/PATH/TO/agora-kb</string>
+    <string>--extra</string>
+    <string>web</string>
+    <string>--extra</string>
+    <string>ingest</string>
+    <string>--extra</string>
+    <string>metrics</string>
+    <string>agora</string>
+    <string>web</string>
+    <string>--repo</string>
+    <string>/ABSOLUTE/PATH/TO/knowledge-repo</string>
+    <string>--host</string>
+    <string>127.0.0.1</string>
+    <string>--port</string>
+    <string>8000</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PYTHONUNBUFFERED</key>
+    <string>1</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>/Users/YOUR_USER/Library/Logs/agora/web.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/YOUR_USER/Library/Logs/agora/web.err.log</string>
+</dict>
+</plist>
