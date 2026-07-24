@@ -23,6 +23,11 @@ Caller contract (the curator/worker owns the run loop):
 
 Git operations shell ``git`` via argv arrays (never a shell string), matching the no-shell rule used
 for backend adapters (ADR-0008 step 3, DATA-MODEL §8).
+
+Everything here is LOCAL except :meth:`Repo.push_backup` (issue #64), the single outbound
+operation: a strictly push-only, fast-forward-only backup of the curated branch to a configured
+remote. There is deliberately no pull/fetch/bidirectional code — multi-machine reconciliation is
+deferred to the #46 topology ADR.
 """
 
 from __future__ import annotations
@@ -76,6 +81,18 @@ _SEED_INDEX = (
 # A full git object id: 40 hex (sha-1) or 64 hex (sha-256). Used to reject names/short-shas and,
 # crucially, the all-zero oid that `git update-ref` would interpret as a ref DELETE.
 _SHA_RE = re.compile(r"\A[0-9a-f]{40}\Z|\A[0-9a-f]{64}\Z")
+# Conservative sanity for a push destination (a git remote NAME or URL, issue #64): printable with
+# no whitespace/control characters. Argv-array execution (never a shell) already prevents shell
+# injection; this guard only rejects values that could be misparsed by git itself — an embedded
+# newline/space smuggling extra arguments into an error message, or a leading "-" reading as a git
+# option (belt-and-suspenders with the "--" end-of-options marker in :meth:`Repo.push_backup`).
+_REMOTE_BAD_CHARS = re.compile(r"[\s\x00-\x1f\x7f]")
+# Upper bound for the ONE network-touching git operation (:meth:`Repo.push_backup`). Every other
+# _git call is local and fast; a push can hang UNBOUNDED on a credential prompt, an ssh host-key /
+# passphrase prompt, or a TCP blackhole — and in `agora watch` (backup.auto) an unbounded hang
+# would stall the curation scheduler itself, breaking the best-effort contract. Generous enough
+# for a slow first push of a markdown KB; callers (the watch tick) may pass a tighter bound.
+_PUSH_TIMEOUT_SECONDS = 300.0
 
 
 def _require_commit_sha(value: str) -> None:
@@ -131,14 +148,29 @@ class Repo:
         cwd: Path | None = None,
         env: dict[str, str] | None = None,
         check: bool = True,
+        timeout: float | None = None,
     ) -> subprocess.CompletedProcess[str]:
         # core.hooksPath=<devnull> on EVERY call neutralizes host-global/repo hooks so a planted or
         # ambient hook can never run arbitrary code during the deterministic publish (ADR-0008).
+        # ``timeout`` (seconds; default unbounded — every local call is fast) exists for the one
+        # network-touching operation, :meth:`push_backup`: on expiry the child is killed and the
+        # hang surfaces as a plain :class:`GitError`, never an uncaught TimeoutExpired.
         cmd = ["git", "-c", f"core.hooksPath={os.devnull}", *args]
         try:
             cp = subprocess.run(  # noqa: S603 (argv list, no shell)
-                cmd, cwd=str(cwd or self.root), capture_output=True, text=True, env=env
+                cmd,
+                cwd=str(cwd or self.root),
+                capture_output=True,
+                text=True,
+                env=env,
+                timeout=timeout,
             )
+        except subprocess.TimeoutExpired as exc:
+            raise GitError(
+                f"git {' '.join(args)} timed out after {timeout:g}s (process killed; "
+                f"the operation did not complete)",
+                command=tuple(args),
+            ) from exc
         except OSError as exc:  # e.g. cwd does not exist — surface as GitError, not a raw OSError
             raise GitError(
                 f"git {' '.join(args)} could not run: {exc}", command=tuple(args)
@@ -288,6 +320,106 @@ class Repo:
         self._git("add", "-A", env=env)
         self._commit(message, env=env)
         return self.head_commit()
+
+    def push_backup(
+        self,
+        remote: str,
+        *,
+        branch: str | None = None,
+        timeout: float | None = _PUSH_TIMEOUT_SECONDS,
+        interactive: bool = True,
+    ) -> str:
+        """Push the curated branch tip to ``remote`` (push-only backup, issue #64); return its sha.
+
+        The ONE outbound git operation in the codebase: local curated branch → a backup remote
+        (``remote`` is a git remote NAME or URL, passed through as a single argv element after a
+        ``--`` end-of-options marker — never a shell string). STRICTLY PUSH-ONLY: nothing here (or
+        anywhere in this slice) pulls, fetches, or configures remotes — reconciling a remote that
+        has moved ahead is the #46 multi-machine topology ADR's territory.
+
+        Fast-forward only, NEVER ``--force``: a non-fast-forward rejection means the remote's
+        branch is ahead of this repo's (another machine has likely pushed) and is surfaced as a
+        :class:`GitError` that names issue #46 rather than overwritten — a backup must never
+        destroy a sibling copy's history. Any other failure (unreachable remote, auth) is a plain
+        :class:`GitError`. The caller owns the best-effort contract: a push failure must never fail
+        the curation transaction that triggered it (the publish CAS is already durable locally).
+
+        BOUNDED: the push runs under ``timeout`` seconds (default ``_PUSH_TIMEOUT_SECONDS``; the
+        only network-touching git call in the codebase) — a credential prompt left unanswered, an
+        ssh host-key/passphrase prompt, or a TCP blackhole becomes a :class:`GitError`, never an
+        unbounded hang. ``interactive=False`` (the unattended ``agora watch`` auto-push) goes
+        further and FAILS FAST instead of prompting at all: ``GIT_TERMINAL_PROMPT=0`` plus askpass
+        neutralized plus ssh BatchMode (see :meth:`_non_interactive_push_env`), so a
+        needs-credentials push errors immediately into the caller's best-effort record/warn path
+        rather than stalling the scheduler until the timeout.
+
+        Credentials are AMBIENT on purpose: unlike the hermetic commit paths, the push inherits the
+        operator's environment/global config (credential helpers, ssh agent) — it authors no commit,
+        so the reproducibility rationale of :meth:`_commit_env` does not apply
+        (``interactive=False`` only disables *prompts*; helpers and the ssh agent still work).
+        Hooks stay neutralized by the global ``core.hooksPath`` override in :meth:`_git`.
+        """
+        if not isinstance(remote, str) or not remote:
+            raise ValueError("backup remote must be a non-empty string (a git remote name or URL)")
+        if remote.startswith("-") or _REMOTE_BAD_CHARS.search(remote):
+            raise ValueError(
+                f"backup remote {remote!r} is not a plausible git remote name/URL "
+                f"(whitespace/control characters and a leading '-' are rejected)"
+            )
+        name = branch or self._branch
+        tip = self.branch_commit(name)
+        # Explicit full refspec, and the SOURCE is the sha just read — not the live branch ref — so
+        # the returned/recorded sha and the remote tip cannot diverge when a concurrent publish
+        # advances the branch between this read and the push (the observability file's one job is
+        # naming exactly which commit is backed up). No dependence on push.default either way.
+        refspec = f"{tip}:refs/heads/{name}"
+        env = None if interactive else self._non_interactive_push_env()
+        cp = self._git("push", "--", remote, refspec, check=False, env=env, timeout=timeout)
+        if cp.returncode != 0:
+            stderr = cp.stderr.strip()
+            if "non-fast-forward" in stderr or "[rejected]" in stderr:
+                raise GitError(
+                    f"push to {remote!r} rejected (non-fast-forward): the remote's {name!r} is "
+                    f"ahead of this repo's — another machine has likely pushed. Push-only backup "
+                    f"never forces; reconciling divergent copies is the multi-machine topology "
+                    f"decision (issue #46), not this operation. git said: {stderr}",
+                    command=("push", "--", remote, refspec),
+                    returncode=cp.returncode,
+                    stderr=stderr,
+                )
+            raise GitError(
+                f"git push to {remote!r} failed (rc={cp.returncode}): {stderr}",
+                command=("push", "--", remote, refspec),
+                returncode=cp.returncode,
+                stderr=stderr,
+            )
+        return tip
+
+    def _non_interactive_push_env(self) -> dict[str, str]:
+        """Push environment that FAILS FAST instead of prompting (the unattended watch auto-push).
+
+        ``GIT_TERMINAL_PROMPT=0`` disables terminal credential prompts; ``GIT_ASKPASS`` /
+        ``SSH_ASKPASS`` are overridden to :data:`os.devnull` (not executable, so an askpass attempt
+        — including an ambient GUI helper an editor exported — errors instead of waiting on a
+        dialog); ssh gets ``-oBatchMode=yes`` so host-key/passphrase prompts fail immediately.
+        The ssh override is applied ONLY when the operator routes ssh no other way (no
+        ``GIT_SSH_COMMAND``/``GIT_SSH`` in the environment and no ``core.sshCommand`` in git
+        config) — an explicit operator transport is never clobbered. Non-interactive credential
+        sources (credential helpers, the ssh agent) keep working; only *prompts* are disabled.
+        """
+        env = {
+            **os.environ,
+            "GIT_TERMINAL_PROMPT": "0",
+            "GIT_ASKPASS": os.devnull,
+            "SSH_ASKPASS": os.devnull,
+        }
+        if "GIT_SSH_COMMAND" not in os.environ and "GIT_SSH" not in os.environ:
+            has_config_ssh = (
+                self._git("config", "--get", "core.sshCommand", check=False).returncode == 0
+            )
+            if not has_config_ssh:
+                env["GIT_SSH_COMMAND"] = "ssh -oBatchMode=yes"
+        return env
 
     def is_published(self, commit: str, *, branch: str | None = None) -> bool:
         """True iff ``commit`` is reachable from the curated branch tip (i.e. it was published).

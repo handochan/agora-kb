@@ -16,10 +16,12 @@ import pytest
 import yaml
 
 from agora_kb.config import (
+    BackupPolicy,
     ConfigError,
     RepoConfig,
     WebConfig,
     load_backend_registry,
+    load_backup_policy,
     load_repo_config,
     load_web_config,
     repo_config_path,
@@ -462,3 +464,86 @@ def test_web_config_unknown_subkey_is_ignored(tmp_path: Path) -> None:
 def test_web_config_not_added_to_repo_config(tmp_path: Path) -> None:
     """RepoConfig stays a separate concern — it has no `web` field (web policy is its own model)."""
     assert "web" not in RepoConfig.model_fields
+
+
+# --- backup policy (push-only git backup, issue #64) --------------------------------------------
+
+
+def test_backup_policy_defaults_when_file_absent(tmp_path: Path) -> None:
+    """No repo.yaml at all → backup OFF (remote=None, auto=False): the complete-no-op default."""
+    policy = load_backup_policy(_layout(tmp_path))
+    assert isinstance(policy, BackupPolicy)
+    assert policy.remote is None
+    assert policy.auto is False
+
+
+def test_backup_policy_defaults_when_block_absent(tmp_path: Path) -> None:
+    """A repo.yaml WITHOUT a backup: block → the same off defaults (existing repos unaffected)."""
+    layout = _layout(tmp_path)
+    _write_repo_yaml(layout, "name: kb\nkind: personal\n")
+    policy = load_backup_policy(layout)
+    assert policy.remote is None
+    assert policy.auto is False
+
+
+def test_backup_policy_parses_remote_and_auto(tmp_path: Path) -> None:
+    layout = _layout(tmp_path)
+    _write_repo_yaml(layout, "backup:\n  remote: git@example.com:me/kb.git\n  auto: true\n")
+    policy = load_backup_policy(layout)
+    assert policy.remote == "git@example.com:me/kb.git"
+    assert policy.auto is True
+
+
+def test_backup_policy_remote_alone_defaults_auto_off(tmp_path: Path) -> None:
+    """`remote` alone enables `agora sync` but NOT the watch auto-push (auto stays opt-in)."""
+    layout = _layout(tmp_path)
+    _write_repo_yaml(layout, "backup:\n  remote: origin\n")
+    policy = load_backup_policy(layout)
+    assert policy.remote == "origin"
+    assert policy.auto is False
+
+
+def test_backup_remote_non_string_fails_loud(tmp_path: Path) -> None:
+    """A SUPPLIED non-string remote raises (the #57 posture: stated policy is never silently
+    dropped — a silent None here would mean silently not backing up)."""
+    layout = _layout(tmp_path)
+    _write_repo_yaml(layout, "backup:\n  remote: 12345\n")
+    with pytest.raises(ConfigError, match="backup.remote"):
+        load_backup_policy(layout)
+
+
+def test_backup_auto_non_bool_fails_loud(tmp_path: Path) -> None:
+    layout = _layout(tmp_path)
+    _write_repo_yaml(layout, 'backup:\n  remote: origin\n  auto: "yes"\n')
+    with pytest.raises(ConfigError, match="backup.auto"):
+        load_backup_policy(layout)
+
+
+def test_backup_unknown_key_fails_loud(tmp_path: Path) -> None:
+    """A typoed key (`remot:`) must never read as "no remote configured": silently NOT backing up
+    is this feature's worst failure mode, so the block is strict about its own keys (unlike the
+    tolerant harvest:/index:/web: siblings, whose absence degrades observably)."""
+    layout = _layout(tmp_path)
+    _write_repo_yaml(layout, "backup:\n  remot: git@example.com:me/kb.git\n")
+    with pytest.raises(ConfigError, match="remot"):
+        load_backup_policy(layout)
+
+
+@pytest.mark.parametrize("block", ["backup: origin\n", "backup:\n- remote: origin\n"])
+def test_backup_non_mapping_block_fails_loud(tmp_path: Path, block: str) -> None:
+    """A present-but-non-mapping backup: (a scalar or a list — a nesting mistake) raises instead
+    of silently reading as backup-off."""
+    layout = _layout(tmp_path)
+    _write_repo_yaml(layout, block)
+    with pytest.raises(ConfigError, match="mapping"):
+        load_backup_policy(layout)
+
+
+def test_backup_policy_not_added_to_repo_config(tmp_path: Path) -> None:
+    """RepoConfig stays a separate concern — no `backup` field (backup policy is its own model),
+    and a repo.yaml carrying a backup: block still loads through load_repo_config unchanged."""
+    assert "backup" not in RepoConfig.model_fields
+    layout = _layout(tmp_path)
+    _write_repo_yaml(layout, "name: kb\nbackup:\n  remote: origin\n  auto: true\n")
+    cfg = load_repo_config(layout)  # must not trip extra='forbid'
+    assert cfg.name == "kb"
