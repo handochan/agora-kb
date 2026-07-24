@@ -105,12 +105,69 @@ curl -s http://127.0.0.1:8000/api/status | head -1
 `agora-harvest`). `Restart=on-failure` restarts crashed daemons; the harvest service is
 `Type=oneshot` with no `Restart=` — the timer owns the retry cadence.
 
+## Per-user identity behind a reverse proxy (`web.identity`, issue #67)
+
+For a **team** deployment fronted by an authenticating reverse proxy, set in the knowledge repo's
+`_kb/repo.yaml`:
+
+```yaml
+web:
+  identity:
+    trusted_header: X-Remote-User   # opt-in: naming the header IS the trust declaration
+    # strip_domain: true            # alice@example.com → alice (optional)
+```
+
+Uploads then stamp `source: web:<header value>` per authenticated user instead of one shared
+`web:local` (ADR-0025 appendix). **Trust boundary — all three are mandatory:** the proxy must
+(1) authenticate every request, (2) force-set the header from the authenticated user, and
+(3) strip/override any client-supplied copy of it. The web face must be reachable **only through
+the proxy** (keep the `127.0.0.1` bind); a directly reachable port with `trusted_header` set lets
+anyone forge any teammate with `curl -H`. A present-but-invalid header value is refused with 400
+(proxy misconfig / forgery signal), an absent header falls back to `--user`.
+
+**Caddy** (basic auth; `{http.auth.user.id}` is the authenticated username):
+
+```caddyfile
+kb.example.com {
+    basic_auth {
+        alice $2a$14$...   # caddy hash-password
+        bob   $2a$14$...
+    }
+    reverse_proxy 127.0.0.1:8000 {
+        header_up X-Remote-User {http.auth.user.id}   # force-set: overrides any client value
+    }
+}
+```
+
+**nginx** (basic auth; `$remote_user` is the authenticated username):
+
+```nginx
+server {
+    listen 443 ssl;
+    server_name kb.example.com;
+    auth_basic           "Agora";
+    auth_basic_user_file /etc/nginx/agora.htpasswd;   # htpasswd -B
+    location / {
+        proxy_pass http://127.0.0.1:8000;
+        proxy_set_header X-Remote-User $remote_user;  # force-set: replaces any client value
+    }
+}
+```
+
+Both directives *set* (not append) the header, which is what strips a spoofed client copy — verify
+with `curl -u alice:pw -H 'X-Remote-User: mallory' https://kb.example.com/api/upload ...` and check
+the receipt's `identity_source: "header"` plus the inbox event's `source: web:alice`. As defense in
+depth the face itself refuses a request carrying the header **more than once** with 400 (an
+append-mode directive such as Apache `RequestHeader append` would let the client's forged copy ride
+alongside the authenticated one), so a set-vs-append misconfiguration surfaces loudly on the first
+upload instead of silently mis-attributing writes.
+
 ## Rules & health
 
 - **127.0.0.1 only.** The web units hard-code `--host 127.0.0.1`. The web face has **no
-  authentication, no SSRF guard, no TLS** — never change the bind host to `0.0.0.0` or any
-  non-loopback address. Remote access, if you must, goes over an SSH tunnel
-  (`ssh -L 8000:127.0.0.1:8000 host`).
+  authentication, no TLS** — never change the bind host to `0.0.0.0` or any non-loopback address.
+  Remote access goes over an SSH tunnel (`ssh -L 8000:127.0.0.1:8000 host`) or the authenticating
+  reverse proxy above (which keeps the loopback bind and adds per-user identity).
 - **backup.auto (#64) under a service manager** is non-interactive: use an ssh agent (macOS:
   `ssh-add --apple-use-keychain`) or a git credential helper. A prompting credential flow fails
   the push; curation is unaffected (check the `agora doctor` backup line). **Linux caveat:** a

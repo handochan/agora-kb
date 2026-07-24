@@ -252,3 +252,59 @@ deployments (the prerequisites the #68 deployment guide points at):
 - **rec D `.epub`** — routed to the markitdown path (`_MARKITDOWN_EXTS` +
   `application/epub+zip`); **no new dependency** (markitdown's epub converter is core), same bomb
   guard applies. Image OCR / audio transcription remain deferred on rec D's own terms.
+
+## Appendix (2026-07-25, append-only) — `web.identity.trusted_header`: reverse-proxy identity threading (issue #67)
+
+Nothing above changes. The Phase-4-auth seam `build_app(user=...)` reserved now accepts a
+**minimal proxy-delegation slice** so a team deployment stops collapsing every contributor into
+one process-wide `web:local` stamp (provenance is the basis of promotion judgment and audit —
+#55 decisions 7–9):
+
+- **`web.identity.trusted_header`** (default `None` = OFF): the name of the request header an
+  **authenticating reverse proxy** (basic auth, SSO, …) injects with the logged-in username
+  (e.g. `X-Remote-User`). When set, each WRITE request (`POST /api/upload`,
+  `POST /api/upload-batch`, the HTMX `POST /upload`) resolves its user from that header and stamps
+  `source = web:<header value>`. Read routes are untouched — identity only matters where
+  provenance is stamped.
+- **Opt-in by construction.** With the default `None`, *no request header ever influences
+  identity* — naming the header **is** the operator's declaration of the proxy trust boundary. A
+  client-forgeable header must never steer provenance by default: a directly exposed web port
+  would let anyone spoof any teammate with `curl -H`. A supplied non-string header name fails
+  **loud** (`ConfigError`, incl. the YAML-1.1 `no`→False trap) — a security opt-in silently
+  reading as "off" would have the operator believing per-user identity is on while everything
+  stamps `web:local`.
+- **Trust boundary (the #68 guide's contract).** The proxy MUST (1) authenticate every request,
+  (2) **force-set** the header from the authenticated principal, and (3) **strip/override** any
+  client-supplied value of the same header. With `trusted_header` set, the web port must be
+  reachable **only** through the proxy (loopback bind or network isolation) — direct exposure
+  makes the header forgeable and provenance worthless. Snippets: `deploy/README.md`.
+- **Present-but-invalid value → 400, never a silent fallback.** A header that exists but carries
+  an empty/garbage value (outside the conservative token `[A-Za-z0-9][A-Za-z0-9._@-]*`, ≤128
+  chars — strictly narrower than the inbox model's `web:.+` source rule, so an accepted value can
+  never be rejected downstream) is a forgery attempt or a misconfigured proxy. Falling back to
+  the process user would *poison the audit trail* (a request that claimed an identity would be
+  silently attributed to `web:local`); refusing loudly surfaces the misconfiguration on the first
+  upload. Nothing is written on refusal (the batch path refuses before any inbox append).
+- **Duplicate identity header → 400.** If the configured header occurs **more than once** on a
+  request the write is refused outright (nothing written). An *append*-mode proxy (Apache
+  `RequestHeader append`, HAProxy `add-header`) leaves the client's forged copy first, so any
+  pick-one rule (first- or last-wins) is a spoofing vector; duplicates are precisely the
+  detectable set-vs-append misconfiguration the 400 policy exists to surface.
+- **Header *name* is validated at config load, not per request.** `trusted_header` must be an
+  RFC 7230 header-name token (`ConfigError` otherwise): a non-latin-1 name (docs-copy-paste
+  en-dash `X–Remote–User`) would otherwise 500 every write inside the header lookup, and a
+  whitespace-padded name (`"X-Remote-User "`) would match no request ever — a permanent silent
+  fallback to `web:local`. Likewise an **unknown `web.identity` sub-key** (the natural
+  `trusted-header:` hyphen typo) fails loud — a deliberate exception to the web loader's
+  tolerant unknown-key convention, because a typo'd security opt-in silently reading as "off" is
+  worse than a crash.
+- **Absent header → process `--user` fallback; default config byte-identical.** A personal
+  deployment (no `identity:` block) behaves exactly as before — locked by regression test.
+- **`web.identity.strip_domain`** (default `false`): truncate an email-form value at the first
+  `@` (`alice@example.com` → `alice`) *before* validation, for proxies that forward
+  `REMOTE_USER` as a mail address. A bare-domain value (`@example.com`) strips to empty → 400.
+- **Audit surface**: the JSON upload receipts carry `identity_source: "header" | "process"` so an
+  operator can verify at a glance whether a capture was attributed via the proxy or the fallback.
+- **Not auth.** This trusts the proxy wholesale; real authn/authz (tokens, OpenFGA/Forgejo
+  delegation) remains ROADMAP Phase 4. This slice only threads an already-authenticated name into
+  the existing `web:<user>` source form (DATA-MODEL §1 — unchanged).

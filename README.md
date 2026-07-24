@@ -129,7 +129,10 @@ it local. The upload surface is hardened for the day you do share it (the team-d
 issue #68): server-side URL fetches are SSRF-guarded (private/loopback/link-local/metadata targets
 and redirects into them are refused) and can be disabled outright with `web.upload.url_enabled:
 false`, and zip-based uploads (docx/xlsx/pptx/epub) are capped against decompression bombs via
-`web.upload.max_uncompressed_bytes` (ADR-0025 appendix).
+`web.upload.max_uncompressed_bytes` (ADR-0025 appendix). Behind an **authenticating reverse proxy**,
+set `web.identity.trusted_header` (e.g. `X-Remote-User`) so each teammate's uploads stamp their own
+`web:<user>` provenance instead of one shared `web:local` — opt-in, header forced/stripped by the
+proxy only (issue #67; snippets in `deploy/README.md`).
 
 **Gold context packs (ADR-0027).** Above the searchable wiki, Agora assembles a **gold** tier: a
 small, token-budgeted, byte-stable slice of your highest-value theme notes, meant to be injected at
