@@ -21,11 +21,18 @@ The algorithm is the LEXICAL-UNION FRONTIER with a single pure-Python scorer (AD
    the ADR-0014 D3 BODY markdown links ``[Title](relative.md)`` (resolved path→basename), the
    frontmatter ``related:`` / ``children:`` ``"[[basename]]"`` arrays, and any tolerated stray body
    ``[[ ]]`` wikilink. The traversal stays deterministic + reproducible (ADR-0009).
-3. **TOKENIZE** the question; an all-stopword question yields ``not_found`` immediately.
-4. **LEXICAL** BM25F over {title, tags, headings, body} with repo-wide IDF.
+3. **TOKENIZE** the question; an all-stopword question yields ``not_found`` immediately. The
+   shared tokenizer (issue #56 / ADR-0012 addendum) NFC-normalizes and emits lowercased ASCII
+   ``[a-z0-9]+`` tokens PLUS character bigrams over CJK runs (unigram for a length-1 run), so
+   Korean/CJK questions and notes are retrievable; the CJK range table is shared with
+   :mod:`core.gold` via :mod:`core.cjk` (single source).
+4. **LEXICAL** BM25F over {title, aliases, tags, headings, summary, body} with repo-wide IDF
+   (aliases 3.0 / summary 2.0 joined in the #56 addendum — both frontmatter-authored, previously
+   unscored).
 5. **STRUCTURAL** degree surrogate ``alpha/(1+d_moc) + beta*indeg_norm`` (no iterative PageRank).
-6. **COMBINE** ``w_lex*lex + w_struct*struct + fm`` (``fm=0`` in Phase-1a) behind a mandatory
-   lexical-evidence gate that drops structurally-strong but lexically-empty notes.
+6. **COMBINE** ``w_lex*lex + w_struct*struct + fm`` (``fm`` LIVE since #56: active +0.10 /
+   deprecated −0.15) behind a mandatory lexical-evidence gate that drops structurally-strong but
+   lexically-empty notes.
 7. **ORDER** by a total order (no ties survive) and truncate to ``limit``.
 
 Float determinism: ``lex``/``struct``/``fm`` are each rounded to 6 decimals, then combined in the
@@ -37,6 +44,7 @@ from __future__ import annotations
 
 import math
 import re
+import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
@@ -44,6 +52,7 @@ from typing import TYPE_CHECKING, Literal
 from pydantic import BaseModel, ConfigDict
 
 from . import frontmatter, index_cache
+from .cjk import CJK_RANGES
 from .layout import InvalidWriterError, RepoLayout
 
 if TYPE_CHECKING:
@@ -53,16 +62,40 @@ if TYPE_CHECKING:
 
 __all__ = ["SearchHit", "QueryResult", "Wiki", "build_cache", "IndexBuildResult"]
 
-# --- frozen configuration (ADR-0012 §1 defaults; normative for tests) ---------------------------
+# --- frozen configuration (ADR-0012 §1 defaults as amended by the #56 addendum) -----------------
 K1 = 1.2  # BM25 term-freq saturation
-B = 0.75  # BM25 length normalization
-FIELD_WEIGHTS: dict[str, float] = {"title": 3.0, "tags": 2.5, "headings": 2.0, "body": 1.0}
+B = 0.75  # BM25 length normalization (applied per field via FIELD_B below)
+# The scoring fields IN ITERATION ORDER (fixed for float determinism, ADR-0012 §6.1). aliases and
+# summary joined in the #56 addendum: aliases are alternate TITLES (weight 3.0, powers QUERY as the
+# schema always claimed) and summary is the note's densest sentence (2.0), both frontmatter-only
+# and previously invisible to the ranker.
+_FIELDS: tuple[str, ...] = ("title", "aliases", "tags", "headings", "summary", "body")
+FIELD_WEIGHTS: dict[str, float] = {
+    "title": 3.0,
+    "aliases": 3.0,
+    "tags": 2.5,
+    "headings": 2.0,
+    "summary": 2.0,
+    "body": 1.0,
+}
+# Per-field BM25F length-normalization ``b`` (#56 review). ``aliases`` is EXEMPT (b=0 → denom=1):
+# it is a sparse OPTIONAL field — most notes carry none — so the corpus-wide avgdl collapses
+# toward 0 and the standard denominator ``1 - b + b*len_f/avgdl_f`` explodes for exactly the notes
+# that DO have aliases, silently crushing the "title-equivalent 3.0" weight (e.g. a 42-note corpus
+# with one 2-token alias list: avgdl≈0.05 → denom≈33 → effective per-occurrence weight ≈0.09,
+# losing to a single body mention). An alias list is a tiny controlled set of alternate titles
+# (L1-15-unique), so document-length normalization carries no signal there. Every other field
+# keeps ``b=B`` — title/summary are present in every produced note so their avgdl is healthy, and
+# changing them would perturb the frozen English ranking (ADR-0012 addendum A2).
+FIELD_B: dict[str, float] = {f: (0.0 if f == "aliases" else B) for f in _FIELDS}
 PIVOT = 1.5  # lexical normalization pivot: lex = raw / (raw + pivot)
 W_LEX = 0.65  # combined-score weight on lexical
 W_STRUCT = 0.35  # combined-score weight on structural
 STRUCT_ALPHA = 0.7  # structural: weight on MOC-distance term
 STRUCT_BETA = 0.3  # structural: weight on in-degree term
-FM_ENABLED = False  # PHASE-1a: fm=0 for ALL notes (flips true in Phase-1b with schema emitter+LINT)
+# Phase-1b LIVE (#56 addendum): the ADR-0012 §8 preconditions (schema emitter + LINT status enum)
+# both shipped, so the status boost/demotion is on — deprecated no longer ties with active.
+FM_ENABLED = True
 MAX_HOPS = 2  # BFS depth from MOC/index seeds
 FLOOR = 0.18  # not_found threshold on the combined [0,1] score
 MAX_HITS = 20  # default limit
@@ -121,13 +154,74 @@ _MDLINK_RE = re.compile(r"\[([^\]]*)\]\([^)]*\)")
 # A non-image markdown link with its TARGET captured — the ADR-0014 D3 body graph-edge form. The
 # target is resolved to a basename (filename minus dir minus ``.md``) by _mdlink_target_basename.
 _MDLINK_TARGET_RE = re.compile(r"(?<!\!)\[(?P<text>[^\]\r\n]*)\]\((?P<target>[^)\r\n]+)\)")
-# A token of the §3 tokenizer alphabet.
+# An ASCII token of the §3 tokenizer alphabet (also the excerpt-window token unit, §7).
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
+# The CJK run alphabet — a character class built from the SHARED range table (core.cjk, the single
+# source also feeding gold's token estimator; issue #56 forbids a second range definition).
+_CJK_CLASS = "".join(f"{chr(lo)}-{chr(hi)}" for lo, hi in CJK_RANGES)
+# One scan alternation: an ASCII token OR a maximal CJK run (bigrammed downstream). Any other
+# codepoint (spaces, ASCII punctuation, non-CJK scripts) separates tokens exactly as before.
+_SCAN_RE = re.compile(rf"[a-z0-9]+|[{_CJK_CLASS}]+")
+
+
+def _cjk_run_tokens(run: str) -> list[str]:
+    """Character bigrams over each letter/number subrun of a CJK run (unigram when length 1).
+
+    The shared ``CJK_RANGES`` include CJK punctuation, fullwidth symbols, and the ideographic
+    space; those codepoints (Unicode categories ``P*``/``S*``/``Z*``) SPLIT the run exactly like
+    any non-token character, so a bigram never bridges a sentence boundary (``메모리。그림`` →
+    ``메모``, ``모리``, ``그림`` — never ``리그``). Deterministic: a pure function of the
+    codepoints under the test suite's pinned CPython/unicodedata (ADR-0012 §6.1 stance).
+    """
+    out: list[str] = []
+    sub: list[str] = []
+
+    def _flush() -> None:
+        if not sub:
+            return
+        if len(sub) == 1:
+            out.append(sub[0])
+        else:
+            out.extend(sub[i] + sub[i + 1] for i in range(len(sub) - 1))
+        sub.clear()
+
+    for ch in run:
+        if unicodedata.category(ch)[0] in ("L", "N"):
+            sub.append(ch)
+        else:
+            _flush()
+    _flush()
+    return out
+
+
+def _scan_tokens(text: str) -> list[str]:
+    """NFC-normalize + lowercase, then emit ASCII tokens and CJK bigrams in document order.
+
+    The UNFILTERED token stream (no stopword removal) — the #56-addendum widening of the raw
+    ``_TOKEN_RE.findall(text.lower())`` scan. NFC first (macOS/NFD-decomposed Hangul jamo compose
+    to the syllables a query carries); for pure-ASCII text NFC is the identity, so the English
+    tokenization is byte-identical to the original §3 rule.
+    """
+    norm = unicodedata.normalize("NFC", text).lower()
+    out: list[str] = []
+    for m in _SCAN_RE.finditer(norm):
+        tok = m.group()
+        if ord(tok[0]) < 128:  # the [a-z0-9]+ branch — kept verbatim
+            out.append(tok)
+        else:  # a CJK run — character bigrams (unigram for a length-1 subrun)
+            out.extend(_cjk_run_tokens(tok))
+    return out
 
 
 def _tokenize(text: str) -> list[str]:
-    """The single shared tokenizer (ADR-0012 §3): lowercased ``[a-z0-9]+`` minus stopwords."""
-    return [t for t in _TOKEN_RE.findall(text.lower()) if t not in STOPWORDS]
+    """The single shared tokenizer (ADR-0012 §3 + #56 addendum): ASCII tokens + CJK bigrams.
+
+    Lowercased ``[a-z0-9]+`` runs minus stopwords, exactly as §3 froze — PLUS, per the #56
+    addendum, NFC normalization and character bigrams over CJK runs (unigram when a run is a
+    single codepoint), so Korean/CJK text is retrievable. The English STOPWORDS cannot collide
+    with a CJK bigram, so the one filter serves both alphabets.
+    """
+    return [t for t in _scan_tokens(text) if t not in STOPWORDS]
 
 
 def _tokenize_tags(tags: tuple[str, ...]) -> list[str]:
@@ -140,9 +234,10 @@ def _tokenize_tags(tags: tuple[str, ...]) -> list[str]:
     """
     out: list[str] = []
     for tag in tags:
-        lowered = tag.lower()
-        # Split parts under the [a-z0-9]+ alphabet (e.g. "single-writer" -> ["single", "writer"]).
-        parts = _TOKEN_RE.findall(lowered)
+        lowered = unicodedata.normalize("NFC", tag).lower()
+        # Split parts under the shared token alphabet (ASCII runs + CJK bigrams, #56 addendum;
+        # e.g. "single-writer" -> ["single", "writer"] exactly as before).
+        parts = _scan_tokens(lowered)
         # Only a hyphenated tag gets its full kebab form injected in addition to the parts; a plain
         # tag's full form equals its single part, so emitting both would double-count.
         if "-" in lowered:
@@ -156,7 +251,13 @@ def _tokenize_tags(tags: tuple[str, ...]) -> list[str]:
 
 
 def _slug(heading: str) -> str:
-    """GitHub/Obsidian-compatible slug (ADR-0012 §6)."""
+    """ASCII approximation of the GitHub/Obsidian slug rule (ADR-0012 §6).
+
+    Text with no ``[a-z0-9]`` material (e.g. a pure-Korean title/heading) yields ``""`` — the
+    documented no-deep-link anchor value. A real GitHub slugger preserves Unicode word characters;
+    widening to that is a deferred decision (ADR-0012 addendum A4: it re-serializes into the
+    reader cache and must be reconciled with the web face's heading-id rule first).
+    """
     return re.sub(r"[^a-z0-9]+", "-", heading.strip().lower()).strip("-")
 
 
@@ -284,14 +385,14 @@ def _note_from_dict(data: dict) -> _Note:
     fields are restored from the serialized lists; headings are rebuilt as :class:`_Heading` values.
 
     STRICT by design: a missing/mis-typed key (including an INCOMPLETE ``field_tokens`` missing
-    one of the four scoring fields, which would otherwise ``KeyError`` later in the scorer)
+    one of the ``_FIELDS`` scoring fields, which would otherwise ``KeyError`` later in the scorer)
     raises ``KeyError``/``TypeError``/``ValueError``. The reuse path in :meth:`Wiki._load_notes`
     catches exactly those and re-parses that one file, so a structurally-corrupt cached entry can
     never crash ``kb_query`` (ADR-0012 §2 crash-proof read path).
     """
     field_tokens = data["field_tokens"]
     if not isinstance(field_tokens, dict) or any(
-        not isinstance(field_tokens.get(f), list) for f in ("title", "tags", "headings", "body")
+        not isinstance(field_tokens.get(f), list) for f in _FIELDS
     ):
         raise ValueError("cached note has a missing/malformed field_tokens field")
     return _Note(
@@ -343,6 +444,22 @@ def _parse_note(path: str, basename: str, is_index: bool, raw_text: str) -> _Not
     else:
         tags = ()
 
+    # aliases (#56 addendum): frontmatter alternate titles — L1-15 enforces their global
+    # uniqueness and the schema always annotated them "(powers QUERY)"; now they do, at title
+    # weight. Same tolerant shape handling as tags (list of scalars, or a bare scalar).
+    raw_aliases = fm.get("aliases")
+    if isinstance(raw_aliases, list):
+        aliases = tuple(str(a) for a in raw_aliases)
+    elif isinstance(raw_aliases, str):
+        aliases = (raw_aliases,)
+    else:
+        aliases = ()
+
+    # summary (#56 addendum): the note's densest sentence lives in frontmatter, which is stripped
+    # before body tokenization — index it as its own weighted field.
+    raw_summary = fm.get("summary")
+    summary = raw_summary if isinstance(raw_summary, str) else ""
+
     # status (normalize to the §8 enum; default 'neutral' for ranking)
     raw_status = fm.get("status")
     status = str(raw_status).strip().lower() if isinstance(raw_status, str) else "neutral"
@@ -377,9 +494,17 @@ def _parse_note(path: str, basename: str, is_index: bool, raw_text: str) -> _Not
                         h1_line = idx
                 else:
                     base_slug = _slug(text)
-                    n = slug_counts.get(base_slug, 0)
-                    slug_counts[base_slug] = n + 1
-                    slug = base_slug if n == 0 else f"{base_slug}-{n}"
+                    if base_slug:
+                        n = slug_counts.get(base_slug, 0)
+                        slug_counts[base_slug] = n + 1
+                        slug = base_slug if n == 0 else f"{base_slug}-{n}"
+                    else:
+                        # #56 review: a heading with no [a-z0-9] material (e.g. pure Korean) has
+                        # no ASCII-derivable anchor — keep the DOCUMENTED "" (no deep link) value
+                        # rather than fabricating dedup suffixes ("-1", "-2") that resolve nowhere
+                        # under any slugger. Unicode-preserving slugs are a deferred decision
+                        # (ADR-0012 addendum A4).
+                        slug = ""
                     headings.append(_Heading(level=level, text=text, slug=slug, line=idx))
         # Body graph edges (ADR-0012 §2 walks the note's link graph). Since ADR-0014 D3 the BODY
         # graph link is a STANDARD MARKDOWN LINK ``[Title](relative.md)`` (the MOC/index child
@@ -432,13 +557,16 @@ def _parse_note(path: str, basename: str, is_index: bool, raw_text: str) -> _Not
             continue
         body_lines.append(_strip_link_punctuation(line))
 
-    # field tokens (ADR-0012 §2/§3). headings appear in BOTH headings and body (double-count).
+    # field tokens (ADR-0012 §2/§3 + #56 addendum). headings appear in BOTH headings and body
+    # (double-count). aliases/summary are frontmatter-only, so they appear ONLY in their fields.
     heading_text = " ".join(h.text for h in headings)
     body_text = " ".join(body_lines)
     field_tokens = {
         "title": _tokenize(title),
+        "aliases": _tokenize(" ".join(aliases)),
         "tags": _tokenize_tags(tags),
         "headings": _tokenize(heading_text),
+        "summary": _tokenize(summary),
         "body": _tokenize(body_text),
     }
 
@@ -482,7 +610,8 @@ class SearchHit(BaseModel):
 
     repo: str
     path: str
-    anchor: str  # heading/wikilink slug; MAY be "" for a pre-heading lexical match
+    anchor: str  # heading/wikilink slug; MAY be "" for a pre-heading lexical match OR a
+    # title/heading with no ASCII-sluggable text (e.g. pure Korean — no deep link, addendum A4)
     line: int  # 1-based
     excerpt: str
     match_reason: Literal["linked-theme", "heading", "lexical"]
@@ -936,10 +1065,12 @@ class Wiki:
         note = cand.note
         q_set = set(q_tokens)
 
-        # Reason 1: linked-theme — d_moc==0 AND q intersects title/tags/MOC-label union.
+        # Reason 1: linked-theme — d_moc==0 AND q intersects title/aliases/tags/MOC-label union
+        # (aliases joined the theme set in the #56 addendum, mirroring the §6 gate).
         if cand.d_moc == 0:
             theme_tokens = (
                 set(note.field_tokens["title"])
+                | set(note.field_tokens["aliases"])
                 | set(note.field_tokens["tags"])
                 | cand.moc_label_tokens
             )
@@ -988,12 +1119,15 @@ class Wiki:
         """Owning field of the SINGLE highest-idf matched q-token (ADR-0012 §6), or ``None``.
 
         Among q-tokens present in any field, pick the one with greatest IDF; ties broken by the
-        field-weight order (title>tags>headings>body) of the highest-weight field that carries the
-        token, then by first-occurrence line. Returns that winning token's owning field — the
-        highest-weight field it occupies — which decides reason 2 (title/headings) vs reason 3.
+        field-weight order (title>aliases>tags>headings>summary>body — the #56-addendum widening;
+        equal-weight pairs order title before aliases and headings before summary) of the
+        highest-weight field that carries the token, then by first-occurrence line. Returns that
+        winning token's owning field — the highest-weight field it occupies — which decides
+        reason 2 (title/headings) vs reason 3 (aliases/summary are frontmatter, so a match landing
+        there stays reason 3 unless the note is a d_moc==0 linked theme).
         """
         # Field rank for the "where the term lands" / tie-break order (lower rank = higher weight).
-        field_rank = {"title": 0, "tags": 1, "headings": 2, "body": 3}
+        field_rank = {f: i for i, f in enumerate(_FIELDS)}
         per_field = {f: set(note.field_tokens[f]) for f in field_rank}
 
         best_token: str | None = None
@@ -1104,8 +1238,8 @@ def _first_field_line(note: _Note, field_name: str, token: str) -> int:
     """1-based line where ``token`` first occurs in ``field_name`` (tie-break order, ADR-0012 §6).
 
     ``title`` → the H1 line; ``headings`` → the first heading text containing the token; ``body`` →
-    the first body line containing the token; ``tags`` → frontmatter, no body line, so a large
-    sentinel that sorts last (the field-weight rank already orders tags ahead of headings/body).
+    the first body line containing the token; ``tags``/``aliases``/``summary`` → frontmatter, no
+    body line, so a large sentinel that sorts last (the field-weight rank already orders them).
     """
     if field_name == "title":
         return note.title_line
@@ -1121,7 +1255,7 @@ def _first_field_line(note: _Note, field_name: str, token: str) -> int:
             if token in set(_tokenize(raw)):
                 return idx + 1
         return 1 << 30  # pragma: no cover - caller guarantees a body match
-    return 1 << 30  # tags: no line
+    return 1 << 30  # tags/aliases/summary: frontmatter, no body line
 
 
 def _collapse(text: str) -> str:
@@ -1170,7 +1304,7 @@ class _CorpusStats:
     @classmethod
     def build(cls, notes: list[_Note]) -> _CorpusStats:
         n = len(notes)
-        fields = ("title", "tags", "headings", "body")
+        fields = _FIELDS
         len_sum: dict[str, int] = dict.fromkeys(fields, 0)
         df: dict[str, int] = {}
         for note in notes:
@@ -1189,7 +1323,7 @@ class _CorpusStats:
 
 def _lexical(note: _Note, q_set: list[str], stats: _CorpusStats) -> float:
     """BM25F lexical score normalized to [0,1) via the pivot (ADR-0012 §4)."""
-    fields = ("title", "tags", "headings", "body")
+    fields = _FIELDS
     # per-field term frequencies and lengths
     tf: dict[str, dict[str, int]] = {}
     len_f: dict[str, int] = {}
@@ -1210,7 +1344,8 @@ def _lexical(note: _Note, q_set: list[str], stats: _CorpusStats) -> float:
             if tf_tf == 0:
                 continue
             avgdl_f = stats.avgdl[f]
-            denom = 1.0 if avgdl_f == 0 else (1 - B + B * len_f[f] / avgdl_f)
+            b = FIELD_B[f]
+            denom = 1.0 if avgdl_f == 0 else (1 - b + b * len_f[f] / avgdl_f)
             ftd += FIELD_WEIGHTS[f] * tf_tf / denom
         if ftd <= 0:
             continue
@@ -1228,18 +1363,26 @@ def _structural(d_moc: int, indeg: int, max_indeg: int) -> float:
 
 
 def _fm(status: str) -> float:
-    """Frontmatter/status boost. Phase-1a: always 0.0 (``fm_enabled=false``)."""
+    """Frontmatter/status boost (ADR-0012 §8; LIVE since the #56 addendum flipped Phase-1b on).
+
+    ``active`` promotes (+0.10), ``deprecated`` demotes (−0.15); ``stub``/``contested``/absent/
+    unknown stay neutral (0.0) — an un-triaged note is never auto-promoted above a curated one.
+    """
     if not FM_ENABLED:
         return 0.0
-    if status == "active":  # pragma: no cover - Phase-1b
+    if status == "active":
         return 0.10
-    if status == "deprecated":  # pragma: no cover - Phase-1b
+    if status == "deprecated":
         return -0.15
     return 0.0
 
 
 def _passes_gate(cand: _Candidate, q_tokens: list[str]) -> bool:
-    """Mandatory lexical-evidence gate (ADR-0012 §6)."""
+    """Mandatory lexical-evidence gate (ADR-0012 §6; theme set widened by the #56 addendum).
+
+    The d_moc==0 theme-token set includes the note's ``aliases`` tokens (an alias IS an alternate
+    title, so a linked theme reachable by its alias passes exactly as one reachable by its title).
+    """
     if cand.lex > 0:
         return True
     if cand.d_moc == 0:
@@ -1248,6 +1391,7 @@ def _passes_gate(cand: _Candidate, q_tokens: list[str]) -> bool:
             cand.moc_label_tokens
             | set(cand.note.field_tokens["tags"])
             | set(cand.note.field_tokens["title"])
+            | set(cand.note.field_tokens["aliases"])
         )
         if q_set & theme:
             return True

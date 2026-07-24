@@ -4,6 +4,7 @@
 
 Refines ADR-0009 (does not supersede); depends on ADR-0001, ADR-0002, ADR-0006, ADR-0008. Amended by ADR-0014 D3 (body graph edges are now standard markdown links `[Title](relative.md)`; frontmatter `related:`/`children:` stay `[[basename]]`).
 **Amends DATA-MODEL §9** (see §12).
+**AMENDED (append-only) — the §1/§3 frozen tokenizer/stopword/field contract and the §8 `fm_enabled` phase flag are REVISED by the addendum at the end of this file** (*Addendum — CJK bigram tokenizer + aliases/summary fields + fm live (#56, landed 2026-07-24)*); the §1/§3/§8 prose below is retained verbatim for history.
 
 ## Context
 ADR-0009 froze the *contract* of `core.wiki.query` — a deterministic, model-free `QueryResult` of
@@ -579,3 +580,142 @@ returned hits.
   tie-break. The test suite must pin the exact interpreter.
 - **−** Cross-repo (multi-tenant) ranking is deferred: per-repo IDF makes scores only loosely comparable,
   so a cross-repo normalization decision is required before multi-repo querying is a contract.
+
+## Addendum — CJK bigram tokenizer + aliases/summary fields + fm live (#56, landed 2026-07-24)
+
+**This addendum REVISES the §1/§3 frozen contract and flips the §8 phase flag.** The §1/§3/§8
+prose above is retained verbatim (append-only convention, cf. ADR-0022/0023 addenda); where they
+conflict, THIS section is normative. Issue **#56** found the defect class: `tokenize()`'s
+`[a-z0-9]+` alphabet silently drops every CJK codepoint, so a Korean question tokenizes to `[]`
+(→ instant `not_found` via gate (a)) and a Korean note's four `field_tokens` are all empty
+(→ `lex = 0` forever, unreachable by ANY query) — while ADR-0027 decision 5 documents this very
+KB as Korean-heavy and ships a CJK range table for gold budgeting. The system counted Korean but
+could not search it. Two already-authored frontmatter fields the ranker never consumed (`aliases:`
+— schema-annotated "(powers QUERY)", L1-15-unique, yet score contribution 0; `summary:` — the
+note's densest sentence, stripped with the frontmatter before body tokenization) are folded into
+the same revision, as is the long-satisfied §8 precondition.
+
+### A1. Tokenizer (revises §3): NFC + CJK character bigrams
+
+```python
+def tokenize(text):
+    norm = NFC(text).lower()
+    for run in scan(norm):              # [a-z0-9]+ runs OR maximal CJK-range runs, in order
+        if ascii_run(run):  yield run                       # verbatim §3 behavior
+        else:               yield from bigrams(run)         # per letter/number subrun; len 1 → unigram
+    # stopword filter unchanged (English list; cannot collide with a CJK bigram)
+```
+
+- **NFC first.** macOS/NFD-decomposed Hangul jamo compose to the syllables a query carries; for
+  pure-ASCII text NFC is the identity, so **English/digit tokenization is byte-invariant** (the
+  §10 fixture scores are unchanged by the tokenizer itself).
+- **CJK runs → character bigrams; a length-1 (sub)run → unigram.** Why bigrams: Korean is
+  agglutinative — a particle suffix (`큐레이터가`) would make whole-word tokens unmatchable by the
+  stem query (`큐레이터`), while bigrams overlap 3/4 ({큐레,레이,이터,터가} ∩ {큐레,레이,이터}),
+  giving graded partial matching under unmodified BM25F. Bigrams need no dictionary, no language
+  detection, and are the standard CJK fallback in lexical engines.
+- **The CJK range table is SHARED, not duplicated**: extracted verbatim from `core/gold.py`
+  (ADR-0027 decision 5) into `core/cjk.py`; both gold's token estimator and this tokenizer import
+  it, so the two CJK definitions can never drift. Gold's estimator behavior (and pack bytes) is
+  unchanged.
+- **Within a CJK run, codepoints of Unicode category `P*`/`S*`/`Z*`** (CJK punctuation `。`,
+  fullwidth symbols, the ideographic space — all inside the shared ranges) **split the run** like
+  any non-token character, so a bigram never bridges a sentence boundary. Determinism stance
+  unchanged from §6.1: pure function of codepoints under the test suite's pinned
+  CPython/unicodedata build.
+- **Morphological analyzers (mecab-ko, kiwipiepy) REJECTED.** (a) Their output is a function of a
+  *versioned dictionary/model*: any dictionary revision re-tokenizes the same bytes differently,
+  which breaks the byte-identical rebuild contract (invariant #1, §6.1) exactly the way the
+  ADR-0022 addendum rejected transliteration tables for slugs — a nondeterminism class the
+  deterministic reader cannot carry. (b) Licensing is non-permissive for the core path (mecab-ko
+  lineage is GPL/LGPL-encumbered; invariant #4 forbids copyleft in the core), and a required
+  native/external analyzer would also violate the stdlib-only oracle posture (§0a). Recall lost vs
+  a true morphological index is accepted; bigrams recover the practical bulk of it.
+- **Korean stopwords: none.** Josa/eomi surface inside bigrams and are diluted by IDF; a curated
+  Korean stopword list would itself be a versioned artifact (same objection as above).
+- **Residual — single-syllable queries vs multi-syllable runs.** A length-1 run emits a unigram
+  and a length-≥2 run emits only bigrams, so the query `밤` can never match a note carrying only
+  `밤나무` (tokens `밤나`/`나무`) and vice versa. Emitting boundary unigrams as well would need a
+  cache re-bump and a recall/precision decision — deferred; stated here so the gap is a contract,
+  not a surprise.
+- **Residual — fullwidth alphanumerics (U+FF01–FF5E).** NFC (not NFKC) is applied, so fullwidth
+  Latin/digits are NOT folded to ASCII; they sit inside the shared CJK ranges and are category
+  `L*`/`N*`, so they stay in the run and bigram (`ＡＩ` → token `ａｉ`), never matching the
+  halfwidth query `ai` — and a fullwidth-Latin↔Hangul boundary is bridged by a bigram (`ｉ에`)
+  where the halfwidth boundary splits. No worse than pre-#56 (such text was entirely invisible);
+  a deterministic FF01–FF5E fold in the scan is a possible follow-up (needs a cache re-bump).
+
+### A2. Scoring fields (revises §1/§2): `aliases` 3.0, `summary` 2.0
+
+```yaml
+  field_weights:          # BM25F per-field weights (pure-Python scorer) — REVISED by #56
+    title: 3.0
+    aliases: 3.0          # NEW: alternate titles (L1-15 globally unique) — title-equivalent
+    tags: 2.5
+    headings: 2.0
+    summary: 2.0          # NEW: the note's densest sentence, frontmatter-only
+    body: 1.0
+```
+
+- Both are parsed from the SAME frontmatter pass the note loader already runs (no new parser);
+  tolerant shapes mirror `tags:` (list of scalars or a bare scalar; non-string → absent).
+- Both join `field_tokens`, the per-field `avgdl`, repo-wide `df`/IDF, and the exact
+  inverted-index candidate prefilter. Field iteration order is fixed as
+  `(title, aliases, tags, headings, summary, body)` (§6.1 float-order determinism); notes without
+  these keys contribute empty fields, so **an aliases/summary-free corpus scores byte-identically
+  to the pre-#56 scorer modulo A3**.
+- The §6 tie-break "field-weight order" becomes `title>aliases>tags>headings>summary>body`
+  (equal-weight pairs: title before aliases, headings before summary). Reason 2 (`heading`) still
+  fires only for title/headings; a top-idf match landing in aliases/summary is frontmatter
+  evidence → reason 3 (`lexical`) with the H1-fallback anchor, unless the note is a `d_moc==0`
+  linked theme.
+- **The §6 gate's theme-token set now includes `aliases` tokens** (and so does the reason-1
+  linked-theme set): an alias IS an alternate title, so a `d_moc==0` theme reachable by its alias
+  behaves exactly like one reachable by its title.
+- **`aliases` is exempt from length normalization (per-field `b`: aliases 0.0, all others 0.75 —
+  `FIELD_B`).** aliases is a sparse OPTIONAL field: with corpus-wide avgdl the BM25F denominator
+  `1 − b + b·len_f/avgdl_f` explodes for exactly the notes that HAVE aliases (a 42-note corpus
+  with one 2-token alias list gives avgdl≈0.05 → denom≈33 → effective weight ≈0.09, losing to a
+  single passing body mention), which would falsify the "title-equivalent 3.0" claim above. An
+  alias list is a tiny controlled set of alternate titles (L1-15-unique) — document-length
+  normalization carries no signal there, so `b=0` (denom=1). Scoring-only: the cache stores
+  tokens, so no schema re-bump; alias-free corpora are byte-identical either way.
+- **Curator write-path caveat (#57).** `normalize_plan` slugifies every model-proposed alias and
+  SKIPS un-slugifiable (e.g. pure-Korean) ones, so a curator-managed wiki cannot currently carry
+  a Korean alias — Korean-alias retrieval is a defensive capability for hand-edited or
+  externally-generated repos. #56 gives Korean aliases real search value, which weakens half of
+  #57's skip rationale ("zero search/link value"); revisiting that skip (e.g. separating the
+  closed link-token grammar from search-only aliases) is an explicit follow-up.
+
+### A3. `fm_enabled` flipped TRUE (executes §8 Phase-1b — no contract change)
+
+The §8 preconditions ("schema emitter + curator LINT land in Phase-1b") shipped long ago (the
+schema emitter and the L1 status-enum LINT are live since Phase 1). `FM_ENABLED = True` now:
+`active` +0.10, `deprecated` −0.15, all else 0. Without this, a `deprecated` note ties with the
+`active` note that superseded it — an ordering bug once #43 lifecycle transitions arrive. The
+normative reference column is now the §10 "fm=on" column.
+
+### A4. Cache + tests
+
+- `CACHE_SCHEMA_VERSION` 1 → 2 (`core/index_cache.py`): the cached `field_tokens` are derived by
+  the tokenizer/parser this addendum changes, so every v1 cache is invalidated whole (the read
+  path silently full-scans and the next deterministic build rewrites it — §2 as-built mechanics
+  unchanged).
+- No byte-pinned reference vectors existed to regenerate (the §10 numbers were always
+  illustrative; `tests/core/test_wiki.py` pins ordering/fields, not floats) — the #56 test
+  additions cover: Korean probes (plain Hangul, mixed-script `AI에이전트`, particle variation
+  `큐레이터가`→`큐레이터`, alias-mediated Korean→English-slug retrieval, a mandatory Korean
+  `not_found` negative), English rank-identity regression (the pre-existing ordering suite,
+  unchanged), active-beats-deprecated fm demotion, v1-cache invalidation, and double-index
+  byte-identity over a Korean corpus.
+- MCP (`kb_query`) and the web face both route through the one `Wiki.query` (verified; no face
+  change).
+- **Anchor scope for pure-CJK titles/headings.** The §6 slug rule stays ASCII-only, so a
+  title/heading with no `[a-z0-9]` material has anchor `""` — the documented no-deep-link value
+  (`SearchHit.anchor` MAY be `""`). The parser no longer fabricates dedup suffixes for empty
+  slugs (previously a note's second empty-slug heading shipped anchor `"-1"`, valid under no
+  slugger). A Unicode-preserving (GitHub-style) slug is deferred: `_Heading.slug` serializes into
+  the reader cache (another `CACHE_SCHEMA_VERSION` bump) and must first be reconciled with the
+  web face's markdown-it-py heading-id rule.
+- Korean-only matched lines return the whole line whitespace-collapsed (≤240 chars) as the
+  excerpt; the ±32-token excerpt window stays ASCII-token-based (§7 scope, unchanged contract).

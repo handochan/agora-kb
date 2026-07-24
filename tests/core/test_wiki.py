@@ -397,6 +397,84 @@ def test_score_is_six_decimals(tmp_path: Path) -> None:
         assert round(h.score, 6) == h.score
 
 
+def test_fm_demotion_active_beats_deprecated_twin(tmp_path: Path) -> None:
+    # ADR-0012 §8 Phase-1b, LIVE since the #56 addendum (FM_ENABLED=True): with identical bodies
+    # (identical lex/struct), the ACTIVE twin must outrank the DEPRECATED twin by the fm gap —
+    # path tie-break alone would order alpha (deprecated) first, so this proves fm differentiates.
+    root = tmp_path / "personal"
+    wikidir = root / "wiki" / "general"
+    wikidir.mkdir(parents=True)
+    (root / "index.md").write_text(
+        "# personal\n\n- [General MOC](wiki/general/general-moc.md)\n", encoding="utf-8"
+    )
+    (root / "wiki" / "general" / "general-moc.md").write_text(
+        "# General\n\n- [Alpha note](themes/alpha-note.md)\n- [Zeta note](themes/zeta-note.md)\n",
+        encoding="utf-8",
+    )
+    same_body = "# Title\n\nWidget calibration tolerance specification details here.\n"
+    (wikidir / "alpha-note.md").write_text(
+        "---\nstatus: deprecated\ntags: [widget]\n---\n" + same_body, encoding="utf-8"
+    )
+    (wikidir / "zeta-note.md").write_text(
+        "---\nstatus: active\ntags: [widget]\n---\n" + same_body, encoding="utf-8"
+    )
+    result = Wiki(RepoLayout(root)).query("widget calibration tolerance")
+    assert result.status == "ok"
+    twins = [h.path for h in result.hits if h.path.endswith("-note.md")]
+    assert twins.index("wiki/general/zeta-note.md") < twins.index("wiki/general/alpha-note.md")
+    scores = {h.path: h.score for h in result.hits}
+    gap = scores["wiki/general/zeta-note.md"] - scores["wiki/general/alpha-note.md"]
+    # active +0.10 vs deprecated -0.15 on otherwise-identical components → exactly 0.25 apart.
+    assert abs(gap - 0.25) < 1e-6
+
+
+def test_sparse_alias_beats_single_body_mention(tmp_path: Path) -> None:
+    # #56 review (FIELD_B): `aliases` is a sparse OPTIONAL field. Under plain corpus-wide avgdl
+    # the BM25F length denominator explodes for the ONE note that has aliases (avgdl_aliases→0),
+    # silently crushing the "title-equivalent 3.0" weight below a single passing body mention.
+    # With the aliases length-normalization exemption (b=0) the alternate-title match must outrank
+    # a note that merely mentions the phrase once in its body — on a mid-size corpus where the
+    # collapse actually manifests (tiny fixtures keep avgdl high and cannot observe it).
+    root = tmp_path / "personal"
+    themes = root / "wiki" / "general" / "themes"
+    themes.mkdir(parents=True)
+    (root / "index.md").write_text(
+        "# personal\n\n- [General MOC](wiki/general/general-moc.md)\n", encoding="utf-8"
+    )
+    moc_lines = ["# General", ""]
+    for i in range(40):  # alias-free filler notes crush avgdl_aliases toward 0
+        name = f"filler-{i:02d}"
+        (themes / f"{name}.md").write_text(
+            f"---\nstatus: active\nsummary: filler note {i} about an unrelated topic\n---\n"
+            f"# Filler {i}\n\nUnrelated prose about topic number {i} and nothing else.\n",
+            encoding="utf-8",
+        )
+        moc_lines.append(f"- [Filler {i}](themes/{name}.md)")
+    (themes / "shared-store.md").write_text(  # the query phrase appears ONLY in its aliases:
+        "---\nstatus: active\naliases: [memory hub]\n"
+        "summary: a shared persistence layer for agents\n---\n"
+        "# Shared Store\n\nAgents persist knowledge in a shared store across sessions.\n",
+        encoding="utf-8",
+    )
+    moc_lines.append("- [Shared Store](themes/shared-store.md)")
+    (themes / "session-notes.md").write_text(  # competitor: one passing body mention
+        "---\nstatus: active\nsummary: notes about session behavior\n---\n"
+        "# Session Notes\n\nSessions sometimes write to the memory hub in passing.\n",
+        encoding="utf-8",
+    )
+    moc_lines.append("- [Session Notes](themes/session-notes.md)")
+    (root / "wiki" / "general" / "general-moc.md").write_text(
+        "\n".join(moc_lines) + "\n", encoding="utf-8"
+    )
+    result = Wiki(RepoLayout(root)).query("memory hub")
+    assert result.status == "ok"
+    ranked = [h.path for h in result.hits]
+    alias_note = "wiki/general/themes/shared-store.md"
+    body_note = "wiki/general/themes/session-notes.md"
+    assert alias_note in ranked and body_note in ranked
+    assert ranked.index(alias_note) < ranked.index(body_note)
+
+
 def test_searchhit_is_frozen_and_forbids_extra() -> None:
     hit = SearchHit(
         repo="personal",
