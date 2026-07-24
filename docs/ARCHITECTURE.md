@@ -62,11 +62,15 @@ ingest/               INPUT adapters: uploads → markdown in raw/.
     office.py            markitdown / pandoc (docx, xlsx, pptx)
 
 faces/                The faces over core.
-  mcp_server.py       FastMCP: kb_remember / kb_query / kb_read / kb_neighbors / kb_status /
-                      kb_curate (kb_read/kb_neighbors reuse the note()/graph() read handlers, #58)
+  mcp_server.py       FastMCP: kb_remember / kb_query / kb_read / kb_neighbors / kb_context /
+                      kb_status / kb_curate (kb_read/kb_neighbors reuse the note()/graph() read
+                      handlers, #58) + the agora://gold/{pack} resource and gold_context prompt —
+                      all three gold channels wrap the same gold_pack() handler, serving the built
+                      _kb/gold/ pack byte-identically (ADR-0027 Phase C, #40)
   web/                FastAPI web face (ADR-0019): API-first JSON API (GET /api/{status,search,notes,
-                      notes/{path},graph}, POST /api/upload) + server-rendered HTMX/Jinja2 UI (browse,
-                      search, upload, knowledge graph, read-only dashboard); localhost no-auth
+                      notes/{path},graph,gold/{pack}}, POST /api/upload) + server-rendered
+                      HTMX/Jinja2 UI (browse, search, upload, knowledge graph, read-only dashboard);
+                      localhost no-auth
     app.py            build_app: the JSON API + HTMX routes; markdown-it-py render (XSS-safe), upload
                       extract→inbox write path (ADR-0020 — curator stays sole raw/ writer); GET /graph
                       + /api/graph + per-note local ego-graph (ADR-0021)

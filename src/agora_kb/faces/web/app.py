@@ -290,6 +290,26 @@ def build_app(*, repo_path: Path, writer: str = "web", user: str = "local") -> F
         """The medallion gold tier: the derived pack's presence, freshness vs silver, size, age."""
         return handlers.gold_status()
 
+    @app.get(
+        "/api/gold/{pack}",
+        tags=["api"],
+        summary="One built gold context pack, served byte-identically (ADR-0027 Phase C).",
+    )
+    def api_gold_pack(pack: str) -> dict[str, object]:
+        """Return ``{status: "ok", pack, text, meta}`` — the built ``_kb/gold/<pack>.md`` verbatim.
+
+        A THIN pass-through to :meth:`AgoraHandlers.gold_pack` — the SAME handler the MCP
+        ``kb_context`` tool / ``agora://gold/{pack}`` resource / ``gold_context`` prompt wrap (the
+        ADR-0019/0021 two-face lock; no logic in the route). ``text`` is byte-identical to the
+        built artifact (never reassembled — ADR-0027 decision 3); ``meta`` carries the sidecar
+        fields. A not-built pack or an invalid (traversal-unsafe) name maps to 404 with the
+        handler's actionable note (build guidance + the packs that do exist).
+        """
+        payload = handlers.gold_pack(pack)
+        if payload["status"] != "ok":
+            raise HTTPException(status_code=404, detail=str(payload["note"]))
+        return payload
+
     # --- Prometheus exposition (the operational half of the observability split) ----------------
     # NOT a JSON API endpoint: this serves the Prometheus text exposition format
     # (CONTENT_TYPE_LATEST), the operational time-series half of DESIGN §5.3's two-way split (heavy

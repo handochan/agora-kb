@@ -2,8 +2,9 @@
 
 The cognitive logic lives in transport-free :class:`AgoraHandlers`, so these tests drive it directly
 over a real on-disk repo (``tmp_path``) — no live MCP transport, no server I/O. A single smoke test
-exercises :func:`build_server` to confirm the 6 tools are registered (the #58 read-side companions
-``kb_read`` / ``kb_neighbors`` are exercised end-to-end in ``test_mcp_read_tools.py``).
+exercises :func:`build_server` to confirm the 7 tools are registered (the #58 read-side companions
+``kb_read`` / ``kb_neighbors`` are exercised end-to-end in ``test_mcp_read_tools.py``; the #40 gold
+channels — ``kb_context`` + resource + prompt — in ``test_gold_consumption.py``).
 """
 
 from __future__ import annotations
@@ -388,12 +389,21 @@ def test_mcp_client_roundtrip_capture_curate_query(tmp_path: Path) -> None:
 
 
 # --- build_server wiring smoke test -------------------------------------------------------------
-def test_build_server_registers_six_tools(tmp_path: Path) -> None:
+def test_build_server_registers_seven_tools(tmp_path: Path) -> None:
     _init_repo(tmp_path)
     server = build_server(repo_path=tmp_path, writer="local")
 
-    # The FastMCP instance constructs and carries the 6 agent tools — the original 4 plus the #58
-    # read-side companions (kb_read / kb_neighbors). The original 4 stay registered unchanged.
+    # The FastMCP instance constructs and carries the 7 agent tools — the original 4, the #58
+    # read-side companions (kb_read / kb_neighbors), and the #40 gold consumption tool
+    # (kb_context). The pre-existing 6 stay registered unchanged (regression lock).
     tools = asyncio.run(server.list_tools())
     names = {t.name for t in tools}
-    assert names == {"kb_remember", "kb_query", "kb_read", "kb_neighbors", "kb_status", "kb_curate"}
+    assert names == {
+        "kb_remember",
+        "kb_query",
+        "kb_read",
+        "kb_neighbors",
+        "kb_context",
+        "kb_status",
+        "kb_curate",
+    }

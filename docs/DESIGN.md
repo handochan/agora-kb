@@ -224,15 +224,19 @@ FastMCP over stdio (local) or Streamable HTTP (team). Tools:
 | `kb_query(question, scope?)` | read | return ordered evidence hits with path/anchor citations; optional later synthesis may use only those hits |
 | `kb_read(path)` | read | open one cited note: raw markdown body + frontmatter + outgoing link basenames; unknown/escaping path → `{error: "not_found"}` (#58, ADR-0012 rider) |
 | `kb_neighbors(path, depth?)` | read | the ADR-0021 link ego-graph around a note — nodes (`id` = rel_path, feeds `kb_read`) + directed edges; `depth` server-clamped and echoed (#58) |
+| `kb_context(pack?)` | read | the ADR-0027 gold context pack — the built `_kb/gold/<pack>.md` served **byte-identically** (standing context, not retrieval); not-built → `status: "not_built"` + build guidance (#40; a `scopes` param is reserved for federation, ADR-0030) |
 | `kb_status(scope?)` | meta | `{inbox_depth, last_consolidation, processed_today, failed}` |
 | `kb_curate(target, force?)` | admin | trigger a consolidation run now (also invoked by triggers) |
 
 One MCP registration = every MCP client (Claude Code, Codex, Qwen, Hermes, …) automatically gains
-these tools. No per-tool plugin needed.
+these tools. No per-tool plugin needed. The same registration also exposes the gold pack as an
+`agora://gold/{pack}` **resource** and a `gold_context` **prompt** (ADR-0027 decision 7, #40) —
+tool, resource, and prompt all wrap the same read-only handler the web `GET /api/gold/{pack}`
+serves, and all are pull-only (nothing is auto-injected).
 
 ### 5.2 Web app (people)
 Implemented (Phase 3 — ADR-0019/0020). `faces/web/app.py` is a **FastAPI** face that is
-**API-first**: a first-class JSON API (`GET /api/{status,search,notes,notes/{path},graph}`,
+**API-first**: a first-class JSON API (`GET /api/{status,search,notes,notes/{path},graph,gold/{pack}}`,
 `POST /api/upload`) plus a thin **server-rendered HTMX + Jinja2** UI over it (`/`, `/search`,
 `/note/{path}`, `/upload`, `/graph`). Run it with `agora web` (the optional `web` extra). Localhost, no-auth
 for now (auth is Phases 4–5). Both layers call the same core read helpers (`Wiki.list_notes` /
