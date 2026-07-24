@@ -94,8 +94,10 @@ Goal: humans contribute and observe via the browser.
 Goal: a few trusted people share repos over a private network.
 - [ ] `core.repo` multi-repo + team/personal kinds; write routing + read scope.
 - [ ] Single repo-owner service per working copy; gateways route captures to the owner (no competing clones).
-- [ ] MCP **Streamable HTTP** transport.
-- [ ] AuthN/AuthZ via **Forgejo delegation** (repos, teams, roles); token auth + Tailscale.
+- [ ] MCP **Streamable HTTP** transport — **coupled to the auth bullet below; must not ship
+      before it** (ADR-0036: no unauthenticated transport).
+- [ ] AuthN/AuthZ via **Forgejo delegation** (repos, teams, roles); token auth + Tailscale
+      ([ADR-0036](adr/0036-authn-authz.md), Proposed — the #69 gate ADR).
 - [ ] Shared git remote (Forgejo); Quartz read-only web view.
 **Exit:** two users, two teams + personal repos, hard-isolated, over the network.
 

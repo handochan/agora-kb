@@ -240,6 +240,14 @@ clone에는 git-tracked 전부(`wiki/`·`index.md`·`raw/`·`log.md`)가 있다 
 > **Footgun 3 — 백업은 `_kb/`를 보호하지 않는다.** push는 git-tracked 내용만 나른다.
 > **미큐레이션 inbox 이벤트·harvest 커서·gold 팩은 허브 디스크와 함께 유실될 수 있다**
 > (캡처→큐레이션 사이의 잔존 창). 중요 캡처가 쌓였으면 `agora curate` 후 `agora sync`.
+>
+> **Footgun 4 — 미러 curated 브랜치는 보호 브랜치여야 한다.** 미러 호스트에서 팀원에게
+> `push` 권한을 주면(향후 Phase-4 auth가 그 비트를 Agora writer 롤로 읽는다, ADR-0036 §2)
+> 그 권한은 **미러에 raw `git push`도 허용**한다 — 큐레이터를 우회한 바이트를 curated 브랜치에
+> 직접 밀어 넣어 `pull --ff-only`로 팀 전체에 복제될 수 있고(불변식 #2 우회), Agora는 이를
+> 감지하지 못한다(`agora doctor`는 원격 브랜치 보호 상태를 못 본다). 미러 curated 브랜치는
+> **보호 브랜치로 설정**해 **허브의 `agora sync` 배포 키만** 쓰게 하라. 팀원의 쓰기는 §3 SSH
+> MCP → inbox → 큐레이터 경로로만 간다.
 
 ## 5. 비밀 취급 — redaction 경계와 금지선
 
