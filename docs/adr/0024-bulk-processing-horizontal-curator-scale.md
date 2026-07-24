@@ -75,6 +75,11 @@ keeps separate: **(1)** horizontal scale **across** repos (N single-writer curat
 tuning); **(3)** TRUE intra-repo parallelism (≥2 curators editing one repo's wiki at once), which
 directly conflicts with invariant #2 / ADR-0002.
 
+> [!NOTE]
+> **Ratified Accepted in the 2026-07-05 Step-0 session (#36).** This ADR is append-only; the
+> "Proposed"-era headings and wording below are preserved verbatim as authoring-time (2026-06-24)
+> language.
+
 ## Proposed Decision
 **Parallelism is ACROSS repos only. One owner/curator per repo remains an invariant** (this ADR
 *extends*, never amends, ADR-0002/0006). "Multiple curators without conflict" is realized as **N
@@ -140,6 +145,11 @@ single-writer curators on N repos**, never as a second writer to one repo. Concr
    Both blockers exist for **unproven** benefit. Revisiting it requires both a superseding/amending ADR
    **and** a measured single-curator-saturation benchmark from §3's metrics. **Default expectation:
    no-go.**
+
+> [!NOTE]
+> **Accepted at Step-0 (#36), 2026-07-05** — the parenthetical below is authoring-time wording
+> (append-only ADR). OD-3 has since been resolved as **OD-3a** (`max_candidates_per_run` wired,
+> #60 — see the addendum below); the other sub-decisions remain deliberately deferred.
 
 ### Open sub-decisions (this ADR is Proposed; these are the deliberately-deferred choices)
 

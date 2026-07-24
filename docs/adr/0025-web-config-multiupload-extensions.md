@@ -64,6 +64,11 @@ first place a Phase-4 multi-tenant world leaks if it becomes a global mutable th
 graph render is settled (ADR-0021); this ADR only gives its two caps — and the upload limits and the
 extension allowlist — a single, per-repo, tenant-safe config home.
 
+> [!NOTE]
+> **Ratified Accepted in the 2026-07-05 Step-0 session (#36) and shipped in PR #33.** This ADR is
+> append-only; the "Proposed"-era headings and wording below are preserved verbatim as
+> authoring-time (2026-06-24) language.
+
 ## Proposed Decision
 1. **The shipped graph's hardcoded caps become `WebConfig`'s first consumers — post-merge.** The graph
    render is Accepted and shipped (ADR-0021); the only #29-remaining graph work is to lift
@@ -122,6 +127,11 @@ extension allowlist — a single, per-repo, tenant-safe config home.
    the same seam. A future #26 cache that speeds `list_notes` must transparently speed the graph too —
    both consume the **same** seam (a future `_kb/index/` derived cache), never a divergent path, so
    determinism (ADR-0009 / ADR-0012) and ranking stay shared.
+
+> [!NOTE]
+> **Accepted at Step-0 (#36), 2026-07-05** — the parenthetical below is authoring-time wording
+> (append-only ADR). The recommendations carried here were ratified and are the shipped behavior
+> (PR #33; see also the #66/#53/#67 appendices below).
 
 ### Open sub-decisions (this ADR is Proposed; these are the choices reviewers should ratify)
 - **D-a — Where settings live.** Options: (A) an optional `web:` block in `_kb/repo.yaml` parsed by

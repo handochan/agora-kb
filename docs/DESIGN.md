@@ -136,8 +136,10 @@ agent-neutral: the documented file channel is a CLAUDE.md-style include `@<repo>
 emission is wrapped in the normative `<!-- agora:pack … -->` … `<!-- agora:pack:end … -->` sentinel
 and the harvester drops that whole span, so an emitted pack round-trips to **zero** harvested facts
 (the outbound loop-break contract, ADR-0027 §8). Harvest-origin notes are default-excluded from packs
-so gold can never become a prompt-injection amplifier. The MCP `kb_context` tool + web `/api/gold`
-consumption channels are deferred to a follow-up (Phase C).
+so gold can never become a prompt-injection amplifier. The Phase-C consumption channels are
+**shipped** (#40 agora half): the MCP `kb_context` tool, the `agora://gold/{pack}` resource +
+`gold_context` prompt, and web `GET /api/gold/{pack}` — all pull-only wrappers over one read-only
+handler (§5.1).
 **Source assets are never-lossy:** an original captured file (pdf/pptx/…) is retained under
 `raw/`/`assets/` and linked from every note it feeds (`raw_ref`/`sources:`), and the curator's
 provenance union keeps that link even when the note's *content* deduplicates — no asset is ever
@@ -210,7 +212,8 @@ already demonstrates this list-or-mapping pattern (`config.py` `_load_taxonomy`)
 **list-only in all three readers today** (`config._load_taxonomy`, `ollama_brain.parse_taxonomy`,
 `schema/lint`), so the normalizer is **net-new** in each. The mapping form is additive: it does NOT
 bump `schema_version` (L1-17 untouched), the bare list stays valid indefinitely, and no migration
-command is needed. See ADR-0022 (Proposed) and DATA-MODEL §3.
+command is needed. See ADR-0022 (Accepted 2026-07-05, #36; this widening is the still-planned
+leg on the open card #24 — issue #23 itself is closed, its floor shipped) and DATA-MODEL §3.
 
 
 ## 5. Faces
@@ -272,13 +275,13 @@ write path the MCP face uses — the web face never reads or mutates `wiki/` / g
   single vendored MIT force-graph lib over a JSON graph endpoint (`GET /api/graph` + the `/graph`
   page) — the extended "single bolt-on charting" precedent, the first firing of the ADR-0019 §7
   escape hatch (a vendored client-side renderer with no Node/SPA toolchain) — **ADR-0021** (Accepted).
-  The render layer (route, template, vendored `force-graph.min.js`, per-note local-graph link) is
-  already shipped under ADR-0021; node/depth caps are hardcoded today (`MAX_GRAPH_NODES`/
-  `MAX_GRAPH_DEPTH`, `faces/mcp_server.py`). Those caps plus upload limits, the accepted-extension
-  allowlist, and feature toggles are *planned* to become operator-configurable via a reserved
-  optional `web:` block in (git-ignored, non-canonical — invariant 1) `_kb/repo.yaml`, resolved
-  **per-repo in `build_app(repo_path)`** (never a global mutable — tenant-safe for Phase 4,
-  invariant 5) rather than hardcoded; the graph caps are its first consumers — Proposed **ADR-0025**.
+  The render layer (route, template, vendored `force-graph.min.js`, per-note local-graph link)
+  shipped under ADR-0021. The node/depth caps, upload limits, the accepted-extension allowlist,
+  feature toggles, and the opt-in reverse-proxy identity header (#67) are **operator-configurable**
+  via the optional `web:` block in (git-ignored, non-canonical — invariant 1) `_kb/repo.yaml` —
+  parsed by `load_web_config` and resolved **per-repo in `build_app(repo_path)`** (never a global
+  mutable — tenant-safe for Phase 4, invariant 5); the graph caps were its first consumers —
+  **ADR-0025** (Accepted, shipped; see DATA-MODEL §3.1(d) for the settled shape).
 - Binary assets → `assets/`, referenced from notes (outside the navigation graph).
 
 ### 5.3 Dashboard (status, read-only)
@@ -317,8 +320,8 @@ fail-closed scope lock + provenance — with **no core change** (each source is 
 > connector** (agent transcripts → deterministically-distilled candidates, with connector-boundary
 > secret redaction before the immutable inbox write) is **shipped** (#25, ADR-0023 Accepted). The API
 > connectors (Letta, mem0) remain Phase 5; the remaining work-context classes below
-> (`dir:`/`git:`/`mail:`/`chat:`/`calendar:`) are **Proposed** (#28) under the same ADR-0023
-> taxonomy / OSS-paths / safety envelope.
+> (`dir:`/`git:`/`mail:`/`chat:`/`calendar:`) are **planned** (#28) under the same (Accepted)
+> ADR-0023 taxonomy / OSS-paths / safety envelope.
 
 **Source classes** — all flow through the one triad and map to `source=harvest:<agent>` (no new inbox
 `source` enum member; the parametric `harvest:<agent>` form already covers every class):
@@ -326,12 +329,12 @@ fail-closed scope lock + provenance — with **no core change** (each source is 
 | Source class | Connector key | OSS path | Status |
 |---|---|---|---|
 | Agent memory files | `file:<agent>` (`letta:`/`mem0:` API) | `MEMORY.md`-shaped markdown glob | **shipped** (file); Letta/mem0 Phase 5 |
-| Local working folders | `dir:<agent>` | filesystem walk | Proposed (ADR-0023) |
-| Git repos | `git:<agent>` | plain git (commit/diff) | Proposed (ADR-0023) |
+| Local working folders | `dir:<agent>` | filesystem walk | planned (#28, ADR-0023) |
+| Git repos | `git:<agent>` | plain git (commit/diff) | planned (#28, ADR-0023) |
 | Agent sessions | `session:<agent>` | transcript glob (e.g. `~/.claude/projects/**/*.jsonl`) | **shipped** (#25, ADR-0023) |
-| Mail | `mail:<agent>` | IMAP/JMAP (Gmail/Graph optional) | Proposed (ADR-0023) |
-| Chat | `chat:<agent>` | Matrix (Slack/Teams optional) | Proposed (ADR-0023) |
-| Calendar | `calendar:<agent>` | CalDAV (Google/MS optional) | Proposed (ADR-0023) |
+| Mail | `mail:<agent>` | IMAP/JMAP (Gmail/Graph optional) | planned (#28, ADR-0023) |
+| Chat | `chat:<agent>` | Matrix (Slack/Teams optional) | planned (#28, ADR-0023) |
+| Calendar | `calendar:<agent>` | CalDAV (Google/MS optional) | planned (#28, ADR-0023) |
 
 Connector-type key grammar is `<type>:<agent>` — `session:`/`dir:`/`git:`/`mail:`/`chat:`/`calendar:`
 join the existing `file:`/`letta:`/`mem0:`. `build_connectors` dispatches on the type prefix and
@@ -347,7 +350,8 @@ the base):
 | **Noise pollution** | harvested items are `kind=candidate` / `confidence=low` → must pass the curator review gate before promotion to `wiki/`; never written directly |
 | **Privacy leakage** | scope enforcement: a personal source feeds **only** the personal repo, never a team repo; team harvest requires explicitly-designated team sources; consent-based |
 
-Three additional rules govern the noisier, higher-volume context sources (Proposed, ADR-0023):
+Three additional rules govern the noisier, higher-volume context sources (ADR-0023, Accepted;
+rule (a) is live in the shipped `session:` connector, the #28 classes remain planned):
 
 - **(a) Connector-boundary distillation + redaction.** Noisier sources (sessions/mail/chat) are
   reduced by **deterministic, model-free** distillation and **PII/secret redaction** at the connector
@@ -366,7 +370,7 @@ Three additional rules govern the noisier, higher-volume context sources (Propos
   reserved; opt-in dry-run/staging only, never auto-writes back to an agent).
 
 Effect: Agora becomes the **shared long-term memory of all the user's/team's agents and work
-context** — the "memory of memories." (ADR-0007; broadening Proposed under ADR-0023.)
+context** — the "memory of memories." (ADR-0007; broadened by the Accepted ADR-0023.)
 
 ## 7. Multi-tenancy & access control
 
@@ -388,7 +392,8 @@ External editors are read/browse tools by default. Direct edits to `wiki/` are u
 curator owns the branch; human contributions use `kb_remember`/upload, or a review-mode PR that the
 repo owner imports. This preserves the single-writer invariant.
 
-**Personal + team compose at read time, not by merging** ([ADR-0030](adr/README.md), Phase-4-coupled).
+**Personal + team compose at read time, not by merging** ([ADR-0030](adr/README.md) — reserved,
+not yet authored; Phase-4-coupled).
 Connecting to a team does not spin up a second Agora or merge repos: personal and team stay separate
 git repos, each with its own single-writer curator. A client-side scope profile
 (`~/.agora/profile.yaml`, outside every repo) lists the repos the caller reads, and queries/gold packs
@@ -456,7 +461,10 @@ sentinel/loop-break contract (Accepted). Reserved: **0028** LLM `DISTILL` curato
 (evidence-triggered); **0029** connector ecosystem — the exec "CWP" wire + registration UX + injection
 re-consent (evidence-triggered); **0030** federation / team composition + promotion airlock
 (Phase-4-coupled); **0031** retention / right-to-delete (a hard prerequisite for `mail:`/`chat:`
-connectors).
+connectors). Reserved-exploratory (2026-07, [docs/notes/retrieval-vs-vectordb.md](notes/retrieval-vs-vectordb.md)):
+**0032** semantic embedding tier as a strictly-additive tail (would supersede 0012 §11); **0033**
+pending-read / read-your-own-write overlay; **0034** bulk map-parallel curation (extends 0024);
+**0035** hybrid tri-signal fusion (layers on 0032) — all evidence-triggered, not yet authored.
 
 **Plane law (V7).** Agora is the **memory plane**; a companion execution runtime (e.g. aelix) is the
 **execution plane** (task boards, self-improving skills); "hermes" is a flagship **distribution

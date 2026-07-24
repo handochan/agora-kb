@@ -80,6 +80,11 @@ additive over #23.
 This collides with load-bearing decisions (D6, §6.1, §4.0), so per the repo invariants it requires an
 ADR.
 
+> [!NOTE]
+> **Ratified Accepted in the 2026-07-05 Step-0 session (#36).** This ADR is append-only; the
+> "Proposed"-era headings and wording below are preserved verbatim as authoring-time (2026-06-24)
+> language.
+
 ## Proposed Decision
 Establish a **governed taxonomy-evolution lane** and a **tuning-surface-only per-domain customization
 lane**. The sandboxed brain may **NEVER** directly widen `_meta/taxonomy.yaml`; that property of D6 is
@@ -191,6 +196,12 @@ team repos included — would auto-apply brain-proposed domains with no review, 
 anti-sprawl guarantee this ADR sells. This is single-writer-safe (the worker, not the brain, writes
 `_meta/`, so invariant #2 is intact) but is a governance hole, so the repo-kind-aware default and
 CREATE_DOMAIN land **together**. Keep the integrity gate domain-agnostic throughout.
+
+> [!NOTE]
+> **Adjudicated at Step-0 (#36), 2026-07-05** — the heading below keeps its authoring-time
+> "Proposed / not yet ratified" wording (append-only ADR); see the issue #36 record for the
+> ratified dispositions, the §A amendment above for the landed #23 floor, and the #57 addendum
+> below.
 
 ### Open sub-decisions (Proposed; recommendations carried but not yet ratified)
 1. **Where a domain is born — INGEST op vs admin-only path.**

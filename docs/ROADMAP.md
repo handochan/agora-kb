@@ -25,7 +25,7 @@ Goal: a single local markdown repo with capture, scheduled consolidation, and qu
 **Exit:** capture from any MCP client → curator atomically files it → deterministic query returns it
 with path/anchor citations; injected or failed backend output cannot modify the live wiki.
 
-## Phase 2 — Pluggable brains + harvester (current/next)
+## Phase 2 — Pluggable brains + harvester — DONE (shipped; live-verified on 4 real brains)
 Goal: tool-agnostic curator and autonomous accumulation, still single-user.
 - [x] `curator.backends` registry from `adapters.yaml`; verify ≥3 brains (qwen, claude, hermes) +
       per-task routing. Per-act `plan`/`author` routing (ADR-0015) + a generic CLI-agent brain shim
@@ -111,47 +111,60 @@ Goal: production-grade access control and review.
 
 ## Backlog (post-Phase-3) / corporate-AX — re-sequenced
 
-The seven backlog issues (#23–#29) re-sequenced into phases. **No invariant changes**: every item is
-additive over the existing seams (read-connectors/extractors per ADR-0004, the candidate gate +
-scope + provenance triad per ADR-0007, the single-writer curator per ADR-0002, markdown-SSOT per
-ADR-0001). Load-bearing pieces are tracked to **Proposed** ADRs and presented as *planned*, not
-settled. The graph piece of #29 is already **shipped** on `feat/web-knowledge-graph-viz` (tip
-`1bad37e`): the vendored MIT force-graph render over a JSON graph endpoint, the per-note ego-graph,
-and `AgoraHandlers.graph()` (caps `MAX_GRAPH_NODES`/`MAX_GRAPH_DEPTH` at `mcp_server.py:59-60`) all
-land under the **Accepted ADR-0021** — the first firing of the ADR-0019 §7 escape hatch. So #29's
-*remaining* scope here is config/upload/extensions, **not** the graph render.
+**Planning SSOT has moved.** The live backlog is the GitHub Project **"agora dev"** (project #2,
+owner `handochan`) plus the vision spine in DESIGN §10; this file keeps the *phase history and
+sequencing rationale*, not the card-by-card queue. Representative open cards: #24 per-domain
+customization, #27 horizontal curator scale, #28 corporate context connectors, #41 federation 3.6a,
+#69 the authn/authz ADR (the Phase-4 gate), #70 deployment-readiness tracking, #55 strategy review
+2026-07 — see the board for the full, current list. **No invariant changes** in any of it: every
+item is additive over the existing seams (read-connectors/extractors per ADR-0004, the candidate
+gate + scope + provenance triad per ADR-0007, the single-writer curator per ADR-0002, markdown-SSOT
+per ADR-0001).
 
-ADR numbering for the new work (ADR-0021 is the graph, already Accepted): taxonomy governance =
-**ADR-0022**, context-harvester connectors = **ADR-0023**, bulk/horizontal scale = **ADR-0024**,
-web config/multi-upload/extensions = **ADR-0025**, skill-suggestion write-back = **ADR-0026**
-(reserved, deferred).
+The original seven backlog issues (#23–#29) were re-sequenced into the phases below. Their
+load-bearing pieces were designed as ADRs **0022–0025** — all four **Accepted** in the 2026-07-05
+Step-0 ratification session (#36) and, together with ADR-0027 (gold packs), largely **shipped**
+since (see Phases 3.5/3.6). The graph piece of #29 shipped earlier via PR #30 on `main` under the
+**Accepted ADR-0021** (vendored MIT force-graph render over `GET /api/graph` + `/graph`, per-note
+ego-graph, `AgoraHandlers.graph()`) — the first firing of the ADR-0019 §7 escape hatch.
+Skill-suggestion write-back keeps **ADR-0026** reserved (not yet authored).
 
-### Phase 3.5 — Web hardening + throughput floor (pull-forward; additive over ADR-0019/0020/0021)
-Low-risk, repo-local, OSS-safe; lands post-Phase-3 with no invariant change.
-- [ ] **#29 web enhancement (config/upload/extensions).** The knowledge-graph render is already shipped
-      (Accepted ADR-0021); this slice is the post-merge follow-up tracked to a new **ADR-0025 —
-      web config, multi-upload, extensions** (Proposed). Lift the two hardcoded graph caps
-      (`MAX_GRAPH_NODES`/`MAX_GRAPH_DEPTH`, `mcp_server.py:59-60`) into an operator-configurable
-      `web.graph.{max_nodes,max_depth}` (the first consumer of the new `web:` block). Add drag-and-drop
-      **multi-upload** (each file → one independent ADR-0020 extract→inbox capture + a per-file batch
-      receipt, best-effort not atomic; per-batch max-files/total-bytes caps; curator stays sole writer
-      of `raw/`) and **broadened extractors** behind the `ingest` extra via the `extractors/base.py`
-      dispatch (`.txt`/`.md` dependency-free passthroughs; widen markitdown routing to
-      html/csv/json/epub — already pinned, no new dep; image-OCR/audio DEFERRED behind their own opt-in
-      extra + ADR-0005 license vetting). Add a `web:` block in git-ignored `_kb/repo.yaml`
-      (`web.graph.{max_nodes,max_depth}`, `web.upload.{max_bytes,max_files,allowed_extensions}`,
-      `web.features.{graph_enabled}`) resolved **per-repo** in `build_app(repo_path)` (never a global
-      mutable — tenant-safe for Phase 4, invariant #5); silently-ignored-if-unwired, same pattern as
-      today's forward-looking keys (DATA-MODEL §3). Plus an untrusted-input hardening pass
-      (decompression-bomb caps, SVG/HTML XSS, per-batch caps — the bomb cap + the #66 SSRF guard
-      later landed via #53/#66, ADR-0025 appendix). Update DESIGN §5.2 (multi-upload +
-      extensible formats; the read-only `/graph` already documented under ADR-0021).
-- [ ] **#26 search index.** Implement the **Accepted** ADR-0012 derived ranking cache as a rebuildable,
-      git-ignored `_kb/index/` (metadata/index, never canonical — ADR-0001) with an optional
-      CPython-bundled FTS5 prefilter behind the deterministic-query contract (ADR-0009); the pure-Python
-      BM25F stays the oracle. This is an **implementation of the already-Accepted ADR-0012, not a new
-      ADR**. Rebuildable-from-markdown is a hard requirement; **semantic/vector** stays deferred (see
-      below), with #28 corporate volume as the explicit future trigger.
+### Phase 3.5 — Web hardening + throughput floor — DONE (pull-forward; additive over ADR-0019/0020/0021)
+Low-risk, repo-local, OSS-safe; landed post-Phase-3 with no invariant change.
+- [x] **#29 web enhancement (config/upload/extensions) — DONE (ADR-0025, Accepted; shipped via
+      PR #33; issue closed).** The knowledge-graph render itself had already shipped under ADR-0021
+      (PR #30); this slice landed the rest. The two previously-hardcoded graph caps
+      (`MAX_GRAPH_NODES`/`MAX_GRAPH_DEPTH`) were lifted into an operator-configurable
+      `web.graph.{max_nodes,max_depth}` — the first consumers of the new top-level `web:` block in
+      git-ignored `_kb/repo.yaml`, parsed by `load_web_config` and resolved **per-repo** in
+      `build_app(repo_path)` (never a global mutable — tenant-safe for Phase 4, invariant #5).
+      Drag-and-drop **multi-upload** shipped (each file → one independent ADR-0020 extract→inbox
+      capture + a per-file batch receipt, best-effort not atomic; per-batch max-files/total-bytes
+      caps; curator stays sole writer of `raw/`), as did **broadened extractors** behind the
+      `ingest` extra via the `extractors/base.py` dispatch (`.txt`/`.md` dependency-free
+      passthroughs; markitdown routing widened to html/csv/json/xml; image-OCR/audio stay DEFERRED
+      behind their own opt-in extra + ADR-0005 license vetting). The untrusted-input hardening pass
+      landed later as ADR-0025 appendix items (Phase 3.6): the extractor-layer SSRF guard +
+      `web.upload.url_enabled` off-switch (#66), the zip decompression-bomb actual-size cap +
+      `.epub` (#53), and reverse-proxy identity threading `web.identity.trusted_header` (#67);
+      SVG/HTML XSS stays covered at render time (markdown-it `html=False`).
+- [x] **#26 search index — DONE (implements the already-Accepted ADR-0012 §2, not a new ADR;
+      shipped via PR #52; issue closed).** The derived ranking/reader cache is a rebuildable,
+      git-ignored `_kb/index/<repo>.notes.json` (metadata/index, never canonical — ADR-0001) behind
+      the deterministic-query contract (ADR-0009); the pure-Python BM25F remains the oracle, and
+      `agora index build/status/clear` manages the cache. The optional CPython-bundled FTS5
+      prefilter was deferred (with #28 corporate volume as the explicit trigger), as was
+      **semantic/vector** (see below). Later extended by #56 (Korean search: NFC + CJK-bigram
+      tokenization, `aliases`/`summary` scoring fields, frontmatter demotion, cache v2 — ADR-0012
+      addendum, Phase 3.6).
+- [x] **#37 gold context packs — DONE (ADR-0027 Phase A/B; landed on `main` @ `f846dd6`; issue
+      closed).** The derived **gold** tier: `_kb/gold/<pack>.md` + `.meta.json` — a pure,
+      deterministic, token-budgeted function of (curated commit, pack spec), assembled by
+      reader-class code (`core/gold.py` `PackAssembler`) from validator-gated theme summaries (no
+      LLM, no new curator op, nothing writes `wiki/`/the inbox/indexes); built best-effort at
+      curator finalize, on `agora gold build`, and lazily on read. Ships the single normative
+      outbound sentinel + loop-break contract (ADR-0027 §8: an emitted pack round-trips to zero
+      harvested facts). The Phase-C consumption channels landed later (#40 agora half — Phase 3.6).
 - [x] **#27 (part) bounded-batch claim + batch observability — DONE via #60 (ADR-0024 OD-3a addendum,
       Phase 3.5).** The already-specified `max_candidates_per_run` (INGEST-CONTRACT §1.3, default 32) is
       WIRED: `load_repo_config` parses it and `claim()` slices the FIFO head at that many distinct
@@ -173,10 +186,45 @@ Low-risk, repo-local, OSS-safe; lands post-Phase-3 with no invariant change.
       literal `general` (which `repo init --domain foo,bar` erases). The governed CREATE_DOMAIN lane +
       per-domain customization remain Phase-4-coupled below.
 
+### Phase 3.6 — Deployability + retrieval quality — DONE (shipped 2026-07-24/25; pre-Phase-4 hardening)
+The 2026-07-23 design review's "make it deployable and actually retrievable" batch — all additive,
+no invariant change; auth itself stays Phase 4 (#69 tracks the gating authn/authz ADR, #70 tracks
+deployment readiness).
+- [x] **#56/#57 Korean-language P0 pair.** #56 Korean *search*: NFC normalization + CJK-bigram
+      tokenization, `aliases`/`summary` scoring fields, frontmatter demotion, index cache v2
+      (ADR-0012 addendum). #57 Korean *knowledge loss*: a purely-Korean seed no longer slugifies to
+      `""` and silently downgrades to DROP — `note-<sha8>` filename fallback + an output-language
+      directive + summary boundary truncation (ADR-0022 addendum).
+- [x] **#58 `kb_read` + `kb_neighbors` MCP tools.** Completes the agentic navigation loop
+      (query → open a cited note → walk its link ego-graph); both are thin wrappers over the
+      existing `note()`/`graph()` read handlers (ADR-0012 rider / ADR-0021).
+- [x] **#40 (agora half) gold Phase-C consumption channels.** `kb_context` MCP tool +
+      `agora://gold/{pack}` resource + `gold_context` prompt + web `GET /api/gold/{pack}` — all
+      pull-only wrappers over one read-only handler serving the built pack byte-identically
+      (ADR-0027 addendum). The aelix-bridge half of #40 stays open.
+- [x] **#60 bounded-batch claim cap** — see the #27-part item under Phase 3.5 (same landing;
+      ADR-0024 OD-3a).
+- [x] **#64 `agora sync`.** Push-only git remote backup: explicit `agora sync`, opt-in `watch`
+      auto-push after a published run, and an `agora doctor` remote line. No pull/merge — the
+      remote is a backup target, never a second writer (ADR-0002 intact).
+- [x] **#65 always-on packaging.** `deploy/` launchd + systemd unit templates for `watch`/`web`,
+      including a separate harvest schedule (`watch` deliberately does not run harvests).
+- [x] **#66/#53 upload hardening.** Extractor-layer SSRF guard (private-network block) + the
+      `web.upload.url_enabled` operator off-switch for the url extractor (#66); zip
+      decompression-bomb *actual-size* cap + `.epub` joins the accepted extensions (#53). Both
+      recorded as the ADR-0025 appendix.
+- [x] **#67 per-user identity threading.** Opt-in `web.identity.trusted_header` (reverse-proxy
+      username header) → per-user `web:<user>` writer namespace + provenance; fail-loud config
+      (a typo'd security key never silently disables it). ADR-0025 appendix.
+- [x] **#68 team deployment guide.** [`docs/DEPLOY-TEAM.md`](DEPLOY-TEAM.md) — hub topology for
+      2–10 people pre-Phase-4 (reverse-proxy auth, SSH forced-command, footguns).
+
 ### Phase 4-coupled — Governed taxonomy + per-domain + personal connectors (multi-tenant-adjacent)
 Gated on / co-developed with Phase-4 multi-tenancy where a source is team/shared.
-- [ ] **#23/#24 governed CREATE_DOMAIN lane + per-domain customization.** New **ADR-0022 — curator
-      taxonomy governance** (Proposed): record that domain creation is a *governed* lane, **not** a
+- [ ] **#23/#24 governed CREATE_DOMAIN lane + per-domain customization.** *(Issue #23 itself is
+      closed — its no-loss floor + thresholds shipped in Phase 3.5; this remaining lane is tracked on
+      the open card #24.)* **ADR-0022 — curator
+      taxonomy governance** (Accepted 2026-07-05, #36): domain creation is a *governed* lane, **not** a
       relaxation of ADR-0010 D6 inside INGEST — the sandboxed brain may NEVER directly widen
       `_meta/taxonomy.yaml`; it only PROPOSES, the deterministic worker applies. The (currently inert)
       `taxonomy_policy` + L1-18 get their job on the creation lane only: `open` = deterministic
@@ -212,7 +260,7 @@ Gated on / co-developed with Phase-4 multi-tenancy where a source is team/shared
       `core/redact.py` wiring + `harvest.redact.{enabled,pii,allow,deny}` config +
       `HarvestCursor.redacted` counter deferred from #39 all landed here); the `SessionReader` seam
       (`ClaudeCodeJsonlReader`) keeps it tool-agnostic. **#28 (`dir:`/`git:`/`mail:`/`chat:`/`calendar:`)
-      still Proposed** under the same ADR-0023 envelope. Reframe the
+      still planned** under the same (Accepted) ADR-0023 envelope. Reframe the
       harvester (ADR-0007, DESIGN §6) from "agent MEMORY files" to "agent memory AND working-context
       sources" via **ADR-0023 — context-harvester connectors** — same gate/scope/provenance,
       no new core path (orchestrator/cursor/gate/scope reused; only `build_connectors` gains type
@@ -236,7 +284,8 @@ Gated on / co-developed with Phase-4 multi-tenancy where a source is team/shared
 ### Phase 5 — Cross-host single-writer + networked corporate sources + skill write-back
 - [ ] **#27 repo→owner fencing lease + sharder.** Promote the scattered one-liners into one rule:
       **shard BY REPO, never within a repo** (ARCHITECTURE §2 / DESIGN §7), tracked to **ADR-0024 —
-      bulk processing / horizontal curator scale** (Proposed). The per-repo `flock` is host-local
+      bulk processing / horizontal curator scale** (Accepted 2026-07-05, #36; its OD-3 has since
+      been resolved as OD-3a — the #60 batch cap, Phase 3.5/3.6). The per-repo `flock` is host-local
       (`fcntl`), so the CAS on the single curated ref (`repo.py compare_and_swap_branch` updates one ref)
       is the only cross-host net — two hosts merely SERIALIZE (loser discards, never corrupts), wasteful
       not unsafe. Sub-items: **(5a)** repo→owner assignment + fencing lease (git-ref CAS + fencing token,
@@ -264,8 +313,10 @@ Gated on / co-developed with Phase-4 multi-tenancy where a source is team/shared
       is the genuinely-open piece, gated on a CONCRETE evidence trigger (inbox backlog depth or per-run
       DROP-rate from #27's metrics), not "until volume exists". DESIGN §6 broadens "Memory harvester" →
       "Context harvester" with a source-class table.
-- [ ] **#25 skill-suggestion write-back.** Opt-in, **never auto-write** to a locally-installed agent;
-      needs its **own ADR-0026** (Proposed, reserved) — sequenced after the #28 context-collection
+- [ ] **#25 skill-suggestion write-back.** *(Issue #25 itself is closed — it shipped the `session:`
+      connector half; this write-back leg has no open board card yet and awaits its own ADR.)* Opt-in,
+      **never auto-write** to a locally-installed agent;
+      needs its **own ADR-0026** (reserved, not yet authored) — sequenced after the #28 context-collection
       design, mirroring how Letta/mem0 write-back was deferred. Acceptance criteria: opt-in flag, emits a
       proposed `SKILL.md` to stdout or `_kb/staging/` only, NEVER writes `~/.claude/skills`, a
       human-confirm gate, and a test asserting no filesystem write outside the staging dir. Note (recorded
