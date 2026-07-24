@@ -215,3 +215,40 @@ extension allowlist — a single, per-repo, tenant-safe config home.
    office/epub (close the `office.py:56-57` deferral), SVG/HTML sanitization in passthrough markdown
    (markdown-it `html=False` already covers render-time), per-batch caps; a guard test each. Localhost
    footgun bounds now, Phase-4-ready structure.
+
+## Appendix (2026-07-25, append-only) — rec D `.epub` lands + the two upload-hardening guards (issues #66/#53)
+
+Nothing above changes. The "untrusted-input hardening pass" (implementation-sketch item 6) and the
+deferred `.epub` half of rec D shipped together as the **network-exposure gate** for team
+deployments (the prerequisites the #68 deployment guide points at):
+
+- **SSRF guard (#66) — extractor layer.** `extract_url` now performs the fetch itself (stdlib
+  `http.client`, trafilatura keeps the content extraction, fed the fetched bytes): http/https only;
+  every resolved address of **every hop** must be public — RFC1918, loopback (127/8, `::1`),
+  link-local (169.254/16 incl. the 169.254.169.254 metadata endpoint, `fe80::/10`), unique-local
+  (`fc00::/7`), unspecified, multicast, reserved, and any other non-global range refuse, and ONE
+  private A record fails the whole set (fail closed). The TCP connection is **pinned to the
+  validated IP** while `Host`/SNI/certificate checks keep the original hostname (DNS-rebinding
+  defence); redirects are followed manually (≤5) and re-validated per hop; the body is capped at
+  25 MiB. Blocked → `ExtractorError` → the face's existing 422. `extract_url(...,
+  allow_private=True)` is the local-caller opt-out seam (`extract()` forwards it); the web face
+  never sets it. (No CLI command fetches URLs today — `agora import` is vault-only — so the
+  `--allow-private-urls` flag lands with whatever CLI URL surface arrives first.)
+- **Operator switch — `web.upload.url_enabled`** (default `true`): `false` refuses url capture with
+  403 **before any resolve/connect**. This is the switch a team deployment can flip; the extractor
+  guard above stays on regardless.
+- **Zip decompression-bomb cap (#53) — extractor layer.** `office.py` guards zip-magic bytes
+  (docx/xlsx/pptx/epub) via stdlib `zipfile` in two layers **before** markitdown decompresses
+  anything: (1) a cheap DECLARED-total pre-check rejects honest bombs without decompressing, and
+  (2) because declared sizes are attacker-forgeable smaller than the real payload, each member is
+  streamed through a size-capped reader that measures the ACTUAL decompressed length and aborts the
+  moment the running total crosses the cap. Exceeding `web.upload.max_uncompressed_bytes` (default
+  250 MiB = 10× the 25 MiB compressed per-file cap, under a 256 MiB ceiling) → `ExtractorError` →
+  422 (an archive's expansion is a content property, distinct from the face's 413 wire-size
+  tolerance). Layer (2) is load-bearing: `ZipExtFile` truncates its *returned* bytes to the declared
+  size but only *after* `zlib` has already expanded the chunk in memory (up to 1 GiB per read-all),
+  so the declared-size pre-check alone does not bound an under-declared entry — measuring the true
+  decompressed length is what closes the forged-smaller case.
+- **rec D `.epub`** — routed to the markitdown path (`_MARKITDOWN_EXTS` +
+  `application/epub+zip`); **no new dependency** (markitdown's epub converter is core), same bomb
+  guard applies. Image OCR / audio transcription remain deferred on rec D's own terms.

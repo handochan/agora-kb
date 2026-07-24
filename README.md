@@ -125,7 +125,11 @@ knowledge graph (plus a per-note local/backlink graph; canvas drag/zoom/click �
 MIT force-graph, no Node — ADR-0021), a read-only **`/dashboard`**
 (KB health · curator · harvester · gold-pack status, HTMX-polled), and a Prometheus **`/metrics`**
 endpoint for external scraping. It binds to `127.0.0.1` by default and ships no authentication — keep
-it local.
+it local. The upload surface is hardened for the day you do share it (the team-deployment guide,
+issue #68): server-side URL fetches are SSRF-guarded (private/loopback/link-local/metadata targets
+and redirects into them are refused) and can be disabled outright with `web.upload.url_enabled:
+false`, and zip-based uploads (docx/xlsx/pptx/epub) are capped against decompression bombs via
+`web.upload.max_uncompressed_bytes` (ADR-0025 appendix).
 
 **Gold context packs (ADR-0027).** Above the searchable wiki, Agora assembles a **gold** tier: a
 small, token-budgeted, byte-stable slice of your highest-value theme notes, meant to be injected at

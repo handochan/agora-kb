@@ -215,8 +215,10 @@ def build_app(*, repo_path: Path, writer: str = "web", user: str = "local") -> F
         with ``source = web:<user>``. Returns the ``{id, queued, inbox_depth}`` receipt — the item
         is searchable only after the next curator run (eventual consistency, DESIGN §2.2).
 
-        Errors map to HTTP: unsupported/empty input → 400, oversize → 413, malformed/garbage input
-        → 422 (:class:`ExtractorError`), a missing ``ingest`` dependency → 503
+        Errors map to HTTP: unsupported/empty input → 400, url capture disabled by the operator
+        (``web.upload.url_enabled: false``) → 403, oversize → 413, malformed/garbage input — incl.
+        an SSRF-blocked URL (issue #66) or a decompression-bomb archive (issue #53) → 422
+        (:class:`ExtractorError`), a missing ``ingest`` dependency → 503
         (:class:`ExtractorUnavailable`, with the install remedy).
         """
         receipt = await _do_upload(
@@ -535,8 +537,10 @@ async def _do_upload(
     (ADR-0020), and the result is appended to the inbox with ``source = web:<user>``. The per-file
     size limit + the allowed-extension gate come from the operator's :class:`WebConfig` (ADR-0025).
     Raises :class:`fastapi.HTTPException` for the documented error cases (no input/empty → 400,
-    oversize → 413, blocked extension → 415, extractor failure → 422, missing dependency → 503, and
-    a non-kebab tag or other inbox-model validation failure → 422).
+    url capture disabled by the operator → 403, oversize → 413, blocked extension → 415, extractor
+    failure — incl. an SSRF-blocked URL or a decompression-bomb archive → 422, missing dependency
+    → 503, and a non-kebab tag or other inbox-model validation failure → 422). The URL fetch runs
+    with the extractor's SSRF guard ON (never ``allow_private`` — issue #66).
     """
     url_val = (url or "").strip() or None
     text_val = text if (text and text.strip()) else None
@@ -550,8 +554,19 @@ async def _do_upload(
             mime=file.content_type,
             max_bytes=max_bytes,
             allowed=web_config.extensions.allowed,
+            max_uncompressed_bytes=web_config.upload.max_uncompressed_bytes,
         )
     elif url_val is not None:
+        if not web_config.upload.url_enabled:
+            # The operator's team-deployment switch (issue #66 / the #68 guide): server-side URL
+            # fetching is OFF wholesale — refuse BEFORE any resolve/connect happens.
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    "url capture is disabled by the operator "
+                    "(web.upload.url_enabled: false in _kb/repo.yaml)."
+                ),
+            )
         doc = _extract(url=url_val)
         markdown = (
             _provenance_header(
@@ -647,6 +662,7 @@ async def _do_upload_batch(
                 mime=mime,
                 max_bytes=web_config.upload.max_bytes,
                 allowed=web_config.extensions.allowed,
+                max_uncompressed_bytes=web_config.upload.max_uncompressed_bytes,
             )
             receipt = _remember_markdown(handlers, markdown, user=user, domain=domain, tags=tags)
         except HTTPException as exc:
@@ -669,13 +685,17 @@ def _file_to_markdown(
     mime: str | None,
     max_bytes: int,
     allowed: list[str] | None,
+    max_uncompressed_bytes: int,
 ) -> str:
     """Size-check + extension-gate + extract one file's bytes → provenance-stamped markdown.
 
     The single per-file branch shared by :func:`_do_upload` and :func:`_do_upload_batch` (DRY, no
     behaviour drift). Enforces the per-file ``max_bytes`` (413) and the optional ``allowed``
     extension gate (415) at the FACE — ``extract`` itself stays format-driven — then prepends the
-    deterministic provenance header (ADR-0020).
+    deterministic provenance header (ADR-0020). ``max_uncompressed_bytes`` is the operator's
+    decompression-bomb cap for zip-based formats (issue #53), enforced INSIDE the extractor and
+    surfaced as its 422 :class:`ExtractorError` (a content property, not a face-level 413 wire
+    size).
     """
     if len(data) > max_bytes:
         raise HTTPException(
@@ -683,7 +703,9 @@ def _file_to_markdown(
             detail=f"upload too large: {len(data)} bytes > {max_bytes} limit",
         )
     _check_allowed_ext(filename, allowed)
-    doc = _extract(data=data, filename=filename, mime=mime)
+    doc = _extract(
+        data=data, filename=filename, mime=mime, max_uncompressed_bytes=max_uncompressed_bytes
+    )
     return (
         _provenance_header(
             source_url=doc.source_url,

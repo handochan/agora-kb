@@ -645,6 +645,10 @@ _DEFAULT_GRAPH_MAX_DEPTH = 3
 _DEFAULT_UPLOAD_MAX_BYTES = 25 * 1024 * 1024  # 25 MiB per file
 _DEFAULT_UPLOAD_MAX_FILES = 50  # per-batch file count
 _DEFAULT_UPLOAD_TOTAL_BYTES = 200 * 1024 * 1024  # 200 MiB per batch
+# Decompression-bomb cap (issue #53): DECLARED uncompressed total allowed for a zip-based upload
+# (docx/xlsx/pptx/epub) — 10× the 25 MiB compressed per-file cap, under a 256 MiB ceiling. Threaded
+# into the extractor guard by the web face; the extractor uses the same default standalone.
+_DEFAULT_UPLOAD_MAX_UNCOMPRESSED_BYTES = 250 * 1024 * 1024
 
 
 class WebGraphConfig(BaseModel):
@@ -657,13 +661,21 @@ class WebGraphConfig(BaseModel):
 
 
 class WebUploadConfig(BaseModel):
-    """Upload limits (ADR-0025): per-file max_bytes, per-batch max_files + total_bytes caps."""
+    """Upload limits (ADR-0025): per-file max_bytes, per-batch max_files + total_bytes caps.
+
+    Hardening knobs (issues #66/#53, the team-deployment gate): ``url_enabled`` lets an operator
+    switch the server-side URL fetch OFF entirely (the #68 team-deployment guide's switch; the SSRF
+    guard in the extractor is always on regardless), and ``max_uncompressed_bytes`` caps the
+    declared uncompressed total of zip-based uploads (the decompression-bomb guard).
+    """
 
     model_config = ConfigDict(extra="forbid")
 
     max_bytes: int = Field(default=_DEFAULT_UPLOAD_MAX_BYTES, ge=1)
     max_files: int = Field(default=_DEFAULT_UPLOAD_MAX_FILES, ge=1)
     total_bytes: int = Field(default=_DEFAULT_UPLOAD_TOTAL_BYTES, ge=1)
+    max_uncompressed_bytes: int = Field(default=_DEFAULT_UPLOAD_MAX_UNCOMPRESSED_BYTES, ge=1)
+    url_enabled: bool = True
 
 
 class WebExtensionsConfig(BaseModel):
@@ -765,6 +777,12 @@ def load_web_config(layout: RepoLayout) -> WebConfig:
                 _DEFAULT_UPLOAD_TOTAL_BYTES,
                 key="web.upload.total_bytes",
             ),
+            max_uncompressed_bytes=_opt_int(
+                upload.get("max_uncompressed_bytes"),
+                _DEFAULT_UPLOAD_MAX_UNCOMPRESSED_BYTES,
+                key="web.upload.max_uncompressed_bytes",
+            ),
+            url_enabled=_opt_bool(upload.get("url_enabled"), True, key="web.upload.url_enabled"),
         ),
         extensions=WebExtensionsConfig(allowed=allowed),
         features=WebFeaturesConfig(

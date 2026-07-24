@@ -143,7 +143,8 @@ Low-risk, repo-local, OSS-safe; lands post-Phase-3 with no invariant change.
       `web.features.{graph_enabled}`) resolved **per-repo** in `build_app(repo_path)` (never a global
       mutable — tenant-safe for Phase 4, invariant #5); silently-ignored-if-unwired, same pattern as
       today's forward-looking keys (DATA-MODEL §3). Plus an untrusted-input hardening pass
-      (decompression-bomb caps, SVG/HTML XSS, per-batch caps). Update DESIGN §5.2 (multi-upload +
+      (decompression-bomb caps, SVG/HTML XSS, per-batch caps — the bomb cap + the #66 SSRF guard
+      later landed via #53/#66, ADR-0025 appendix). Update DESIGN §5.2 (multi-upload +
       extensible formats; the read-only `/graph` already documented under ADR-0021).
 - [ ] **#26 search index.** Implement the **Accepted** ADR-0012 derived ranking cache as a rebuildable,
       git-ignored `_kb/index/` (metadata/index, never canonical — ADR-0001) with an optional
