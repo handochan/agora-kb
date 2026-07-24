@@ -222,6 +222,8 @@ FastMCP over stdio (local) or Streamable HTTP (team). Tools:
 |---|---|---|
 | `kb_remember(text, target?, domain?, tags?, source?)` | write | append inbox item, return `{id, queued, inbox_depth}` — **non-blocking** |
 | `kb_query(question, scope?)` | read | return ordered evidence hits with path/anchor citations; optional later synthesis may use only those hits |
+| `kb_read(path)` | read | open one cited note: raw markdown body + frontmatter + outgoing link basenames; unknown/escaping path → `{error: "not_found"}` (#58, ADR-0012 rider) |
+| `kb_neighbors(path, depth?)` | read | the ADR-0021 link ego-graph around a note — nodes (`id` = rel_path, feeds `kb_read`) + directed edges; `depth` server-clamped and echoed (#58) |
 | `kb_status(scope?)` | meta | `{inbox_depth, last_consolidation, processed_today, failed}` |
 | `kb_curate(target, force?)` | admin | trigger a consolidation run now (also invoked by triggers) |
 

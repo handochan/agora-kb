@@ -719,3 +719,10 @@ normative reference column is now the §10 "fm=on" column.
   web face's markdown-it-py heading-id rule.
 - Korean-only matched lines return the whole line whitespace-collapsed (≤240 chars) as the
   excerpt; the ±32-token excerpt window stays ASCII-token-based (§7 scope, unchanged contract).
+
+> **Rider (#58, landed 2026-07-24) — read-side companion tools.** The MCP face now registers
+> `kb_read` (→ `AgoraHandlers.note()`) and `kb_neighbors` (→ `AgoraHandlers.graph()` ego-graph,
+> ADR-0021) so an MCP-only agent can OPEN a `kb_query` hit's `path` and walk its links — the
+> query → read → neighbors → re-query navigation loop this ranking serves. Wiring only:
+> `Wiki.query`, the tokenizer/cache contract above, and the frozen `QueryResult`/`SearchHit`
+> shapes are untouched.
