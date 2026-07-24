@@ -18,9 +18,10 @@ Uploaded bytes and fetched URLs are **untrusted** input: every third-party call 
 malformed/garbage input raises :class:`ExtractorError` rather than leaking an arbitrary traceback.
 
 .. note::
-   **SSRF (Phase-4 concern).** :func:`extract_url` fetches a server-side URL. In a future multi-user
-   deployment that is a Server-Side Request Forgery vector (fetching internal/cloud-metadata URLs).
-   No auth/allowlisting is built here: Phase 3 is localhost single-user. See ADR-0004 and the
+   **SSRF guard (issue #66 — implemented).** :func:`extract_url` fetches a server-side URL behind a
+   default-on SSRF guard: http/https only, every resolved address (and every redirect hop) must be
+   public, and the connection is pinned to the validated IP (DNS-rebinding defence). A local caller
+   may opt in to internal URLs with ``allow_private=True``; the web face never does. See the
    docstring of :func:`agora_kb.ingest.extractors.url.extract_url`.
 """
 
@@ -61,7 +62,7 @@ _TEXT_MIMES = frozenset({"text/plain", "text/markdown", "text/x-markdown"})
 # WIDENED markitdown routing (ADR-0025): TEXT-based markup/data formats the ALREADY-pinned
 # markitdown core handles (no new dependency, invariant 4). Routed to the generic markitdown path
 # in office.py.
-_MARKITDOWN_EXTS = frozenset({".html", ".htm", ".csv", ".json", ".xml"})
+_MARKITDOWN_EXTS = frozenset({".html", ".htm", ".csv", ".json", ".xml", ".epub"})
 _MARKITDOWN_MIMES = frozenset(
     {
         "text/html",
@@ -70,13 +71,14 @@ _MARKITDOWN_MIMES = frozenset(
         "application/json",
         "application/xml",
         "text/xml",
+        "application/epub+zip",
     }
 )
 
-# epub, image (OCR), and audio (transcription) are DEFERRED: each needs its own pinned markitdown
-# reader / optional extra + ADR-0005 vetting (extra deps, privacy/cost). The `ingest` extra pins
-# only markitdown[docx,xlsx,pptx], so an epub upload would fail confusingly at runtime — so it is
-# deliberately NOT routed here.
+# .epub IS routed (ADR-0025 rec D, issue #53): markitdown's epub converter needs only the
+# already-pinned core (zipfile + beautifulsoup4), and the zip decompression-bomb guard in
+# office.py covers it. Image (OCR) and audio (transcription) remain DEFERRED: each needs its own
+# optional extra + ADR-0005 vetting (extra deps, privacy/cost), so they are NOT routed here.
 
 
 class ExtractorUnavailable(RuntimeError):
@@ -137,6 +139,8 @@ def extract(
     data: bytes | None = None,
     filename: str | None = None,
     mime: str | None = None,
+    allow_private: bool = False,
+    max_uncompressed_bytes: int | None = None,
 ) -> ExtractedDoc:
     """Dispatch to the right extractor and return an :class:`ExtractedDoc`.
 
@@ -145,9 +149,18 @@ def extract(
     - ``url`` given → the URL extractor (:func:`~agora_kb.ingest.extractors.url.extract_url`).
     - ``data`` given → choose the extractor by ``mime``/``filename`` extension:
       ``.pdf`` (or ``application/pdf``) → PDF; ``.docx``/``.xlsx``/``.pptx``/``.doc``… (or the
-      matching office MIME) → office; ``.html``/``.csv``/``.json``/``.xml`` (or the
+      matching office MIME) → office; ``.html``/``.csv``/``.json``/``.xml``/``.epub`` (or the
       matching MIME) → markitdown (ADR-0025, reuses the office engine); ``.txt``/``.md``/
       ``.markdown`` (or ``text/plain``/``text/markdown``) → the dependency-free text passthrough.
+
+    Two hardening knobs are forwarded to the extractor they apply to (and ignored by the others),
+    and only when set — so the defaults live in ONE place (the concrete extractor) and existing
+    :class:`Extractor`-shaped callables/mocks keep working:
+
+    - ``allow_private`` (URL path; issue #66): opt OUT of the SSRF guard for a legitimately
+      internal URL — local CLI callers only; the web face never sets it.
+    - ``max_uncompressed_bytes`` (office/markitdown zip paths; issue #53): the declared
+      uncompressed-total cap of the decompression-bomb guard.
 
     Raises :class:`ValueError` when neither or both of ``url``/``data`` are given, or when the
     ``data`` type is unsupported/ambiguous (no recognizable PDF/office/markitdown/text signal).
@@ -162,6 +175,8 @@ def extract(
     if url is not None:
         from .url import extract_url
 
+        if allow_private:
+            return extract_url(url, allow_private=True)
         return extract_url(url)
 
     # data path — choose pdf vs office.
@@ -214,6 +229,10 @@ def extract(
 
         if not filename:
             raise ValueError("office extraction requires a filename to determine the document type")
+        if max_uncompressed_bytes is not None:
+            return extract_office(
+                data, filename=filename, max_uncompressed_bytes=max_uncompressed_bytes
+            )
         return extract_office(data, filename=filename)
     if is_markitdown:
         from .office import extract_markitdown
@@ -221,6 +240,10 @@ def extract(
         if not filename:
             raise ValueError(
                 "markitdown extraction requires a filename to determine the document type"
+            )
+        if max_uncompressed_bytes is not None:
+            return extract_markitdown(
+                data, filename=filename, max_uncompressed_bytes=max_uncompressed_bytes
             )
         return extract_markitdown(data, filename=filename)
     if is_text:
@@ -232,5 +255,5 @@ def extract(
         "unsupported or ambiguous upload: cannot determine extractor from "
         f"mime={mime!r}, filename={filename!r}. Supported: .pdf; "
         ".docx/.doc/.xlsx/.xls/.pptx/.ppt office documents; "
-        ".html/.htm/.csv/.json/.xml (markitdown); and .txt/.md/.markdown text."
+        ".html/.htm/.csv/.json/.xml/.epub (markitdown); and .txt/.md/.markdown text."
     )

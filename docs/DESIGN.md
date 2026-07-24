@@ -260,9 +260,10 @@ write path the MCP face uses — the web face never reads or mutates `wiki/` / g
   vetting. The **curator remains the sole writer of `raw/`** (ADR-0002): it materializes `raw/` from
   each capture body during consolidation; the *face* never writes `raw/`. (ADR-0020.) Staging the
   **original binary** verbatim in `raw/` (+ the sha256 re-ingest-drift sidecar) and image/OCR
-  extraction remain deferred follow-ups. Per-batch max-files / total-bytes caps and an untrusted-input
-  hardening pass (decompression-bomb / SVG·HTML XSS guards) ride with the multi-upload surface —
-  Proposed **ADR-0025**.
+  extraction remain deferred follow-ups. Per-batch max-files / total-bytes caps shipped with the
+  multi-upload surface (**ADR-0025**, Accepted); the untrusted-input hardening landed as the
+  extractor-layer SSRF guard (#66) + zip decompression-bomb cap (#53) — see the ADR-0025 appendix —
+  while SVG/HTML XSS stays covered at render time (markdown-it `html=False`).
 - **Knowledge graph** (read-only) at `/graph`: a derived, Obsidian-like view of the wiki's
   link/relation structure — global plus a per-note local ego-graph (node click → the note, a domain
   filter, contested/orphan accents). It is purely derived from the

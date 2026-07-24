@@ -564,10 +564,11 @@ def test_extract_office_malformed_raises_extractor_error() -> None:
 
 def test_extract_url_real_no_network(monkeypatch: pytest.MonkeyPatch) -> None:
     """trafilatura over an HTML STRING (fetch monkeypatched) extracts content+title; no network."""
-    trafilatura = pytest.importorskip("trafilatura")
+    pytest.importorskip("trafilatura")
+    from agora_kb.ingest.extractors import url as url_mod
 
-    # Replace the network fetch with a pure function returning our HTML string.
-    monkeypatch.setattr(trafilatura, "fetch_url", lambda url: _HTML)
+    # Replace the guarded network fetch (issue #66 seam) with a pure function returning our HTML.
+    monkeypatch.setattr(url_mod, "_fetch_url_guarded", lambda url, *, allow_private: _HTML)
 
     doc = extract_url("https://example.com/agora")
     assert doc.extractor == "url"
@@ -579,16 +580,25 @@ def test_extract_url_real_no_network(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_extract_url_fetch_failure_raises_extractor_error(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A failed/empty fetch raises ExtractorError (untrusted input), not a raw traceback."""
-    trafilatura = pytest.importorskip("trafilatura")
-    monkeypatch.setattr(trafilatura, "fetch_url", lambda url: None)
+    """A failed fetch raises ExtractorError (untrusted input), not a raw traceback."""
+    pytest.importorskip("trafilatura")
+    from agora_kb.ingest.extractors import url as url_mod
+
+    def boom(url: str, *, allow_private: bool) -> bytes:
+        raise ExtractorError(f"could not fetch URL: {url!r}")
+
+    monkeypatch.setattr(url_mod, "_fetch_url_guarded", boom)
     with pytest.raises(ExtractorError):
         extract_url("https://example.com/unreachable")
 
 
 def test_extract_url_no_content_raises_extractor_error(monkeypatch: pytest.MonkeyPatch) -> None:
     """A fetched page with no extractable main content raises ExtractorError."""
-    trafilatura = pytest.importorskip("trafilatura")
-    monkeypatch.setattr(trafilatura, "fetch_url", lambda url: "<html><body></body></html>")
+    pytest.importorskip("trafilatura")
+    from agora_kb.ingest.extractors import url as url_mod
+
+    monkeypatch.setattr(
+        url_mod, "_fetch_url_guarded", lambda url, *, allow_private: "<html><body></body></html>"
+    )
     with pytest.raises(ExtractorError):
         extract_url("https://example.com/empty")

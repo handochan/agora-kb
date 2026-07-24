@@ -388,6 +388,9 @@ def test_web_config_absent_file_loads_defaults(tmp_path: Path) -> None:
     assert cfg.upload.max_bytes == 25 * 1024 * 1024
     assert cfg.upload.max_files == 50
     assert cfg.upload.total_bytes == 200 * 1024 * 1024
+    # Hardening defaults (issues #53/#66): 10x the compressed per-file cap; url capture ON.
+    assert cfg.upload.max_uncompressed_bytes == 250 * 1024 * 1024
+    assert cfg.upload.url_enabled is True
     assert cfg.extensions.allowed is None
     assert cfg.features.graph_enabled is True
 
@@ -414,6 +417,8 @@ def test_web_config_overrides_each_field(tmp_path: Path) -> None:
         "    max_bytes: 1048576\n"
         "    max_files: 5\n"
         "    total_bytes: 5242880\n"
+        "    max_uncompressed_bytes: 9999\n"
+        "    url_enabled: false\n"
         "  extensions:\n"
         "    allowed: [PDF, .md, txt]\n"
         "  features:\n"
@@ -425,6 +430,8 @@ def test_web_config_overrides_each_field(tmp_path: Path) -> None:
     assert cfg.upload.max_bytes == 1048576
     assert cfg.upload.max_files == 5
     assert cfg.upload.total_bytes == 5242880
+    assert cfg.upload.max_uncompressed_bytes == 9999
+    assert cfg.upload.url_enabled is False
     # Each allowed extension is normalized to a lowercased, dot-prefixed form.
     assert cfg.extensions.allowed == [".pdf", ".md", ".txt"]
     assert cfg.features.graph_enabled is False
@@ -443,6 +450,14 @@ def test_web_config_bad_bool_fails_loud(tmp_path: Path) -> None:
     layout = _layout(tmp_path)
     _write_repo_yaml(layout, "web:\n  features:\n    graph_enabled: 'yes'\n")
     with pytest.raises(ConfigError, match="web.features.graph_enabled"):
+        load_web_config(layout)
+
+
+def test_web_config_bad_url_enabled_fails_loud(tmp_path: Path) -> None:
+    """A non-boolean url_enabled (issue #66 switch) fails loud — security policy never coerces."""
+    layout = _layout(tmp_path)
+    _write_repo_yaml(layout, "web:\n  upload:\n    url_enabled: 'off'\n")
+    with pytest.raises(ConfigError, match="web.upload.url_enabled"):
         load_web_config(layout)
 
 
