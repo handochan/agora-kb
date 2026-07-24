@@ -246,7 +246,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_web.add_argument("--port", type=int, default=8000, help="bind port (default: 8000)")
     p_web.add_argument("--writer", default="web", help="inbox writer namespace (default: web)")
     p_web.add_argument(
-        "--user", default="local", help="identity stamped into source=web:<user> (default: local)"
+        "--user",
+        default="local",
+        help=(
+            "identity stamped into source=web:<user> (default: local; the fallback when "
+            "web.identity.trusted_header is unset or the header is absent, issue #67)"
+        ),
     )
     p_web.set_defaults(func=_cmd_web)
 

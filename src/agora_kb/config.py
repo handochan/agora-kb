@@ -29,6 +29,7 @@ config never widens the closed vocabulary the curator validates against.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -68,6 +69,7 @@ __all__ = [
     "WebUploadConfig",
     "WebExtensionsConfig",
     "WebFeaturesConfig",
+    "WebIdentityConfig",
     "load_web_config",
 ]
 
@@ -699,6 +701,43 @@ class WebFeaturesConfig(BaseModel):
     graph_enabled: bool = True
 
 
+class WebIdentityConfig(BaseModel):
+    """Reverse-proxy identity threading for the web face (issue #67, ADR-0025 appendix).
+
+    ``trusted_header`` names the request header an **authenticating reverse proxy** injects with
+    the logged-in username (e.g. ``X-Remote-User``); when set, uploads are stamped
+    ``source = web:<header value>`` per request. The default ``None`` means the feature is OFF —
+    **no request header ever influences identity** (naming the header is itself the operator's
+    opt-in signal; trusting a client-forgeable header by default would let anyone spoof
+    provenance). ``strip_domain`` (default ``False``) truncates an email-form value at the first
+    ``@`` (``alice@example.com`` → ``alice``) before validation. Trust boundary: the proxy MUST
+    force-set/strip this header on every request; never expose the web port directly with
+    ``trusted_header`` set (see ``deploy/README.md``).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    trusted_header: str | None = None
+    strip_domain: bool = False
+
+
+#: RFC 7230 header-name token (ASCII tchar). The loader enforces this on ``trusted_header`` so a
+#: non-token name fails LOUD at load: a non-latin-1 name (e.g. a docs-copy-paste en-dash
+#: ``X–Remote–User``) would otherwise 500 EVERY write request inside starlette's header lookup,
+#: and a whitespace-padded name (``"X-Remote-User "``) would match no real request ever —
+#: a permanent silent fallback to the process user, the exact failure mode ``_opt_str_loud``
+#: exists to prevent (issue #67).
+_HTTP_TOKEN_RE = re.compile(r"\A[!#$%&'*+.^_`|~0-9A-Za-z-]+\Z")
+
+#: The wired ``web.identity`` sub-keys. Unlike the other ``.get()``-based web sub-mappings, an
+#: UNKNOWN key here fails loud: this block is a SECURITY opt-in, and a typo'd key (the natural
+#: ``trusted-header:`` hyphen slip — the header name itself is hyphenated) would silently leave
+#: identity threading OFF while the operator believes it is on, stamping every upload
+#: ``web:<process-user>``. The general tolerant convention is documented in
+#: :func:`load_web_config`; this deliberate exception mirrors the ``_opt_str_loud`` rationale.
+_IDENTITY_KEYS = frozenset({"trusted_header", "strip_domain"})
+
+
 class WebConfig(BaseModel):
     """Operator settings for the web face (ADR-0025), read from ``_kb/repo.yaml`` ``web:``.
 
@@ -716,6 +755,7 @@ class WebConfig(BaseModel):
     upload: WebUploadConfig = Field(default_factory=WebUploadConfig)
     extensions: WebExtensionsConfig = Field(default_factory=WebExtensionsConfig)
     features: WebFeaturesConfig = Field(default_factory=WebFeaturesConfig)
+    identity: WebIdentityConfig = Field(default_factory=WebIdentityConfig)
 
 
 def load_web_config(layout: RepoLayout) -> WebConfig:
@@ -729,7 +769,9 @@ def load_web_config(layout: RepoLayout) -> WebConfig:
     loaders; see the module docstring near ``ConfigError``). Resolved PER-REPO by ``build_app`` so
     web policy can never leak across repos (invariant 5 / ADR-0006). Unknown sub-keys (e.g.
     ``web.graph.typo``) are IGNORED at the loader level, consistent with the other ``.get()``-based
-    loaders (only WIRED keys are read), so a stray key never crashes the face.
+    loaders (only WIRED keys are read), so a stray key never crashes the face — EXCEPT
+    ``web.identity``, whose unknown keys fail loud (:func:`_load_identity_config`: a typo'd
+    security opt-in silently off is worse than a crash).
     """
     raw = _read_yaml_mapping(repo_config_path(layout))
     web = _sub_mapping(raw.get("web"))
@@ -738,6 +780,7 @@ def load_web_config(layout: RepoLayout) -> WebConfig:
     upload = _sub_mapping(web.get("upload"))
     extensions = _sub_mapping(web.get("extensions"))
     features = _sub_mapping(web.get("features"))
+    identity = _sub_mapping(web.get("identity"))
 
     allowed_raw = extensions.get("allowed")
     allowed: list[str] | None
@@ -789,6 +832,41 @@ def load_web_config(layout: RepoLayout) -> WebConfig:
             graph_enabled=_opt_bool(
                 features.get("graph_enabled"), True, key="web.features.graph_enabled"
             ),
+        ),
+        identity=_load_identity_config(identity),
+    )
+
+
+def _load_identity_config(identity: dict[str, object]) -> WebIdentityConfig:
+    """Narrow the ``web.identity`` sub-mapping into a :class:`WebIdentityConfig`, fail-loud.
+
+    A security opt-in must never be silently misread (issue #67): a supplied non-string header
+    name (incl. the YAML 1.1 ``no``→False trap) fails LOUD via :func:`_opt_str_loud`; an unknown
+    sub-key (e.g. the hyphenated ``trusted-header:`` typo) fails LOUD instead of quietly leaving
+    the feature off (see :data:`_IDENTITY_KEYS`); and a header name that is not an RFC 7230 token
+    fails LOUD instead of 500-ing every write (non-latin-1 name) or never matching a request
+    (whitespace-padded name) — see :data:`_HTTP_TOKEN_RE`.
+    """
+    unknown = sorted(str(k) for k in identity.keys() - _IDENTITY_KEYS)
+    if unknown:
+        raise ConfigError(
+            f"unknown web.identity key(s) {unknown!r} — the wired keys are "
+            f"{sorted(_IDENTITY_KEYS)!r} (underscores, not hyphens); a typo here would "
+            "silently leave identity threading OFF"
+        )
+    trusted_header = _opt_str_loud(
+        identity.get("trusted_header"), key="web.identity.trusted_header"
+    )
+    if trusted_header is not None and not _HTTP_TOKEN_RE.match(trusted_header):
+        raise ConfigError(
+            f"web.identity.trusted_header must be a valid HTTP header-name token "
+            f"(ASCII letters/digits/-_. and RFC 7230 tchar specials), got {trusted_header!r} — "
+            "check for copy-paste dashes or stray whitespace"
+        )
+    return WebIdentityConfig(
+        trusted_header=trusted_header,
+        strip_domain=_opt_bool(
+            identity.get("strip_domain"), False, key="web.identity.strip_domain"
         ),
     )
 

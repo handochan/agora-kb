@@ -23,6 +23,18 @@ re-export shim) — ``import agora_kb`` never requires fastapi (invariant 4 / AD
 **No auth (Phase 3 is localhost single-user; auth is deferred to ROADMAP Phase 4).** Identity is
 still threaded so Phase 4 is not a retrofit: ``build_app`` takes ``writer``/``user`` and every
 upload is stamped ``source = f"web:{user}"`` (the inbox ``web:<user>`` source form, DATA-MODEL §1).
+
+**Per-user identity behind a trusted reverse proxy (issue #67, ADR-0025 appendix).** When the
+operator sets ``web.identity.trusted_header`` (e.g. ``X-Remote-User``), each WRITE request's user
+is taken from that header — the one an authenticating proxy (basic auth, SSO, …) injects — so a
+team deployment stamps ``web:<alice>`` / ``web:<bob>`` instead of collapsing everyone into one
+process-wide ``web:local``. Strictly OPT-IN: the default (``trusted_header: None``) ignores every
+request header (a client-forgeable header must never influence provenance unless the operator
+declared the proxy trust boundary), and an absent header falls back to the process ``--user``
+(byte-identical personal-deployment behaviour). A PRESENT-but-invalid header value (empty, or
+outside the conservative ``web:<user>`` token charset) is a forgery attempt or a proxy
+misconfiguration → the write is refused with 400, never silently attributed. Reads are untouched —
+identity only matters where provenance is stamped (the inbox write path).
 """
 
 from __future__ import annotations
@@ -39,7 +51,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
 
-from agora_kb.config import WebConfig, load_web_config
+from agora_kb.config import WebConfig, WebIdentityConfig, load_web_config
 from agora_kb.core import Repo
 from agora_kb.core.hashing import content_sha256
 from agora_kb.faces.mcp_server import AgoraHandlers
@@ -69,6 +81,14 @@ _STATIC_DIR = Path(__file__).parent / "static"
 # A markdown body link `[text](target)` (image links `![..](..)` excluded via the (?<!\!) guard).
 _MDLINK_RE = re.compile(r"(?<!\!)\[(?P<text>[^\]\r\n]*)\]\((?P<target>[^)\r\n]+)\)")
 
+# A proxy-supplied remote user (issue #67): a conservative single token — alnum start, then
+# alnum/dot/underscore/hyphen (mirrors core.models._TEAM_RE's charset) plus '@' for email-form
+# usernames. STRICTER than the inbox model's `web:.+` source rule (\Aweb:.+\Z), so every accepted
+# value is guaranteed valid as `web:<user>` — the face pre-validates, the model never 500s.
+_REMOTE_USER_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._@-]*\Z")
+# A sane bound for a proxy-injected username/email (not a wire limit — a forgery/misconfig guard).
+_REMOTE_USER_MAX_LEN = 128
+
 
 # --- JSON API response models (the documented ADR-0019 §1 contract) -----------------------------
 class UploadReceipt(BaseModel):
@@ -76,12 +96,15 @@ class UploadReceipt(BaseModel):
 
     Mirrors :meth:`AgoraHandlers.remember`'s ``{id, queued, inbox_depth}``: ``queued`` is True iff
     a new immutable inbox event was appended (eventual consistency — searchable after the next
-    curator run, not now).
+    curator run, not now). ``identity_source`` records where the stamped user came from — the
+    trusted proxy header (``"header"``) or the process ``--user`` fallback (``"process"``) — for
+    audit (issue #67).
     """
 
     id: str
     queued: bool
     inbox_depth: int
+    identity_source: str = "process"
 
 
 class FileReceipt(BaseModel):
@@ -100,9 +123,14 @@ class FileReceipt(BaseModel):
 
 
 class BatchUploadReceipt(BaseModel):
-    """The receipt for ``POST /api/upload-batch`` — one :class:`FileReceipt` per submitted file."""
+    """The receipt for ``POST /api/upload-batch`` — one :class:`FileReceipt` per submitted file.
+
+    ``identity_source`` is batch-level (one request = one resolved identity): ``"header"`` when the
+    stamped user came from the trusted proxy header, ``"process"`` otherwise (issue #67).
+    """
 
     results: list[FileReceipt]
+    identity_source: str = "process"
 
 
 def build_app(*, repo_path: Path, writer: str = "web", user: str = "local") -> FastAPI:
@@ -110,8 +138,11 @@ def build_app(*, repo_path: Path, writer: str = "web", user: str = "local") -> F
 
     Resolves the repo, builds one :class:`AgoraHandlers` (the shared core seam), mounts the Jinja2
     templates + vendored static assets, and registers the JSON API + HTMX routes. ``writer`` is the
-    inbox namespace for captures; ``user`` is the identity stamped into the ``web:<user>`` source —
-    both are params (not request-derived) so Phase-4 auth threads identity here without a rewrite.
+    inbox namespace for captures; ``user`` is the DEFAULT identity stamped into the ``web:<user>``
+    source. When the operator opts in via ``web.identity.trusted_header`` (issue #67), each write
+    request's user comes from that reverse-proxy-injected header instead (see
+    :func:`_resolve_upload_user`); with the feature off (the default) ``user`` is process-fixed and
+    request headers are ignored — the Phase-4 auth seam this param always reserved.
     """
     repo = Repo.resolve(repo_path)
     handlers = AgoraHandlers(repo, writer=writer)
@@ -202,6 +233,7 @@ def build_app(*, repo_path: Path, writer: str = "web", user: str = "local") -> F
         response_model=UploadReceipt,
     )
     async def api_upload(
+        request: Request,
         file: UploadFile | None = None,
         url: Annotated[str | None, Form()] = None,
         text: Annotated[str | None, Form()] = None,
@@ -212,26 +244,31 @@ def build_app(*, repo_path: Path, writer: str = "web", user: str = "local") -> F
 
         Exactly one input is used (precedence file > url > text). The extracted markdown gets a
         deterministic provenance header (ADR-0020) and is written via :meth:`AgoraHandlers.remember`
-        with ``source = web:<user>``. Returns the ``{id, queued, inbox_depth}`` receipt — the item
-        is searchable only after the next curator run (eventual consistency, DESIGN §2.2).
+        with ``source = web:<user>`` — the user is per-request when the operator configured
+        ``web.identity.trusted_header`` (issue #67), else the process ``--user``. Returns the
+        ``{id, queued, inbox_depth, identity_source}`` receipt — the item is searchable only after
+        the next curator run (eventual consistency, DESIGN §2.2).
 
-        Errors map to HTTP: unsupported/empty input → 400, url capture disabled by the operator
-        (``web.upload.url_enabled: false``) → 403, oversize → 413, malformed/garbage input — incl.
-        an SSRF-blocked URL (issue #66) or a decompression-bomb archive (issue #53) → 422
-        (:class:`ExtractorError`), a missing ``ingest`` dependency → 503
+        Errors map to HTTP: unsupported/empty input or an invalid identity-header value → 400, url
+        capture disabled by the operator (``web.upload.url_enabled: false``) → 403, oversize → 413,
+        malformed/garbage input — incl. an SSRF-blocked URL (issue #66) or a decompression-bomb
+        archive (issue #53) → 422 (:class:`ExtractorError`), a missing ``ingest`` dependency → 503
         (:class:`ExtractorUnavailable`, with the install remedy).
         """
+        req_user, identity_source = _resolve_upload_user(
+            request, identity=web_config.identity, process_user=user
+        )
         receipt = await _do_upload(
             handlers,
             web_config=web_config,
-            user=user,
+            user=req_user,
             file=file,
             url=url,
             text=text,
             domain=domain,
             tags=tags,
         )
-        return UploadReceipt(**receipt)
+        return UploadReceipt(**receipt, identity_source=identity_source)
 
     @app.post(
         "/api/upload-batch",
@@ -240,6 +277,7 @@ def build_app(*, repo_path: Path, writer: str = "web", user: str = "local") -> F
         response_model=BatchUploadReceipt,
     )
     async def api_upload_batch(
+        request: Request,
         files: list[UploadFile],
         domain: Annotated[str | None, Form()] = None,
         tags: Annotated[str | None, Form()] = None,
@@ -252,17 +290,22 @@ def build_app(*, repo_path: Path, writer: str = "web", user: str = "local") -> F
         while the good files still queue (the inbox is append-only per-event). Per-batch caps
         (``upload.max_files`` count, ``upload.total_bytes`` total) are enforced UP-FRONT and reject
         the whole batch with 413 before any write (count is known; the total is checked as each file
-        is read, stopping + reporting on the first overflow).
+        is read, stopping + reporting on the first overflow). The stamped user is per-request when
+        ``web.identity.trusted_header`` is configured (issue #67; an invalid header value → 400
+        BEFORE any write), else the process ``--user``.
         """
+        req_user, identity_source = _resolve_upload_user(
+            request, identity=web_config.identity, process_user=user
+        )
         results = await _do_upload_batch(
             handlers,
             web_config=web_config,
-            user=user,
+            user=req_user,
             files=files,
             domain=domain,
             tags=tags,
         )
-        return BatchUploadReceipt(results=results)
+        return BatchUploadReceipt(results=results, identity_source=identity_source)
 
     # --- dashboard JSON API (read-only meta face; DESIGN §5.3 / ADR-0003) -----------------------
     # The first-class, documented JSON for the three dashboard panels — the SAME transport-free
@@ -428,13 +471,18 @@ def build_app(*, repo_path: Path, writer: str = "web", user: str = "local") -> F
         batch path (best-effort per-file outcomes → ``_batch_receipt.html``); with ≤1 file (plus the
         url/text single-capture form) it runs the single :func:`_do_upload` → ``_receipt.html``. An
         empty file input degrades to the url/text path (FastAPI sends an empty-filename part).
+        The stamped user is per-request under ``web.identity.trusted_header`` (issue #67) — same
+        rules as the JSON API; an invalid header value propagates as a plain 400 (a proxy-misconfig
+        signal, not a form-validation outcome, so no receipt fragment is rendered).
         """
+        # The identity_source audit field is a JSON-API surface; the HTMX fragment omits it.
+        req_user, _ = _resolve_upload_user(request, identity=web_config.identity, process_user=user)
         real_files = [f for f in (file or []) if f.filename]
         if len(real_files) > 1:
             results = await _do_upload_batch(
                 handlers,
                 web_config=web_config,
-                user=user,
+                user=req_user,
                 files=real_files,
                 domain=domain,
                 tags=tags,
@@ -450,7 +498,7 @@ def build_app(*, repo_path: Path, writer: str = "web", user: str = "local") -> F
             receipt = await _do_upload(
                 handlers,
                 web_config=web_config,
-                user=user,
+                user=req_user,
                 file=single,
                 url=url,
                 text=text,
@@ -515,6 +563,61 @@ def build_app(*, repo_path: Path, writer: str = "web", user: str = "local") -> F
         return templates.TemplateResponse(request, "_gold.html", {"panel": handlers.gold_status()})
 
     return app
+
+
+# --- per-request identity resolution (issue #67, ADR-0025 appendix) -----------------------------
+def _resolve_upload_user(
+    request: Request, *, identity: WebIdentityConfig, process_user: str
+) -> tuple[str, str]:
+    """Resolve the user to stamp into ``source = web:<user>`` for ONE write request.
+
+    Returns ``(user, identity_source)`` where ``identity_source`` is ``"header"`` or ``"process"``.
+    The decision table (issue #67):
+
+    - ``identity.trusted_header`` unset (the default) → the process ``user`` — every request header
+      is IGNORED (no opt-in, no trust: a client-forgeable header must never steer provenance).
+    - header configured but ABSENT on the request → the process ``user`` fallback (personal
+      deployments behind no proxy keep byte-identical behaviour).
+    - header present MORE THAN ONCE → 400. An append-mode proxy (Apache ``RequestHeader append``,
+      HAProxy ``add-header``) puts the client's forged copy FIRST, so any pick-one rule is a
+      spoofing vector (first-wins would stamp the forgery outright); duplicate identity headers
+      are themselves the proxy-misconfiguration signal the 400 policy exists to surface.
+    - header PRESENT exactly once → its value (after the optional ``strip_domain`` truncation at
+      the first ``@``) MUST be a non-empty conservative token (:data:`_REMOTE_USER_RE`, ≤
+      :data:`_REMOTE_USER_MAX_LEN`). An invalid value raises 400 — NOT a silent fallback: a
+      present-but-garbage identity header is either a forgery attempt or a misconfigured proxy,
+      and silently attributing the write to the process user would poison provenance (the audit
+      trail would say ``web:local`` for a request that claimed to be someone). The accepted charset
+      is strictly narrower than the inbox model's ``web:.+`` source rule, so a value the face
+      accepts can never be rejected downstream by the pydantic :class:`InboxItem`.
+    """
+    header = identity.trusted_header
+    if header is None:
+        return process_user, "process"
+    values = request.headers.getlist(header)
+    if not values:
+        return process_user, "process"
+    if len(values) > 1:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"duplicate identity header {header!r} ({len(values)} occurrences) — an "
+                "append-mode proxy lets a client-forged copy shadow the authenticated one; "
+                "configure the proxy to SET (replace) the header, never append."
+            ),
+        )
+    raw = values[0]
+    value = raw.split("@", 1)[0] if identity.strip_domain else raw
+    if not value or len(value) > _REMOTE_USER_MAX_LEN or not _REMOTE_USER_RE.match(value):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"invalid identity header {header!r}: value must be a non-empty token "
+                "([A-Za-z0-9] then [A-Za-z0-9._@-], max "
+                f"{_REMOTE_USER_MAX_LEN} chars) — check the reverse-proxy configuration."
+            ),
+        )
+    return value, "header"
 
 
 # --- the shared upload pipeline (one body for /api/upload, /api/upload-batch, and the HTMX POST) --

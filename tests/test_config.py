@@ -507,6 +507,98 @@ def test_web_config_not_added_to_repo_config(tmp_path: Path) -> None:
     assert "web" not in RepoConfig.model_fields
 
 
+# --- (n.1) web.identity — reverse-proxy identity threading (issue #67) --------------------------
+
+
+def test_web_config_identity_defaults_off(tmp_path: Path) -> None:
+    """No web:/identity: block → trusted_header None (feature OFF) + strip_domain False.
+
+    The default MUST be off: naming the header is the operator's opt-in signal; a client-forgeable
+    header must never influence provenance without that explicit declaration (issue #67).
+    """
+    cfg = load_web_config(_layout(tmp_path))
+    assert cfg.identity.trusted_header is None
+    assert cfg.identity.strip_domain is False
+
+
+def test_web_config_identity_configured(tmp_path: Path) -> None:
+    """An explicit identity block reads trusted_header + strip_domain as stated."""
+    layout = _layout(tmp_path)
+    _write_repo_yaml(
+        layout,
+        "web:\n  identity:\n    trusted_header: X-Remote-User\n    strip_domain: true\n",
+    )
+    cfg = load_web_config(layout)
+    assert cfg.identity.trusted_header == "X-Remote-User"
+    assert cfg.identity.strip_domain is True
+
+
+def test_web_config_identity_non_string_header_fails_loud(tmp_path: Path) -> None:
+    """A non-string trusted_header fails loud — a security opt-in is never silently misread.
+
+    A tolerant `_opt_str` would read `trusted_header: 123` as None, leaving the feature OFF while
+    the operator believes it is on (every upload silently collapses back to web:local).
+    """
+    layout = _layout(tmp_path)
+    _write_repo_yaml(layout, "web:\n  identity:\n    trusted_header: 123\n")
+    with pytest.raises(ConfigError, match="web.identity.trusted_header"):
+        load_web_config(layout)
+
+
+def test_web_config_identity_yaml_bool_trap_fails_loud(tmp_path: Path) -> None:
+    """The YAML 1.1 trap: an unquoted `no` parses as False → ConfigError with quote guidance."""
+    layout = _layout(tmp_path)
+    _write_repo_yaml(layout, "web:\n  identity:\n    trusted_header: no\n")
+    with pytest.raises(ConfigError, match="web.identity.trusted_header"):
+        load_web_config(layout)
+
+
+def test_web_config_identity_bad_strip_domain_fails_loud(tmp_path: Path) -> None:
+    """A non-boolean strip_domain (a string) fails loud, never truthy-coerces."""
+    layout = _layout(tmp_path)
+    _write_repo_yaml(layout, "web:\n  identity:\n    strip_domain: 'true'\n")
+    with pytest.raises(ConfigError, match="web.identity.strip_domain"):
+        load_web_config(layout)
+
+
+def test_web_config_identity_non_latin1_header_name_fails_loud(tmp_path: Path) -> None:
+    """A non-ASCII header name (docs-copy-paste en-dash) fails at LOAD, not as a 500 per write.
+
+    Without the RFC 7230 token check, `X–Remote–User` (U+2013) loads fine but starlette's
+    latin-1 header-name encoding raises UnicodeEncodeError inside EVERY write request → 500.
+    """
+    layout = _layout(tmp_path)
+    _write_repo_yaml(layout, 'web:\n  identity:\n    trusted_header: "X–Remote–User"\n')
+    with pytest.raises(ConfigError, match="header-name token"):
+        load_web_config(layout)
+
+
+def test_web_config_identity_whitespace_header_name_fails_loud(tmp_path: Path) -> None:
+    """A whitespace-padded header name fails at LOAD — it could never match a real request.
+
+    `"X-Remote-User "` (quoted trailing space survives YAML) silently matches nothing: every
+    upload would fall back to web:<process-user> with zero operator-visible signal — the exact
+    silent-off failure mode the loud identity loader exists to prevent.
+    """
+    layout = _layout(tmp_path)
+    _write_repo_yaml(layout, 'web:\n  identity:\n    trusted_header: "X-Remote-User "\n')
+    with pytest.raises(ConfigError, match="header-name token"):
+        load_web_config(layout)
+
+
+def test_web_config_identity_unknown_key_fails_loud(tmp_path: Path) -> None:
+    """An unknown web.identity key (the natural hyphen typo) fails loud, never silently OFF.
+
+    The other web sub-mappings tolerate unknown keys (only wired keys are read); identity is the
+    deliberate exception because `trusted-header:` (hyphen, mirroring the header name itself)
+    would otherwise leave the security opt-in silently disabled.
+    """
+    layout = _layout(tmp_path)
+    _write_repo_yaml(layout, "web:\n  identity:\n    trusted-header: X-Remote-User\n")
+    with pytest.raises(ConfigError, match="unknown web.identity key"):
+        load_web_config(layout)
+
+
 # --- backup policy (push-only git backup, issue #64) --------------------------------------------
 
 
