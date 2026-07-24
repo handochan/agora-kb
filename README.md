@@ -175,6 +175,14 @@ events, harvest cursors, and gold packs are NOT protected by the push* — knowl
 yet curated can still be lost with the disk (a residual capture→curate window; a separate spool
 backup is a later decision). Run `agora curate` before you rely on a fresh `agora sync`.
 
+**Always-on (launchd / systemd).** `agora watch`, `agora web`, and `agora harvest` are plain
+foreground processes; [`deploy/`](deploy/) ships example launchd LaunchAgents and systemd user
+units that start them at login/boot, restart them when they exit, and capture logs — see
+[`deploy/README.md`](deploy/README.md) for the install steps. Two rules baked into the examples:
+the web unit binds `127.0.0.1` **only** (the web face has no auth/TLS), and **harvest needs its
+own scheduled unit** — the `agora watch` loop evaluates only the curation triggers and never runs
+harvest.
+
 ## Documentation
 
 | Doc | What |
