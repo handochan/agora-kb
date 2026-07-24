@@ -281,3 +281,36 @@ single-writer curators on N repos**, never as a second writer to one repo. Concr
   ADR on domain-partitioned intra-repo writers (per-domain index fragments + per-curator log shards
   merged deterministically, **plus** per-domain branches or a serialized publish step to escape the
   single curated-ref CAS). Output is a memo, not code. Default expectation: no-go.
+
+## Addendum — OD-3 resolved as OD-3a: `max_candidates_per_run` wired (#60, landed 2026-07-24)
+
+OD-3's recommendation **(a)** is now the landed behavior; this addendum records the as-built shape so
+the OD-3 prose above stays historical and nothing re-litigates it.
+
+- **One cap, the documented one.** `repo.yaml curator.limits.max_candidates_per_run` (INGEST-CONTRACT
+  §1.3, default **32**) is parsed by `load_repo_config` (same `_opt_int`/`ge=1` style as the ADR-0022
+  `curator.limits` siblings) and threaded `worker.run` → `claim()` at every run site (CLI `curate`,
+  `watch`, MCP `kb_curate`). Per OD-3a, **no `max_events_per_run` was introduced** — the DATA-MODEL
+  §3.1(a) planned-key stub is resolved to this single cap, avoiding the triple-narrative conflict with
+  the contract. An event-level pre-dedup cap returns only under OD-3c's stated interaction if claim
+  cost (not bundle cost) is ever shown to dominate.
+- **Enforcement point: the claim, counted in candidates.** The contract wording ("the FIFO claim caps
+  the snapshot") won over the OD-3a sketch ("bounds the bundle in `build_bundle()`"): capping only at
+  bundle time would strand over-cap events in `processing/` and break "snapshot = sole event
+  universe". Instead `claim()` counts DISTINCT canonical `content_sha256` groups (exactly tier-2's
+  grouping, re-derived from event bodies — the candidate, which is what drives PASS-1 prompt size) and
+  claims the longest contiguous FIFO **head** whose distinct-group count fits the cap. Byte-equivalent
+  duplicates inside the head ride along without costing a cap slot; everything past the cut stays
+  untouched in the inbox for the next trigger. FIFO order, tier-1 dedup, append-only, and the
+  single-writer flock+CAS are byte-for-byte unchanged — the manifest simply covers a shorter head, and
+  the backlog drains across successive triggers.
+- **Observability (the §3 slice for this knob).** Per run: a worker log line + `RunReport.counts`
+  extras (`claimed` / `candidates` / `inbox_remaining`, surfaced on the CLI `counts:` line and MCP
+  `kb_curate`). Persisted: `state.json last_batch {claimed, candidates, cap, inbox_remaining}`
+  (DATA-MODEL §4, additive), read by `kb_status`/`curator_status` and exported as cheap gauges
+  (`agora_last_run_claimed_events`, `agora_last_run_candidates`, `agora_max_candidates_per_run`,
+  `agora_last_run_inbox_remaining`) alongside the existing `agora_inbox_depth` — no `lint()` on
+  scrape. `claimed == candidates == cap` with a large remainder ⇒ capped backlog drain.
+- **Small-model guidance.** The contract default 32 is frontier-sized; INGEST-CONTRACT §1.3 now
+  documents the starting bands (≤8B dense: **8–12**; ~30B-A3B MoE: **16–24**), pending empirical
+  calibration by the #44 batch sweep.

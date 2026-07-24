@@ -217,6 +217,12 @@ class AgoraHandlers:
                 "failed": state.counters.failed,
             },
             "failed": self._failed_count(),
+            # #60 / ADR-0024 §3: the last published run's claim/bundle shape (None ⇒ never run or a
+            # pre-#60 state.json) — events claimed, tier-2 candidates, the max_candidates_per_run
+            # cap in effect, and the queue depth left right after the claim.
+            "last_batch": (
+                None if state.last_batch is None else state.last_batch.model_dump(mode="json")
+            ),
             "gold": self._gold_meta_row(),
         }
 
@@ -342,6 +348,7 @@ class AgoraHandlers:
             "processed_today": base["processed_today"],
             "failed": base["failed"],
             "counters": base["counters"],
+            "last_batch": base["last_batch"],
             "active_backend": self._active_backend(),
             "recent_log": self._recent_log(),
         }
@@ -767,6 +774,7 @@ class AgoraHandlers:
             taxonomy=cfg.taxonomy,
             max_attempts=cfg.max_attempts,
             related_k=cfg.related_k,
+            max_candidates=cfg.max_candidates_per_run,
             max_orphans=cfg.max_orphans,
         )
         return {

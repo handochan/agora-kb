@@ -61,9 +61,10 @@ from typing import TYPE_CHECKING, Literal, Protocol
 
 from ..core import frontmatter
 from ..core.ids import new_event_id
+from ..core.inbox import Inbox
 from ..core.layout import RepoLayout
 from ..core.repo import GitError, Repo
-from ..core.state import CuratorState, StateStore
+from ..core.state import CuratorState, LastBatch, StateStore
 from ..schema.emit import Taxonomy
 from ..schema.lint import lint
 from ..schema.notes import Note, parse_all_notes
@@ -78,6 +79,7 @@ from .bundle import BundleResult, build_bundle
 from .claim import LockHeld, claim, curator_lock
 from .constants import (
     DEFAULT_MAX_ATTEMPTS,
+    DEFAULT_MAX_CANDIDATES_PER_RUN,
     DEFAULT_RELATED_K,
     SCHEMA_SYMLINKS,
     SCRATCH_DIRNAME,
@@ -253,6 +255,7 @@ def run(
     taxonomy: Taxonomy,
     max_attempts: int = DEFAULT_MAX_ATTEMPTS,
     related_k: int = DEFAULT_RELATED_K,
+    max_candidates: int = DEFAULT_MAX_CANDIDATES_PER_RUN,
     max_orphans: int | None = None,
 ) -> RunReport:
     """Execute ONE transactional curator run (ADR-0008 steps 1-6 / DESIGN §4 / ADR-0011 §0).
@@ -264,6 +267,10 @@ def run(
     §5.1 per-event retry budget (``repo.yaml curator.max_attempts``, default
     :data:`~agora_kb.curator.constants.DEFAULT_MAX_ATTEMPTS`); keyword-only + additive so the frozen
     signature is preserved while an operator-configured budget is honored end-to-end.
+    ``max_candidates`` is the §1.3 per-run candidate cap the FIFO claim enforces
+    (``repo.yaml curator.limits.max_candidates_per_run``, default
+    :data:`~agora_kb.curator.constants.DEFAULT_MAX_CANDIDATES_PER_RUN`; ADR-0024 OD-3a / #60) —
+    the un-claimed remainder simply stays in the inbox for the next trigger.
 
     Returns a :class:`RunReport`. A held lock or empty/all-deduped inbox is a ``noop``; a PLAN,
     LINT,
@@ -284,6 +291,7 @@ def run(
                 taxonomy=taxonomy,
                 max_attempts=max_attempts,
                 related_k=related_k,
+                max_candidates=max_candidates,
                 max_orphans=max_orphans,
             )
     except LockHeld:
@@ -301,6 +309,7 @@ def _run_locked(
     taxonomy: Taxonomy,
     max_attempts: int = DEFAULT_MAX_ATTEMPTS,
     related_k: int = DEFAULT_RELATED_K,
+    max_candidates: int = DEFAULT_MAX_CANDIDATES_PER_RUN,
     max_orphans: int | None = None,
 ) -> RunReport:
     """The body of :func:`run`, executed UNDER the held curator lock (ADR-0011 §0)."""
@@ -324,14 +333,39 @@ def _run_locked(
     run_id = _new_run_id(now)
     run_date = run_id[:10]
 
-    # ADR-0008 step 1 / §0: atomic FIFO claim + tier-1 dedup (authoritative under the lock). A None
-    # result ⇒ the inbox was empty or every event collapsed away — nothing to consolidate.
-    manifest = claim(layout, base_commit=base_commit, run_id=run_id, started=_iso(now), state=state)
+    # ADR-0008 step 1 / §0: atomic FIFO claim + tier-1 dedup (authoritative under the lock), capped
+    # at max_candidates distinct tier-2 content groups (§1.3, ADR-0024 OD-3a / #60 — the remainder
+    # stays in the inbox for the next trigger). A None result ⇒ the inbox was empty or every event
+    # collapsed away — nothing to consolidate.
+    manifest = claim(
+        layout,
+        base_commit=base_commit,
+        run_id=run_id,
+        started=_iso(now),
+        state=state,
+        max_candidates=max_candidates,
+    )
     if manifest is None:
         return RunReport(run_id=run_id, status="noop", counts={"claimed": 0})
 
     # ADR-0011 §1 / §5 tier-2: build the read-only bundle (candidates + provenance + related/).
     bundle = build_bundle(layout, repo, manifest, related_k=related_k)
+
+    # #60 batch observability: the run's claim/bundle shape + the queue depth left after the claim
+    # (one cheap dir count — the un-claimed FIFO remainder the next trigger will pick up). Captured
+    # here while the bundle is in scope; logged now, folded into the RunReport counts + state.json
+    # last_batch at finalize (the dashboard/metrics read those).
+    claimed_n = len(manifest.event_ids)
+    candidates_n = len(bundle.candidates)
+    inbox_remaining = Inbox(layout).depth()
+    _logger.info(
+        "run %s: claimed %d event(s) -> %d candidate(s) (cap %d); %d event(s) left in inbox",
+        run_id,
+        claimed_n,
+        candidates_n,
+        max_candidates,
+        inbox_remaining,
+    )
 
     # ADR-0008 step 2: a detached worktree at base_commit is the ONLY writable mount; the model
     # never
@@ -571,6 +605,15 @@ def _run_locked(
     state = state_store.load()
     state.record_published_run(run_id, new_commit)
     state.mark_run(now, new_commit)
+    # #60 / ADR-0024 §3: persist the run's batch shape so the dashboard/metrics can surface
+    # batch-size-vs-cap pressure without re-reading run manifests (claimed==candidates==cap with a
+    # big inbox_remaining ⇒ the backlog is draining in capped slices).
+    state.last_batch = LastBatch(
+        claimed=claimed_n,
+        candidates=candidates_n,
+        cap=max_candidates,
+        inbox_remaining=inbox_remaining,
+    )
     _bump_counters(state, counts)
     # ADR-0017 §7: bump the per-connector harvest cursors from THIS run's harvested-candidate
     # dispositions. HAPPY-PATH ONLY — mirrors _bump_counters exactly and is NEVER replayed in
@@ -643,6 +686,17 @@ def _run_locked(
     if not synced or not rebuild_gold_packs(repo, now=now):
         counts = {**counts, "gold_unbuilt": 1}
 
+    # #60 batch observability on the report surface (CLI `counts:` line / MCP kb_curate): the
+    # run's claim/bundle shape + the post-claim queue depth. Added HERE — after _bump_counters /
+    # _append_log / _commit_message consumed the pure disposition tallies — so log.md and the
+    # commit message stay byte-identical.
+    counts = {
+        **counts,
+        "claimed": claimed_n,
+        "candidates": candidates_n,
+        "inbox_remaining": inbox_remaining,
+    }
+
     return RunReport(run_id=run_id, status="published", published_commit=new_commit, counts=counts)
 
 
@@ -706,6 +760,14 @@ def _finalize_recovered(
     state = state_store.load()
     if not state.is_published(run_id):
         state.record_published_run(run_id, commit)
+        # #60: the happy-path finalize records published_runs AND last_batch in ONE atomic state
+        # save, so an unrecorded run means that save never landed — whatever last_batch holds
+        # describes an OLDER published run. Its true shape is unknowable post-crash (candidates/
+        # cap went down with the crashed process), so CLEAR it rather than let kb_status /
+        # /metrics label the previous run's shape as this run's; the gauges then omit, exactly
+        # like never-run. Same best-effort posture as the un-replayed counters below. A re-walked
+        # already-finalized manifest keeps its recorded last_batch (is_published skips this).
+        state.last_batch = None
     if state.last_commit != commit:
         # last_run timestamp is unknown post-crash; the published commit is the durable fact.
         state.last_commit = commit
