@@ -1,0 +1,90 @@
+name: CI
+
+# Repo-wide gate. ubuntu-latest + macos-latest are the required checks; windows-latest runs
+# the same chain purely as the objective progress signal for the Windows port epic (#85).
+# See issue #100.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Least privilege: this workflow reads the repo and nothing else. No secrets are consumed.
+permissions:
+  contents: read
+
+# Supersede in-flight runs for the same PR; a new push to a PR invalidates the older run.
+# Cancellation is deliberately scoped to pull_request: on a push event `github.head_ref` is empty,
+# so every main push shares the group `CI-refs/heads/main` and an unconditional cancel would end
+# the previous commit's run as `cancelled`. Main must keep a per-commit conclusion — "the last
+# green commit on main" is load-bearing for release/rollback decisions.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    # The single platform branch in this whole file: Windows is expected to fail today
+    # (unconditional `import fcntl` in curator/claim.py, tracked by #86), so its red must not
+    # colour the workflow conclusion. #86 promotes Windows to required by deleting this line.
+    continue-on-error: ${{ matrix.os == 'windows-latest' }}
+    timeout-minutes: 30
+    strategy:
+      # Never let one OS cancel the others: the Windows red is expected and its log is the
+      # asset we are after, and ubuntu/macos must still report independently.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # setup-uv publishes NO bare major alias past v7: `refs/tags/v8` and `refs/tags/v9` do not
+      # exist (nor as branches), so `@v9` fails the whole job at "Set up job" — before a single
+      # step, including the Windows leg whose log is the point of running it at all. Pin the
+      # v9.0.0 commit, which is upstream's own documented convention. Never shorten this to `@v9`.
+      - name: Set up uv and Python 3.12
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          # Pin uv itself. The `uv lock --check` step below asserts the lockfile would not change,
+          # and uv rewrites uv.lock's `revision` when the lock format evolves (this repo is at
+          # version = 1, revision = 3). With an unpinned uv, setup-uv installs latest, so such a
+          # release would turn an unrelated PR red on BOTH required legs and block every merge.
+          # 0.11.19 is the uv that wrote the committed lock; bump it and re-run `uv lock` together.
+          version: "0.11.19"
+          # pyproject declares requires-python = ">=3.12"; pin the floor so CI proves the
+          # oldest supported interpreter rather than whatever the runner image ships.
+          python-version: "3.12"
+          enable-cache: true
+
+      # `uv sync --frozen` deliberately does NOT validate the lockfile against pyproject.toml
+      # (that is `--locked`). Keep drift detection as its own step so a stale uv.lock fails
+      # here with a legible message instead of surfacing as a confusing install error.
+      - name: Verify uv.lock is in sync with pyproject.toml
+        run: uv lock --check
+
+      # --all-extras, not --extra dev. `dev` is an entry in [project.optional-dependencies]
+      # (there is no [dependency-groups] and no [tool.uv]), so --all-extras is a strict
+      # superset of it and additionally installs web/ingest/metrics. Without those, ~108
+      # tests across 8 files vanish into module-level `pytest.importorskip` — a green CI that
+      # never exercised the web face or the extractors. Install cost is absorbed by the cache.
+      - name: Install project with all extras (web, ingest, metrics, dev)
+        run: uv sync --frozen --all-extras
+
+      - name: Lint (ruff check)
+        run: uv run ruff check .
+
+      - name: Format check (ruff format --check)
+        run: uv run ruff format --check .
+
+      # -ra prints the skip-reason summary, so the log itself proves the extras are present:
+      # a fastapi/trafilatura/pdfminer/markitdown/prometheus_client skip reason must never
+      # appear. The only expected reasons are explicit platform conditionals — on ubuntu the
+      # two macOS-only seatbelt markers plus "plutil not available (non-macOS)", and on any
+      # runner without a local Ollama the two isolation tests that skip rather than guess.
+      - name: Test (pytest)
+        run: uv run pytest -ra
