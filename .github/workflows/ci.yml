@@ -43,6 +43,40 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
+      # ADR-0013 is fail-closed: a `network: none` backend refuses to run at all unless a real
+      # kernel sandbox is available (linux -> bwrap, darwin -> the built-in sandbox-exec). The
+      # macOS runner ships sandbox-exec, but ubuntu-latest does NOT ship bubblewrap, so without
+      # this step every curator test that expects a published run gets `no_backend` instead --
+      # which is exactly how the first CI run failed while macOS passed. Installing bwrap keeps
+      # the Linux leg exercising the REAL confinement path rather than skipping past it.
+      # (Operator-facing consequence, documented for beta: a Linux install needs bubblewrap, or
+      # the curator fail-closes -- see docs/GETTING-STARTED.md, issue #104.)
+      # Installing bwrap is necessary but NOT sufficient on ubuntu-latest: Ubuntu 24.04+ ships
+      # kernel.apparmor_restrict_unprivileged_userns=1, so `BwrapIsolation.available()`'s userns
+      # probe still fails and selection falls through to the same fail-closed refusal. This is the
+      # exact condition `USERNS_REMEDIATION` (curator/isolation/bwrap.py) describes for operators.
+      # CI runners are ephemeral and single-tenant, so relaxing the sysctl here is the cheapest of
+      # the documented remedies and — unlike skipping the tests — keeps the Linux leg exercising
+      # the REAL confinement path. A real Linux deployment should instead install an AppArmor
+      # profile granting userns to /usr/bin/bwrap (carried into docs/GETTING-STARTED.md, #104).
+      - name: Install bubblewrap + allow unprivileged userns (ADR-0013 kernel sandbox)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update && sudo apt-get install -y bubblewrap
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          # Mirrors BwrapIsolation._system_ro_binds(): /lib64 carries the ELF interpreter for
+          # /usr/bin/true, so omitting it makes exec fail with a misleading ENOENT and turns the
+          # probe into a false negative -- that was bug #113, which this leg is what exposed.
+          bwrap --version
+          if bwrap --unshare-all --die-with-parent \
+                   --ro-bind /usr /usr --ro-bind /bin /bin \
+                   --ro-bind /lib /lib --ro-bind /lib64 /lib64 -- true; then
+            echo "bwrap userns probe: OK"
+          else
+            echo "bwrap userns probe FAILED — curator would fail closed"
+            exit 1
+          fi
+
       # setup-uv publishes NO bare major alias past v7: `refs/tags/v8` and `refs/tags/v9` do not
       # exist (nor as branches), so `@v9` fails the whole job at "Set up job" — before a single
       # step, including the Windows leg whose log is the point of running it at all. Pin the

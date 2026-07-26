@@ -167,6 +167,31 @@ def test_install_uses_all_extras_and_runs_tools_through_uv(workflow: dict[str, A
     assert any(r.startswith("uv run pytest") and "-ra" in r for r in runs)
 
 
+def test_linux_leg_installs_bubblewrap_for_the_fail_closed_sandbox(
+    workflow: dict[str, Any],
+) -> None:
+    """The Linux leg must install bwrap, or every curator run fail-closes to ``no_backend``.
+
+    ADR-0013 refuses to run a ``network: none`` backend without a real kernel sandbox. macOS
+    runners ship ``sandbox-exec``; ubuntu-latest does **not** ship bubblewrap — which is exactly
+    how the first CI run failed on the required Linux leg while macOS passed green.
+    """
+    steps = _test_job(workflow)["steps"]
+    installs = [
+        s
+        for s in steps
+        if "run" in s and "bubblewrap" in str(s["run"]) and str(s.get("if", "")).strip()
+    ]
+    assert installs, "the Linux leg must install bubblewrap (ADR-0013 fail-closed sandbox)"
+    # Guarded so the step never runs on the macOS/Windows legs, where apt-get does not exist.
+    assert any("Linux" in str(s["if"]) for s in installs)
+    # Must precede the test step, or the install is pointless.
+    order = [i for i, s in enumerate(steps) if "run" in s]
+    bwrap_at = next(i for i in order if "bubblewrap" in str(steps[i]["run"]))
+    pytest_at = next(i for i in order if str(steps[i]["run"]).startswith("uv run pytest"))
+    assert bwrap_at < pytest_at
+
+
 def test_continue_on_error_is_windows_only_and_appears_once(
     workflow: dict[str, Any], workflow_text: str
 ) -> None:

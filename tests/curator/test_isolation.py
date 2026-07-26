@@ -214,6 +214,34 @@ def test_selection_linux_without_bwrap_fails_closed(monkeypatch: pytest.MonkeyPa
         select_backend_isolation(allow_reduced_isolation=False)
 
 
+def test_userns_probe_binds_the_same_system_dirs_as_the_real_invocation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The probe must ro-bind what the real sandbox binds, or it is a false negative.
+
+    ``/usr/bin/true`` is dynamically linked: without ``/lib64`` (or ``/lib``) its ELF interpreter
+    is missing inside the sandbox and ``execvp`` fails with a misleading ENOENT even though the
+    namespaces were created. That made ``available()`` False — and the curator fail-closed with
+    "no usable kernel sandbox" — on ordinary x86-64 Linux hosts where bwrap works fine.
+    """
+    from agora_kb.curator.isolation import bwrap as bwrap_mod
+
+    captured: list[list[str]] = []
+
+    def _fake_run(argv: list[str], **_: object) -> subprocess.CompletedProcess[bytes]:
+        captured.append(argv)
+        return subprocess.CompletedProcess(argv, 0, b"", b"")
+
+    monkeypatch.setattr(bwrap_mod.shutil, "which", lambda _: "/usr/bin/bwrap")
+    monkeypatch.setattr(bwrap_mod.subprocess, "run", _fake_run)
+    assert bwrap_mod.BwrapIsolation().available() is True
+
+    argv = captured[0]
+    bound = {argv[i + 1] for i, tok in enumerate(argv) if tok == "--ro-bind"}
+    expected = {d for d in bwrap_mod._SYSTEM_RO_BIND_DIRS if Path(d).exists()}
+    assert bound == expected, "probe binds must match the real invocation's system dirs"
+
+
 def test_selection_linux_with_bwrap_returns_bwrap(monkeypatch: pytest.MonkeyPatch) -> None:
     """Linux with a usable bwrap → the bwrap adapter (mechanism is OS-driven)."""
     monkeypatch.setattr(sys, "platform", "linux")
