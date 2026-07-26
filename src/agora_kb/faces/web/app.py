@@ -35,6 +35,18 @@ declared the proxy trust boundary), and an absent header falls back to the proce
 outside the conservative ``web:<user>`` token charset) is a forgery attempt or a proxy
 misconfiguration → the write is refused with 400, never silently attributed. Reads are untouched —
 identity only matters where provenance is stamped (the inbox write path).
+
+**Browser-mediated attack defense (issue #94, ADR-0025 appendix).** The loopback bind is a network
+boundary a browser walks straight through, so ``build_app`` registers three middlewares:
+:class:`_HostAllowlistMiddleware` (starlette's ``TrustedHostMiddleware`` under an actionable 400)
+rejects a ``Host`` outside ``web.security.allowed_hosts`` — loopback-only by default — which closes
+DNS rebinding, which would otherwise give an attacker page same-origin reads of the whole KB;
+:class:`_OriginGuardMiddleware` rejects a state-changing request whose ``Origin``/``Referer``
+authority is not **this deployment's own** (closing cross-site form CSRF into the append-only
+inbox); and :class:`_SecurityHeadersMiddleware` refuses framing (``X-Frame-Options`` / CSP
+``frame-ancestors``), so a clickjacked UI cannot borrow the user's same-origin position. Still NOT
+authentication — that is ADR-0036 / Phase 4; this is defense in depth on top of the unauthenticated
+premise.
 """
 
 from __future__ import annotations
@@ -46,10 +58,12 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Annotated
 
 from fastapi import FastAPI, Form, HTTPException, Query, Request, UploadFile
-from fastapi.responses import HTMLResponse, Response
+from fastapi.responses import HTMLResponse, PlainTextResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
+from starlette.datastructures import Headers, MutableHeaders
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from agora_kb.config import WebConfig, WebIdentityConfig, load_web_config
 from agora_kb.core import Repo
@@ -62,7 +76,10 @@ from agora_kb.ingest.extractors import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from starlette.templating import _TemplateResponse
+    from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 __all__ = ["build_app", "MAX_UPLOAD_BYTES"]
 
@@ -133,6 +150,257 @@ class BatchUploadReceipt(BaseModel):
     identity_source: str = "process"
 
 
+# --- browser-mediated attack defense (issue #94, ADR-0025 appendix) -----------------------------
+#
+# The `127.0.0.1` bind is a NETWORK boundary and a browser walks straight through it: the victim
+# only has to open a malicious page while `agora web` is running. Two paths, two guards:
+#
+# (A) CSRF → inbox injection. `POST /api/upload` is a multipart form = a CORS "simple request", so
+#     an auto-submitting cross-site <form> reaches it with NO preflight. The attacker cannot read
+#     the response, but the WRITE lands: appended to the append-only inbox (invariant 3), curated
+#     into the wiki on the next run, and undeletable through product features (the plan op
+#     vocabulary has no delete). :class:`_OriginGuardMiddleware` refuses a state-changing request
+#     whose Origin/Referer authority is not the one the request itself was addressed to.
+# (B) DNS rebinding → whole-KB read. A TTL-0 attacker domain rebound to 127.0.0.1 gives the
+#     attacker page SAME-ORIGIN reads of `/api/notes`, `/api/gold/{pack}`, `/metrics`, … The
+#     rebound request still carries the attacker's DNS NAME in `Host`, so
+#     :class:`_HostAllowlistMiddleware` (starlette's ``TrustedHostMiddleware`` over
+#     ``web.security.allowed_hosts``) rejects it with 400.
+# (C) Framing → clickjacking. A page that IFRAMES the UI submits from an allowed origin, so (A)
+#     cannot see it; :class:`_SecurityHeadersMiddleware` denies framing outright instead.
+#
+# None of the three is authentication — that stays ADR-0036 / Phase 4. This is defense in depth ON
+# TOP of the unauthenticated premise, and it is honest about its reach: it closes BROWSER-mediated
+# attacks only. Anything that can already run arbitrary local requests is out of scope.
+
+#: Methods that never change state → never Origin-checked (RFC 9110 "safe"). Everything else is.
+#: Checking by METHOD rather than by a route list is deliberate: a future write route inherits the
+#: guard automatically instead of silently shipping unprotected.
+_SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS", "TRACE"})
+
+
+def _host_matches(host: str, patterns: Sequence[str]) -> bool:
+    """Match ``host`` against the ``allowed_hosts`` patterns with starlette's exact semantics.
+
+    Exact equality, or a leading ``*.`` subdomain wildcard (``*.example.com`` matches
+    ``a.example.com``). Deliberately the SAME rule as the ``TrustedHostMiddleware`` this wraps, so
+    the pre-check that produces the actionable 400 can never disagree with the enforcing gate
+    underneath it (:class:`_HostAllowlistMiddleware`). A bare ``*`` never reaches here —
+    :func:`agora_kb.config._host_pattern` refuses it.
+
+    Only the HOST allowlist uses this. The Origin check does NOT: a wildcard entry would otherwise
+    promote every sibling subdomain (one XSS'd marketing subdomain, one dangling CNAME) into a
+    trusted WRITE origin, and a loopback entry kept for hub-local health checks would promote every
+    port of every team member's laptop.
+    """
+    return any(
+        host == pattern or (pattern.startswith("*.") and host.endswith(pattern[1:]))
+        for pattern in patterns
+    )
+
+
+def _request_authority(headers: Headers) -> str:
+    """This deployment's OWN authority (``host[:port]``), as the client addressed it in ``Host``.
+
+    The comparison baseline for the Origin check. Safe to trust here because the request has
+    already passed :class:`_HostAllowlistMiddleware` (registered OUTSIDE the Origin guard), so the
+    value is one the operator allow-listed — never an arbitrary attacker string.
+    """
+    return headers.get("host", "").strip().lower()
+
+
+def _stated_authority(value: str) -> str | None:
+    """Normalize an ``Origin`` (or ``Referer``) header value to ``host[:port]``, else ``None``.
+
+    ``None`` means "present but unusable" — the literal ``null`` origin a sandboxed iframe /
+    ``data:`` document sends (a classic CSRF vector), a hostless value (``file://``), an empty
+    value, or a malformed URL. Callers treat that as a MISMATCH, never as "absent".
+
+    The SCHEME is dropped: a TLS-terminating proxy makes the browser send ``https://…`` while the
+    app itself speaks plain http, so comparing schemes would 403 every proxied deployment. The
+    PORT is KEPT — it is what distinguishes ``http://127.0.0.1:3000`` (some other page served on
+    the victim's own loopback) from the face itself, and the whole ``origin`` concept is
+    scheme+host+port. That is why the proxy contract is "pass the client's ``Host`` through
+    VERBATIM" (nginx ``proxy_set_header Host $http_host``): a proxy that rewrites or truncates it
+    breaks the equality the browser's own ``Origin`` states.
+    """
+    raw = value.strip()
+    if not raw or raw.lower() == "null":
+        return None
+    try:
+        parts = urllib.parse.urlsplit(raw)
+        host, port = parts.hostname, parts.port
+    except ValueError:  # malformed IPv6 bracket / non-numeric port / unparseable authority
+        return None
+    if not host:
+        return None
+    host = host.lower()
+    if ":" in host:  # IPv6 literal — restore the brackets the Host header carries
+        host = f"[{host}]"
+    return f"{host}:{port}" if port is not None else host
+
+
+class _OriginGuardMiddleware:
+    """Refuse CROSS-SITE state-changing requests (the CSRF half of issue #94).
+
+    Policy (ADR-0025 appendix), applied to every non-safe method BEFORE the route — and therefore
+    before FastAPI parses the multipart body and before any inbox append:
+
+    - ``Origin`` (or, absent that, ``Referer``) PRESENT and its authority equals the request's own
+      ``Host`` → pass. Same-origin browser use (the HTMX form) always lands here, so the UI is
+      unaffected. The baseline is the request's own Host — NOT ``web.security.allowed_hosts``,
+      which is the HOST gate's job: that list legitimately carries entries (hub-local ``127.0.0.1``
+      for health checks and Prometheus, a ``*.team.example.com`` wildcard) that must never become
+      trusted WRITE origins.
+    - PRESENT and mismatched (incl. the ``null`` origin) → **403**, nothing written. This is the
+      whole defense: every current browser attaches ``Origin`` to a cross-site form POST / fetch.
+    - ABSENT → pass by default. Scripted writers (``curl``, CI, the upload procedures documented
+      in ``deploy/README.md`` and ``docs/DEPLOY-TEAM.md``) send no ``Origin``, and refusing them
+      by default would break documented operations for no browser-attack gain. The residual risk —
+      a browser so old it omits ``Origin`` on cross-site writes — is closed by opting into
+      ``web.security.require_origin: true``, at which point ABSENT → **403** too.
+
+    A pure ASGI middleware (not ``BaseHTTPMiddleware``): no request/response buffering, no task
+    group, and the rejection happens without ever pulling the request body.
+    """
+
+    def __init__(self, app: ASGIApp, *, require_origin: bool) -> None:
+        self.app = app
+        self.require_origin = require_origin
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http" or scope["method"] in _SAFE_METHODS:
+            await self.app(scope, receive, send)
+            return
+        headers = Headers(scope=scope)
+        # PRESENCE, not truthiness: an empty `Origin:` is PRESENT-and-unusable (→ mismatch), not
+        # absent. Falling back to Referer on an empty Origin would make the policy depend on which
+        # OTHER header happened to ride along.
+        stated = headers.get("origin")
+        if stated is None:
+            stated = headers.get("referer")
+        if stated is None:
+            if self.require_origin:
+                await self._refuse(
+                    scope,
+                    receive,
+                    send,
+                    "missing Origin/Referer on a state-changing request: "
+                    "web.security.require_origin is true, so every write must state its origin.",
+                )
+                return
+            await self.app(scope, receive, send)
+            return
+        if _stated_authority(stated) != _request_authority(headers):
+            await self._refuse(
+                scope,
+                receive,
+                send,
+                "cross-origin write refused: the Origin/Referer of a state-changing request must "
+                "match this deployment's own host and port (the Host header it was sent to). If a "
+                "reverse proxy fronts the web face, it must pass the client's Host through "
+                "VERBATIM (nginx: proxy_set_header Host $http_host; Caddy does this by default) "
+                "and that hostname must be in web.security.allowed_hosts.",
+            )
+            return
+        await self.app(scope, receive, send)
+
+    async def _refuse(self, scope: Scope, receive: Receive, send: Send, detail: str) -> None:
+        """Send the 403 without echoing any attacker-controlled value back into the response."""
+        response = PlainTextResponse(f"{detail} (agora web face, issue #94)", status_code=403)
+        await response(scope, receive, send)
+
+
+class _HostAllowlistMiddleware:
+    """starlette's ``TrustedHostMiddleware`` with an actionable 400 and RFC-9110 Host casing.
+
+    The enforcement is still upstream's — this wrapper adds only what the operator needs and the
+    vendored middleware cannot express (plus the ``www_redirect`` opt-out below):
+
+    - **A diagnosable refusal.** Upstream answers a bare ``Invalid host header``, which names
+      neither the product nor the knob; an operator who puts a proxy in front and has not yet met
+      ``web.security`` sees a 400 that does not even say it came from agora. The pre-check here
+      uses :func:`_host_matches` — upstream's OWN rule — so the two layers can never disagree, and
+      the body names the config key plus the operator-owned list (never the attacker-supplied
+      Host).
+    - **Case-insensitive Host matching.** RFC 9110 §4.2.3 makes the host case-insensitive, but
+      upstream compares ``host == pattern`` verbatim while the loader lowercases every pattern, so
+      ``Host: LOCALHOST`` would 400. Lowercasing the header in the scope (a lossless normalization)
+      fixes the pre-check, the upstream check, and the Origin comparison in one place.
+
+    ``www_redirect`` is turned OFF: a 307 preserves method AND body, so a ``www.``-prefixed entry
+    would bounce a state-changing request to another URL (scheme taken from ``scope``, i.e. an
+    http downgrade behind TLS termination) BEFORE the Origin guard ever sees it. This face has no
+    reason to offer www canonicalization; "a Host outside the list is 400" stays a single rule.
+    """
+
+    def __init__(self, app: ASGIApp, *, allowed_hosts: Sequence[str]) -> None:
+        self.allowed_hosts = list(allowed_hosts)
+        self.app = TrustedHostMiddleware(app, allowed_hosts=self.allowed_hosts, www_redirect=False)
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        scope = _lowercase_host(scope)
+        host = Headers(scope=scope).get("host", "").split(":")[0]
+        if not _host_matches(host, self.allowed_hosts):
+            response = PlainTextResponse(
+                "unknown Host header: this request was addressed to a host the agora web face is "
+                "not configured to answer on. Add it to web.security.allowed_hosts in repo.yaml "
+                f"(currently: {', '.join(self.allowed_hosts)}) — and make sure any reverse proxy "
+                "passes the client's Host through verbatim. (agora web face, issue #94)",
+                status_code=400,
+            )
+            await response(scope, receive, send)
+            return
+        await self.app(scope, receive, send)
+
+
+def _lowercase_host(scope: Scope) -> Scope:
+    """Return ``scope`` with a lowercased ``Host`` (RFC 9110 §4.2.3: the host is case-insensitive).
+
+    Copies rather than mutates — the caller's scope dict is shared with whatever wrapped it. A
+    no-op (same object) when the header is already lowercase, which is every browser request.
+    """
+    headers: list[tuple[bytes, bytes]] = scope.get("headers") or []
+    if not any(k == b"host" and v != v.lower() for k, v in headers):
+        return scope
+    return {**scope, "headers": [(k, v.lower() if k == b"host" else v) for k, v in headers]}
+
+
+class _SecurityHeadersMiddleware:
+    """Deny framing on every response (the clickjacking half of issue #94).
+
+    The Origin guard cannot see a clickjacking submit: a page that iframes ``/upload`` and lures a
+    click submits with the FACE's own origin, which is exactly what the guard allows. Framing is
+    never a legitimate use of this face (no embed story, no OAuth-style dialogs), so both the
+    legacy header and its CSP successor are set to "never".
+
+    ``setdefault``, not overwrite: a route that ever needs its own framing policy keeps it. The
+    CSP carries ONLY ``frame-ancestors`` — a broader policy would have to be reconciled with the
+    vendored htmx/force-graph assets and the markdown-rendered note bodies, which is a separate
+    decision, not a side effect of the framing fix.
+    """
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        async def _send(message: Message) -> None:
+            if message["type"] == "http.response.start":
+                headers = MutableHeaders(scope=message)
+                headers.setdefault("x-frame-options", "DENY")
+                headers.setdefault("content-security-policy", "frame-ancestors 'none'")
+            await send(message)
+
+        await self.app(scope, receive, _send)
+
+
 def build_app(*, repo_path: Path, writer: str = "web", user: str = "local") -> FastAPI:
     """Construct the FastAPI web face over ``repo_path`` (mirrors ``mcp_server.build_server``).
 
@@ -143,6 +411,10 @@ def build_app(*, repo_path: Path, writer: str = "web", user: str = "local") -> F
     request's user comes from that reverse-proxy-injected header instead (see
     :func:`_resolve_upload_user`); with the feature off (the default) ``user`` is process-fixed and
     request headers are ignored — the Phase-4 auth seam this param always reserved.
+
+    Also registers the three issue-#94 browser-attack middlewares (Host allowlist over
+    ``web.security.allowed_hosts``, Origin guard, framing denial) — per-repo, like every other
+    :class:`WebConfig` knob.
     """
     repo = Repo.resolve(repo_path)
     handlers = AgoraHandlers(repo, writer=writer)
@@ -160,6 +432,18 @@ def build_app(*, repo_path: Path, writer: str = "web", user: str = "local") -> F
         title="Agora web face",
         summary="Browse, search, and capture knowledge over the Agora core API (ADR-0019).",
     )
+    # Browser-mediated attack defense (issue #94) — see the middleware section above.
+    # Registration order matters: starlette runs the MOST RECENTLY added middleware OUTERMOST, so
+    # this reads bottom-up. The Host allowlist sits OUTSIDE the Origin guard for two reasons: a
+    # rebound (or otherwise unknown-Host) request is rejected before anything else in the stack
+    # looks at it, AND the Origin guard's comparison baseline — the request's own Host — is
+    # therefore always an operator-allow-listed value by the time it is read. The framing headers
+    # go outermost so they ride on refusals too.
+    app.add_middleware(_OriginGuardMiddleware, require_origin=web_config.security.require_origin)
+    app.add_middleware(
+        _HostAllowlistMiddleware, allowed_hosts=list(web_config.security.allowed_hosts)
+    )
+    app.add_middleware(_SecurityHeadersMiddleware)
     if _STATIC_DIR.is_dir():
         app.mount("/static", StaticFiles(directory=str(_STATIC_DIR)), name="static")
 

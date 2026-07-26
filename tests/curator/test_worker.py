@@ -956,7 +956,11 @@ def test_phase3_exit_web_upload_becomes_a_queryable_curated_note(tmp_path: Path)
     repo = _init_repo(tmp_path)
 
     # 1) UPLOAD through the browser face → one web:-sourced inbox capture (queued, not searchable).
-    client = TestClient(build_app(repo_path=tmp_path, writer="web", user="alice"))
+    # base_url pins the Host to loopback: the default web.security.allowed_hosts (issue #94) has
+    # no `testserver` entry, and this exit-criterion chain really does POST /api/upload.
+    client = TestClient(
+        build_app(repo_path=tmp_path, writer="web", user="alice"), base_url="http://127.0.0.1"
+    )
     resp = client.post(
         "/api/upload",
         data={

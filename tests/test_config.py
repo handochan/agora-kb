@@ -599,6 +599,118 @@ def test_web_config_identity_unknown_key_fails_loud(tmp_path: Path) -> None:
         load_web_config(layout)
 
 
+# --- (n.2) web.security — browser-mediated attack defense (issue #94) ---------------------------
+
+
+def test_web_config_security_defaults_to_loopback_only(tmp_path: Path) -> None:
+    """No web:/security: block → loopback-only Host allowlist + require_origin OFF.
+
+    The default deliberately does NOT contain starlette's TestClient `testserver`: shipping a
+    bypass host in a production default to make a test suite pass is exactly the wrong trade
+    (the suite pins `base_url="http://127.0.0.1"` instead).
+    """
+    cfg = load_web_config(_layout(tmp_path))
+    assert cfg.security.allowed_hosts == ["localhost", "127.0.0.1"]
+    assert cfg.security.require_origin is False
+    assert "testserver" not in cfg.security.allowed_hosts
+
+
+def test_web_config_security_configured(tmp_path: Path) -> None:
+    """An explicit block REPLACES the default list and reads require_origin as stated."""
+    layout = _layout(tmp_path)
+    _write_repo_yaml(
+        layout,
+        "web:\n  security:\n    allowed_hosts: [kb.example.com, '*.team.example.com']\n"
+        "    require_origin: true\n",
+    )
+    cfg = load_web_config(layout)
+    assert cfg.security.allowed_hosts == ["kb.example.com", "*.team.example.com"]
+    assert cfg.security.require_origin is True
+
+
+def test_web_config_security_hosts_are_normalized(tmp_path: Path) -> None:
+    """Entries are stripped + lowercased so a copy-pasted `KB.Example.com ` still matches."""
+    layout = _layout(tmp_path)
+    _write_repo_yaml(layout, "web:\n  security:\n    allowed_hosts: ['  KB.Example.com ']\n")
+    assert load_web_config(layout).security.allowed_hosts == ["kb.example.com"]
+
+
+def test_web_config_security_unknown_key_fails_loud(tmp_path: Path) -> None:
+    """A typo'd security key fails loud, never silently leaving the permissive default.
+
+    Same posture as web.identity (issue #67): `allowed_host:` / `require-origin:` reading as
+    "absent" would have the operator believe a public hostname is allow-listed, or that Origin is
+    mandatory, while neither is true.
+    """
+    layout = _layout(tmp_path)
+    _write_repo_yaml(layout, "web:\n  security:\n    allowed_host: [kb.example.com]\n")
+    with pytest.raises(ConfigError, match="unknown web.security key"):
+        load_web_config(layout)
+
+
+def test_web_config_security_require_origin_non_bool_fails_loud(tmp_path: Path) -> None:
+    """A quoted 'true' would truthy-coerce under a tolerant reader — refuse instead."""
+    layout = _layout(tmp_path)
+    _write_repo_yaml(layout, "web:\n  security:\n    require_origin: 'true'\n")
+    with pytest.raises(ConfigError, match="web.security.require_origin"):
+        load_web_config(layout)
+
+
+@pytest.mark.parametrize(
+    ("block", "match"),
+    [
+        ("    allowed_hosts: kb.example.com\n", "must be a list"),
+        ("    allowed_hosts: [kb.example.com, 123]\n", "must be strings"),
+        ("    allowed_hosts: []\n", "must not be empty"),
+        ("    allowed_hosts: ['']\n", "non-empty hostnames"),
+        ("    allowed_hosts: ['https://kb.example.com']\n", "looks like a URL"),
+        ("    allowed_hosts: ['kb.example.com:8000']\n", "without a port"),
+        ("    allowed_hosts: ['::1']\n", "IPv6 literals"),
+        ("    allowed_hosts: ['[::1]']\n", "IPv6 literals"),
+        ("    allowed_hosts: ['*']\n", "must not contain"),
+        ("    allowed_hosts: ['*.*.example.com']\n", "not a valid wildcard"),
+        ("    allowed_hosts: ['kb*.example.com']\n", "not a valid wildcard"),
+    ],
+)
+def test_web_config_security_bad_allowed_hosts_fail_loud(
+    tmp_path: Path, block: str, match: str
+) -> None:
+    """Every allowlist shape that could never match a real request is reported at LOAD.
+
+    Left unchecked each of these manifests as an unexplained 400 on every request (a port or an
+    IPv6 literal never survives starlette's `Host.split(":")[0]`), a bare AssertionError at app
+    construction (malformed wildcards), or — worst — a silent kill switch (`*` disables Host
+    validation entirely).
+    """
+    layout = _layout(tmp_path)
+    _write_repo_yaml(layout, f"web:\n  security:\n{block}")
+    with pytest.raises(ConfigError, match=match):
+        load_web_config(layout)
+
+
+@pytest.mark.parametrize(
+    "block",
+    [
+        "web:\n  security: strict\n",
+        "web:\n  security:\n    - allowed_hosts: [kb.example.com]\n",
+        "web:\n  security: true\n",
+    ],
+)
+def test_web_config_security_non_mapping_fails_loud(tmp_path: Path, block: str) -> None:
+    """A scalar / list under `security:` must not narrow to `{}` and restore the defaults.
+
+    The tolerant `_sub_mapping` helper answers `{}` for any non-mapping, which for the OTHER web
+    sub-blocks only means "use the defaults". Here it would mean the operator believes a public
+    hostname is allow-listed (or that Origin is mandatory) while the deployment silently runs the
+    permissive default — the same failure the unknown-key check exists to prevent, reached through
+    an indentation slip instead of a typo.
+    """
+    layout = _layout(tmp_path)
+    _write_repo_yaml(layout, block)
+    with pytest.raises(ConfigError, match="web.security must be a mapping"):
+        load_web_config(layout)
+
+
 # --- backup policy (push-only git backup, issue #64) --------------------------------------------
 
 

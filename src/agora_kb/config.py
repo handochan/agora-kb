@@ -70,6 +70,7 @@ __all__ = [
     "WebExtensionsConfig",
     "WebFeaturesConfig",
     "WebIdentityConfig",
+    "WebSecurityConfig",
     "load_web_config",
 ]
 
@@ -738,6 +739,58 @@ _HTTP_TOKEN_RE = re.compile(r"\A[!#$%&'*+.^_`|~0-9A-Za-z-]+\Z")
 _IDENTITY_KEYS = frozenset({"trusted_header", "strip_domain"})
 
 
+# --- web.security — browser-mediated attack defense (issue #94, ADR-0025 appendix) --------------
+#
+# The 127.0.0.1 bind is a NETWORK boundary, and a browser walks straight through it: a page the
+# victim merely opens can (a) auto-submit a cross-site multipart form into `POST /api/upload`
+# (CSRF → an append to the append-only, undeletable inbox) and (b) DNS-rebind an attacker domain
+# to 127.0.0.1 and then read the ENTIRE KB same-origin. These two knobs close both without
+# introducing auth (which stays ADR-0036 / Phase 4).
+
+#: Default Host allowlist — the two loopback spellings a human types at the `agora web` default
+#: bind (`--host 127.0.0.1`). DELIBERATELY excludes starlette's ``TestClient`` default
+#: ``testserver``: a PRODUCTION default must never ship a bypass host. The test suite pins
+#: ``TestClient(app, base_url="http://127.0.0.1")`` instead (issue #94).
+_DEFAULT_ALLOWED_HOSTS: tuple[str, ...] = ("localhost", "127.0.0.1")
+
+#: The wired ``web.security`` sub-keys. Like ``web.identity`` (and unlike the other tolerant
+#: ``.get()``-based web sub-mappings) an UNKNOWN key here fails loud: this block is a SECURITY
+#: opt-in whose whole point is to be stricter than the default, so a typo (``allowed_host:``,
+#: ``require-origin:``) silently leaving the deployment on the permissive default is worse than a
+#: crash — the operator would believe a public hostname is allow-listed, or that Origin is
+#: mandatory, while neither is true.
+_SECURITY_KEYS = frozenset({"allowed_hosts", "require_origin"})
+
+
+class WebSecurityConfig(BaseModel):
+    """Browser-mediated attack defenses for the web face (issue #94, ADR-0025 appendix).
+
+    ``allowed_hosts`` is the Host-header allowlist handed to starlette's ``TrustedHostMiddleware``
+    (a non-matching ``Host`` → 400), which is what makes DNS rebinding fail: the rebound request
+    still carries the attacker's DNS name in ``Host``. It defaults to loopback only, so any
+    deployment reached under another name (a reverse proxy that preserves the public Host — the
+    documented standard, ``docs/DEPLOY-TEAM.md`` §2) MUST add that hostname here. Patterns follow
+    starlette's semantics: an exact host, or a ``*.example.com`` subdomain wildcard. The port is
+    never part of the comparison (starlette matches on ``host.split(":")[0]``), so entries carry
+    no port; IPv6 literals are rejected at load for the same reason (see :func:`_host_pattern`).
+    This list governs the HOST gate ONLY. The Origin/CSRF check does not read it — it compares an
+    incoming ``Origin`` against the request's own ``Host`` — precisely so that an entry added for
+    another purpose (hub-local ``127.0.0.1`` for health checks, a subdomain wildcard) cannot be
+    promoted into a trusted WRITE origin (issue #94 review).
+
+    ``require_origin`` hardens the state-changing routes: with the default ``False`` a request
+    that carries NO ``Origin``/``Referer`` (a script, ``curl``, CI) is allowed — a browser always
+    sends ``Origin`` on cross-site writes, so refusing *mismatches* alone already closes the CSRF
+    path, and refusing *absence* by default would break every documented upload ``curl``. A team
+    deployment that has no scripted writers can set it ``True`` to also refuse header-less writes.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    allowed_hosts: list[str] = Field(default_factory=lambda: list(_DEFAULT_ALLOWED_HOSTS))
+    require_origin: bool = False
+
+
 class WebConfig(BaseModel):
     """Operator settings for the web face (ADR-0025), read from ``_kb/repo.yaml`` ``web:``.
 
@@ -756,6 +809,7 @@ class WebConfig(BaseModel):
     extensions: WebExtensionsConfig = Field(default_factory=WebExtensionsConfig)
     features: WebFeaturesConfig = Field(default_factory=WebFeaturesConfig)
     identity: WebIdentityConfig = Field(default_factory=WebIdentityConfig)
+    security: WebSecurityConfig = Field(default_factory=WebSecurityConfig)
 
 
 def load_web_config(layout: RepoLayout) -> WebConfig:
@@ -769,9 +823,10 @@ def load_web_config(layout: RepoLayout) -> WebConfig:
     loaders; see the module docstring near ``ConfigError``). Resolved PER-REPO by ``build_app`` so
     web policy can never leak across repos (invariant 5 / ADR-0006). Unknown sub-keys (e.g.
     ``web.graph.typo``) are IGNORED at the loader level, consistent with the other ``.get()``-based
-    loaders (only WIRED keys are read), so a stray key never crashes the face — EXCEPT
-    ``web.identity``, whose unknown keys fail loud (:func:`_load_identity_config`: a typo'd
-    security opt-in silently off is worse than a crash).
+    loaders (only WIRED keys are read), so a stray key never crashes the face — EXCEPT the two
+    SECURITY blocks ``web.identity`` and ``web.security``, whose unknown keys fail loud
+    (:func:`_load_identity_config` / :func:`_load_security_config`: a typo'd security opt-in
+    silently off is worse than a crash).
     """
     raw = _read_yaml_mapping(repo_config_path(layout))
     web = _sub_mapping(raw.get("web"))
@@ -781,6 +836,18 @@ def load_web_config(layout: RepoLayout) -> WebConfig:
     extensions = _sub_mapping(web.get("extensions"))
     features = _sub_mapping(web.get("features"))
     identity = _sub_mapping(web.get("identity"))
+    # A non-mapping `web.security:` (a scalar typo, or an indentation slip that makes it a LIST of
+    # one-key mappings) must not narrow to `{}` the way the tolerant sub-blocks do: the operator
+    # would believe a public host is allow-listed / Origin is mandatory while the deployment
+    # silently ran on the permissive default. Same reasoning as the unknown-key check below.
+    security_raw = web.get("security")
+    if security_raw is not None and not isinstance(security_raw, dict):
+        raise ConfigError(
+            f"web.security must be a mapping of {sorted(_SECURITY_KEYS)}, got {security_raw!r} — "
+            "check the indentation under `security:` (a list or a scalar here would leave the "
+            "security defaults silently in force)"
+        )
+    security = _sub_mapping(security_raw)
 
     allowed_raw = extensions.get("allowed")
     allowed: list[str] | None
@@ -834,6 +901,7 @@ def load_web_config(layout: RepoLayout) -> WebConfig:
             ),
         ),
         identity=_load_identity_config(identity),
+        security=_load_security_config(security),
     )
 
 
@@ -869,6 +937,108 @@ def _load_identity_config(identity: dict[str, object]) -> WebIdentityConfig:
             identity.get("strip_domain"), False, key="web.identity.strip_domain"
         ),
     )
+
+
+def _load_security_config(security: dict[str, object]) -> WebSecurityConfig:
+    """Narrow the ``web.security`` sub-mapping into a :class:`WebSecurityConfig`, fail-loud.
+
+    Same posture as :func:`_load_identity_config` (issue #94 mirrors #67): a security opt-in must
+    never be silently misread. An unknown sub-key fails LOUD (:data:`_SECURITY_KEYS`); a
+    non-list/non-string ``allowed_hosts`` or a non-boolean ``require_origin`` raises
+    :class:`ConfigError`; and every host pattern is validated by :func:`_host_pattern` so an entry
+    that could NEVER match (a port, an IPv6 literal, a URL) is reported at load instead of
+    manifesting as an unexplained 400 on every request. An EMPTY list is refused too — it would
+    lock the operator out of their own face while looking like "no restriction".
+    """
+    unknown = sorted(str(k) for k in security.keys() - _SECURITY_KEYS)
+    if unknown:
+        raise ConfigError(
+            f"unknown web.security key(s) {unknown!r} — the wired keys are "
+            f"{sorted(_SECURITY_KEYS)!r} (underscores, not hyphens); a typo here would "
+            "silently leave the face on the permissive default"
+        )
+    raw_hosts = security.get("allowed_hosts")
+    if raw_hosts is None:
+        allowed_hosts = list(_DEFAULT_ALLOWED_HOSTS)
+    else:
+        if not isinstance(raw_hosts, list):
+            raise ConfigError(
+                f"web.security.allowed_hosts must be a list of hostnames, got {raw_hosts!r}"
+            )
+        for entry in raw_hosts:
+            if not isinstance(entry, str):
+                raise ConfigError(
+                    f"web.security.allowed_hosts entries must be strings, got {entry!r}"
+                )
+        allowed_hosts = [_host_pattern(e) for e in raw_hosts]
+        if not allowed_hosts:
+            raise ConfigError(
+                "web.security.allowed_hosts must not be empty — an empty allowlist rejects "
+                "EVERY request with 400 (including your own browser). Remove the key to keep "
+                f"the default {list(_DEFAULT_ALLOWED_HOSTS)!r}"
+            )
+    return WebSecurityConfig(
+        allowed_hosts=allowed_hosts,
+        require_origin=_opt_bool(
+            security.get("require_origin"), False, key="web.security.require_origin"
+        ),
+    )
+
+
+def _host_pattern(entry: str) -> str:
+    """Normalize + validate ONE ``web.security.allowed_hosts`` pattern (fail-loud, issue #94).
+
+    Returns the stripped/lowercased host. Rejects, with an actionable message, every shape that
+    could never match a real request under starlette's ``TrustedHostMiddleware`` semantics
+    (``host = Host.split(":")[0]``, then exact ``==`` or a ``*.suffix`` match):
+
+    - a **URL** (``https://kb.example.com``) — a bare hostname is wanted;
+    - an **IPv6 literal** (``::1`` / ``[::1]``), which that naive split mangles into ``"["`` —
+      IPv6-literal binds are NOT supported by the allowlist (a declared posture, not an oversight:
+      ``docs/DEPLOY-TEAM.md`` §2 / ADR-0025 appendix). Bind IPv4 loopback or front the face with a
+      hostname;
+    - a **port** (``kb.example.com:8000``) — the port is stripped from the Host before matching,
+      so a ported entry matches nothing (one portless entry covers every bound port);
+    - a **bare ``*``** — starlette treats it as "allow any Host", i.e. it disables the whole
+      rebinding defense. A security block must not carry a silent kill switch: list the hostnames
+      explicitly, or a ``*.example.com`` subdomain wildcard;
+    - a **malformed wildcard** (``a*b``, ``*.*.com``) — starlette would raise a bare
+      ``AssertionError`` at app construction (and skip the check entirely under ``python -O``).
+    """
+    host = entry.strip().lower()
+    if not host:
+        raise ConfigError("web.security.allowed_hosts entries must be non-empty hostnames")
+    if "/" in host:
+        raise ConfigError(
+            f"web.security.allowed_hosts entry {entry!r} looks like a URL — supply a bare "
+            "hostname (e.g. kb.example.com), no scheme and no path"
+        )
+    if "[" in host or "]" in host or host.count(":") > 1:
+        raise ConfigError(
+            f"web.security.allowed_hosts entry {entry!r} looks like an IPv6 literal — IPv6 "
+            "literals are UNSUPPORTED by the Host allowlist: the Host header is matched on "
+            'Host.split(":")[0], which turns "[::1]:8000" into "[" and can match no pattern at '
+            "all. Bind IPv4 loopback (--host 127.0.0.1, the default) or reach the face under a "
+            "hostname"
+        )
+    if ":" in host:
+        raise ConfigError(
+            f"web.security.allowed_hosts entry {entry!r} must be a bare hostname without a port — "
+            "the port is stripped from the Host header before matching, so a ported entry never "
+            "matches (one portless entry already covers every port you bind)"
+        )
+    if host == "*":
+        raise ConfigError(
+            "web.security.allowed_hosts must not contain '*' — it disables Host validation "
+            "outright, and with it the DNS-rebinding defense. List each hostname explicitly, or "
+            "use a '*.example.com' subdomain wildcard"
+        )
+    if "*" in host and not (host.startswith("*.") and "*" not in host[1:]):
+        raise ConfigError(
+            f"web.security.allowed_hosts entry {entry!r} is not a valid wildcard — only a leading "
+            "'*.' subdomain wildcard is supported (e.g. '*.example.com')"
+        )
+    return host
 
 
 def _normalize_ext(ext: str) -> str:
