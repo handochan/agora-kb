@@ -90,6 +90,228 @@ Goal: humans contribute and observe via the browser.
       (Neo4j) was rejected on license/SSOT/overkill grounds.
 **Exit:** upload a PDF/URL in the browser → it becomes a linked wiki note; dashboard shows the queue.
 
+## 0.1.0-beta — release cutline (next; the first tagged, installable release) — epic #93
+
+Goal: hand the shipped Phases 1–3.6 to people who are **not** the author — a developer dogfooder and
+a team of 2–10 evaluating fit — without shipping a footgun. Nothing new is designed here: this is a
+**packaging + operational-truth** cutline over code that already exists, plus the one security gap a
+browser can reach today and the two path-safety defects that only the author's tidy directory names
+have been hiding. Audience is deliberately *both* (solo dogfood **and** team fit), so neither half is
+cut for the other. Platforms are macOS + Linux, with **Windows conditional** on the CI gate below.
+The support promise is narrow and literal: `main` moves, the KB format does not — every `_kb/` tier
+stays derived and rebuildable (ADR-0001), so a beta upgrade never asks anyone to migrate `wiki/`.
+
+### Track A — beta packaging (15 items)
+
+The 15 bullets below map **one-to-one** onto the 15 filed issues (security 2 · operational truth 4 ·
+path safety 1 · release infrastructure 4 · docs 3 · verification 1). Landing order is **CI first**,
+then code, then docs, then `SECURITY.md`, then the smoke, then the tag: the workflow is Track A's
+*first* artifact, so every later slice lands on a visible green, the pre-fix Windows baseline is
+recorded before anyone touches the code, and Track B gets its `windows-latest` signal from day one.
+
+**Security (2)**
+- [ ] **Web CSRF + DNS-rebinding defense — must-have (#94).** `build_app` installs **zero** middleware
+      (`rg add_middleware src/` → 0 hits) and `POST /api/upload` takes `multipart/Form`
+      (`faces/web/app.py:229-242`) — a *simple* request, so no CORS preflight guards it: any page the
+      operator visits while `agora web` runs can write into the inbox, and the next curate persists
+      it into `wiki/` with no supported way back (the closed op vocabulary has no DELETE,
+      `curator/plan.py:51-56`). No `Host` validation means DNS rebinding reads `/api/notes`,
+      `/api/search`, and `/api/gold/{pack}` wholesale. The ADR-0027 §8 sentinel does **not** cover
+      this — it is a gold-assembly / harvest-boundary contract, so injected text leaves verbatim via
+      `kb_query`/`kb_read` and can act as instructions inside another agent. Lands as an
+      ADR-0019/0025 appendix, the same precedent as #66/#53/#67 — no new ADR.
+- [ ] **`SECURITY.md` (#95).** `.github` has never existed in this repo's history
+      (`git log --all -- .github` → empty), so there is no channel for a private vulnerability
+      report. `SECURITY.md` is load-bearing for a beta that ships a local web face: it must state the
+      threat model (localhost, unauthenticated, single trusted operator), the reporting channel, and
+      the surfaces that are **not** defended. Written after the CSRF item lands, so it describes
+      reality. `CONTRIBUTING.md` and `CODE_OF_CONDUCT.md` are deliberately **post-beta** — the beta
+      audience is dogfooders and team evaluators, not contributors, and neither file gates the
+      release.
+
+**Operational truth (4)**
+- [ ] **First-run failure diagnosis (#96)** (one issue, one failure story). `_cmd_curate` prints three
+      lines (`cli.py:487-490`) while the real cause lives only in
+      `_kb/failed/<date>/<run>/error.json` (`worker.py:876`) and that path is never printed;
+      `mark_run` is called from the publish path only (`worker.py:607`), so `last_run: never`
+      survives any number of failures, and `state.counters.failed` counts **terminal** failures only
+      (`worker.py:897-900`) — a run that is still retrying looks healthy on all three axes (depth,
+      last_run, counters); and none of the six `_doctor_*` checks (`cli.py:1089-1109`) probes whether
+      the configured brain answers, so doctor reports healthy immediately after a curate failed for
+      exactly that reason. The failed-event counter already exists at `faces/mcp_server.py:814` —
+      surface it rather than write a new one.
+- [ ] **`agora watch` crash-loop containment (#97).** The only `except` wrapping `_watch_tick`
+      (`cli.py:764-770`) is `KeyboardInterrupt`, so a corrupt `state.json` (a deliberate raise —
+      `core/state.py:144-152`) turns the #65 always-on units into a 10-second restart loop under
+      systemd `Restart=on-failure`/`RestartSec=10` and launchd `KeepAlive`. Per-tick isolation +
+      backoff.
+- [ ] **`schema_version` compatibility check (#98).** Read in three places (`config.py:174/909/915`) and
+      compared against a supported range in **none**; no doctor line. A repo written by a future
+      build must fail loudly. (`agora repo upgrade` itself stays #63.)
+- [ ] **`agora requeue` — failed-event reinjection (#99).** `rg requeue src/` → 0. With `watch --interval`
+      defaulting to 60s (`cli.py:228`), a threshold trigger that ignores `last_run` and fires every
+      tick (`curator/triggers.py:117-119`), and `max_attempts=3` (`config.py:127`), a backend outage
+      moves captures **terminally** into `_kb/failed/` in roughly three minutes with no supported way
+      back. Reinjection must reuse the existing `event_key` idempotency path — the inbox is
+      append-only (invariant 3).
+
+**Path safety (1 — new, carved out of #90)**
+- [ ] **Cross-platform path safety (#108).** Two defects that reproduce on **POSIX**, not just Windows.
+      (a) `build_cache` calls `layout.index_notes_path()` **unguarded** (`core/wiki.py:1444`) while
+      all five other call sites guard it (`wiki.py:866-869`, `cli.py:932-936`, `cli.py:952-956`,
+      `cli.py:1185-1188`, `worker.py:995-1017`), and that function feeds the **repo directory name**
+      through `safe_path_component` → `validate_writer`, whose charset is
+      `\A[A-Za-z0-9][A-Za-z0-9._-]*\Z` (`core/layout.py:29,43-48,51-60,211-222`) — verified live to
+      reject both `My Knowledge` and `내지식`. Since `_cmd_index_build` catches only
+      `(ConfigError, GitError)` (`cli.py:902-906`), `agora index build` dies with a raw traceback in
+      any repo whose directory name contains a space or Hangul — reproduced on macOS after a
+      *successful* `agora repo init` on the same path. The docstring at `layout.py:214-218` even
+      states that the *read* path degrades to a full scan so "query never crashes"; the write path
+      simply never got the same treatment. (`agora curate` is unaffected — `rebuild_index_cache`
+      swallows it and degrades, `worker.py:995-1017` — so the crash surface is `index build` alone.)
+      (b) `ingest/vault_import.py:637` validates a `sources:` entry with `entry.startswith("raw/")`
+      and nothing else — no `..` check, no resolve containment — and `:676-679` then writes to
+      `dest / entry`, so `raw/../../etc/x` passes the gate and lands outside `dest` when an untrusted
+      vault is imported (`harvester/connectors.py:801-807` already has the `_within` containment
+      helper this path should reuse). Both were carved out of #90 §(d)/§(e) because they are not
+      Windows-specific; #90 keeps only its Windows-native remainder and does **not** close when this
+      lands.
+
+**Release infrastructure (4)**
+- [ ] **CI — Track A's first landing (#100).** `.github` has never existed in this repo's history
+      (`git log --all -- .github` → empty). One workflow shared by both tracks: `ubuntu-latest` +
+      `macos-latest` **required**, `windows-latest` `continue-on-error` (progress signal **and** the
+      release gate below). It goes in before the code slices so each of them lands on a visible green
+      and so the Windows baseline (currently 33 collect errors across 71 test modules) is recorded
+      *before* anyone starts fixing. Note that `uv sync` alone installs no test tooling —
+      pytest/ruff/mypy sit in `[project.optional-dependencies] dev` with no `[dependency-groups]` and
+      no `[tool.uv]` (`pyproject.toml:19`) — so CI needs `uv sync --frozen --extra dev`
+      (`--all-extras` once web/ingest tests are in scope). `uv lock --check` already passes (129
+      packages).
+- [ ] **Version anchor (#101).** `agora --version` is not registered (`build_parser`, `cli.py:69-263`);
+      `pyproject.toml:3` and `src/agora_kb/__init__.py:12` each hard-code `0.0.0` independently, and
+      the repo has **0 git tags**. One source of truth (`importlib.metadata`), the flag, the first
+      `CHANGELOG.md`, and the `v0.1.0b1` tag convention.
+- [ ] **PyPI name claim (#102).** `agora-kb` currently 404s (unclaimed); bare `agora` belongs to someone
+      else. A `0.1.0b1` placeholder upload claims the name, kept deliberately separate from an actual
+      distribution track.
+- [ ] **Windows friendly failure (#103).** Until #86 lands, `curator/claim.py:30` imports `fcntl`
+      unconditionally via `curator/__init__.py:12` → `cli.py:57`, so even `agora --help` raises
+      `ModuleNotFoundError` on native Windows. A platform check at the entry point turns that into a
+      sentence that names the platform, the tracking issue, and the WSL2 interim caveat — a temporary
+      line of defense, removed when #86 lands.
+
+**Docs (3)**
+- [ ] **`docs/GETTING-STARTED.md` — installable-from-zero + the Ollama premise (#104).** Quickstart step 1
+      is `uv sync` (`README.md:69`) and the web face needs `--extra web --extra ingest --extra
+      metrics` (`README.md:115`), announced in a different section. Separately, `repo init` writes an
+      `adapters.yaml` whose only backend is `agora-ollama-brain` with `curator.backend: qwen`
+      (`config.py:95,292,312`), yet `ollama pull`, Ollama installation, and hardware requirements
+      appear **nowhere** in the repo — and `select_model` silently falls back to the
+      alphabetically-first installed model when no qwen is present
+      (`adapters/ollama_brain.py:148-169`), while `agora doctor` still reports healthy because it
+      never probes the brain (`cli.py:1085-1112`).
+- [ ] **`docs/LIMITATIONS.md` — the data-safety contract (#105).** What a beta user may put in and what can
+      disappear, in one page: `repo init` git-ignores `_kb/` (`core/repo.py:52-54`) so nothing
+      uncurated is backed up; the closed op vocabulary has no DELETE (`curator/plan.py:51-56`) so
+      nothing is retractable; retries fail invisibly (`worker.py:607`, `worker.py:897-900`); and the
+      manual `_kb/failed/` reinjection procedure — including the trap that the retry budget is
+      derived from *retained `error.json` records*, not from the event file (`worker.py:917-930`) —
+      is documented here because no command exists for it yet.
+- [ ] **README reconciliation + repo metadata + LICENSE (#106).** No `git clone` and no repository URL
+      anywhere (`git clone|pip install|pypi` → 0 hits), no supported-OS statement, and a headline
+      still reading "Phases 1–3 shipped" (`README.md:6`) that omits 3.5/3.6; `LICENSE:190` still
+      carries the unsubstituted `Copyright [yyyy] [name of copyright owner]` boilerplate (the
+      dependency scan is clean — 0 GPL/AGPL across 129 locked packages, ADR-0005 intact); and
+      `gh repo view` still reports "Design phase." with `topics: null` and no homepage.
+
+**Verification (1)**
+- [ ] **Clean-machine release smoke — Track A's exit gate (#107).** A from-scratch run on a clean machine or
+      VM by someone who is not the author (clone → install → `repo init` → capture → curate → query →
+      web, README only), plus three failure rehearsals — Ollama daemon down, default `uv sync` then
+      `agora web`, and a non-qwen model as the only installed model — each judged on one question:
+      can the user recover unaided? Runs only after all fourteen other items merge, and no tag is cut
+      before it passes.
+
+### Track B — native Windows core (#85)
+- [ ] **#87 → #86 → #88 → #89**, in that order: the ADR decision, then the `fcntl` import blocker +
+      the single-writer lock port + the `windows-latest` matrix, then LF/git hygiene, then encoding.
+      Today `curator/claim.py:30` imports `fcntl` unconditionally via `curator/__init__.py:12` →
+      `cli.py:57`, so even `agora --help` raises `ModuleNotFoundError` on native Windows. Track B does
+      **not** block the tag — the gate below only decides *which* release it lands in. Three
+      corrections surfaced by this cutline: #89's "4 `text=True` sites" is actually **6**
+      (`core/repo.py:164`, `curator/worker.py:1260`, `curator/backends.py:295`,
+      `curator/isolation/seatbelt.py:247`, `curator/isolation/selftest.py:197`,
+      `adapters/cli_agent_brain.py:73`); #87's "ADR-0028" collides with the existing `DISTILL`
+      reservation (`docs/adr/README.md:38`) so the Windows ADR needs an unassigned number; and #90
+      loses two items to Track A — §(d)'s `core/wiki.py:1444` row and §(e)'s `vault_import`
+      containment reproduce on POSIX, so they ship in beta while #90 keeps only the Windows-native
+      remainder (reserved device names, reparse points, `os.link` exclusive create, handle
+      contention, case-insensitive globs, writer case-folding) and stays open.
+
+### The Windows CI gate (objective; not re-litigated at tag time)
+Judged **once**, on the last `main` CI run before tagging, from the `windows-latest` job alone —
+decided by one run URL, not by discussion:
+- **green** (0 collect errors, 0 failures) → `v0.1.0b1` ships with Windows in the supported-platform
+  list.
+- **red** → `v0.1.0b1` ships **macOS + Linux only**, immediately, and Windows moves to `v0.1.0b2`,
+  re-judged by the same rule when #85 closes. b1 is never delayed for b2's content.
+
+Making the job green by `skipif`-ing the tests that fail on Windows **forges the gate and is
+forbidden** — the same rule as #85's invariant-preservation principle ("where a POSIX mechanism is
+the *enforcer*, name a replacement enforcer, never skip"). A platform skip is admissible only when it
+is *replaced* by a test that verifies the Windows enforcer of the same invariant.
+
+**Exit:** someone who is not the author clones the repo at the tag, follows the README on a supported
+OS — including from a directory whose name has a space in it — and ends up with a curated, queryable
+KB, and a web page they happen to visit while `agora web` is running cannot write to it.
+
+### Not in 0.1.0-beta — what a beta user must not assume
+Stated as user-facing risk, not as a feature backlog. Every line is a thing that can bite someone.
+- **Windows** — conditional on the gate above. Until it lands, native Windows cannot run a single
+  `agora` command (`curator/claim.py:30`), and the WSL2 interim path has **zero verification
+  evidence**: no test, CI job, or doc in this repo mentions WSL, and ADR-0013:615-617 still files
+  Windows posture as an open question. (The two cross-platform path-safety defects carved out of #90
+  *are* fixed in beta; the rest of #90 is not.)
+- **AuthN/AuthZ** — none. ADR-0036 is *Proposed*, Phase 4 (#69). Anyone who can reach the process is
+  a full-rights operator; there is no login, no token, no role.
+- **Network exposure** — `agora web` binds `127.0.0.1` by design (`cli.py:245`). Exposing it — LAN,
+  Tailscale, or public — is outside the supported envelope until auth lands; teams must use the
+  reverse-proxy hub topology in [`DEPLOY-TEAM.md`](DEPLOY-TEAM.md), where the proxy, not Agora, is
+  the security boundary.
+- **Multi-user** — `web.identity.trusted_header` (#67) threads a *provenance* label, not a
+  permission. It separates writers in the log; it isolates nothing and enforces nothing.
+- **Remote MCP** — stdio only. Streamable HTTP is explicitly coupled to the Phase-4 auth bullet and
+  must not ship before it (ADR-0036).
+- **Two-way sync** — `agora sync` is push-only by construction (#64); the remote is a backup target,
+  never a second writer (ADR-0002). There is no pull, no merge, no conflict resolution, and no
+  multi-machine story — a second machine writing the same KB is unsupported (#46).
+- **Backup scope** — `repo init` git-ignores `_kb/` (`core/repo.py:52-54`), so a git-remote backup
+  carries `wiki/` and **not** the uncurated inbox, harvest cursors, gold packs, failed events, or
+  curator state. Anything captured but not yet curated is not backed up by `agora sync`.
+- **Deletion** — the closed op vocabulary has no DELETE (`curator/plan.py:51-56`) and the inbox is
+  append-only (invariant 3). Nothing written can be retracted through a supported path; retention and
+  right-to-delete are the unwritten ADR-0031 (#42). **Do not capture secrets or other people's PII.**
+- **Instant retrieval** — a capture is queryable only after a curator run publishes it. There is no
+  read-your-own-write overlay (ADR-0033, reserved and unauthored), so "I just saved it and search
+  can't find it" is expected behavior, not a bug.
+- **Schema migration** — `agora repo upgrade` is #63, open, and `schema_version` is read but never
+  compared against a supported range (`config.py:174/909/915`). A repo initialized by this beta is
+  expected to keep working, but there is no migration command if the schema moves.
+- **Embeddings / semantic search** — deliberately absent; deterministic BM25F ranking is the contract
+  (ADR-0009/0012). ADR-0032 is reserved and evidence-triggered, not planned for beta.
+- **Cloud brains** — the default brain is a local Ollama model and an OSS path is mandatory
+  (invariant 4). Routing `plan`/`author` to a hosted CLI agent (ADR-0015/0016) is supported but sends
+  KB content off the machine — an explicit operator decision, never a default.
+- **Sandbox limits** — ADR-0013 confinement covers the *authoring* subprocess (macOS Seatbelt / Linux
+  bwrap); the default Ollama brain does inference **outside** it by design, and the compensating
+  control ADR-0013:424-425 promises for `allow_reduced_isolation` (forced review-mode) is not
+  implemented (`rg reduced_isolation curator/worker.py` → 0; tracked in #91). The real last line of
+  defense is the deterministic FINAL-DIFF gate, not the kernel.
+- **Contributor process** — no `CONTRIBUTING.md` and no `CODE_OF_CONDUCT.md` in this release; they
+  are post-beta. Vulnerabilities go through `SECURITY.md`; everything else goes through issues.
+
+
 ## Phase 4 — Small team (multi-tenant, network)
 Goal: a few trusted people share repos over a private network.
 - [ ] `core.repo` multi-repo + team/personal kinds; write routing + read scope.
