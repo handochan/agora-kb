@@ -216,6 +216,31 @@ class RepoLayout:
         name can never escape ``_kb/index/`` (the same traversal guard the inbox/harvest namespaces
         use, DESIGN §7). A name that is not a safe component raises :class:`InvalidWriterError`; the
         read path treats that as "no cache" and falls back to a full scan (query never crashes).
+
+        A repo directory named e.g. ``My Knowledge`` or ``내지식`` is perfectly legal on disk but is
+        NOT a safe component, so no cache file can be addressed for it (issue #108). The raise
+        carries an OPERATOR-facing message — what did not happen, why, and what still works — so
+        every call site (read fallbacks, ``agora index status``/``clear``, and the ``build_cache``
+        write path) can surface the same explanation verbatim instead of a bare regex mismatch.
+        The message is deliberately plain prose with NO parentheses and NO raw regex: every one of
+        those call sites interpolates it INSIDE its own ``(...)``, so a nested group or a
+        ``\\A[A-Za-z0-9]...`` blob would land in front of the operator verbatim. The remedy clause
+        follows the actual input — renaming the directory only helps when the stem CAME from the
+        directory name (``repo is None``); an explicit stem is the caller's to fix.
         """
-        stem = safe_path_component(repo if repo is not None else self.root.name)
+        name = repo if repo is not None else self.root.name
+        try:
+            stem = safe_path_component(name)
+        except InvalidWriterError as exc:
+            remedy = (
+                "rename the repo directory to a safe name to enable the cache"
+                if repo is None
+                else "pass a cache stem that is a safe component to enable the cache"
+            )
+            raise InvalidWriterError(
+                f"repo name {name!r} is not usable as a cache filename component: it must start "
+                f"with a letter or digit and contain only letters, digits, '.', '_' or '-', up to "
+                f"{_WRITER_MAX} characters. No cache file can be addressed for this repo, so "
+                f"search/query fall back to a full scan; {remedy}"
+            ) from exc
         return self.index_cache_dir / f"{stem}.notes.json"

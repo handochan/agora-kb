@@ -11,6 +11,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from agora_kb.core import frontmatter
 from agora_kb.ingest.vault_import import ImportReport, import_vault
 
@@ -636,6 +638,231 @@ def test_existing_valid_raw_source_is_kept_and_copied(tmp_path: Path) -> None:
     assert (dest / "raw/general/kept-source.md").read_text(encoding="utf-8") == (
         "the immutable captured source body\n"
     )
+    assert report.lint.ok is True
+
+
+# --- raw/ containment: an untrusted vault can never write outside dest (issue #108) -------------
+
+
+# Entries a ``startswith("raw/")`` gate ACCEPTED that nonetheless address a file outside
+# ``dest/raw/`` — these are the WRITE-ESCAPE locks. Each gets its OWN vault: the copy branch
+# ``return``s after the first successful copy, so several escaping entries on one note would leave
+# every entry but the first unexercised (the assertion would pass with or without the fix). Each
+# case therefore names the file the pre-fix copy READ (it must exist, or the branch never fires)
+# and the file it WROTE. The grammar is enforced on ALL platforms — a KB imported on macOS must
+# behave the same on Windows — so the Windows spelling is rejected by POSIX-side code too, which
+# here means "never copied anywhere" rather than "escaped".
+_WRITE_ESCAPES = [
+    # climbs clean out of dest: src/raw/../../pwned.md → dest/raw/../../pwned.md
+    pytest.param("raw/../../pwned.md", "pwned.md", "out/pwned.md", id="climbs-out-of-dest"),
+    # stays inside dest but leaves dest/raw/: src/sibling.md → dest/sibling.md
+    pytest.param("raw/../sibling.md", "vault/sibling.md", "out/kb/sibling.md", id="out-of-raw"),
+    # a backslash is a separator on Windows and a filename character on POSIX; either way the
+    # entry must never be copied, so the POSIX-side write target is asserted absent too.
+    pytest.param(
+        "raw/..\\..\\pwned-win.md",
+        "vault/raw/..\\..\\pwned-win.md",
+        "out/kb/raw/..\\..\\pwned-win.md",
+        id="backslash-separator",
+    ),
+]
+
+# Entries the grammar alone rejects and that the OLD ``startswith("raw/")`` gate already dropped —
+# they lock the STRIP behaviour (recorded, never silently kept), not a write escape.
+_NON_RAW_SOURCES = [
+    "/etc/passwd",  # absolute
+    "C:/raw/pwned-drive.md",  # drive letter
+    "raw",  # the root itself, not an artifact under it
+]
+
+
+@pytest.mark.parametrize(("entry", "read_rel", "write_rel"), _WRITE_ESCAPES)
+def test_traversal_raw_source_cannot_write_outside_dest(
+    tmp_path: Path, entry: str, read_rel: str, write_rel: str
+) -> None:
+    """A ``sources:`` entry that traverses out of ``dest/raw/`` is DROPPED and never copied (#108).
+
+    ``dest`` is nested one level deeper than ``src`` so a traversal's read target and write target
+    differ: pre-fix, ``entry.startswith("raw/")`` passed the gate, ``(src / entry)`` resolved to a
+    real file, and ``dest / entry`` wrote OUTSIDE the destination repo. The assertion inspects that
+    write path directly, not just the warning text.
+    """
+    src = tmp_path / "vault"
+    dest = tmp_path / "out" / "kb"
+    # ``src/raw/`` must EXIST: the kernel resolves ``raw/../x`` component by component, so without
+    # it the pre-fix ``(src / entry).is_file()`` probe would fail and the copy branch would never
+    # fire — the escape assertion below would then hold with or without the fix.
+    (src / "raw").mkdir(parents=True, exist_ok=True)
+    read_target = tmp_path / read_rel
+    read_target.parent.mkdir(parents=True, exist_ok=True)
+    read_target.write_text("SECRET\n", encoding="utf-8")
+    # A single-quoted YAML scalar gets no escape processing, so the entry arrives verbatim (in
+    # particular the backslash spelling stays a backslash).
+    _write(
+        src,
+        "wiki/general/themes/evil.md",
+        f"---\ntitle: Evil\nsources: ['{entry}']\n---\n\n# Evil\n\nUntrusted vault prose.\n",
+    )
+
+    report = import_vault(src, dest, domains=["general"], import_date=_IMPORT_DATE)
+
+    # (1) nothing was copied to the escaping write target, and the read target is untouched.
+    assert not (tmp_path / write_rel).exists()
+    assert read_target.read_text(encoding="utf-8") == "SECRET\n"
+
+    # (2) the entry was dropped WITH a record — warn + drop, never a silent pass.
+    rec = _record(report, "wiki/general/themes/evil.md")
+    assert entry in rec.stripped_sources
+    assert any("escapes raw/" in w for w in rec.warnings)
+
+    # (3) the note itself still imports normally: the synth raw/ snapshot is its sole source.
+    fm = _parses(dest, "wiki/general/themes/evil.md")
+    assert fm["sources"] == ["raw/general/evil.md"]
+    assert "Untrusted vault prose." in (dest / "raw/general/evil.md").read_text(encoding="utf-8")
+    assert report.lint.ok is True
+
+
+def test_non_raw_sources_are_stripped_with_a_record(tmp_path: Path) -> None:
+    """Grammar-only rejects (absolute, drive letter, bare ``raw``) are stripped + recorded (#108).
+
+    These never reached the copy branch even before the containment fix, so they lock the no-loss
+    STRIP contract rather than a write escape: whatever is refused is visible in
+    ``stripped_sources`` and in a warning, and the theme still gets its own snapshot.
+    """
+    src = tmp_path / "vault"
+    dest = tmp_path / "out"
+    fm_sources = ", ".join(f"'{s}'" for s in _NON_RAW_SOURCES)
+    _write(
+        src,
+        "wiki/general/themes/odd.md",
+        f"---\ntitle: Odd\nsources: [{fm_sources}]\n---\n\n# Odd\n\nProse.\n",
+    )
+
+    report = import_vault(src, dest, domains=["general"], import_date=_IMPORT_DATE)
+
+    rec = _record(report, "wiki/general/themes/odd.md")
+    for entry in _NON_RAW_SOURCES:
+        assert entry in rec.stripped_sources
+    assert any("not under raw/" in w for w in rec.warnings)
+    assert _parses(dest, "wiki/general/themes/odd.md")["sources"] == ["raw/general/odd.md"]
+    assert report.lint.ok is True
+
+
+def test_dot_slash_raw_source_is_kept_and_normalized(tmp_path: Path) -> None:
+    """``./raw/<...>`` is a real raw artifact in an unnormalized spelling — kept, not stripped.
+
+    The old ``startswith("raw/")`` gate dropped it as "not under raw/" and the theme fell back to a
+    body snapshot, losing a valid provenance link. Containment (issue #108) judges the RESOLVED
+    path, so the entry survives and is rewritten in canonical POSIX form — the spelling every
+    downstream consumer (lint L1-8, the graph) expects. This test pins that widened acceptance so
+    it cannot drift back silently.
+    """
+    src = tmp_path / "vault"
+    dest = tmp_path / "out"
+    _write(src, "raw/general/kept-source.md", "the immutable captured source body\n")
+    _write(
+        src,
+        "wiki/general/themes/dotted.md",
+        "---\ntitle: Dotted\nsources: ['./raw/general/kept-source.md']\n---\n\n# Dotted\n\nP.\n",
+    )
+
+    report = import_vault(src, dest, domains=["general"], import_date=_IMPORT_DATE)
+
+    rec = _record(report, "wiki/general/themes/dotted.md")
+    assert rec.stripped_sources == ()
+    assert rec.synth_raw_source is None  # the pre-existing artifact wins; no snapshot
+    assert _parses(dest, "wiki/general/themes/dotted.md")["sources"] == [
+        "raw/general/kept-source.md"
+    ]
+    assert (dest / "raw/general/kept-source.md").read_text(encoding="utf-8") == (
+        "the immutable captured source body\n"
+    )
+    assert report.lint.ok is True
+
+
+def test_relocated_dest_raw_symlink_keeps_a_cited_artifact(tmp_path: Path) -> None:
+    """An operator who parks ``dest/raw/`` on another volume keeps working (issue #108 review).
+
+    ``dest`` belongs to the operator, not to the untrusted vault, and the body-snapshot fallback in
+    ``_synth_raw_source`` writes ``dest/raw/...`` through such a symlink unconditionally. Demanding
+    that a CITED artifact ALSO resolve under ``dest`` itself would therefore drop valid provenance
+    without preventing a single write. Both branches must agree: the cited artifact and the synth
+    snapshot both land in the relocated store, and nothing is reported as an escape.
+    """
+    src = tmp_path / "vault"
+    dest = tmp_path / "kb"
+    store = tmp_path / "bigstore"  # the operator's other volume
+    store.mkdir()
+    dest.mkdir()
+    try:
+        (dest / "raw").symlink_to(store, target_is_directory=True)
+    except (OSError, NotImplementedError) as exc:  # unprivileged Windows / symlink-less filesystem
+        pytest.skip(f"filesystem cannot create symlinks: {exc}")
+    _write(src, "raw/general/kept-source.md", "the immutable captured source body\n")
+    _write(
+        src,
+        "wiki/general/themes/has-raw.md",
+        "---\ntitle: Has Raw\nsources: [raw/general/kept-source.md]\n---\n\n# Has Raw\n\nProse.\n",
+    )
+    _write(src, "wiki/general/themes/no-raw.md", "---\ntitle: No Raw\n---\n\n# No Raw\n\nProse.\n")
+
+    report = import_vault(src, dest, domains=["general"], import_date=_IMPORT_DATE)
+
+    cited = _record(report, "wiki/general/themes/has-raw.md")
+    assert cited.stripped_sources == ()
+    assert not any("escapes raw/" in w for w in cited.warnings)
+    assert _parses(dest, "wiki/general/themes/has-raw.md")["sources"] == [
+        "raw/general/kept-source.md"
+    ]
+    # Both write branches followed the operator's link into the relocated store.
+    assert (store / "general/kept-source.md").read_text(encoding="utf-8") == (
+        "the immutable captured source body\n"
+    )
+    assert (store / "general/no-raw.md").is_file()
+    assert report.lint.ok is True
+
+
+@pytest.mark.parametrize("planted", ["inside-raw", "raw-itself"])
+def test_symlinked_raw_source_cannot_exfiltrate_into_dest(tmp_path: Path, planted: str) -> None:
+    """A ``raw/`` entry whose path escapes through a SYMLINK planted in the vault is not copied.
+
+    The grammar layer cannot see either of these: the cited paths have no ``..`` and are relative.
+    The resolve layer catches them on the READ end of the copy, which would otherwise pull an
+    arbitrary host file into the imported KB (issue #108). Both plantings are covered because they
+    fail DIFFERENT containment checks — a link inside ``raw/`` escapes the resolved ``raw/`` root,
+    while a symlinked ``raw/`` root escapes only the vault root.
+    """
+    src = tmp_path / "vault"
+    dest = tmp_path / "out"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.md").write_text("SECRET\n", encoding="utf-8")
+    src.mkdir(parents=True, exist_ok=True)
+    link = (src / "raw" / "link") if planted == "inside-raw" else (src / "raw")
+    cited = "raw/link/secret.md" if planted == "inside-raw" else "raw/secret.md"
+    link.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        link.symlink_to(outside, target_is_directory=True)
+    except (OSError, NotImplementedError) as exc:  # unprivileged Windows / symlink-less filesystem
+        pytest.skip(f"filesystem cannot create symlinks: {exc}")
+    _write(
+        src,
+        "wiki/general/themes/leak.md",
+        f"---\ntitle: Leak\nsources: [{cited}]\n---\n\n# Leak\n\nOwn prose.\n",
+    )
+
+    report = import_vault(src, dest, domains=["general"], import_date=_IMPORT_DATE)
+
+    assert not (dest / cited).exists()
+    assert not any(
+        p.is_file() and "SECRET" in p.read_text(encoding="utf-8", errors="ignore")
+        for p in (dest / "raw").rglob("*")
+    )
+    rec = _record(report, "wiki/general/themes/leak.md")
+    assert any("escapes the source vault raw/" in w for w in rec.warnings)
+    # The theme falls back to its own body snapshot — a normal import result, not a failure.
+    fm = _parses(dest, "wiki/general/themes/leak.md")
+    assert fm["sources"] == ["raw/general/leak.md"]
     assert report.lint.ok is True
 
 

@@ -1425,8 +1425,24 @@ def build_cache(repo: Repo) -> IndexBuildResult:
     has no curated tip to stamp. The build is independent of ``index.enabled`` (that flag gates the
     READ path); callers that should honor the kill-switch check it before calling (the worker does;
     ``agora index build`` is an explicit act).
+
+    Raises :class:`~agora_kb.config.ConfigError` when the repo directory name is not a safe filename
+    component (``My Knowledge``, ``내지식``, …) and so cannot address a cache file — issue #108. The
+    cache path is resolved FIRST, before any note is parsed, and the raise is TRANSLATED from the
+    layout guard's :class:`InvalidWriterError` into the error class every caller already handles:
+    ``agora index build`` prints it as a one-line cause+remedy, the curator's
+    ``rebuild_index_cache`` degrades to the ``index_cache_unbuilt`` signal. This is the WRITE-side
+    counterpart of the read path's silent no-cache fallback (:meth:`Wiki._usable_cache_entries`) —
+    both sides agree that no cache exists (neither invents a stem, so they can never address
+    DIFFERENT files), but a build that produced nothing must SAY so rather than report success.
     """
+    from ..config import ConfigError
+
     layout = repo.layout
+    try:
+        notes_path = layout.index_notes_path()
+    except InvalidWriterError as exc:
+        raise ConfigError(f"no reader cache was written — {exc}") from exc
     commit = repo.branch_commit()
     wiki = Wiki(layout)
     notes_payload: dict[str, dict] = {}
@@ -1441,6 +1457,5 @@ def build_cache(repo: Repo) -> IndexBuildResult:
         curated_commit=commit,
         notes=notes_payload,
     )
-    notes_path = layout.index_notes_path()
     index_cache.write_payload(notes_path, payload)
     return IndexBuildResult(note_count=count, curated_commit=commit, notes_path=notes_path)
