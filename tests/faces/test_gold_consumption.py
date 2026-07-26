@@ -92,7 +92,10 @@ def _web_client(repo: Repo):  # noqa: ANN202 - TestClient; fastapi is optional (
 
     from agora_kb.faces.web import build_app
 
-    return TestClient(build_app(repo_path=repo.layout.root, writer="web", user="alice"))
+    return TestClient(
+        build_app(repo_path=repo.layout.root, writer="web", user="alice"),
+        base_url="http://127.0.0.1",
+    )
 
 
 # --- (a) handler unit tests ---------------------------------------------------------------------

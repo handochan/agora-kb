@@ -193,7 +193,9 @@ from fastapi.testclient import TestClient  # noqa: E402
 def _client(tmp_path: Path) -> TestClient:
     from agora_kb.faces.web import build_app
 
-    return TestClient(build_app(repo_path=tmp_path, writer="web", user="alice"))
+    return TestClient(
+        build_app(repo_path=tmp_path, writer="web", user="alice"), base_url="http://127.0.0.1"
+    )
 
 
 def test_metrics_route_returns_prometheus_exposition(tmp_path: Path) -> None:

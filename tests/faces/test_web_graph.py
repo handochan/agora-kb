@@ -67,7 +67,9 @@ def _client(tmp_path: Path, *, user: str = "alice") -> TestClient:
     from agora_kb.faces.web import build_app
 
     app = build_app(repo_path=tmp_path, writer="web", user=user)
-    return TestClient(app)
+    # Host must match the default web.security.allowed_hosts (loopback only, issue #94):
+    # starlette's TestClient default `testserver` is deliberately NOT allow-listed.
+    return TestClient(app, base_url="http://127.0.0.1")
 
 
 # --- JSON /api/graph ----------------------------------------------------------------------------

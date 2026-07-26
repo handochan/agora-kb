@@ -125,7 +125,15 @@ knowledge graph (plus a per-note local/backlink graph; canvas drag/zoom/click �
 MIT force-graph, no Node — ADR-0021), a read-only **`/dashboard`**
 (KB health · curator · harvester · gold-pack status, HTMX-polled), and a Prometheus **`/metrics`**
 endpoint for external scraping. It binds to `127.0.0.1` by default and ships no authentication — keep
-it local. The upload surface is hardened for the day you do share it (the team-deployment guide,
+it local. A loopback bind is a *network* boundary, and a browser walks through it, so the face also
+defends the browser-mediated paths (issue #94, ADR-0025 appendix): a **Host allowlist**
+(`web.security.allowed_hosts`, loopback-only by default) rejects DNS-rebinding reads with 400, an
+**Origin/Referer guard** rejects any upload whose origin is not the deployment's own host:port with
+403 before anything reaches the inbox (a request with no `Origin` — `curl`, CI — still passes unless
+you set `web.security.require_origin: true`), and every response **denies framing**. Behind a
+reverse proxy, pass the client's `Host` through verbatim (`proxy_set_header Host $http_host`) and
+add your public hostname to `allowed_hosts` — an explicit list replaces the loopback default rather
+than extending it. The upload surface is hardened for the day you do share it (the team-deployment guide,
 [`docs/DEPLOY-TEAM.md`](docs/DEPLOY-TEAM.md)): server-side URL fetches are SSRF-guarded (private/loopback/link-local/metadata targets
 and redirects into them are refused) and can be disabled outright with `web.upload.url_enabled:
 false`, and zip-based uploads (docx/xlsx/pptx/epub) are capped against decompression bombs via

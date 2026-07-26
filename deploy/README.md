@@ -137,6 +137,7 @@ kb.example.com {
         alice $2a$14$...   # caddy hash-password
         bob   $2a$14$...
     }
+    # reverse_proxy preserves the original Host (kb.example.com) — the #94 Host standard.
     reverse_proxy 127.0.0.1:8000 {
         header_up X-Remote-User {http.auth.user.id}   # force-set: overrides any client value
     }
@@ -153,6 +154,11 @@ server {
     auth_basic_user_file /etc/nginx/agora.htpasswd;   # htpasswd -B
     location / {
         proxy_pass http://127.0.0.1:8000;
+        proxy_set_header Host $http_host;             # #94 Host standard: preserve the client's
+                                                      # Host VERBATIM, port included (nginx would
+                                                      # otherwise send $proxy_host =
+                                                      # 127.0.0.1:8000; $host drops the port,
+                                                      # which breaks non-default public ports)
         proxy_set_header X-Remote-User $remote_user;  # force-set: replaces any client value
     }
 }
@@ -166,12 +172,63 @@ append-mode directive such as Apache `RequestHeader append` would let the client
 alongside the authenticated one), so a set-vs-append misconfiguration surfaces loudly on the first
 upload instead of silently mis-attributing writes.
 
+## Browser-mediated attack defense (`web.security`, issue #94)
+
+The `127.0.0.1` bind is a *network* boundary, and a browser walks straight through it: a page the
+victim merely opens can auto-submit a cross-site multipart form into `POST /api/upload` (the write
+lands in the append-only, undeletable inbox), and an attacker domain rebound to `127.0.0.1`
+(DNS rebinding) can read the whole KB *same-origin*. Two guards close both, over one operator list:
+
+```yaml
+web:
+  security:
+    # An explicit list REPLACES the default (it does not extend it): keep 127.0.0.1 for hub-local
+    # health checks / Prometheus and localhost for browsing through the SSH tunnel below.
+    allowed_hosts: [kb.example.com, 127.0.0.1, localhost]   # default: [localhost, 127.0.0.1]
+    # require_origin: true                                  # also refuse writes with NO Origin
+```
+
+- **Host allowlist** → starlette `TrustedHostMiddleware`: a `Host` outside the list is **400**
+  (with a body that names this config key — matching is case-insensitive and never redirects).
+  Bare hostnames only (exact, or a `*.example.com` subdomain wildcard) — the port is stripped
+  before matching, so entries carry none. **A reverse proxy must pass the client's `Host` through
+  verbatim** (Caddy does by default; nginx needs `proxy_set_header Host $http_host;` — both
+  snippets above do it) and the public hostname must be in this list, or every proxied request
+  400s — and browser uploads 403, since the Origin check below is anchored to it. IPv6 literals
+  (`--host ::1`) are **not supported** — starlette matches on `Host.split(":")[0]`, which cannot
+  express `[::1]`; bind IPv4 loopback (the default) or use a hostname. Putting `::1` in the list
+  fails at startup with a `ConfigError` that says so.
+- **Origin/Referer guard** on the three state-changing routes (`POST /api/upload`,
+  `POST /api/upload-batch`, HTMX `POST /upload`): a request whose `Origin` (or, absent that,
+  `Referer`) `host:port` is not the request's **own `Host`** is **403** and **nothing is
+  appended**. The baseline is the request's Host, *not* this allowlist: the list carries entries
+  that exist for other reasons (hub-local loopback for health checks, a subdomain wildcard), and
+  trusting them for writes would let any page on any team member's loopback — or one XSS'd sibling
+  subdomain — inject into the hub's inbox. The scheme is not compared (TLS termination); the port
+  is. A request with **no** `Origin` passes by default — that is what keeps scripted/CI writers and
+  the verification `curl` above working, and browsers always send `Origin` on cross-site writes, so
+  refusing mismatches alone closes the browser path. Set `require_origin: true` to refuse
+  header-less writes too (recommended for a team hub with no scripted uploads; then add
+  `-H 'Origin: https://kb.example.com'` to any upload `curl`). GET health checks are never
+  Origin-checked.
+- **Framing denial** on every response (`X-Frame-Options: DENY` + CSP `frame-ancestors 'none'`): a
+  click inside an iframe submits with the face's own origin, so the guard above cannot see it.
+
+Quick check from the hub: `curl -s -o /dev/null -w '%{http_code}\n' -H 'Host: evil.com'
+http://127.0.0.1:8000/api/status` must print **400**. Unknown keys in this block fail loud
+(`ConfigError`) — a typo in a security opt-in must not read as "off".
+
+This is **not** authentication (that is ROADMAP Phase 4 / ADR-0036); it is defense in depth on top
+of the unauthenticated premise, and it closes *browser-mediated* attacks only.
+
 ## Rules & health
 
 - **127.0.0.1 only.** The web units hard-code `--host 127.0.0.1`. The web face has **no
   authentication, no TLS** — never change the bind host to `0.0.0.0` or any non-loopback address.
   Remote access goes over an SSH tunnel (`ssh -L 8000:127.0.0.1:8000 host`) or the authenticating
-  reverse proxy above (which keeps the loopback bind and adds per-user identity).
+  reverse proxy above (which keeps the loopback bind and adds per-user identity). The loopback
+  bind is a *network* boundary only — the browser-mediated paths through it are closed by
+  `web.security` above (issue #94), not by the bind.
 - **backup.auto (#64) under a service manager** is non-interactive: use an ssh agent (macOS:
   `ssh-add --apple-use-keychain`) or a git credential helper. A prompting credential flow fails
   the push; curation is unaffected (check the `agora doctor` backup line). **Linux caveat:** a

@@ -7,7 +7,8 @@ Phase-4 auth 없이 소규모 팀(2~10명)이 하나의 KB를 공유하는 **허
 
 이 가이드는 **이미 코드에 랜딩된 기능만** 다룬다: `agora sync` push-only 백업(#64), `deploy/`
 상시 구동 유닛(#65), 업로드 SSRF 가드 + `web.upload.url_enabled` 스위치(#66) + zip-bomb
-캡(#53), `web.identity.trusted_header` per-user 신원(#67), MCP 항해 도구
+캡(#53), `web.security` Host 허용목록 + Origin 검사(#94), `web.identity.trusted_header`
+per-user 신원(#67), MCP 항해 도구
 `kb_read`/`kb_neighbors`(#58), gold 팩 원격 소비 채널 `kb_context` / `GET /api/gold/{pack}`(#40).
 
 ## 1. 토폴로지 — 허브 1대
@@ -56,6 +57,14 @@ curator:
     max_candidates_per_run: 64    # 큐레이션 1회 처리 후보 상한 (#60) — 팀 유입량에 맞춰 조정
 
 web:
+  security:
+    allowed_hosts:                # Host 허용목록 (§2, #94) — 명시하면 기본값을 확장이 아니라
+                                  # **대체**하므로, 필요한 호스트를 빠짐없이 적는다
+      - kb.example.com            # 프록시가 원 Host를 넘기는 공개 호스트를 반드시 추가한다
+      - 127.0.0.1                 # 허브 로컬 헬스체크/Prometheus 스크레이프용 (남겨둔다)
+      - localhost                 # SSH 터널 브라우저 접속용 (§2의 ssh -L 뒤 localhost:8000)
+    # require_origin: true        # 상태변경 요청에 Origin/Referer 필수화 — 스크립트 업로드가
+                                  # 없는 팀이라면 권장 (구형 브라우저 잔여 리스크까지 차단)
   identity:
     trusted_header: X-Remote-User # 인증 프록시가 강제 주입하는 헤더 (§2, #67)
     strip_domain: true            # alice@example.com → alice
@@ -71,9 +80,10 @@ web:
 ```
 
 설정 로더의 fail-loud는 **부분적**이다: 코드가 읽는 키의 **타입 불일치**는 기동 시
-`ConfigError`로 즉시 실패하지만, **키 이름 오타**(미지 키)는 `backup:`·`web.identity:`
-블록에서만 거부되고 나머지(`kind`, `curator.*`, 그 외 `web.*`, `harvest.*` 등)는 조용히
-무시되어 기본값이 적용된다 — 예: `max_candidates_per_rn:` 오타는 에러 없이 캡이 기본 32로
+`ConfigError`로 즉시 실패하지만, **키 이름 오타**(미지 키)는
+`backup:`·`web.identity:`·`web.security:` 블록에서만 거부되고 나머지(`kind`, `curator.*`, 그 외
+`web.*`, `harvest.*` 등)는 조용히 무시되어 기본값이 적용된다 —
+예: `max_candidates_per_rn:` 오타는 에러 없이 캡이 기본 32로
 남고, `url_enabld:` 오타는 URL 추출이 켜진(기본 true) 채로 남는다. 그러니 위 예시를 그대로
 복사해 값만 바꾸고, 반영 후 `uv run agora doctor --repo <repo>`로 backup 라인을 확인하되
 doctor가 표면화하지 않는 값(curator 캡 등)은 실제로 달라졌는지 별도로 확인한다.
@@ -92,6 +102,58 @@ doctor가 표면화하지 않는 값(curator 캡 등)은 실제로 달라졌는�
 (4) **`/metrics`·`/dashboard`·`/api/dashboard` 경로 차단**(운영 내부 전용 — Prometheus
 스크레이프와 운영자 대시보드, 그리고 대시보드 패널의 JSON 쌍둥이 라우트
 `/api/dashboard/*`는 허브 로컬에서만)을 더한다.
+
+### Host 표준 — 프록시는 **원 Host를 보존**한다 (#94)
+
+웹 face는 이제 **Host 허용목록**(`web.security.allowed_hosts`, 기본 `localhost`+`127.0.0.1`)을
+starlette `TrustedHostMiddleware`로 강제한다. 목록 밖 Host는 **400**이다. 이것이 DNS rebinding
+(공격자 도메인을 TTL 0으로 `127.0.0.1`에 재바인딩해 same-origin으로 KB 전량을 읽는 공격)을
+막는 유일한 수단이다 — 재바인딩된 요청도 Host에는 여전히 공격자 **도메인 이름**이 실린다.
+
+**표준은 하나다: 프록시는 클라이언트가 보낸 원 Host(`kb.example.com`)를 포트까지 포함해 그대로
+앱에 넘기고, 운영자는 그 호스트를 `web.security.allowed_hosts`에 추가한다.** Caddy
+`reverse_proxy`는 원 Host를 기본 보존하므로 아래 스니펫이 그대로 표준이고, nginx `proxy_pass`는
+기본이 `$proxy_host`(=`127.0.0.1:8000`)라 **`proxy_set_header Host $http_host;` 한 줄이 필수**다
+(`$host`가 아니라 `$http_host`인 이유: `$host`는 포트를 떼므로 공개 포트가 443/80이 아닐 때
+브라우저 `Origin`과 어긋난다). 이 표준을 따르면 §1 예시의 `allowed_hosts` 한 곳만 보고 두 프록시
+구성이 모두 동작한다.
+
+> `allowed_hosts`를 명시하면 기본값(`localhost`+`127.0.0.1`)은 **확장이 아니라 대체**된다.
+> 공개 호스트만 적으면 허브 로컬 헬스체크(`curl 127.0.0.1:8000/api/status`)와 SSH 터널 뒤의
+> `http://localhost:8000` 접속이 400이 된다 — §1 예시가 셋을 모두 담고 있는 이유다.
+>
+> **원 Host 보존은 선택이 아니다.** 앱이 받는 Host가 브라우저가 실제로 접속한 호스트와 다르면
+> 읽기는 (그 Host를 목록에 넣어) 통과시킬 수 있어도 **브라우저 업로드는 403**이다. Origin 검사가
+> "요청 자신의 Host"를 기준으로 하기 때문이며, 이는 의도된 설계다(§아래 CSRF 문단). 403 본문이
+> 이 요구사항을 그대로 알려준다.
+>
+> **`X-Forwarded-Host`/`X-Forwarded-Proto`는 신뢰하지 않는다**(코드가 읽지 않는다). #67이
+> `X-Remote-User`에 대해 세운 "프록시가 강제 set/strip 한다"는 신뢰 경계는 운영자가 명시적으로
+> 선언한 헤더에만 적용되며, 그 선언이 없는 헤더로 보안 판정을 뒤집지 않는다.
+>
+> **IPv6 리터럴(`--host ::1`)은 미지원**이다. starlette의 매칭이 `Host.split(":")[0]`이라
+> `[::1]:8000`은 어떤 패턴과도 매치될 수 없다. 루프백은 IPv4(`--host 127.0.0.1`, 기본값)로
+> 바인드하거나 호스트명으로 접근한다. `allowed_hosts`에 `::1`을 넣으면 기동 시 `ConfigError`가
+> 이유와 대안을 알려준다(조용한 무시가 아니다).
+
+**CSRF(브라우저發 인박스 주입) 방어는 "요청 자신의 Host" 기준이다.** 상태변경 3라우트
+(`POST /api/upload`·`POST /api/upload-batch`·HTMX `POST /upload`)는 요청의 `Origin`(없으면
+`Referer`)의 **host:port**가 그 요청이 보내진 `Host`와 다르면 **403**이고 인박스에는 아무것도
+append되지 않는다(scheme은 비교하지 않는다 — TLS 종단 때문). 기준이 `allowed_hosts` 목록이
+**아닌** 이유: 목록에는 쓰기 신뢰와 무관한 항목(허브 로컬 `127.0.0.1` 헬스체크용,
+`*.team.example.com` 와일드카드)이 들어가는데, 목록을 공유하면 팀원 노트북의 아무 로컬 포트나
+탈취된 형제 서브도메인이 공개 허브에 쓸 수 있게 된다. `Origin`이
+**아예 없는** 요청(스크립트·CI·아래 검증 `curl`)은 기본값에서 **통과**한다 — 브라우저는
+크로스사이트 쓰기에 항상 `Origin`을 붙이므로 불일치 거절만으로 브라우저 경로는 닫히고, absent
+거절을 기본으로 하면 이 문서의 업로드 절차부터 깨진다. 스크립트 업로드를 쓰지 않는 팀은
+`require_origin: true`로 absent까지 막는 것을 **권장**한다(잔여 리스크: `Origin`을 붙이지 않는
+구형 브라우저). GET 헬스체크는 상태변경이 아니므로 Origin 검사 대상이 아니다 — GET에서 통과해야
+하는 것은 Host 허용목록뿐이다.
+
+**프레이밍(clickjacking)도 막는다.** 모든 응답에 `X-Frame-Options: DENY` +
+`Content-Security-Policy: frame-ancestors 'none'`이 붙는다 — iframe 안에서의 클릭은 face 자신의
+origin으로 제출되므로 위 Origin 검사로는 구분할 수 없기 때문이다. 웹 face를 다른 페이지에
+임베드하는 용례는 없다.
 
 **Caddy** (공개 DNS면 TLS 자동 발급; 사내망이면 `tls internal` 추가):
 
@@ -114,6 +176,8 @@ kb.example.com {
     }
 
     handle {
+        # reverse_proxy 는 원 Host(kb.example.com)를 기본 보존한다 = #94 Host 표준.
+        # 앱 쪽 web.security.allowed_hosts 에 kb.example.com 이 있어야 200이 된다(§1 예시).
         reverse_proxy 127.0.0.1:8000 {
             header_up X-Remote-User {http.auth.user.id}   # 강제 설정: 클라이언트 값 덮어씀
         }
@@ -140,6 +204,11 @@ server {
 
     location / {
         proxy_pass http://127.0.0.1:8000;
+        proxy_set_header Host $http_host;             # #94 Host 표준: 원 Host 를 포트까지 보존
+                                                      # (없으면 $proxy_host=127.0.0.1:8000 이 가고
+                                                      # 브라우저 Origin 과 어긋나 업로드가 403.
+                                                      # $host 는 포트를 떼므로 비표준 포트에서
+                                                      # 같은 증상 — $http_host 를 쓴다)
         proxy_set_header X-Remote-User $remote_user;  # 강제 설정: 위조 사본 대체
     }
 }
@@ -285,11 +354,16 @@ repo `kind`가 **미선언이면 team으로 취급**되므로, personal 소스(�
 3. **상시 구동 유닛 설치** (watch·web·harvest — [`deploy/README.md`](../deploy/README.md) 절차)
    → 검증: `curl -s http://127.0.0.1:8000/api/status` 응답 + 유닛 상태
    (`launchctl print` / `systemctl --user status`) + 재부팅 후 재확인
-4. **프록시 구성** (§2) → 검증: `curl -u alice https://kb.example.com/api/status` 200 ·
+4. **프록시 구성** (§2) → 검증: `curl -u alice https://kb.example.com/api/status` 200
+   (= 원 Host 보존 + `allowed_hosts` 등록이 둘 다 맞았다는 뜻; 400이면 §2 Host 표준 재확인) ·
    `curl https://kb.example.com/api/status` 401 · `curl -u alice https://kb.example.com/metrics`
-   403 · `curl -u alice https://kb.example.com/api/dashboard/health` 403 · 위조 헤더 업로드
-   테스트에서 응답 영수증이 `identity_source: "header"` **그리고** 허브 `_kb/inbox/web/`에
-   착지한 이벤트 frontmatter가 `source: web:alice`(§2 — `source`는 영수증에 없다)
+   403 · `curl -u alice https://kb.example.com/api/dashboard/health` 403 · 허브 로컬에서
+   `curl -s -o /dev/null -w '%{http_code}\n' -H 'Host: evil.com' http://127.0.0.1:8000/api/status`
+   가 **400**(#94 rebinding 차단) · 위조 헤더 업로드 테스트에서 응답 영수증이
+   `identity_source: "header"` **그리고** 허브 `_kb/inbox/web/`에 착지한 이벤트 frontmatter가
+   `source: web:alice`(§2 — `source`는 영수증에 없다). 그 업로드 `curl`은 `Origin`이 없어
+   기본 정책에서 그대로 통과한다 — `require_origin: true`로 강화했다면
+   `-H 'Origin: https://kb.example.com'`을 붙여야 한다.
 5. **SSH forced-command 키 배포** (§3, key당 `--writer`)
    → 검증: `ssh agora@kb.example.com ls` 가 ls를 실행하지 **않고** MCP 서버가 뜸(JSON-RPC 대기)
 6. **팀원 MCP 등록** — `claude mcp add agora-team -- ssh -T agora@kb.example.com`

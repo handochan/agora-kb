@@ -318,3 +318,133 @@ one process-wide `web:local` stamp (provenance is the basis of promotion judgmen
 - **Not auth.** This trusts the proxy wholesale; real authn/authz (tokens, OpenFGA/Forgejo
   delegation) remains ROADMAP Phase 4. This slice only threads an already-authenticated name into
   the existing `web:<user>` source form (DATA-MODEL §1 — unchanged).
+
+## Appendix (2026-07-26, append-only) — `web.security`: Host allowlist + Origin guard (issue #94)
+
+Nothing above changes. A third `WebConfig` sub-block joins `identity` on the **fail-loud** side of
+the loader, this time closing the two attacks a browser can mount against an *unauthenticated*
+localhost face. The premise being defended is uncomfortable but real: `--host 127.0.0.1` is a
+**network** boundary, and a browser walks straight through it — the victim only has to open a
+malicious page while `agora web` is running.
+
+- **(A) CSRF → inbox injection.** `POST /api/upload` is a multipart form = a CORS *simple request*,
+  so a cross-site auto-submitting `<form>` reaches it with **no preflight**. The attacker cannot
+  read the response, but the **write lands**: appended to the append-only inbox (invariant 3),
+  curated into `wiki/` on the next run, and **undeletable through product features** (the plan op
+  vocabulary has no delete). Worse, the upload path applies no sentinel neutralization, so injected
+  text can reach other agents as instructions via `kb_query` / gold packs.
+- **(B) DNS rebinding → whole-KB read.** With no `Host` validation, a TTL-0 attacker domain rebound
+  to `127.0.0.1` gives the attacker page **same-origin** reads of `/api/notes`, `/api/notes/{path}`,
+  `/api/search`, `/api/graph`, `/api/gold/{pack}`, `/metrics`, `/api/dashboard/*` — the entire
+  personal KB, and the gold packs are *compressed* summaries, so exfiltration is more efficient than
+  raw notes.
+
+- **(C) Clickjacking → framed UI.** A page that iframes `/upload` and lures a click submits from
+  the face's *own* origin, so the Origin guard cannot distinguish it from real use.
+
+**Decision — three ASGI-level guards.**
+
+- **`web.security.allowed_hosts`** (default `["localhost", "127.0.0.1"]`) is handed to starlette's
+  `TrustedHostMiddleware`: a non-matching `Host` → 400. That is what makes rebinding fail — the
+  rebound request still carries the attacker's DNS *name* in `Host`. Entries are bare hostnames
+  (exact, or a `*.example.com` subdomain wildcard); the port is never compared because the
+  middleware matches on `Host.split(":")[0]`. The middleware is wrapped (`_HostAllowlistMiddleware`)
+  for three reasons and no more: the 400 body names the product and the knob instead of upstream's
+  bare `Invalid host header` (an operator meeting a proxy 400 cannot otherwise tell proxy from app);
+  the `Host` header is lowercased first, since RFC 9110 §4.2.3 makes the host case-insensitive while
+  upstream compares `host == pattern` verbatim against loader-lowercased patterns; and
+  `www_redirect` is turned **off**, because a 307 preserves method *and* body, so a `www.`-prefixed
+  entry would bounce a state-changing request to another URL — scheme taken from the ASGI scope,
+  i.e. an http downgrade behind TLS termination — before the Origin guard ever ran. The wrapper's
+  pre-check reuses upstream's own matching rule, and upstream stays underneath as the enforcing
+  gate, so the two layers cannot disagree.
+- **`web.security.require_origin`** (default `false`) hardens the state-changing routes; see the
+  absent-Origin decision below.
+- **Framing is denied on every response** (`X-Frame-Options: DENY` + CSP `frame-ancestors 'none'`,
+  `setdefault` so a route can still opt out). Only `frame-ancestors` is set: a broader CSP would
+  have to be reconciled with the vendored htmx/force-graph assets and rendered note bodies, which
+  is a separate decision, not a side effect of the framing fix.
+
+**Absent-Origin policy: present-and-mismatched → 403, absent → pass (default), absent → 403 under
+`require_origin: true`.** The threat is *browser-mediated* CSRF, and every current browser attaches
+`Origin` to a cross-site form POST / `fetch`; refusing **mismatches** therefore already closes the
+browser path, and same-origin HTMX POSTs (which do carry `Origin`) are unaffected. Refusing
+**absence** by default would instead break this repo's own documented operations — the upload `curl`
+procedures in `deploy/README.md` and `docs/DEPLOY-TEAM.md` §2/checklist send no `Origin`, as do
+scripted/CI writers generally. (GET health-check `curl`s are *not* affected either way: the Origin
+check applies only to state-changing methods.) The **residual risk is stated, not hidden**: a
+browser old enough to omit `Origin` on cross-site writes is not covered — a team deployment with no
+scripted writers should set `require_origin: true`, and the guide recommends it.
+
+**Comparison baseline: the Origin's `host:port` against the request's OWN `Host` — not the
+allowlist, and not the scheme.** The first implementation of this appendix judged the `Origin`
+against `allowed_hosts`, on the theory that one operator list is one mental model. Adversarial
+review killed that: the allowlist legitimately carries entries that exist for reasons having
+nothing to do with write trust, and sharing the list silently promoted every one of them into a
+**trusted CSRF origin**. Two proven exploits, both against the configuration this repo's own guide
+prints: with `allowed_hosts: [kb.example.com, 127.0.0.1]` (the loopback entry is there for
+hub-local health checks and Prometheus) *any* page on *any* team member's laptop —
+`http://127.0.0.1:3000` — wrote into the public hub's inbox, and `require_origin: true` did not
+close it; with a `*.team.example.com` wildcard, one XSS'd sibling subdomain or one dangling-CNAME
+takeover did the same. Judging against the request's own `Host` costs nothing (it is the value
+`TrustedHostMiddleware` has *already* validated one layer out, so it is never an arbitrary attacker
+string) and both exploits become 403.
+
+The **port is therefore compared** — it is exactly what separates `http://127.0.0.1:3000` from the
+face itself, and scheme+host+port *is* the definition of an origin. The **scheme is still not
+compared**: a TLS-terminating proxy makes the browser send `https://…` while the app speaks plain
+`http`, and comparing it would 403 every proxied deployment. The consequence is a sharpened proxy
+contract, now stated in both guides: the proxy must pass the client's `Host` through **verbatim**
+(nginx `proxy_set_header Host $http_host`, which unlike `$host` keeps a non-default port; Caddy
+does this by default). A proxy that rewrites `Host` no longer "degrades gracefully" — browser
+uploads 403 — and the 403 body says exactly that. `Origin: null` (sandboxed iframe / `data:`
+document) is a **mismatch**, never "absent"; so is an **empty** `Origin:`, which is present-and-
+unusable rather than absent (a truthiness test would have fallen through to `Referer`, making the
+policy depend on which other header happened to ride along). **`X-Forwarded-Host` /
+`X-Forwarded-Proto` are NOT consulted** — the
+#67 trust boundary (a proxy that force-sets and strips a header) is not assumed for headers the
+operator never declared; the proxy standard is instead to **preserve the original `Host`**
+(`docs/DEPLOY-TEAM.md` §2, where the Caddy and nginx snippets are now unified on it) and to
+allow-list the public hostname. Should a future deployment shape force `X-Forwarded-*` trust, that
+becomes its own ADR, not a silent default.
+
+**No CORS middleware.** There is no origin we want to *permit* cross-origin access to, and the
+browser's default same-origin policy is already the strongest possible answer; adding
+`CORSMiddleware` could only widen the surface. Deliberately omitted.
+
+**No CSRF token.** Tokens require a session, and the face has none (no auth, no cookies). A
+double-submit token over no session would be theatre. When ADR-0036 lands authenticated sessions,
+this decision reopens and this appendix gets updated.
+
+**IPv6 literals are explicitly unsupported.** `TrustedHostMiddleware` matches on
+`Host.split(":")[0]`, which mangles `[::1]:8000` into `"["` — no pattern can match it. The
+alternatives were to reimplement Host matching (dropping the vetted upstream middleware) or to plant
+a synthetic bypass entry in the allowlist; both are worse than declaring the limitation, especially
+as `agora web` defaults to `--host 127.0.0.1`, the `deploy/` units hard-code it, and every
+documented proxy topology speaks to IPv4 loopback. The posture is made *legible* rather than silent:
+the request gets the 400, and an operator who reaches for the obvious fix (`allowed_hosts: ["::1"]`)
+gets a `ConfigError` naming the limitation and the workaround. The same load-time validation rejects
+ported entries, URLs, malformed wildcards, an empty list, and a bare `*` — the last because it
+disables Host validation outright; a security block must not ship a silent kill switch.
+
+**Fail-loud loader, like `web.identity`.** Unknown `web.security` keys raise `ConfigError` (the
+`_SECURITY_KEYS` gate), and so does a **non-mapping** `web.security:` — a scalar typo, or the
+indentation slip that turns the block into a list. The tolerant `_sub_mapping` helper answers `{}`
+for both, which for every other web sub-block only means "use the defaults", but here means the
+operator believes a public hostname is allow-listed (or that `Origin` is mandatory) while the
+deployment silently runs the permissive default. Same failure as a typo'd `allowed_host:` /
+`require-origin:`, reached through a different slip: a security opt-in silently reading as "off" is
+worse than a crash.
+
+**Test-suite consequence, recorded because it is a real trap.** All nine `TestClient` construction
+sites (eight in `tests/faces/`, one in `tests/curator/test_worker.py`'s Phase-3 exit e2e, which
+really does `POST /api/upload`) previously relied on starlette's default `Host: testserver`. They are
+pinned to `TestClient(app, base_url="http://127.0.0.1")` instead of adding `testserver` to the
+default allowlist: a **production** default must never ship a bypass host to make a test suite pass.
+
+**Not auth.** Everything here is defense in depth *on top of* the unauthenticated premise, and it is
+honest about its reach — it closes **browser-mediated** attacks only. Real authn/authz stays
+ADR-0036 / Phase 4. Two adjacent gaps are explicitly **not** closed here: the absence of sentinel
+neutralization on the upload write path (adversarial text arriving through a *legitimate* upload
+still reaches downstream agents verbatim), and the lack of any rollback for an injected item (the
+missing DELETE op, #42 / ADR-0031).
