@@ -25,7 +25,7 @@ from agora_kb.curator.isolation import (
     SandboxSpec,
     select_backend_isolation,
 )
-from agora_kb.curator.subprocess_backend import SubprocessBackend
+from agora_kb.curator.subprocess_backend import BackendUnavailableError, SubprocessBackend
 from agora_kb.curator.worker import AuthorRegion
 
 
@@ -166,6 +166,93 @@ def test_loopback_backend_is_not_confined(tmp_path: Path) -> None:
     assert iso.specs == []  # loopback brain was NOT confined (inference outside)
     text = note.read_text(encoding="utf-8")
     assert "AUTHORED PROSE" in text[text.find(start) + len(start) : text.find(end)]
+
+
+def test_author_reports_a_failed_region_instead_of_swallowing_its_exit_code(
+    tmp_path: Path,
+) -> None:
+    """A non-zero PASS-2 region must come back as a DIAGNOSTIC, not as silence (#115).
+
+    The exit code used to be discarded, so a backend that could not start (bwrap failing at
+    ``execvp`` for every region) left the worker with an empty diff — indistinguishable from
+    "nothing to do" — and the run published placeholder bodies while reporting success.
+    """
+    note_rel = "wiki/general/themes/probe.md"
+    _note_with_sentinel(tmp_path, note_rel)
+    spec = BackendSpec(
+        name="broken",
+        argv=(sys.executable, "-c", "import sys; sys.stderr.write('boom\\n'); sys.exit(3)"),
+        network="loopback",  # unconfined: this asserts the reporting, not the sandbox
+    )
+    backend = SubprocessBackend(spec)
+
+    failures = backend.author(
+        tmp_path,
+        {note_rel: ["c1"]},
+        {"c1": AuthorRegion(op="CREATE_THEME", title="T", summary="s", source_text="x")},
+    )
+
+    assert len(failures) == 1
+    assert "exited 3" in failures[0]
+    assert "boom" in failures[0]  # the backend's own stderr, not a generic message
+    assert note_rel in failures[0] and "c1" in failures[0]
+
+
+def test_author_reports_nothing_when_every_region_succeeds(tmp_path: Path) -> None:
+    """The happy path returns an EMPTY diagnostic list — no warning noise on a good run."""
+    note_rel = "wiki/general/themes/probe.md"
+    _note_with_sentinel(tmp_path, note_rel)
+    spec = BackendSpec(name="ok", argv=(sys.executable, "-c", "pass"), network="loopback")
+
+    failures = SubprocessBackend(spec).author(
+        tmp_path,
+        {note_rel: ["c1"]},
+        {"c1": AuthorRegion(op="CREATE_THEME", title="T", summary="s", source_text="x")},
+    )
+
+    assert failures == []
+
+
+def test_sandboxed_bare_name_program_is_resolved_on_the_host_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A bare-name ``argv[0]`` is resolved against the HOST PATH before entering the sandbox.
+
+    The sandbox carries a minimal ``PATH`` of its own, so a console script installed in a venv's
+    ``bin`` (``agora-ollama-brain``, ``agora-cli-brain``) is readable inside but not FINDABLE — the
+    launch fails and PASS 2 writes nothing. Resolving on the host, where the operator's PATH already
+    selected the program, keeps the in-sandbox lookup out of the picture.
+    """
+    note_rel = "wiki/general/themes/probe.md"
+    _note_with_sentinel(tmp_path, note_rel)
+    monkeypatch.setattr(
+        "agora_kb.curator.subprocess_backend.shutil.which",
+        lambda name: f"/opt/venv/bin/{name}" if name == "agora-ollama-brain" else None,
+    )
+    spec = BackendSpec(name="brain", argv=("agora-ollama-brain",), network="none")
+    iso = _RecordingIsolation()
+
+    SubprocessBackend(spec, isolation=iso).author(
+        tmp_path,
+        {note_rel: ["c1"]},
+        {"c1": AuthorRegion(op="CREATE_THEME", title="T", summary="s", source_text="x")},
+    )
+
+    assert iso.specs[0].argv[0] == "/opt/venv/bin/agora-ollama-brain"
+
+
+def test_sandboxed_unresolvable_program_fails_loudly(tmp_path: Path) -> None:
+    """An argv[0] that is on no PATH raises instead of degrading to a placeholder body."""
+    note_rel = "wiki/general/themes/probe.md"
+    _note_with_sentinel(tmp_path, note_rel)
+    spec = BackendSpec(name="ghost", argv=("definitely-not-installed-brain",), network="none")
+
+    with pytest.raises(BackendUnavailableError, match="not found on PATH"):
+        SubprocessBackend(spec, isolation=_RecordingIsolation()).author(
+            tmp_path,
+            {note_rel: ["c1"]},
+            {"c1": AuthorRegion(op="CREATE_THEME", title="T", summary="s", source_text="x")},
+        )
 
 
 # --- real seatbelt confinement (macOS) ----------------------------------------------------------

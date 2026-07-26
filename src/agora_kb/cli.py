@@ -58,7 +58,7 @@ from .curator.constants import DEFAULT_BODY_BYTE_BOUND
 from .curator.cron import is_cron_due
 from .curator.isolation import SandboxUnavailable, select_backend_isolation
 from .curator.subprocess_backend import RoutedBackend, SubprocessBackend, build_routed_backend
-from .curator.worker import recover, run
+from .curator.worker import RunReport, recover, run
 from .schema import Taxonomy, emit_schema, lint
 
 __all__ = ["main", "build_parser"]
@@ -487,7 +487,19 @@ def _cmd_curate(args: argparse.Namespace) -> int:
     print(f"status: {report.status}")
     print(f"published_commit: {report.published_commit or '-'}")
     print(f"counts: {counts}")
+    _print_run_warnings(report)
     return 0
+
+
+def _print_run_warnings(report: RunReport) -> None:
+    """Print a published run's non-fatal diagnostics to STDERR (issue #115).
+
+    A run that publishes placeholder bodies is still ``status: published`` by design (§4.2), so the
+    ONLY thing standing between an operator and a silently-empty KB is this line. STDERR keeps the
+    machine-readable ``status:``/``counts:`` stdout contract byte-identical.
+    """
+    for warning in report.warnings:
+        print(f"warning: {warning}", file=sys.stderr)
 
 
 def _build_backend(
@@ -831,6 +843,9 @@ def _watch_tick(repo: Repo) -> None:
     print(
         f"{stamp} ran ({decision.reason}): status={report.status} commit={commit} counts={counts}"
     )
+    # An always-on watch loop is exactly where a silently prose-less run would accumulate unnoticed
+    # (#115) — the per-tick line above says "published" either way.
+    _print_run_warnings(report)
     # Issue #64: best-effort backup push, ONLY after a curation that actually published and ONLY
     # when backup.auto is opted in (default off → this call is side-effect-free, byte-identical).
     if report.status == "published":

@@ -64,13 +64,15 @@ jobs:
         run: |
           sudo apt-get update && sudo apt-get install -y bubblewrap
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
-          # Mirrors BwrapIsolation._system_ro_binds(): /lib64 carries the ELF interpreter for
-          # /usr/bin/true, so omitting it makes exec fail with a misleading ENOENT and turns the
-          # probe into a false negative -- that was bug #113, which this leg is what exposed.
+          # Mirrors BwrapIsolation._mount_plan(): a whole-filesystem read-only bind plus a private
+          # /proc and /dev. Both halves are load-bearing. Enumerating system dirs instead was bug
+          # #113 (a missing /lib64 made exec fail with a misleading ENOENT and turned the probe
+          # into a false negative), and a probe that skips the mounts the real run performs was
+          # half of #115 (it green-lights a sandbox that then fails at run time -- which on the
+          # PASS-2 path used to publish placeholder bodies while reporting success).
           bwrap --version
           if bwrap --unshare-all --die-with-parent \
-                   --ro-bind /usr /usr --ro-bind /bin /bin \
-                   --ro-bind /lib /lib --ro-bind /lib64 /lib64 -- true; then
+                   --ro-bind / / --proc /proc --dev /dev -- true; then
             echo "bwrap userns probe: OK"
           else
             echo "bwrap userns probe FAILED — curator would fail closed"
@@ -108,6 +110,26 @@ jobs:
       # never exercised the web face or the extractors. Install cost is absorbed by the cache.
       - name: Install project with all extras (web, ingest, metrics, dev)
         run: uv sync --frozen --all-extras
+
+      # #115 discriminator, and it MUST run after `uv sync` — the whole point is the uv-managed
+      # venv interpreter, whose `.venv/bin/python` reaches the real binary through a
+      # minor-version alias symlink (`cpython-3.12-linux-x86_64-gnu` → `cpython-3.12.<z>-...`).
+      # Binding realpath-resolved roots left that alias component missing, so bwrap failed at
+      # `execvp` and PASS 2 published placeholder bodies while reporting success. The bwrap step
+      # above only proves the namespace; this proves the thing that actually broke. Non-fatal: the
+      # pytest run below is the gate, this is the breadcrumb that says WHICH half broke.
+      - name: Probe that a venv interpreter starts inside the sandbox (#115)
+        if: runner.os == 'Linux'
+        run: |
+          if bwrap --unshare-all --die-with-parent --clearenv \
+                   --setenv PATH /usr/bin:/bin \
+                   --ro-bind / / --proc /proc --dev /dev --tmpfs /run --tmpfs /tmp \
+                   -- "$(uv run python -c 'import sys; print(sys.executable)')" \
+                      -c 'import sys, yaml; print("in-sandbox venv python OK", sys.version_info[:2])'; then
+            echo "bwrap interpreter probe: OK"
+          else
+            echo "bwrap interpreter probe FAILED — PASS-2 would author no prose (see #115)"
+          fi
 
       - name: Lint (ruff check)
         run: uv run ruff check .

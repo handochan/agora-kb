@@ -35,6 +35,7 @@ plan.json / fills the sentinels) with no real model in the loop. A region missin
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 import shutil
@@ -67,9 +68,16 @@ __all__ = [
     "BackendUnavailableError",
 ]
 
+_logger = logging.getLogger(__name__)
+
 # A generous default per-invocation wall clock for a local model (overridden by spec.timeout_s when
 # the adapter pins one). Kept here so a hung backend cannot wedge a run indefinitely.
 _DEFAULT_TIMEOUT_S = 600
+
+# How much of a failed region's stderr rides on the RunReport line. Enough for the actionable head
+# of a message like ``bwrap: execvp …: No such file or directory`` without dumping a model's
+# multi-kilobyte traceback onto the operator's terminal (the full text is in the warning log).
+_FAILURE_DETAIL_CHARS = 400
 
 # PASS-1 PLAN prompt (INGEST-CONTRACT §8.1) — the verbatim, copy-pasteable string the worker hands
 # the backend over stdin. It carries NO unfilled placeholders: the backend reads the bundle files
@@ -280,7 +288,7 @@ class SubprocessBackend:
         worktree: Path,
         needs_prose: dict[str, list[str]],
         context: dict[str, AuthorRegion],
-    ) -> None:
+    ) -> list[str]:
         """PASS 2 — run the configured argv once per REGION to fill its body sentinel (§8.2).
 
         For each (note, run-scoped region id) the backend is invoked with ``cwd`` = the writable
@@ -288,11 +296,18 @@ class SubprocessBackend:
         summary + verbatim source text), so each region's prompt carries its OWN source; the backend
         edits ONLY between that region's markers in place. A region missing from ``context``
         (defensive) falls back to the minimal note-path + id prompt. A non-zero exit for a region is
-        LEFT for the worker's §4.2 AUTHOR-diff gate to handle (it degrades that note to a
-        prose-pending placeholder and the run still publishes a structurally-valid note), so a flaky
-        prose pass never fails the whole run. A missing executable, however, is fatal (the brain
-        cannot run at all): re-raised so the run fails cleanly rather than publishing empty bodies.
+        still NOT fatal — the worker's §4.2 AUTHOR-diff gate degrades that note to a prose-pending
+        placeholder and the run publishes a structurally-valid note, so a flaky prose pass never
+        fails the whole run. A missing executable, however, is fatal (the brain cannot run at all):
+        re-raised so the run fails cleanly rather than publishing empty bodies.
+
+        RETURNS one human-readable diagnostic per FAILED region (empty when every region exited 0).
+        The exit code used to be discarded here, which is what made #115 silent: bwrap could fail at
+        ``execvp`` for EVERY region and the run still reported ``status: published`` with
+        placeholder bodies. The worker threads these onto the :class:`RunReport` so the operator
+        sees the backend's own stderr instead of an inexplicably empty KB.
         """
+        failures: list[str] = []
         for rel_path, sids in needs_prose.items():
             for sid in sids:
                 prompt = self._pass2_prompt(rel_path, sid, context.get(sid))
@@ -301,8 +316,16 @@ class SubprocessBackend:
                 # sandbox when an isolation adapter is injected AND ``spec.network == 'none'`` (a
                 # malicious backend then cannot write outside the worktree nor reach the network); a
                 # loopback Ollama brain stays unconfined (inference outside). A non-zero exit is
-                # intentionally NOT raised — the §4.2 gate degrades that note.
-                self._invoke(worktree=worktree, prompt=prompt, confine=True)
+                # intentionally NOT raised — the §4.2 gate degrades that note — but it IS reported.
+                result = self._invoke(worktree=worktree, prompt=prompt, confine=True)
+                if result.returncode != 0:
+                    detail = (result.stderr or result.stdout).strip().replace("\n", " ")
+                    failures.append(
+                        f"AUTHOR {rel_path} [{sid}]: backend {self._spec.name!r} exited "
+                        f"{result.returncode}: {detail[:_FAILURE_DETAIL_CHARS] or '<no output>'}"
+                    )
+                    _logger.warning("%s", failures[-1])
+        return failures
 
     def _pass2_prompt(self, rel_path: str, sentinel_id: str, region: AuthorRegion | None) -> str:
         """Build the per-region PASS-2 prompt: the §8.2 grounded template, else the minimal one.
@@ -378,6 +401,7 @@ class SubprocessBackend:
         assert self._isolation is not None  # guarded by the caller's confinement predicate
         worktree_str = str(worktree)
         argv = [arg.replace("{worktree}", worktree_str) for arg in self._spec.argv]
+        argv[0] = self._absolute_program(argv[0])
         timeout_s = int(self._spec.timeout_s) if self._spec.timeout_s else _DEFAULT_TIMEOUT_S
         # Anchor the throwaway scratch as a SIBLING of the worktree (under its private holder dir),
         # so it is deterministically OUTSIDE the writable mount regardless of ``$TMPDIR`` — a
@@ -404,14 +428,49 @@ class SubprocessBackend:
             stderr=result.stderr.decode("utf-8", "replace"),
         )
 
+    def _absolute_program(self, program: str) -> str:
+        """Resolve a BARE-NAME ``argv[0]`` against the HOST ``PATH`` before entering the sandbox.
+
+        The sandbox sets ``PATH`` to ``/usr/bin:/bin`` (:data:`_SANDBOX_PATH`), so a bare console
+        script name — ``agora-ollama-brain``, ``agora-cli-brain``, anything installed in a venv's
+        ``bin`` — is NOT findable inside it even though the file is readable there. bwrap then fails
+        at ``execvp`` and PASS-2 writes nothing (the #115 failure mode). Resolving the name on the
+        HOST, where the operator's PATH is what selected the program in the first place, keeps the
+        in-sandbox lookup out of the picture entirely.
+
+        A path-ish ``argv[0]`` (anything containing a separator, including ``sys.executable``) is
+        passed through UNCHANGED — it is already unambiguous and the caller's assertions about
+        ``spec.argv`` stay true. An unresolvable bare name raises
+        :class:`BackendUnavailableError` here rather than becoming an opaque non-zero exit that the
+        §4.2 gate would degrade to a placeholder.
+        """
+        if os.sep in program or (os.altsep is not None and os.altsep in program):
+            return program
+        found = shutil.which(program)
+        if found is None:
+            raise BackendUnavailableError(
+                f"backend {self._spec.name!r} program {program!r} was not found on PATH; a "
+                "sandboxed backend is executed by absolute path (the sandbox carries a minimal "
+                "PATH of its own), so it must be installed and on the operator's PATH"
+            )
+        return found
+
     def _resolve_read_roots(self, worktree: Path) -> list[str | os.PathLike[str]]:
         """Resolve the spec's ``read_roots`` placeholders into existing read-only paths (ADR-0013).
 
         Substitutes ``{venv}`` → ``sys.prefix``, ``{interpreter}`` → its directory, and
         ``{worktree}`` → ``worktree`` in each configured read root, keeping only paths that exist
         (``build_sandbox_spec`` resolves them ``strict=True``, so a missing root would otherwise
-        crash). Phase-1 ships a broad ``(allow file-read*)`` in the profile, so these are
-        belt-and-suspenders today; the load-bearing grants once the read posture is tightened.
+        crash).
+
+        These are **belt-and-suspenders on BOTH platforms today** (issue #114/#115): macOS ships a
+        broad ``(allow file-read*)`` in the profile, and since the ADR-0013 appendix the Linux
+        mount plan is a whole-filesystem read-only bind, so a backend's runtime is readable either
+        way. They become load-bearing again — together, not one platform silently ahead of the
+        other — when the read posture is tightened. Note what read roots can NEVER express: every
+        root is realpath-resolved while ``execvp`` walks the ACCESS path, so an interpreter reached
+        through a symlink chain (a uv venv's ``bin/python``) has intermediate components no root
+        can name. That is why the fix was the mount plan, not more roots.
         """
         interp_dir = str(Path(sys.executable).resolve().parent)
         roots: list[str | os.PathLike[str]] = []
@@ -483,8 +542,8 @@ class RoutedBackend:
         worktree: Path,
         needs_prose: dict[str, list[str]],
         context: dict[str, AuthorRegion],
-    ) -> None:
-        self._author.author(worktree, needs_prose, context)
+    ) -> list[str] | None:
+        return self._author.author(worktree, needs_prose, context)
 
 
 def build_routed_backend(

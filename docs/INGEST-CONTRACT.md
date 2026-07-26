@@ -186,7 +186,8 @@ cap slot (it collapses at tier-2 with its provenance unioned). Everything past t
 the inbox — no file moves — so the next trigger naturally continues FIFO (append-only, single-writer, and
 "snapshot = sole event universe" are all byte-for-byte preserved; the manifest simply covers a shorter
 head). Per OD-3a, NO sibling `max_events_per_run` is introduced — one cap, this one. Observability: the run
-log line + `RunReport.counts` (`claimed`/`candidates`/`inbox_remaining`) + `state.json last_batch` →
+log line + `RunReport.counts` (`claimed`/`candidates`/`inbox_remaining`, plus `prose_regions`/
+`prose_pending` on a run that had prose to author) + `state.json last_batch` →
 `/metrics` gauges (`agora_last_run_claimed_events`, `agora_last_run_candidates`,
 `agora_max_candidates_per_run`, `agora_last_run_inbox_remaining`).
 
@@ -429,6 +430,13 @@ ONLY canonical-`ALLOWLIST` paths with no symlink/escape introduced (§4.5) and n
 disposition. Otherwise the entire diff is discarded; nothing partial is ever published; events return to
 `inbox/` (retry within budget §5.1) or move to `failed/` with a separate error record naming the failed
 check(s). Events are NEVER mutated — lifecycle is by location only (DATA-MODEL §1).
+
+"Degrades" is a SUCCESS, but never a SILENT one (issue #115). A region PASS 2 left at its placeholder
+— including the case where the backend never ran and the diff is empty, which the §4.2 validator
+cannot see because it only inspects CHANGED files — is counted per REGION and reported:
+`RunReport.counts` carries `prose_regions` / `prose_pending`, `RunReport.warnings` carries the
+backend's own stderr, `prose_complete` is `false` on the manifest, and the CLI prints the warnings to
+stderr. The publish and the SUCCESS predicate above are unchanged; only the reporting is.
 
 The `_agora_scratch/` invariant: the worker appends `_agora_scratch/` to the WORKTREE's `.gitignore` before
 invoking the backend, so `plan.json` and any model scratch are writable (honoring ADR-0008 "worktree is the

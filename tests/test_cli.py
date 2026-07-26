@@ -93,16 +93,17 @@ def _write_stub_adapters(repo_root: Path) -> Path:
     brain = repo_root / "stub_brain.py"
     brain.write_text(_STUB_BRAIN, encoding="utf-8")
     adapters = repo_root / "adapters.yaml"
-    # read_roots is NOT optional for a sandboxed backend on Linux. The seatbelt profile (macOS)
-    # ships a broad `(allow file-read*)`, so omitting these still works there — but bwrap is
-    # deny-by-OMISSION: anything unbound simply does not exist inside the sandbox, so the stub's
-    # interpreter is unreachable and PASS-2 degrades to a `_summary pending_` placeholder. This
-    # is exactly what a Linux operator must configure (see issue #114).
+    # NO `read_roots` on purpose (#115). This spec omits `network:`, so it defaults to `none` and
+    # PASS 2 runs inside the REAL kernel sandbox on both supported platforms — with the brain
+    # script sitting OUTSIDE the worktree, at the KB repo root, exactly where an operator's brain
+    # lives. It is therefore the end-to-end proof that a plain adapters.yaml is enough: read_roots
+    # could never have expressed a venv interpreter anyway (every root is realpath-resolved while
+    # `execvp` walks the access path through unbound symlink components), which is why the Linux
+    # leg published placeholder bodies while reporting success.
     adapters.write_text(
         "backends:\n"
         f"  stub: {{ argv: [{sys.executable!r}, {str(brain)!r}], "
-        'cwd: "{worktree}", prompt: stdin, '
-        'read_roots: ["{venv}", "{interpreter}"] }\n'
+        'cwd: "{worktree}", prompt: stdin }\n'
         "default_backend: stub\n",
         encoding="utf-8",
     )
@@ -285,17 +286,6 @@ def test_doctor_tolerates_a_malformed_adapters_yaml(
 
 
 @requires_git
-@pytest.mark.xfail(
-    sys.platform == "linux",
-    reason=(
-        "issue #115: under bwrap, PASS-2 produces no prose and the note is left as the "
-        "`_summary pending_` placeholder while the run still reports status: published. "
-        "PASS-1 succeeds with the SAME argv/interpreter, so this is not read-root visibility. "
-        "strict=True on purpose — when #115 is fixed this test must start failing as XPASS "
-        "so the marker gets removed rather than silently masking a regression."
-    ),
-    strict=True,
-)
 def test_curate_with_stub_backend_publishes_and_query_reflects_it(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -345,7 +335,8 @@ def test_curate_with_stub_backend_publishes_and_query_reflects_it(
 
     rc = main(["curate", "--repo", str(target), "--force"])
     assert rc == 0
-    out = capsys.readouterr().out
+    captured = capsys.readouterr()
+    out, err = captured.out, captured.err
     assert "status: published" in out
     assert "CREATE_THEME=1" in out
 
@@ -358,6 +349,53 @@ def test_curate_with_stub_backend_publishes_and_query_reflects_it(
     assert any(h.path == "wiki/ai-tech/themes/curator-concurrency.md" for h in result.hits)
     # The inbox is drained.
     assert Inbox(layout).depth() == 0
+    # PASS 2 authored every region, so the run reports zero pending prose and warns about nothing.
+    # (`err` is read from the SAME readouterr() call as `out` above — a second call would return an
+    # already-drained buffer and the assertion could never fail.)
+    assert "prose_pending=0" in out
+    assert "warning:" not in err
+
+
+# A brain whose PASS 1 plans normally but whose PASS 2 dies without writing a byte — the shape of a
+# backend the sandbox could not start (#115: `bwrap: execvp …: No such file or directory`).
+_SILENT_PASS2_BRAIN = _STUB_BRAIN.split("for note in")[0] + (
+    'sys.stderr.write("simulated launch failure\\n")\nsys.exit(1)\n'
+)
+
+
+@requires_git
+def test_curate_warns_loudly_when_pass2_authors_no_prose(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A published-but-prose-less run must say so on STDERR — the #115 anti-silence guarantee.
+
+    The run still publishes (structure is APPLY-owned and valid) and ``status: published`` is still
+    correct, so the ONLY thing between the operator and a KB of empty bodies is this warning plus
+    the ``prose_pending`` count. On Linux this failed for every region of every run and printed
+    nothing at all.
+    """
+    target = tmp_path / "kb"
+    layout = _init_stub_repo(target)
+    (target / "stub_brain.py").write_text(_SILENT_PASS2_BRAIN, encoding="utf-8")
+    Inbox(layout).write(
+        text="One curator advances the branch under a lock.",
+        writer="dochan",
+        source="claude-code",
+        domain="ai-tech",
+        now=datetime(2026, 6, 13, 2, 40, 10, tzinfo=UTC),
+    )
+    capsys.readouterr()
+
+    assert main(["curate", "--repo", str(target), "--force"]) == 0
+
+    captured = capsys.readouterr()
+    assert "status: published" in captured.out  # unchanged: the publish itself is correct
+    assert "prose_pending=1" in captured.out
+    assert "warning: PROSE PENDING" in captured.err
+    # The backend's own stderr reaches the operator, so the cause is actionable, not a mystery.
+    assert "simulated launch failure" in captured.err
+    theme = layout.wiki_dir / "ai-tech" / "themes" / "curator-concurrency.md"
+    assert "_summary pending_" in theme.read_text(encoding="utf-8")
 
 
 # --- doctor -------------------------------------------------------------------------------------

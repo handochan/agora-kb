@@ -4,9 +4,11 @@ Runs the REAL sandbox config against a throwaway worktree AND a separate throwaw
 before any real run trusts the sandbox, and doubles as the platform-capability detector. Three
 hardenings make the verdict trustworthy (ADR-0013):
 
-* the network assertion is **EPERM-specific** and uses a **REACHABLE** target (the host Ollama
-  daemon at ``127.0.0.1:11434``) so "blocked" provably means EPERM, NOT "host unreachable /
-  connection refused" — a non-EPERM ``OSError`` (``NET_AMBIGUOUS``) FAILS the self-test, never pass;
+* the network assertion accepts only the errnos that PROVE a refusal for the running mechanism
+  (:func:`_denial_errnos`: ``EPERM`` under seatbelt's policy engine; the namespace's structural
+  ``EROFS`` / ``ECONNREFUSED`` family under bwrap) and uses a **REACHABLE** target (the host Ollama
+  daemon at ``127.0.0.1:11434``) so "blocked" cannot mean "nothing was there" — anything else
+  (``NET_AMBIGUOUS``) FAILS the self-test, never passes;
 * it runs an **Apple-shimmed binary** (``/usr/bin/git --version``) to catch the ``xcrun_db`` /
   ``/dev/null`` fatal that a missing ``(allow file-write* /dev/null)`` would cause; and
 * ``read_roots`` come from the REAL configured backend (passed in), so the probe exercises the same
@@ -15,10 +17,12 @@ hardenings make the verdict trustworthy (ADR-0013):
 Two probes (ADR-0013 §"Runtime self-test", VERBATIM behavior):
 
 1. a ``python -c`` that (a) writes INSIDE the worktree (must succeed), (b) writes OUTSIDE
-   (``~/agora-selftest-probe``) and must get ``PermissionError`` — else prints ``OUTSIDE_WRITE_OK``,
-   (c) ``socket.create_connection(("127.0.0.1", 11434), timeout=2)`` must raise ``PermissionError``
-   / ``EPERM`` — else prints ``NET_OK`` / ``NET_AMBIGUOUS:<errno>``; prints ``SELFTEST_FS_NET_PASS``
-   on success; and
+   (``~/agora-selftest-probe``) and must be refused with a mechanism-accepted errno — printing
+   ``OUTSIDE_DENIED``, else ``OUTSIDE_WRITE_OK`` / ``OUTSIDE_AMBIGUOUS:<errno>``, (c)
+   ``socket.create_connection(("127.0.0.1", 11434), timeout=2)`` must likewise be refused —
+   printing ``NET_DENIED``, else ``NET_OK`` / ``NET_AMBIGUOUS:<errno>``; prints
+   ``SELFTEST_FS_NET_PASS`` on success. Each leg's verdict is read from its POSITIVE marker, so a
+   probe that dies early is never mistaken for a proven denial; and
 2. ``["/usr/bin/git", "--version"]`` must succeed (returncode 0, ``git version`` in stdout) —
    proving the ``/dev/null`` write-allow.
 
@@ -30,6 +34,7 @@ belongs to the caller (the orchestrator), keeping this module free of any repo-l
 
 from __future__ import annotations
 
+import errno
 import os
 import platform
 import socket
@@ -56,6 +61,32 @@ _OLLAMA_PORT = 11434
 _OUTSIDE_PROBE = "~/agora-selftest-probe"
 
 
+def _denial_errnos(mechanism: str) -> frozenset[int]:
+    """The errnos that PROVE the sandbox refused, per mechanism (ADR-0013 appendix, issue #115).
+
+    ``EPERM`` is the seatbelt answer: the policy engine vetoes the syscall. A bwrap namespace denies
+    STRUCTURALLY instead — an out-of-worktree write hits a read-only mount (``EROFS``) and a connect
+    finds an empty network namespace (``ECONNREFUSED`` / ``ENETUNREACH`` / ``EHOSTUNREACH``). Both
+    are kernel refusals; only the mechanism differs, so the accepted set is mechanism-keyed rather
+    than a union (a seatbelt run reporting ``ECONNREFUSED`` would still be ambiguous and must fail).
+
+    The ambiguity the ADR guards against — "the target simply was not there" — is NOT excluded by
+    this function and must be excluded BY THE CALLER: :func:`ollama_reachable` is checked on the
+    HOST, and only a reachable target makes ``network_denied`` mean anything under a mechanism whose
+    denial is ``ECONNREFUSED`` (``cli._doctor_sandbox`` does this and labels the verdict "unproven"
+    otherwise). ``self_test`` itself reports the leg's outcome without that context. An unknown
+    mechanism gets the strict ``EPERM``-only set.
+    """
+    if mechanism == "bwrap":
+        # EACCES is deliberately ABSENT: bwrap never denies by DAC, so it would admit an ordinary
+        # host permission error — the very thing an UNCONFINED run produces — as proof of
+        # confinement, while adding no true positive.
+        return frozenset(
+            {errno.EPERM, errno.EROFS, errno.ECONNREFUSED, errno.ENETUNREACH, errno.EHOSTUNREACH}
+        )
+    return frozenset({errno.EPERM})
+
+
 def self_test(
     isolation: BackendIsolation,
     throwaway_worktree: Path,
@@ -65,10 +96,13 @@ def self_test(
     """Run the two hardened probes against ``isolation``; return a :class:`SelfTestReport`.
 
     ``throwaway_worktree`` and ``throwaway_tmp`` MUST be DISTINCT realpath-resolved dirs with
-    ``tmp`` NOT inside ``wt`` (asserted). Probe 1 is the filesystem+network ``python -c`` (EPERM-
-    specific, reachable target); probe 2 is the Apple-shim ``git --version``. The booleans are
-    derived ONLY from the probe markers / returncodes, never from "any error" (ADR-0013): a non-
-    EPERM ``OSError`` on the network leg yields ``NET_AMBIGUOUS`` and FAILS — not treated as denied.
+    ``tmp`` NOT inside ``wt`` (asserted). Probe 1 is the filesystem+network ``python -c``; probe 2
+    is the Apple-shim ``git --version``. The booleans are derived ONLY from each leg's POSITIVE
+    marker, never from "any error" and never from the absence of a failure marker (ADR-0013 +
+    appendix): an errno outside :func:`_denial_errnos` for the running mechanism yields
+    ``OUTSIDE_AMBIGUOUS`` / ``NET_AMBIGUOUS`` and FAILS — it is not treated as denied. Whether a
+    network denial is MEANINGFUL additionally depends on the target being reachable from the host,
+    which the CALLER establishes (:func:`ollama_reachable`), not this function.
     """
     wt = throwaway_worktree.resolve(strict=True)
     tmp = throwaway_tmp.resolve(strict=True)
@@ -86,23 +120,36 @@ def self_test(
     # probe, so the probe writes to a path the sandbox must deny.
     outside = Path(_OUTSIDE_PROBE).expanduser()
 
-    # Probe 1: filesystem + network, asserting EPERM specifically and using a REACHABLE target.
+    # The errnos that PROVE a denial for THIS mechanism. Seatbelt refuses by policy (EPERM); a
+    # bwrap namespace refuses by construction — writes land on a read-only mount (EROFS) and the
+    # netns has no route to anything (ECONNREFUSED / ENETUNREACH / EHOSTUNREACH). Demanding EPERM
+    # everywhere would mis-grade a perfectly-confined Linux sandbox, and — worse, before this was
+    # fixed — an EROFS write-outside aborted probe 1 before the network leg ever ran, so
+    # ``network_denied`` came back True having proven NOTHING (issue #115: the mount plan that made
+    # the Linux sandbox usable also made its self-test lie). Mechanism-specific, never a blanket
+    # "any error is a denial".
+    denial_errnos = _denial_errnos(isolation.name)
+
+    # Probe 1: filesystem + network. Each leg prints a POSITIVE marker on the accepted denial, so a
+    # probe that dies early can never be read as "denied" by the absence of a failure marker.
     probe_fs_net = textwrap.dedent(
         f"""
         import errno, socket, sys
+        DENIED = {sorted(denial_errnos)!r}
         open({str(inside)!r}, "w").write("ok")                       # (a) inside worktree -> OK
-        try:                                                          # (b) outside -> must be EPERM
+        try:                                                         # (b) outside -> must be DENIED
             open({str(outside)!r}, "w").write("x"); print("OUTSIDE_WRITE_OK"); sys.exit(2)
-        except PermissionError: pass
+        except OSError as e:
+            if e.errno not in DENIED: print(f"OUTSIDE_AMBIGUOUS:{{e.errno}}"); sys.exit(5)
+            print("OUTSIDE_DENIED")
         # (c) network: target a REACHABLE host (the user's own Ollama 127.0.0.1:11434, listening)
-        #     so "blocked" provably means EPERM, NOT "host unreachable / connection refused".
+        #     so a failure provably means the sandbox blocked it, NOT "nothing is there".
         try:
             socket.create_connection(({_OLLAMA_HOST!r}, {_OLLAMA_PORT}), timeout=2)
             print("NET_OK"); sys.exit(3)
-        except PermissionError: pass                                  # the ONLY accepted "denied"
         except OSError as e:
-            if e.errno == errno.EPERM: pass
-            else: print(f"NET_AMBIGUOUS:{{e.errno}}"); sys.exit(4)    # refused/unreachable != block
+            if e.errno not in DENIED: print(f"NET_AMBIGUOUS:{{e.errno}}"); sys.exit(4)
+            print("NET_DENIED")
         print("SELFTEST_FS_NET_PASS")
         """
     ).strip()
@@ -134,8 +181,10 @@ def self_test(
     r2 = isolation.run(spec2)
 
     write_inside_ok = inside.exists()
-    write_outside_denied = b"OUTSIDE_WRITE_OK" not in r1.stdout
-    network_denied = b"NET_OK" not in r1.stdout and b"NET_AMBIGUOUS" not in r1.stdout
+    # POSITIVE evidence only: a leg counts as denied when its own marker was printed, never when a
+    # failure marker merely failed to appear (a probe that crashed before the leg prints neither).
+    write_outside_denied = b"OUTSIDE_DENIED" in r1.stdout
+    network_denied = b"NET_DENIED" in r1.stdout
     apple_shim_ok = r2.returncode == 0 and b"git version" in r2.stdout
     passed = (
         r1.returncode == 0

@@ -31,7 +31,7 @@ from agora_kb.curator.isolation import (
     scrub_env,
     select_backend_isolation,
 )
-from agora_kb.curator.isolation.base import SandboxSpec
+from agora_kb.curator.isolation.base import SandboxResult, SandboxSpec
 from agora_kb.curator.isolation.restricted import RestrictedIsolation
 from agora_kb.curator.isolation.selftest import ollama_reachable
 
@@ -214,32 +214,198 @@ def test_selection_linux_without_bwrap_fails_closed(monkeypatch: pytest.MonkeyPa
         select_backend_isolation(allow_reduced_isolation=False)
 
 
-def test_userns_probe_binds_the_same_system_dirs_as_the_real_invocation(
-    monkeypatch: pytest.MonkeyPatch,
+def test_userns_probe_runs_the_same_mount_plan_as_the_real_invocation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """The probe must ro-bind what the real sandbox binds, or it is a false negative.
+    """The probe must exercise the REAL mount plan, or its verdict means nothing.
 
-    ``/usr/bin/true`` is dynamically linked: without ``/lib64`` (or ``/lib``) its ELF interpreter
-    is missing inside the sandbox and ``execvp`` fails with a misleading ENOENT even though the
-    namespaces were created. That made ``available()`` False — and the curator fail-closed with
-    "no usable kernel sandbox" — on ordinary x86-64 Linux hosts where bwrap works fine.
+    Both directions have already shipped as bugs. A probe that binds LESS than the real invocation
+    hit the missing-ELF-interpreter ENOENT and reported "no usable kernel sandbox" on ordinary
+    x86-64 Linux (#113). A probe that skips a mount the real run performs (``--proc``) green-lights
+    a sandbox that then fails at run time, and on the PASS-2 path that degrades to a silently-empty
+    note (#115). Asserting on the SHARED ``_mount_plan()`` — captured from a real ``run()`` argv and
+    from the probe's argv — is what keeps them from drifting apart again.
     """
     from agora_kb.curator.isolation import bwrap as bwrap_mod
 
-    captured: list[list[str]] = []
+    probe_argv: list[list[str]] = []
 
     def _fake_run(argv: list[str], **_: object) -> subprocess.CompletedProcess[bytes]:
-        captured.append(argv)
+        probe_argv.append(argv)
         return subprocess.CompletedProcess(argv, 0, b"", b"")
 
     monkeypatch.setattr(bwrap_mod.shutil, "which", lambda _: "/usr/bin/bwrap")
     monkeypatch.setattr(bwrap_mod.subprocess, "run", _fake_run)
     assert bwrap_mod.BwrapIsolation().available() is True
 
-    argv = captured[0]
-    bound = {argv[i + 1] for i, tok in enumerate(argv) if tok == "--ro-bind"}
-    expected = {d for d in bwrap_mod._SYSTEM_RO_BIND_DIRS if Path(d).exists()}
-    assert bound == expected, "probe binds must match the real invocation's system dirs"
+    run_argv = _capture_bwrap_run_argv(monkeypatch, tmp_path)
+    plan = bwrap_mod._mount_plan()
+    assert _contains_subsequence(probe_argv[0], plan), "probe must run the real mount plan"
+    assert _contains_subsequence(run_argv, plan), "run() must use the shared mount plan"
+
+
+def _capture_bwrap_run_argv(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> list[str]:
+    """Run :meth:`BwrapIsolation.run` with ``_spawn`` stubbed; return the argv it would have run.
+
+    Lets the Linux adapter's argv construction be asserted on ANY host (there is no bwrap on the
+    macOS dev box), which is the coverage hole that let #115's mount plan ship unexercised.
+    """
+    from agora_kb.curator.isolation import bwrap as bwrap_mod
+
+    captured: list[list[str]] = []
+
+    def _fake_spawn(self: object, argv: list[str], *, spec: SandboxSpec) -> SandboxResult:
+        captured.append(argv)
+        return SandboxResult(
+            returncode=0, stdout=b"", stderr=b"", mechanism="bwrap", reduced_isolation=False
+        )
+
+    monkeypatch.setattr(bwrap_mod.BwrapIsolation, "_spawn", _fake_spawn)
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    tmp = tmp_path / "scratch"
+    tmp.mkdir()
+    spec = build_sandbox_spec(
+        argv=["/bin/echo", "hi"],
+        worktree=wt,
+        tmp_dir=tmp,
+        read_roots=[Path(sys.prefix)],
+        stdin_data=None,
+        env={},
+        timeout_s=30,
+    )
+    bwrap_mod.BwrapIsolation().run(spec)
+    return captured[0]
+
+
+def _contains_subsequence(argv: list[str], sub: list[str]) -> bool:
+    """True iff ``sub`` appears as a CONTIGUOUS run of tokens inside ``argv``."""
+    return any(argv[i : i + len(sub)] == sub for i in range(len(argv) - len(sub) + 1))
+
+
+def test_bwrap_run_binds_the_root_read_only_and_only_worktree_and_tmp_writable(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The Linux mount plan is macOS-parity: everything readable, only worktree + tmp writable.
+
+    Pins the #115 fix on every platform. The read surface is a whole-filesystem ``--ro-bind / /``
+    because the previous enumerate-what-you-need posture could not express a venv interpreter (each
+    root is realpath-resolved, but ``execvp`` walks the ACCESS path through symlink components that
+    were never bound) — so PASS 2 died at ``execvp`` and published placeholder bodies. ``--proc`` /
+    ``--dev`` MUST follow the root bind: reversed, the sandbox inherits the HOST's ``/proc``.
+    """
+    argv = _capture_bwrap_run_argv(monkeypatch, tmp_path)
+    assert _contains_subsequence(argv, ["--ro-bind", "/", "/"])
+    assert argv.index("--ro-bind") < argv.index("--proc") < argv.index("--dev")
+    # The ONLY rw binds are the worktree and the scratch — a `--bind` of anything else would hand
+    # the backend a writable path outside the ADR-0008 diff.
+    rw = [argv[i + 1] for i, tok in enumerate(argv) if tok == "--bind"]
+    assert rw == [
+        str((tmp_path / "wt").resolve()),
+        str((tmp_path / "scratch").resolve()),
+    ]
+    # The egress deny and the process-group/session hardening are unchanged.
+    assert "--unshare-all" in argv
+    assert "--new-session" in argv
+    # The operator's read_roots are still bound (the adapters.yaml read contract survives the
+    # posture change, so a future read-hardening pass has a config surface to tighten).
+    ro = [argv[i + 1] for i, tok in enumerate(argv) if tok == "--ro-bind"]
+    assert str(Path(sys.prefix).resolve()) in ro
+
+
+def test_bwrap_masks_socket_bearing_dirs_and_readmits_argv_files(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Socket dirs are tmpfs-masked, and an argv file under one is bound back (#115 review).
+
+    ``--unshare-net`` does not cover a PATHNAME unix socket and a read-only mount does not block
+    ``connect()``, so a bare whole-filesystem read bind would let the confined backend reach
+    ``/run/docker.sock``, the session bus, or an agent socket — strictly weaker than the seatbelt
+    profile it is supposed to match. The masks close that; the argv re-admit keeps a brain script
+    that legitimately lives under a masked dir (this suite's own stub) reachable.
+    """
+    from agora_kb.curator.isolation import bwrap as bwrap_mod
+
+    # The POLICY: the socket-bearing dirs a Linux host actually uses. (`/tmp` doubles as the
+    # backend's private writable scratch, restoring what the pre-#115 `--tmpfs /tmp` provided.)
+    assert bwrap_mod._SOCKET_DIRS == ("/run", "/var/run", "/tmp")
+
+    argv = _capture_bwrap_run_argv(monkeypatch, tmp_path)
+    masked = [argv[i + 1] for i, tok in enumerate(argv) if tok == "--tmpfs"]
+    # Masks are realpath-resolved and de-duplicated: `/var/run` is a symlink to `/run` on a
+    # merged-/run distro, and bwrap ABORTS THE WHOLE NAMESPACE when asked to mount onto a symlink.
+    assert masked == bwrap_mod._masked_dirs()
+    assert len(masked) == len(set(masked))
+    for path in masked:
+        assert Path(path).is_dir()
+        assert Path(path).resolve() == Path(path)
+    # Every mask lands after the root bind, or the root bind would cover it.
+    assert masked  # this host has at least one of them, so the ordering assertion means something
+    assert argv.index("--ro-bind") < min(argv.index(m) for m in masked)
+
+    # An argv FILE under a masked dir is re-admitted at its own path; its PARENT never is.
+    brain = tmp_path / "brain.py"
+    brain.write_text("print('hi')\n", encoding="utf-8")
+    monkeypatch.setattr(bwrap_mod, "_SOCKET_DIRS", ("/run", "/var/run", str(tmp_path)))
+    binds = bwrap_mod._argv_file_binds(["/usr/bin/python3", str(brain), "--flag"])
+    assert binds == ["--ro-bind", str(brain), str(brain)]
+    assert str(tmp_path) not in binds
+
+
+def test_self_test_never_reads_a_crashed_probe_as_a_proven_denial(tmp_path: Path) -> None:
+    """A probe that dies before a leg must NOT come back as "that leg was denied" (#115).
+
+    The verdicts used to be derived from the ABSENCE of a failure marker, so a probe that aborted
+    early — which is exactly what happened on Linux once the sandbox became usable, where the
+    write-outside leg raises EROFS rather than EPERM and killed the process before the network leg
+    — reported ``network_denied=True`` having proven nothing at all. Each leg now requires its own
+    POSITIVE marker.
+    """
+    from agora_kb.curator.isolation.selftest import self_test
+
+    class _CrashedProbe:
+        """An adapter whose probe exits non-zero with NO markers (the crashed-early shape)."""
+
+        name = "bwrap"
+
+        def available(self) -> bool:
+            return True
+
+        def self_test(self, *_: object) -> object:  # pragma: no cover - not used
+            raise NotImplementedError
+
+        def run(self, spec: SandboxSpec) -> SandboxResult:
+            return SandboxResult(
+                returncode=1, stdout=b"", stderr=b"boom", mechanism="bwrap", reduced_isolation=False
+            )
+
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    tmp = tmp_path / "scratch"
+    tmp.mkdir()
+
+    report = self_test(_CrashedProbe(), wt, tmp, [])
+
+    assert report.write_outside_denied is False
+    assert report.network_denied is False
+    assert report.passed is False
+
+
+def test_denial_errnos_are_mechanism_specific() -> None:
+    """bwrap denies structurally (EROFS / ECONNREFUSED); seatbelt denies by policy (EPERM only).
+
+    A blanket "any errno is a denial" would let a genuinely-unconfined run pass, and an
+    EPERM-everywhere rule mis-grades a correctly-confined namespace — so the accepted set is keyed
+    on the mechanism that produced it.
+    """
+    from agora_kb.curator.isolation.selftest import _denial_errnos
+
+    assert _denial_errnos("seatbelt") == frozenset({errno.EPERM})
+    bwrap_set = _denial_errnos("bwrap")
+    assert errno.EROFS in bwrap_set and errno.ECONNREFUSED in bwrap_set
+    assert errno.ENOENT not in bwrap_set  # "not found" never proves a policy
+    # An unknown mechanism gets the STRICT set, never the permissive one.
+    assert _denial_errnos("something-new") == frozenset({errno.EPERM})
 
 
 def test_selection_linux_with_bwrap_returns_bwrap(monkeypatch: pytest.MonkeyPatch) -> None:
