@@ -47,6 +47,23 @@ _SANDBOX_PATH = "/usr/bin:/bin"
 # Operator remediation surfaced when an unprivileged user namespace is blocked (ADR-0013 §"Linux
 # plan", the AppArmor-userns caveat). Printed by the self-test / ``agora doctor`` so the fix is
 # actionable.
+# The system dirs a dynamically-linked binary needs before it can even start: the ELF interpreter
+# lives under /lib64 (or /lib) on mainstream layouts, so omitting them makes an otherwise-fine
+# exec fail with a misleading ENOENT. Absent entries are skipped so a minimal layout still binds.
+# SHARED between the real sandbox invocation and the availability probe on purpose — when they
+# drifted apart, the probe reported "no usable sandbox" on every ordinary Linux host.
+_SYSTEM_RO_BIND_DIRS = ("/usr", "/bin", "/lib", "/lib64")
+
+
+def _system_ro_binds() -> list[str]:
+    """``--ro-bind`` argv pairs for the system dirs that exist on this host."""
+    argv: list[str] = []
+    for sysdir in _SYSTEM_RO_BIND_DIRS:
+        if Path(sysdir).exists():
+            argv += ["--ro-bind", sysdir, sysdir]
+    return argv
+
+
 USERNS_REMEDIATION = (
     "bubblewrap could not create an unprivileged user namespace. On Ubuntu 24.04+ / hardened hosts "
     "this is blocked by kernel.apparmor_restrict_unprivileged_userns=1. Remediation: install an "
@@ -74,19 +91,24 @@ class BwrapIsolation:
 
     @staticmethod
     def _userns_usable() -> bool:
-        """Best-effort: can ``bwrap`` actually create the namespaces? Run a tiny no-op under it."""
+        """Best-effort: can ``bwrap`` actually create the namespaces? Run a tiny no-op under it.
+
+        The probe MUST ro-bind the same system dirs as the real invocation
+        (:func:`_system_ro_binds`). Binding only ``/usr`` + ``/bin`` looks sufficient but is not:
+        ``/usr/bin/true`` is dynamically linked, so without ``/lib64`` (``/lib`` on some layouts)
+        the kernel cannot load its ELF interpreter and ``execvp`` reports a *misleading*
+        ``No such file or directory`` — the namespaces were created fine. That false negative made
+        :meth:`available` return False on ordinary x86-64 Linux, so the curator fail-closed with
+        "no usable kernel sandbox" on a host where bwrap works perfectly (found by the first CI
+        run on ubuntu-latest; macOS never hits this because it takes the seatbelt path).
+        """
         try:
             cp = subprocess.run(  # noqa: S603 — fixed argv, no shell.
                 [
                     "bwrap",
                     "--unshare-all",
                     "--die-with-parent",
-                    "--ro-bind",
-                    "/usr",
-                    "/usr",
-                    "--ro-bind",
-                    "/bin",
-                    "/bin",
+                    *_system_ro_binds(),
                     "--",
                     "true",
                 ],
@@ -152,9 +174,7 @@ class BwrapIsolation:
         ]
         # ro-bind the system dirs needed for the interpreter/CLI to start; skip any that are absent
         # on this host (e.g. /lib64) so a minimal layout does not fail the bind.
-        for sysdir in ("/usr", "/bin", "/lib", "/lib64"):
-            if Path(sysdir).exists():
-                argv += ["--ro-bind", sysdir, sysdir]
+        argv += _system_ro_binds()
         for root in read_roots:
             argv += ["--ro-bind", str(root), str(root)]
         # The ONLY writable mounts: the worktree (content) and the separate scratch (HOME/TMPDIR).
