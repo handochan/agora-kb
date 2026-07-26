@@ -34,7 +34,7 @@ import os.path
 import re
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import yaml
 
@@ -617,7 +617,83 @@ def _note_domain_of(rel_path: str) -> str | None:
     return None
 
 
-def _strip_non_raw_sources(build: _NoteBuild) -> None:
+_RAW_ROOT = "raw"
+
+
+def _within(path: Path, root: Path) -> bool:
+    """True iff ``path`` is ``root`` itself or lives beneath it (both already resolved).
+
+    Same containment predicate the harvester uses for its connector globs
+    (``harvester.connectors._within``) — kept local so ``ingest`` does not import ``harvester``.
+    """
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
+def _contained_raw_ref(
+    entry: object, root: Path, *, raw_may_be_relocated: bool = False
+) -> str | None:
+    """Return ``entry`` iff it is a safe relative ``raw/...`` reference CONTAINED under ``root``.
+
+    The single validator both ``sources:`` consumers share (issue #108): ``_strip_non_raw_sources``
+    decides what may stay in frontmatter and ``_synth_raw_source`` decides what may be READ from the
+    source vault and WRITTEN into the destination. ``entry.startswith("raw/")`` alone is NOT a
+    containment check — ``raw/../../etc/x`` passes it, and ``dest / entry`` then lands outside
+    ``dest``. An imported vault is UNTRUSTED input (that is the point of ``agora import``), so the
+    check is two layers, on every platform (no ``os.name`` branch — a KB must behave identically
+    wherever it is imported):
+
+    1. **grammar** — a non-empty ``str`` with no NUL, no ``\\`` (a Windows separator that POSIX
+       semantics would treat as a filename character), no ``:`` (drive letter / NTFS stream), not
+       absolute, at least two components, first component exactly ``raw``, and no ``..`` part;
+    2. **resolution** — ``(root / entry)`` resolved must live strictly beneath ``(root / "raw")``
+       resolved, which catches an escape through a SYMLINK planted INSIDE ``raw/`` that the grammar
+       cannot see.
+
+    ``raw_may_be_relocated`` decides whether ``raw/`` ITSELF may be a symlink pointing out of
+    ``root``, and the asymmetry is about WHO controls the tree:
+
+    * the SOURCE vault is untrusted, so the strict default ALSO requires the resolved target to sit
+      under ``root`` itself — otherwise a vault shipping ``raw/ -> /`` turns the provenance copy
+      into an exfiltration read of an arbitrary host file;
+    * the DESTINATION repo belongs to the operator, who may legitimately park ``raw/`` on another
+      volume via a symlink. The caller passes ``raw_may_be_relocated=True`` there, because the
+      contract a dest entry must satisfy is exactly "does not leave ``raw/``" — and the
+      body-snapshot fallback in :func:`_synth_raw_source` writes ``dest / "raw/..."`` through that
+      same link unconditionally. Demanding more of a CITED artifact than of the snapshot written
+      beside it would drop valid provenance without preventing any write (issue #108 review).
+
+    Returns the entry in its NORMALIZED POSIX spelling when safe (``raw/./x.md`` and ``./raw/x.md``
+    → ``raw/x.md``; an already-canonical entry is returned byte-identical, so existing imports do
+    not change), else ``None`` (callers warn + drop; never silently pass).
+    """
+    if not isinstance(entry, str) or not entry:
+        return None
+    if "\x00" in entry or "\\" in entry or ":" in entry:
+        return None
+    candidate = PurePosixPath(entry)
+    if candidate.is_absolute():
+        return None
+    parts = candidate.parts
+    if len(parts) < 2 or parts[0] != _RAW_ROOT or any(part == ".." for part in parts):
+        return None
+    try:
+        base = root.resolve()
+        raw_root = (root / _RAW_ROOT).resolve()
+        target = (root / entry).resolve()
+    except (OSError, ValueError):  # pragma: no cover - hostile byte sequences the OS rejects
+        return None
+    if target == raw_root or not _within(target, raw_root):
+        return None
+    if not raw_may_be_relocated and not _within(target, base):
+        return None
+    return candidate.as_posix()
+
+
+def _strip_non_raw_sources(build: _NoteBuild, *, dest: Path) -> None:
     """Remove every pre-existing ``sources:`` entry that is not a ``raw/...`` path (change D).
 
     ADR-0014 D5 v2 change D: a real vault theme may cite a FOREIGN locator (e.g.
@@ -627,6 +703,13 @@ def _strip_non_raw_sources(build: _NoteBuild) -> None:
     ``raw/`` snapshot from change B then becomes the authoritative source. A non-list ``sources:``
     is normalized to ``[]`` (tolerant). A valid ``raw/<...>`` entry is KEPT (change B then skips the
     synth, deferring to the pre-existing artifact if it exists in the vault).
+
+    "Valid" is :func:`_contained_raw_ref`, not a ``raw/`` prefix test: a traversal entry such as
+    ``raw/../../etc/x`` LOOKS like a raw source but escapes ``dest/raw/`` (issue #108). It is
+    dropped on the same no-loss terms as a foreign locator — recorded in ``stripped_sources`` with a
+    warning, never silently kept. Conversely a merely UNNORMALIZED spelling of a real raw artifact
+    (``./raw/x.md``) is no longer dropped as "not under raw/": it is kept in canonical POSIX form,
+    which is what every downstream consumer (lint L1-8, the graph) expects to read.
     """
     raw = build.fm.get("sources")
     if not isinstance(raw, list):
@@ -634,10 +717,14 @@ def _strip_non_raw_sources(build: _NoteBuild) -> None:
         return
     kept: list[str] = []
     for entry in raw:
-        if isinstance(entry, str) and entry.startswith("raw/"):
-            kept.append(entry)
+        ref = _contained_raw_ref(entry, dest, raw_may_be_relocated=True)
+        if ref is not None:
+            kept.append(ref)
+            continue
+        build.stripped_sources.append(str(entry))
+        if isinstance(entry, str) and entry.startswith(f"{_RAW_ROOT}/"):
+            build.warnings.append(f"stripped unsafe source {entry!r} (escapes raw/)")
         else:
-            build.stripped_sources.append(str(entry))
             build.warnings.append(f"stripped non-raw source {entry!r} (not under raw/)")
     build.fm["sources"] = kept
 
@@ -673,11 +760,28 @@ def _synth_raw_source(build: _NoteBuild, *, src: Path, dest: Path) -> None:
     current = build.fm.get("sources")
     if isinstance(current, list):
         for entry in current:
-            if isinstance(entry, str) and entry.startswith("raw/") and (src / entry).is_file():
-                out = dest / entry
-                out.parent.mkdir(parents=True, exist_ok=True)
-                out.write_bytes((src / entry).read_bytes())
-                return
+            # BOTH ends of the copy are validated with the SAME helper (issue #108): the WRITE end
+            # must stay under the dest's raw/ (wherever the operator relocated it — the fallback
+            # snapshot below writes through that same link) and the READ end must stay under the
+            # SOURCE vault's raw/ AND inside the vault, since an attacker-planted symlink would
+            # otherwise turn the copy into an exfiltration read of an arbitrary host file. Failing
+            # either, the entry is skipped and the theme falls back to the body snapshot below —
+            # the normal-note result is unchanged.
+            cited = _contained_raw_ref(entry, dest, raw_may_be_relocated=True)
+            if cited is None:
+                continue
+            if _contained_raw_ref(cited, src) is None:
+                build.warnings.append(
+                    f"skipped raw/ source {cited!r} (escapes the source vault raw/)"
+                )
+                continue
+            origin = src / cited
+            if not origin.is_file():
+                continue
+            out = dest / cited
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_bytes(origin.read_bytes())
+            return
 
     if build.body.strip():
         ref = f"raw/{domain}/{slug}.md" if domain else f"raw/{slug}.md"
@@ -927,7 +1031,7 @@ def import_vault(
         _filter_tags(build, allowed_tags)
         _normalize_fm_link_arrays(build, known_basenames)
         _convert_body_links(build, basename_to_relpath)
-        _strip_non_raw_sources(build)  # change D — remove non-raw/ source entries (+ record)
+        _strip_non_raw_sources(build, dest=dest)  # change D — drop non-raw//escaping sources
         _synth_raw_source(build, src=src, dest=dest)  # change B — synth raw/ provenance or stub
         _sync_moc_children(build, known_basenames)  # change C — children == resolvable child set
         if build.type_inferred == "theme" and build.fm.get("status") != "stub":

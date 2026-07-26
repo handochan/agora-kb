@@ -409,8 +409,12 @@ def test_index_paths_are_guarded_and_under_kb_index(tmp_path: Path) -> None:
     assert layout.index_notes_path() == layout.kb_dir / "index" / "myrepo.notes.json"
     assert layout.index_cache_dir == layout.kb_dir / "index"
     # explicit repo arg is validated as a safe path component
-    with pytest.raises(InvalidWriterError):
+    with pytest.raises(InvalidWriterError) as excinfo:
         layout.index_notes_path("../escape")
+    # …and the remedy follows the INPUT: the directory here is fine ("myrepo"), so telling the
+    # operator to rename it would be a misdirection — the caller's stem is what has to change.
+    message = str(excinfo.value)
+    assert "cache stem" in message and "rename the repo directory" not in message
 
 
 # --- CLI ------------------------------------------------------------------------------------------
@@ -443,6 +447,82 @@ def test_cli_doctor_reports_index_line(tmp_path: Path, capsys: pytest.CaptureFix
     main(["doctor", "--repo", str(repo.root)])
     out = capsys.readouterr().out
     assert "index:" in out and "cache=fresh" in out
+
+
+# --- unsafe repo DIRECTORY names: the write path degrades like the read path (issue #108) --------
+
+
+@pytest.mark.parametrize("name", ["My Knowledge", "내지식"])
+def test_unsafe_repo_dir_name_never_tracebacks_and_reports_consistently(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], name: str
+) -> None:
+    """A repo DIRECTORY name that is not a safe filename component must never crash a build (#108).
+
+    ``~/My Knowledge`` and ``~/내지식`` are ordinary directories that ``agora repo init`` accepts,
+    but neither can address ``_kb/index/<repo>.notes.json``. The five READ call sites have always
+    degraded to a full scan; the WRITE path (``build_cache``) was unguarded and ``agora index
+    build`` exited with a raw ``InvalidWriterError`` traceback. No platform branch is involved —
+    this reproduces on POSIX and Windows alike.
+    """
+    from agora_kb.cli import main
+
+    repo = _repo(tmp_path, name=name)
+    root = str(repo.root)
+
+    # The layout guard still refuses to INVENT a stem (read and write agree "there is no cache"),
+    # but it now explains itself: cause + what still works + remedy.
+    with pytest.raises(InvalidWriterError) as excinfo:
+        repo.layout.index_notes_path()
+    message = str(excinfo.value)
+    assert name in message and "full scan" in message and "rename" in message
+    # Every surface below interpolates this message inside its OWN parentheses, so the message may
+    # not open one of its own, and it must spell the rule out rather than paste `\A[A-Za-z0-9]...`
+    # in front of the operator.
+    assert "(" not in message and ")" not in message
+    assert "\\A" not in message and "[A-Za-z0-9]" not in message
+
+    # build_cache raises the class every caller already handles (never a bare InvalidWriterError).
+    with pytest.raises(ConfigError):
+        build_cache(repo)
+
+    # `agora index build`: no traceback, and the output says all three things.
+    assert main(["index", "build", "--repo", root]) == 1
+    out = capsys.readouterr().out
+    assert "could not build" in out and "no reader cache was written" in out  # (1) nothing written
+    assert name in out  # (2) the cause is the repo directory name
+    assert "full scan" in out and "rename" in out  # (3) search still works + the remedy
+    assert not repo.layout.index_cache_dir.exists()
+
+    # The READ path is untouched: query still answers, and status/doctor agree with build that
+    # there is no cache (no "built" here / "absent" there contradiction).
+    result = Wiki(repo.layout).query("curator concurrency control")
+    assert result.status == "ok" and result.hits
+    assert Wiki(repo.layout).query("quantum biology photosynthesis").status == "not_found"
+
+    assert main(["index", "status", "--repo", root]) == 0
+    out = capsys.readouterr().out
+    assert "cache: unavailable" in out and name in out
+
+    main(["doctor", "--repo", root])
+    assert "cache=absent" in capsys.readouterr().out
+
+    # `agora index clear` is a no-op, not a crash.
+    assert main(["index", "clear", "--repo", root]) == 0
+    assert "no cache to clear" in capsys.readouterr().out
+
+
+def test_unsafe_repo_dir_name_does_not_abort_a_curator_publish(tmp_path: Path) -> None:
+    """``rebuild_index_cache`` still DEGRADES (never raises) when no cache path exists (#108).
+
+    The translated ``ConfigError`` must keep the curator's swallow+signal posture intact: a run is
+    already published in git when the rebuild runs, so an unbuildable derived cache may only be
+    surfaced as ``index_cache_unbuilt``.
+    """
+    from agora_kb.curator.worker import rebuild_index_cache
+
+    repo = _repo(tmp_path, name="My Knowledge")
+    assert rebuild_index_cache(repo) is False
+    assert not repo.layout.index_cache_dir.exists()
 
 
 # --- Korean corpus: cache parity + bigram determinism (issue #56, ADR-0012 addendum) -------------
