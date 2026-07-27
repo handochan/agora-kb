@@ -18,7 +18,7 @@ from pathlib import Path
 import pytest
 from fastmcp import Client
 
-from agora_kb.core import Inbox, Repo
+from agora_kb.core import Inbox, Repo, failed_event_count
 from agora_kb.core.wiki import Wiki
 from agora_kb.faces.mcp_server import AgoraHandlers, build_server
 from agora_kb.schema import Taxonomy, emit_schema
@@ -76,6 +76,11 @@ for note in (cwd / "wiki").rglob("*.md"):
     note.write_text("\\n".join(out))
 sys.exit(0)
 """
+
+# A brain that cannot run at all — the shape of an absent/dead Ollama daemon (#96). A non-zero
+# PASS 1 makes SubprocessBackend.plan raise BackendUnavailableError, so worker._fail discards the
+# run with a `PLAN-BACKEND:` reason and a durable `_kb/failed/**/error.json` record.
+_DEAD_BRAIN = 'import sys\nsys.stderr.write("ollama: connection refused\\n")\nsys.exit(1)\n'
 
 _TAXONOMY = Taxonomy(
     schema_version=1,
@@ -260,6 +265,41 @@ def test_status_reflects_pending_and_failed(tmp_path: Path) -> None:
     assert result["failed"] == 1
 
 
+def test_kb_status_failed_delegates_to_the_shared_helper(tmp_path: Path) -> None:
+    """`kb_status.failed` IS ``core.failed_event_count`` — #96 crit 8, half 2 (the SAME helper).
+
+    The CLI prints the same number as ``agora status``'s ``failed_events``. The criterion is that
+    the two agree BY CONSTRUCTION — one function — not because two hand-written recursive globs
+    happen to match today and drift tomorrow.
+    """
+    repo = _init_repo(tmp_path)
+    handlers = AgoraHandlers(repo, writer="local")
+    run_dir = repo.layout.failed_dir / "2026-06-13" / "20260613T000000Z-deadbeef"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "20260613T024010Z-a1b2c3.md").write_text("oops\n", encoding="utf-8")
+    (run_dir / "20260613T024011Z-d4e5f6.md").write_text("oops\n", encoding="utf-8")
+    (run_dir / "error.json").write_text('{"failed_checks": []}\n', encoding="utf-8")
+
+    assert handlers.status()["failed"] == failed_event_count(repo.layout) == 2
+
+
+def test_kb_status_failed_is_not_a_second_copy_of_the_glob(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The other half of "same helper": value equality alone would survive a re-inlined copy.
+
+    Pinning the shared function to an impossible number proves the face DELEGATES rather than
+    re-implementing the recursive glob — which is what #96 crit 8 actually asks for.
+    """
+    import agora_kb.faces.mcp_server as mcp_mod
+
+    repo = _init_repo(tmp_path)
+    handlers = AgoraHandlers(repo, writer="local")
+    monkeypatch.setattr(mcp_mod, "failed_event_count", lambda layout: 99)
+
+    assert handlers.status()["failed"] == 99
+
+
 def test_status_processed_today_counts_today_partition(tmp_path: Path) -> None:
     from datetime import UTC, datetime
 
@@ -342,6 +382,9 @@ def test_curate_with_stub_backend_publishes(tmp_path: Path) -> None:
     assert "The single curator holds a per-repo flock." in theme.read_text(encoding="utf-8")
     assert result["counts"].get("prose_pending") == 0
     assert result["warnings"] == []
+    # #96: `failure` is set ONLY by worker._fail, so a published run must carry None — the key is
+    # additive and must add no noise to the happy path an agent reads on every curate.
+    assert result["failure"] is None
 
 
 def test_curate_empty_inbox_with_backend_is_noop(tmp_path: Path) -> None:
@@ -353,6 +396,45 @@ def test_curate_empty_inbox_with_backend_is_noop(tmp_path: Path) -> None:
 
     assert result["status"] == "noop"
     assert result["published_commit"] is None
+
+
+@requires_git
+def test_kb_curate_failed_payload_carries_failure(tmp_path: Path) -> None:
+    """A FAILED run's payload says WHY and WHERE, not just ``status: "failed"`` (#96).
+
+    The fatal counterpart to ``warnings``: an agent that saw only the verdict sat in exactly the
+    position the human operator was in before #96. ``record_path`` is repo-RELATIVE, so the agent
+    resolves it against the repo root it already knows (and it never leaks the host layout,
+    invariant 5); ``reasons`` ships in full because each entry is already bounded at construction
+    (``worker._bounded_reasons``), so no unbounded brain traceback can reach a context window.
+    """
+    repo = _init_curatable_repo(tmp_path)
+    # A dead brain: PASS 1 exits non-zero, so the run publishes nothing and _fail records it.
+    (tmp_path / "stub_brain.py").write_text(_DEAD_BRAIN, encoding="utf-8")
+    handlers = AgoraHandlers(repo, writer="dochan")
+    Inbox(repo.layout).write(
+        text="One curator advances the branch under a lock.",
+        writer="dochan",
+        source="claude-code",
+        domain="ai-tech",
+        now=datetime(2026, 6, 13, 2, 40, 10, tzinfo=UTC),
+    )
+
+    result = handlers.curate()
+
+    assert result["status"] == "failed"
+    # The fatal cause rides its OWN key: it must not leak into the non-fatal #115 channel.
+    assert result["warnings"] == []
+    failure = result["failure"]
+    assert failure is not None
+    assert isinstance(failure["run_id"], str) and failure["run_id"]
+    assert failure["phase"] == "claimed"  # PLAN failed, so nothing was ever applied
+    assert failure["cas_conflict"] is False
+    assert failure["reasons"] and failure["reasons"][0].startswith("PLAN-BACKEND")
+    assert "connection refused" in failure["reasons"][0]  # the brain's own stderr, bounded
+    record = failure["record_path"]
+    assert record.startswith("_kb/failed/") and record.endswith("/error.json")
+    assert (repo.layout.root / record).is_file()  # relative to the repo root the agent knows
 
 
 # --- live MCP client round-trip (the Exit clause) -----------------------------------------------
