@@ -210,6 +210,15 @@ Mutable engine state. JSON (single small file; rewritten atomically under the lo
   "last_commit": "705f4a4",
   "counters": { "ingested": 142, "merged": 38, "dropped": 11, "failed": 2 },
   "last_batch": { "claimed": 12, "candidates": 8, "cap": 8, "inbox_remaining": 4 },
+  "last_attempt": "2026-06-13T04:10:00Z",
+  "last_failure": {
+    "when": "2026-06-13T04:10:00Z",
+    "run_id": "2026-06-13T04-10-00.000Z--3f2a1b",
+    "phase": "claimed",
+    "reasons": ["TAXONOMY: unknown domain 'not-a-real-domain'"],
+    "reasons_total": 1,
+    "record_path": "_kb/failed/2026-06-13/2026-06-13T04-10-00.000Z--3f2a1b/error.json"
+  },
   "event_keys": { "dochan:<event_key>": "<event-id>" },
   "published_runs": { "<run-id>": "<commit-sha>" }
 }
@@ -223,6 +232,38 @@ recovery does NOT recompute it: finalizing a run whose happy-path state save nev
 `last_batch` back to `null` (the crashed run's shape is unknowable, so recovery clears rather than
 mislabels the previous run's shape as the recovered run's — the same best-effort posture as the
 un-replayed counters).
+`last_attempt` / `last_failure` (#96) are the **failure surface**, and both are additive optionals
+(absent/`null` in a pre-#96 state.json). `last_run` means "last successful PUBLISH" — `mark_run`
+fires only on the publish path — so a curator that fails every run leaves it at `never` forever,
+while a *non-terminal* failure returns its events to `inbox/` (depth unchanged) and bumps no counter
+(`counters.failed` counts **terminal** failures only, at retry-budget exhaustion). Without these two
+fields nothing an operator can read moves at all.
+
+- **`last_attempt`** is stamped ONCE per run that actually CLAIMED work — success, failure, or
+  crash — right after the claim, so it can never be older than `last_run`, and `last_attempt >>
+  last_run` is the "the curator is trying and getting nowhere" signal. An idle tick (nothing to
+  claim) writes nothing.
+- **`last_failure`** records the most recent run that did not publish: `reasons` is a **bounded
+  preview** (≤ 5 entries, each already flattened to one line and capped at 400 chars upstream — it
+  is never re-clipped here, so `reasons_total`, the FULL count, cannot lie), and `record_path` is
+  the repo-relative POSIX path of that run's `error.json`, which keeps the untruncated
+  `failed_checks`. Repo-relative so the record survives a repo move and no host layout leaks into a
+  repo-scoped file (invariant 5). `phase` is `claimed` for a failure BEFORE apply and `applied`
+  after it.
+- It is **sticky**: a later successful publish does NOT clear it (it is a historical fact, like
+  `counters`). "Is it still broken?" is `CuratorState.failure_is_current` — a derived property,
+  never serialized — which is true while `last_failure.when >= last_run` (or nothing has ever
+  published). Crash recovery touches neither field (it replays no clock and no counters), and a CAS
+  conflict is not a failure: it writes no `error.json` and no `last_failure`.
+- Surfaces: `agora status` (`last_attempt:` / `last_failure:` / `failed_events:`), `agora doctor`'s
+  `failures:` line, and `agora curate`'s `failed_record:` / `failed_checks:` lines.
+
+> **Downgrade note.** A `state.json` written by this version is **not readable by a pre-#96 agora**
+> (the loader is deliberately fail-loud rather than dropping unknown keys). The remedy is to
+> **re-upgrade agora** — never to delete `_kb/state.json`, which would discard the double-publish
+> guard (`published_runs`) and the delivery-idempotency cache (`event_keys`). `_kb/` is git-ignored
+> at `repo init`, so such a file cannot propagate to another machine or tenant.
+
 `event_keys` is a bounded delivery-idempotency cache and may be rebuilt from retained events.
 `published_runs` lets recovery finalize a committed run without invoking the backend twice. Separately,
 `_kb/index/<repo>.notes.json` is the read-side query cache — **IMPLEMENTED in issue #26** (ADR-0012 §2

@@ -130,21 +130,32 @@ recorded before anyone touches the code, and Track B gets its `windows-latest` s
       release.
 
 **Operational truth (4)**
-- [ ] **First-run failure diagnosis (#96)** (one issue, one failure story). `_cmd_curate` prints three
-      lines (`cli.py:487-490`) while the real cause lives only in
-      `_kb/failed/<date>/<run>/error.json` (`worker.py:876`) and that path is never printed;
-      `mark_run` is called from the publish path only (`worker.py:607`), so `last_run: never`
-      survives any number of failures, and `state.counters.failed` counts **terminal** failures only
-      (`worker.py:897-900`) — a run that is still retrying looks healthy on all three axes (depth,
-      last_run, counters); and none of the six `_doctor_*` checks (`cli.py:1089-1109`) probes whether
-      the configured brain answers, so doctor reports healthy immediately after a curate failed for
-      exactly that reason. The failed-event counter already exists at `faces/mcp_server.py:814` —
-      surface it rather than write a new one.
-- [ ] **`agora watch` crash-loop containment (#97).** The only `except` wrapping `_watch_tick`
-      (`cli.py:764-770`) is `KeyboardInterrupt`, so a corrupt `state.json` (a deliberate raise —
-      `core/state.py:144-152`) turns the #65 always-on units into a 10-second restart loop under
-      systemd `Restart=on-failure`/`RestartSec=10` and launchd `KeepAlive`. Per-tick isolation +
-      backoff.
+- [x] **First-run failure diagnosis (#96)** — DONE. A failed `agora curate` now prints
+      `failed_record:` (the repo-relative `_kb/failed/<date>/<run>/error.json`) and `failed_checks:`
+      (a bounded echo) on stdout, carried by `RunReport.failure` and rendered by the ONE face-side
+      printer that already handled `warnings` (`cli._print_run_diagnostics`; MCP `kb_curate` gains a
+      matching `failure` key). `_kb/state.json` gained `last_attempt` + `last_failure` (DATA-MODEL
+      §4), so a *non-terminal* failure — which returns its events to `inbox/`, never calls
+      `mark_run`, and bumps no counter — is visible in `agora status`
+      (`last_attempt:` / `last_failure: UNRESOLVED …` / `failed_events:`, the last via the ONE
+      shared `core.failed_event_count` that `kb_status.failed` also uses) and in `agora doctor`'s
+      `failures:` line. `agora doctor` now PROBES the configured brain (`brains:` line): argv[0] on
+      PATH + executable for any backend, plus `/api/tags` reachability and the model `select_model`
+      would actually pick for `agora-ollama-brain`; an unusable brain is `status: unhealthy` + exit
+      1 with a tool-agnostic, copy-pasteable fix block (a headless CLI agent already on PATH via
+      `agora-cli-brain`/ADR-0016 first, Ollama demoted to "instead"), and `--skip-probe` is the
+      escape hatch for brain-less nodes. Bundled: doctor no longer tracebacks on a malformed
+      `repo.yaml` (it falls back to defaults and still reaches `status:`), `agora status` reports a
+      corrupt `state.json` instead of tracebacking, and `error.json`'s `"phase"` is truthful for
+      post-APPLY failures (`applied`, not the constant `claimed`).
+- [x] **`agora watch` crash-loop containment (#97)** — DONE. A raising tick is caught per tick,
+      reported as ONE bounded `<stamp> tick failed: <Type>: <message>` line on stderr (no
+      traceback; `AGORA_WATCH_TRACEBACK=1` adds one for bug reports), and followed by an
+      exponential backoff — `interval × 2ⁿ`, capped at `max(interval, 900s)` — that resets on the
+      first clean tick, so a repaired `repo.yaml`/`state.json` recovers without a restart. The loop
+      exits 0, so the #65 units' `Restart=on-failure`/`KeepAlive` no longer convert a deterministic
+      per-tick raise into a 10-second crash loop; `--once` keeps its single-shot contract (same
+      line, `return 1`). Ctrl-C still stops cleanly, and every happy-path tick byte is unchanged.
 - [ ] **`schema_version` compatibility check (#98).** Read in three places (`config.py:174/909/915`) and
       compared against a supported range in **none**; no doctor line. A repo written by a future
       build must fail loudly. (`agora repo upgrade` itself stays #63.)
@@ -209,12 +220,15 @@ recorded before anyone touches the code, and Track B gets its `windows-latest` s
       (`config.py:95,292,312`), yet `ollama pull`, Ollama installation, and hardware requirements
       appear **nowhere** in the repo — and `select_model` silently falls back to the
       alphabetically-first installed model when no qwen is present
-      (`adapters/ollama_brain.py:148-169`), while `agora doctor` still reports healthy because it
-      never probes the brain (`cli.py:1085-1112`).
+      (`adapters/ollama_brain.py:148-169`). `agora doctor` now probes the brain and says so (#96:
+      it reports the daemon, the model a run would pick, and WARNs on that alphabetical fallback),
+      so this item is the prose half only: install/hardware premise, and that a CLI agent via
+      `agora-cli-brain` is a first-class alternative to Ollama.
 - [ ] **`docs/LIMITATIONS.md` — the data-safety contract (#105).** What a beta user may put in and what can
       disappear, in one page: `repo init` git-ignores `_kb/` (`core/repo.py:52-54`) so nothing
       uncurated is backed up; the closed op vocabulary has no DELETE (`curator/plan.py:51-56`) so
-      nothing is retractable; retries fail invisibly (`worker.py:607`, `worker.py:897-900`); and the
+      nothing is retractable; a retry no longer fails invisibly (#96 records `last_failure` on every
+      non-publishing run) but still leaves `last_run`/`counters.failed` untouched by design; and the
       manual `_kb/failed/` reinjection procedure — including the trap that the retry budget is
       derived from *retained `error.json` records*, not from the event file (`worker.py:917-930`) —
       is documented here because no command exists for it yet.
