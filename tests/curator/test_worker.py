@@ -39,6 +39,7 @@ from agora_kb.curator.worker import (
     Backend,
     FakeBackend,
     RunReport,
+    _unauthored_regions,
     recover,
     run,
 )
@@ -1251,6 +1252,90 @@ def test_author_failure_degrades_prose_but_run_still_publishes(tmp_path: Path) -
     manifest = read_manifest(manifest_path(layout, report.run_id))
     assert manifest.phase == "finalized"
     assert manifest.prose_complete is False
+
+
+class _SilentBackend(FakeBackend):
+    """A brain whose PASS 2 does NOTHING — the shape of a backend that could not start.
+
+    Exactly what bwrap produced on Linux when ``execvp`` failed for every region (#115): zero bytes
+    written, zero changed files, and — before the fix — zero complaints from the engine.
+    """
+
+    def author(
+        self,
+        worktree: Path,
+        needs_prose: dict[str, list[str]],
+        context: dict[str, AuthorRegion],
+    ) -> list[str]:
+        return ["AUTHOR wiki/x.md [c1]: backend 'stub' exited 1: bwrap: execvp …: No such file"]
+
+
+def test_author_that_writes_nothing_publishes_but_reports_prose_pending(tmp_path: Path) -> None:
+    """A PASS 2 that authors NOTHING must not be reported as an unqualified success (#115).
+
+    The §4.2 validator only ever saw CHANGED files, so a backend that wrote nothing produced an
+    empty diff, no validation errors, ``prose_complete=True`` and ``status: published`` — while
+    every body on disk was still APPLY's ``_summary pending_`` placeholder. On Linux that ran for a
+    whole KB without a single error line. The run still publishes (the structure is valid and
+    APPLY-owned), but it now says so: ``prose_pending`` on the report, the backend's own stderr in
+    ``warnings``, and ``prose_complete=False`` on the manifest.
+    """
+    repo = _init_repo(tmp_path)
+    layout = repo.layout
+    inbox = Inbox(layout)
+
+    e1 = _write_capture(inbox, text="One curator advances the branch under a lock.", second=10)
+    _seed_raw(repo, e1)
+    plan = _create_theme_plan("ignored", "c1", e1)
+
+    report = _run(repo, _SilentBackend(plan))
+
+    assert report.status == "published"  # structure is valid — the publish is still correct
+    assert report.counts["prose_regions"] == 1
+    assert report.counts["prose_pending"] == 1
+    assert any("PROSE PENDING" in w for w in report.warnings)
+    # The backend's own diagnostic rides along, so the operator sees WHY (not just THAT).
+    assert any("execvp" in w for w in report.warnings)
+    assert read_manifest(manifest_path(layout, report.run_id)).prose_complete is False
+    with repo.worktree(at=report.published_commit) as published:  # type: ignore[arg-type]
+        theme = published / "wiki" / "ai-tech" / "themes" / "curator-concurrency.md"
+        assert "_summary pending_" in theme.read_text(encoding="utf-8")
+        assert lint(RepoLayout(published), taxonomy=TAXONOMY, run_date=RUN_DATE).ok
+
+
+def test_unauthored_regions_grades_each_region_not_each_file() -> None:
+    """``_unauthored_regions`` is REGION-granular: a partly-authored note is partly pending.
+
+    The per-FILE ``changed`` list cannot express "2 of 3 regions came back empty" — the file
+    changed, so the whole note counted as authored. Placeholder bodies (both APPLY's fill and the
+    §4.2 reset form) count as unauthored even when the file's bytes moved.
+    """
+    start_a, end_a = body_sentinels("a")
+    start_b, end_b = body_sentinels("b")
+    head = "---\ntitle: T\n---\n"
+    old = (
+        f"{head}\n{start_a}\n_summary pending_\n{end_a}\n\n{start_b}\n_summary pending_\n{end_b}\n"
+    )
+    new = (
+        f"{head}\n{start_a}\nReal prose landed here.\n{end_a}\n"
+        f"\n{start_b}\n> _summary pending_\n{end_b}\n"
+    )
+    needs = {"wiki/d/themes/n.md": ["a", "b"]}
+
+    pending = _unauthored_regions(needs, {"wiki/d/themes/n.md": old}, {"wiki/d/themes/n.md": new})
+
+    assert pending == [("wiki/d/themes/n.md", "b")]
+
+
+def test_unauthored_regions_flags_an_untouched_note() -> None:
+    """Byte-identical old/new (the backend never ran) is the #115 case: every region is pending."""
+    start, end = body_sentinels("c1")
+    text = f"---\ntitle: T\n---\n\n{start}\n_summary pending_\n{end}\n"
+    needs = {"wiki/d/themes/n.md": ["c1"]}
+
+    pending = _unauthored_regions(needs, {"wiki/d/themes/n.md": text}, {"wiki/d/themes/n.md": text})
+
+    assert pending == [("wiki/d/themes/n.md", "c1")]
 
 
 def test_stray_wikilink_is_stripped_and_run_publishes(tmp_path: Path) -> None:

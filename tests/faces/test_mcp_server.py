@@ -336,6 +336,12 @@ def test_curate_with_stub_backend_publishes(tmp_path: Path) -> None:
     theme = repo.layout.wiki_dir / "ai-tech" / "themes" / "curator-concurrency.md"
     assert theme.is_file()
     assert Wiki(repo.layout).query("curator concurrency").status == "ok"
+    # The BODY oracle (#115). Without it this test passes on a note whose body is still the
+    # `_summary pending_` placeholder — which is exactly what the Linux sandbox produced while
+    # every other assertion here stayed green. `published` must mean prose, not just structure.
+    assert "The single curator holds a per-repo flock." in theme.read_text(encoding="utf-8")
+    assert result["counts"].get("prose_pending") == 0
+    assert result["warnings"] == []
 
 
 def test_curate_empty_inbox_with_backend_is_noop(tmp_path: Path) -> None:

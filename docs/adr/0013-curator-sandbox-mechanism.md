@@ -1,6 +1,7 @@
 # ADR-0013 — Curator sandbox mechanism (macOS Seatbelt + cross-platform plan)
 
-**Status:** Accepted · 2026-06-13
+**Status:** Accepted · 2026-06-13 · **Linux mount plan amended by the 2026-07-27 appendix (issue
+#115): the bind set in §"Linux plan" is superseded by a whole-filesystem read-only bind.**
 
 ## Context
 ADR-0008 mandates that the curator's cognitive INGEST step (its step 2-3) runs "inside an OS sandbox
@@ -359,6 +360,11 @@ the profile, not by luck of sibling placement.
 
 ### Linux plan — bubblewrap (+ optional Landlock/seccomp)
 
+> **The bind set below is SUPERSEDED by the 2026-07-27 appendix (issue #115)** — `--ro-bind / /`
+> replaces `--tmpfs /tmp` + the enumerated system dirs, and G4/G5 are satisfied by the read-only
+> root rather than by omission. Everything else in this § (netns egress deny, `--clearenv`,
+> `--new-session`, the separate `$TMP`) still stands. Kept verbatim as the historical record.
+
 Primary network block is the **network namespace** (kernel-enforced, loopback-only), not a proxy.
 `tmp_dir` is a SEPARATE rw-bind OUTSIDE the worktree, mirroring macOS.
 
@@ -670,3 +676,115 @@ satisfied with zero AGPL/copyleft exposure.
 - **−** Temporary worktrees + per-run sandbox setup add disk and process-spawn overhead (already noted
   in ADR-0008); acceptable because curation is batch/background, and the self-test result is cached in
   `_kb/state.json` keyed by `{mechanism, OS build, binary mtime}`.
+
+## Appendix (2026-07-27, append-only) — the Linux mount plan is macOS-parity, not deny-by-omission (issue #115)
+
+**What changed:** the `### Linux plan` §'s bind set above (`--tmpfs /tmp` + `--ro-bind /usr /bin /lib
+/lib64` + the operator's `read_roots`) is **superseded** by a whole-filesystem read-only bind:
+
+```bash
+  --ro-bind / /              `# everything READABLE, nothing writable`
+  --proc /proc --dev /dev    `# MUST follow the root bind, or the host's /proc leaks through it`
+  --tmpfs /run --tmpfs /tmp  `# mask the AF_UNIX socket dirs (realpath-resolved, de-duplicated)`
+  --ro-bind "$READ_ROOT" …   `# the operator's read_roots: harmless no-ops today, see below`
+  --ro-bind "$ARGV_FILE" …   `# re-admit argv files hidden by a mask (files only, never a parent)`
+  --bind "$WORKTREE" "$WORKTREE"   `# the only writable CONTENT mount`
+  --bind "$TMP" "$TMP"             `# the only other writable mount (= HOME/TMPDIR)`
+```
+
+Everything else in that § — `--unshare-all` as the authoritative netns egress deny, `--clearenv` +
+the three `--setenv`s, `--new-session`, `--die-with-parent`, `--chdir "$WORKTREE"`, the timeout
+group-kill, the userns caveat — is unchanged.
+
+**Why: the previous posture could not express a real backend, and failed SILENTLY.** Every path
+reaching an adapter is `Path.resolve(strict=True)`-ed (the §"Realpath normalization" invariant that
+Seatbelt *requires*), but `execvp` walks the **access** path. A venv interpreter is reached through
+a symlink chain — `.venv/bin/python` → `<uv>/python/cpython-3.12-linux-x86_64-gnu/bin/python3.12`,
+where that *minor-version alias* directory is itself a symlink to `cpython-3.12.13-…`. Binding the
+resolved realpath leaves the alias component non-existent inside the namespace, so the kernel fails
+the exec with a misleading `bwrap: execvp …: No such file or directory` **before the backend runs
+at all**. No value of `read_roots` can fix this: the mountpoint that is missing is one the resolver
+erases by construction. Two further layers sat behind it (the interpreter's stdlib under
+`<base_prefix>/lib`, never covered by `{venv}`/`{interpreter}`; and the brain SCRIPT itself, which
+lives outside the worktree), so each fix attempt uncovered the next failure.
+
+Reproduced end-to-end on ubuntu-24.04 with a real `bwrap`: PASS 2 returned `rc=1` for every region,
+wrote nothing, and the run reported `status: published` with `_summary pending_` bodies. macOS was
+green throughout — its profile ships a broad `(allow file-read*)`, so the same adapters.yaml worked
+there. The Linux leg was the only thing exercising deny-by-omission, and what it proved is that the
+posture is unshippable for arbitrary operator-configured brains (a `agora-cli-brain -- claude -p`
+would need node's entire install closure, an agent's config dir, …). Enumerating a launch closure
+was prototyped and rejected: bwrap cannot mount a file over a path inside an already-bound read-only
+directory, so it degrades to binding parent directories — which for a brain script at the KB repo
+root would expose `_kb/` and defeat G5 outright.
+
+**A whole-filesystem read bind is NOT sufficient for parity on its own — unix sockets.**
+`--unshare-net` does not cover an AF_UNIX **pathname** socket (it is reached through the filesystem,
+not the network stack), and a read-only mount does not block `connect()` — `MNT_READONLY` returns
+`EROFS` only for reg/dir/link. So a bare `--ro-bind / /` would have handed the confined backend
+`/run/docker.sock`, the session bus, and any gpg/ssh agent socket: **strictly weaker than the
+seatbelt profile**, whose `(deny default)` + `(deny system-socket)` refuse them outright. Verified
+both ways on Linux — without the mask a `connect()` to a host socket SUCCEEDS; with it, `ENOENT`.
+The mount plan therefore masks `/run`, `/var/run` and `/tmp` with empty tmpfs, realpath-resolved and
+de-duplicated (on a merged-`/run` distro `/var/run` is a symlink, and bwrap aborts the whole
+namespace when asked to mount onto one), and then re-admits the operator's own argv FILES that a
+mask would hide — files only, never a parent directory, and only under a masked dir. Masking `/tmp`
+also restores the private WRITABLE tmpfs the pre-#115 plan gave the backend. Residual: a socket at
+an unmasked custom path is still reachable; the seccomp layer this ADR already files as later
+hardening is the complete answer.
+
+**Security delta — stated plainly.**
+- **Unchanged:** G1 out-of-worktree writes (`EROFS` — the root is read-only; verified), G2 network
+  egress (`--unshare-net`, verified), G3 credential env-scrub, G4/G5 **writes** to the main repo's
+  `.git` / `_kb` (`EROFS`, verified), the writable-mount set (worktree + tmp + the private `/tmp`
+  tmpfs, exactly as before), and the ADR-0008 post-hoc validator behind all of it.
+- **Weakened:** the main repo's `.git` / `_kb` and the rest of the filesystem become **readable**
+  inside the Linux sandbox. G4/G5 were previously satisfied "by omission" (invisible); they are now
+  satisfied the way macOS has always satisfied them — visible, unwritable. This makes Linux
+  **equal to**, not weaker than, the shipping macOS posture, whose broad `file-read*` is already
+  recorded as a `−` in Consequences above.
+  **Do not repeat that bullet's mitigation as stated.** "G2 means a read alone cannot leak" is too
+  strong for this system: the confined step's DELIVERABLE is prose that the curator publishes, and
+  nothing between a read and a published body inspects CONTENT (§4.2 checks structure — region
+  scope, frontmatter byte-identity, byte bound, stray links — never meaning). A backend that reads a
+  secret can write it into a note body. What actually bounds that: the KB is the operator's own
+  local repo, the region byte bound caps volume, `log.md` + the commit record every run, and the
+  backend cannot transmit anywhere. This is a property of both platforms and predates this change —
+  the appendix records it because the read surface is now the *same* on both, so it is one
+  cross-platform decision to revisit, not two.
+- **Deliberately NOT taken:** masking `.git`/`_kb` with `--tmpfs` (the `SandboxSpec.main_git` /
+  `main_kb` fields exist and bwrap still ignores them). It would make Linux stricter than macOS
+  again — reintroducing exactly the per-platform divergence that let this bug hide for a release.
+
+Read-hardening therefore stays a **single cross-platform** follow-up (the §"Open questions" item),
+not a per-OS drift. `read_roots` keeps its meaning in `adapters.yaml` and is still bound, so that
+follow-up has a config surface to tighten against on both platforms at once.
+
+**One CROSS-PLATFORM correctness fix rides along.** A bare-name `argv[0]` (`agora-ollama-brain`,
+`agora-cli-brain` — console scripts in the operator's venv `bin`) is now resolved against the HOST
+`PATH` before the spec is built. Both adapters replace `PATH` with a minimal in-sandbox value
+(`/usr/bin:/bin`, plus the Homebrew/sbin entries on macOS), so the confined process could not find a
+venv console script on EITHER platform; it only escaped notice because the shipped shims are
+configured `network: loopback` and therefore run unconfined. An `argv[0]` containing a separator is
+passed through untouched, and a name on no PATH now raises `BackendUnavailableError` — a clean failed
+run instead of a placeholder body.
+
+**Two supporting corrections, both the same bug class (a check weaker than the thing it checks).**
+1. `available()`'s userns probe now runs the **real** `_mount_plan()` rather than a subset. A probe
+   weaker than the run green-lights a sandbox that then fails at run time (#115); a probe with a
+   *different* bind set reported "no usable sandbox" on ordinary Linux hosts (#113). They are one
+   function now and cannot drift apart.
+2. The runtime self-test's denial errnos are **mechanism-keyed** (`_denial_errnos`). Seatbelt denies
+   by policy (`EPERM`); a namespace denies structurally (`EROFS` for a read-only mount,
+   `ECONNREFUSED`/`ENETUNREACH` for an empty netns). Demanding `EPERM` everywhere aborted probe 1 at
+   the write-outside leg on Linux — so `network_denied` came back `True` **having proven nothing**.
+   Each leg now also requires its own POSITIVE marker (`OUTSIDE_DENIED` / `NET_DENIED`), so a probe
+   that dies early can never be read as a proven denial. The reachable-target requirement stands.
+
+**Loudness (the half of #115 that is platform-independent).** A PASS-2 that authors nothing was
+indistinguishable from "nothing to do": the §4.2 validator only inspects CHANGED files, so an empty
+diff produced no errors and `prose_complete` stayed `True`. The worker now grades PASS 2 **per
+region** against the worktree (`_unauthored_regions`), reports `prose_regions` / `prose_pending` in
+`counts`, carries the backend's own stderr on `RunReport.warnings`, and the CLI prints those to
+stderr. The publish itself is unchanged — a structurally-valid prose-pending note still publishes
+(ADR-0011 §4.2) — but it can no longer be reported as an unqualified success.

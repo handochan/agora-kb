@@ -69,6 +69,7 @@ from ..schema.emit import Taxonomy
 from ..schema.lint import lint
 from ..schema.notes import Note, parse_all_notes
 from .apply import (
+    BODY_PLACEHOLDER,
     apply_plan,
     body_sentinels,
     region_sentinel_id,
@@ -153,7 +154,7 @@ class Backend(Protocol):
         worktree: Path,
         needs_prose: dict[str, list[str]],
         context: dict[str, AuthorRegion],
-    ) -> None:
+    ) -> list[str] | None:
         """PASS 2 — fill the candidate-id body sentinels in ``worktree`` (§3 / §4.2).
 
         ``needs_prose`` maps each note's repo-relative path to the run-scoped region ids whose
@@ -162,6 +163,12 @@ class Backend(Protocol):
         summary + the candidate's verbatim source text, §8.2) so the backend can ground its prose
         and honor the op. The backend writes ONLY between those markers; the worker validates the
         diff with :func:`validate_author_diff` and strips/degrades anything out of bounds.
+
+        MAY return one human-readable diagnostic per region it failed to author (a non-zero exit,
+        an unreachable model), which the worker surfaces on the :class:`RunReport`. ``None`` is the
+        no-diagnostics answer, so an implementation that simply writes prose (every test fake) is
+        unaffected. The worker NEVER treats a returned diagnostic as authority on success: whether
+        prose actually landed is decided by the §4.2 diff, never by the backend's own account.
         """
         ...
 
@@ -213,6 +220,80 @@ def _is_theme_note(note: Note) -> bool:
     return len(parts) == 4 and parts[0] == "wiki" and parts[2] == "themes"
 
 
+def _read_notes(worktree: Path, needs_prose: dict[str, list[str]]) -> dict[str, str]:
+    """Read each ``needs_prose`` note's current text; a note PASS 2 DELETED reads as ``""``.
+
+    PASS 2 is an untrusted backend with a writable worktree, so it can delete or rename a note it
+    was asked to author. A bare ``read_text`` would then raise ``FileNotFoundError`` straight out of
+    :func:`run`, which catches only ``LockHeld`` — an uncaught traceback where the contract promises
+    a clean FAILED run. Reading the absent note as empty keeps the deterministic path: the §4.2
+    validator sees a changed file whose sentinels are gone and rejects it, and
+    :func:`_unauthored_regions` counts every missing region as pending.
+    """
+    state: dict[str, str] = {}
+    for rel in needs_prose:
+        path = worktree / rel
+        state[rel] = path.read_text(encoding="utf-8") if path.is_file() else ""
+    return state
+
+
+def _region_body(text: str, sentinel_id: str) -> str | None:
+    """Return the text BETWEEN ``sentinel_id``'s body markers, or ``None`` if the region is absent.
+
+    The exact inverse of :func:`_replace_sentinel_region`'s surgery, used by
+    :func:`_unauthored_regions` to grade PASS 2 per REGION rather than per FILE. Pure.
+    """
+    start, end = body_sentinels(sentinel_id)
+    si = text.find(start)
+    ei = text.find(end)
+    if si == -1 or ei == -1 or ei < si:
+        return None
+    return text[si + len(start) : ei]
+
+
+# A region body that still reads as one of these carries no prose, whatever the diff says: APPLY's
+# initial fill, the §4.2 reset form, or nothing at all. Derived from the REAL constants rather than
+# re-spelled, so a change to either placeholder cannot silently stop being detected — in the
+# AUTHOR-diff-rejected path this set is the only thing standing between a reset note and a report
+# claiming its prose landed. Compared after ``strip()`` so trailing-newline churn is not mistaken
+# for authored content.
+_EMPTY_REGION_BODIES = frozenset({"", BODY_PLACEHOLDER, _RESET_PLACEHOLDER})
+
+
+def _unauthored_regions(
+    needs_prose: dict[str, list[str]],
+    per_file_old: dict[str, str],
+    per_file_new: dict[str, str],
+) -> list[tuple[str, str]]:
+    """Return every ``(rel_path, sentinel_id)`` PASS 2 left WITHOUT prose (§4.2 gap, issue #115).
+
+    A region counts as unauthored when its body came back byte-identical to the post-APPLY state, or
+    when what came back is still a placeholder. This is deliberately REGION-granular: the per-FILE
+    ``changed`` list the §4.2 diff validator consumes cannot tell "the brain authored 2 of this
+    note's 3 regions" from "the brain authored all 3", and — the #115 failure — cannot tell "the
+    brain wrote nothing anywhere" from "there was nothing to do". An empty diff produced no
+    validation errors, so ``prose_complete`` stayed ``True`` and the run reported success while
+    every body on disk was the placeholder.
+
+    Pure + deterministic, and it grades the WORKTREE, never the backend's own account of itself —
+    the model stays outside the integrity boundary (ADR-0011 §4).
+    """
+    unauthored: list[tuple[str, str]] = []
+    for rel, sids in needs_prose.items():
+        old_text = per_file_old.get(rel, "")
+        new_text = per_file_new.get(rel, "")
+        for sid in sids:
+            new_body = _region_body(new_text, sid)
+            if new_body is None:
+                # The region vanished — a structural violation the §4.2 validator rejects on its
+                # own; count it as unauthored so the report never claims prose that is not there.
+                unauthored.append((rel, sid))
+                continue
+            if new_body.strip() in _EMPTY_REGION_BODIES or new_body == _region_body(old_text, sid):
+                unauthored.append((rel, sid))
+    return unauthored
+
+
 def _replace_sentinel_region(text: str, candidate_id: str, prose: str) -> str:
     """Return ``text`` with the ``candidate_id`` body-sentinel region body replaced by ``prose``.
 
@@ -244,6 +325,13 @@ class RunReport:
     status: Literal["published", "failed", "noop", "recovered"]
     published_commit: str | None = None
     counts: dict[str, int] = field(default_factory=dict)
+    warnings: list[str] = field(default_factory=list)
+    """Non-fatal operator-facing diagnostics for a run that STILL published (issue #115).
+
+    A PASS-2 that authors nothing publishes structurally-valid notes with placeholder bodies by
+    design (§4.2 degrade) — but reporting that as an unqualified success is how a Linux operator
+    accumulated an entire KB of empty bodies without a single error line. The faces print these;
+    they never change the terminal ``status``."""
 
 
 def run(
@@ -470,6 +558,8 @@ def _run_locked(
         candidate_texts = {c.candidate_id: c.text for c in bundle.candidates}
         needs_prose, sentinels, context = _needs_prose_map(plan, wt, run_date, candidate_texts)
         prose_complete = True
+        prose_warnings: list[str] = []
+        prose_counts: dict[str, int] = {}
         if needs_prose:
             base_state = {rel: (wt / rel).read_text(encoding="utf-8") for rel in needs_prose}
             # A fatal backend-invocation failure on PASS 2 (missing executable / hung process) is
@@ -477,7 +567,10 @@ def _run_locked(
             # than let it escape run() as a traceback. A per-note NON-ZERO exit is NOT fatal — the
             # SubprocessBackend leaves it for the §4.2 AUTHOR-diff degrade path below.
             try:
-                backend.author(wt, needs_prose, context)
+                # A backend MAY report per-region failures (a non-zero exit, an unreachable model).
+                # Advisory only: the §4.2 diff below decides what actually landed. They exist so the
+                # operator sees the backend's own stderr next to a prose-pending result (#115).
+                author_failures = backend.author(wt, needs_prose, context) or []
             except (BackendUnavailableError, subprocess.TimeoutExpired) as exc:
                 return _fail(
                     layout,
@@ -493,7 +586,7 @@ def _run_locked(
             # the WHOLE note to the placeholder over one stray link. Links are structure (APPLY-
             # owned); the strip is iterated to a fixed point in strip_stray_wikilinks.
             _strip_stray_links(wt, needs_prose, plan, live_basenames, run_date)
-            new_state = {rel: (wt / rel).read_text(encoding="utf-8") for rel in needs_prose}
+            new_state = _read_notes(wt, needs_prose)
             changed = [rel for rel in needs_prose if base_state[rel] != new_state[rel]]
             author_errors = validate_author_diff(
                 changed_paths=changed,
@@ -509,6 +602,31 @@ def _run_locked(
                 # note rather than failing (only the prose pass is lost).
                 _degrade_prose(wt, needs_prose, base_state)
                 prose_complete = False
+                new_state = _read_notes(wt, needs_prose)
+                prose_warnings.append(
+                    f"AUTHOR-DIFF rejected: {len(author_errors)} violation(s); every prose region "
+                    f"was reset to the placeholder — {author_errors[0]}"
+                )
+
+            # §4.2 gap-closure (#115): grade PASS 2 per REGION against the worktree. An EMPTY diff
+            # is not evidence of success — it is exactly what a backend that could not start
+            # produces, and it used to sail through the validator (no changed paths ⇒ no errors)
+            # leaving prose_complete=True on a KB full of placeholders. Runs AFTER the degrade
+            # above so a rejected pass is counted from its post-reset state, not double-counted.
+            unauthored = _unauthored_regions(needs_prose, base_state, new_state)
+            prose_counts = {
+                "prose_regions": sum(len(sids) for sids in needs_prose.values()),
+                "prose_pending": len(unauthored),
+            }
+            if unauthored:
+                prose_complete = False
+                pending_notes = sorted({rel for rel, _ in unauthored})
+                prose_warnings.append(
+                    f"PROSE PENDING: {len(unauthored)} of {prose_counts['prose_regions']} body "
+                    f"region(s) were left unauthored; published with placeholder bodies in "
+                    f"{', '.join(pending_notes)}"
+                )
+                prose_warnings.extend(author_failures)
 
         # §4.4 deterministic LINT of the full worktree — the SAME gate the dashboard runs. A lint
         # failure is a structural failure: discard the whole diff, publish nothing (§4.4).
@@ -695,9 +813,19 @@ def _run_locked(
         "claimed": claimed_n,
         "candidates": candidates_n,
         "inbox_remaining": inbox_remaining,
+        # #115 prose observability. Emitted HERE (with the other post-log report-only keys) so
+        # log.md, the commit subject and state.counters stay byte-identical, and only when the run
+        # had prose to author — a run with no needs_prose keeps its small report shape.
+        **prose_counts,
     }
 
-    return RunReport(run_id=run_id, status="published", published_commit=new_commit, counts=counts)
+    return RunReport(
+        run_id=run_id,
+        status="published",
+        published_commit=new_commit,
+        counts=counts,
+        warnings=prose_warnings,
+    )
 
 
 # --- recovery (ADR-0011 §9 truth-table) --------------------------------------------------------

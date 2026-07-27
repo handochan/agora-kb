@@ -81,7 +81,9 @@ _SENTINEL_END = "<!-- agora:body:end id={cid} -->"
 # the §4.2 AUTHOR-failure RESET placeholder, which ADR-0011 §4.2 pins as the blockquote ``>
 # _summary pending_`` derived from the plan summary; the reset path lives in the worker, not here,
 # so the two must not be conflated.
-_BODY_PLACEHOLDER = "_summary pending_"
+BODY_PLACEHOLDER = "_summary pending_"
+# Historical private alias, kept so in-module references and any external reader stay valid.
+_BODY_PLACEHOLDER = BODY_PLACEHOLDER
 
 # §4.2 default per-region body byte bound (tunable via repo.yaml curator.limits, §1.3).
 DEFAULT_MAX_BODY_BYTES = 8 * 1024

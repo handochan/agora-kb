@@ -884,6 +884,10 @@ class AgoraHandlers:
             "status": report.status,
             "published_commit": report.published_commit,
             "counts": report.counts,
+            # Non-fatal diagnostics for a run that published anyway — chiefly "PASS 2 authored no
+            # prose, the bodies are placeholders" (#115). An agent reading only ``status`` would
+            # otherwise be told the consolidation succeeded while every new note is empty.
+            "warnings": report.warnings,
             "recovered": recovered,
         }
 

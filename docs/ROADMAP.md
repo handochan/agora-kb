@@ -307,7 +307,12 @@ Stated as user-facing risk, not as a feature backlog. Every line is a thing that
   bwrap); the default Ollama brain does inference **outside** it by design, and the compensating
   control ADR-0013:424-425 promises for `allow_reduced_isolation` (forced review-mode) is not
   implemented (`rg reduced_isolation curator/worker.py` → 0; tracked in #91). The real last line of
-  defense is the deterministic FINAL-DIFF gate, not the kernel.
+  defense is the deterministic FINAL-DIFF gate, not the kernel. **The sandbox confines WRITES and
+  network, not reads:** on both platforms the authoring subprocess can read the whole filesystem
+  (macOS `(allow file-read*)` since Phase 1; Linux `--ro-bind / /` since the #115 fix, which is what
+  made the Linux sandbox able to launch a venv interpreter at all — ADR-0013 appendix 2026-07-27).
+  It cannot write outside the temp worktree and has no network, so a read alone cannot leave the
+  machine; read-hardening is a single cross-platform follow-up, not shipped in beta.
 - **Contributor process** — no `CONTRIBUTING.md` and no `CODE_OF_CONDUCT.md` in this release; they
   are post-beta. Vulnerabilities go through `SECURITY.md`; everything else goes through issues.
 
