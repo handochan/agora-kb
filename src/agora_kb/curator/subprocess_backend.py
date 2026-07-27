@@ -66,6 +66,7 @@ __all__ = [
     "RoutedBackend",
     "build_routed_backend",
     "BackendUnavailableError",
+    "resolve_program_on_path",
 ]
 
 _logger = logging.getLogger(__name__)
@@ -443,10 +444,12 @@ class SubprocessBackend:
         ``spec.argv`` stay true. An unresolvable bare name raises
         :class:`BackendUnavailableError` here rather than becoming an opaque non-zero exit that the
         §4.2 gate would degrade to a placeholder.
+
+        The resolution itself lives in :func:`resolve_program_on_path`; this method is the RAISING
+        half. That split is what lets `agora doctor`'s brain probe (#96) REPORT the same answer a
+        spawn would get, by construction rather than by a parallel copy of three lines.
         """
-        if os.sep in program or (os.altsep is not None and os.altsep in program):
-            return program
-        found = shutil.which(program)
+        found = resolve_program_on_path(program)
         if found is None:
             raise BackendUnavailableError(
                 f"backend {self._spec.name!r} program {program!r} was not found on PATH; a "
@@ -515,6 +518,20 @@ def fill_sentinel_region(text: str, candidate_id: str, prose: str) -> str:
         return text
     region_start = si + len(start)
     return f"{text[:region_start]}\n{prose}\n{text[ei:]}"
+
+
+def resolve_program_on_path(program: str) -> str | None:
+    """Return the executable a spawn would use for ``argv[0]``, or ``None`` when unresolvable.
+
+    A path-ish ``program`` (contains ``os.sep``/``os.altsep``, including ``sys.executable``) is
+    returned UNCHANGED; a bare name goes through ``shutil.which``. Shared by
+    :meth:`SubprocessBackend._absolute_program` (which RAISES on ``None``) and `agora doctor`'s
+    brain probe (which REPORTS it), so the health check and the spawn resolve identically by
+    construction rather than by parallel copies of three lines.
+    """
+    if os.sep in program or (os.altsep is not None and os.altsep in program):
+        return program
+    return shutil.which(program)
 
 
 class RoutedBackend:

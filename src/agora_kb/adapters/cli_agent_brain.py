@@ -18,9 +18,18 @@ Tool-agnostic by config (invariant 6 — never hard-code a tool/model): the regi
 ``adapters.yaml`` provides the exact CLI argv to shell, after a ``--`` separator, e.g.::
 
     backends:
-      claude: { argv: [agora-cli-brain, --, claude, -p],         network: loopback }
-      gemini: { argv: [agora-cli-brain, --, gemini, -p, ""],      network: loopback }
-      codex:  { argv: [agora-cli-brain, --, codex, exec],         network: loopback }
+      claude:
+        argv: [agora-cli-brain, --, claude, -p]
+        network: loopback
+      codex:
+        argv: [agora-cli-brain, --, codex, exec, --skip-git-repo-check, --sandbox, read-only]
+        network: loopback
+      gemini:
+        argv: [agora-cli-brain, --, gemini, -p, ""]
+        network: loopback
+
+This table is the prose rendering of :data:`KNOWN_CLI_AGENTS` below, and a test locks the two
+together (they drifted once already — codex's flags lived only in ``docs/DATA-MODEL.md`` §8).
 
 The configured CLI MUST read its prompt from stdin and print ONLY its text answer to stdout.
 """
@@ -35,7 +44,30 @@ from pathlib import Path
 
 from agora_kb.adapters.ollama_brain import BrainError, detect_mode, run_author, run_plan
 
-__all__ = ["CliAgentError", "call_cli_agent", "main"]
+__all__ = ["CliAgentError", "KNOWN_CLI_AGENTS", "call_cli_agent", "main"]
+
+# The CLI agents ADR-0016 documents as working brains: {backend name: full adapters.yaml argv}.
+# ONE source of truth for this module's docstring table, DATA-MODEL.md §8, and `agora doctor`'s
+# remediation hint (#96). A HINT registry ONLY — never routing: what actually runs is always the
+# operator's adapters.yaml (invariant 6). An entry here changes NO behaviour beyond what doctor
+# SUGGESTS when it finds that program already on PATH. The program to probe is ``argv[2]`` — the
+# token right after the ``--`` separator.
+KNOWN_CLI_AGENTS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("claude", ("agora-cli-brain", "--", "claude", "-p")),
+    (
+        "codex",
+        (
+            "agora-cli-brain",
+            "--",
+            "codex",
+            "exec",
+            "--skip-git-repo-check",
+            "--sandbox",
+            "read-only",
+        ),
+    ),
+    ("gemini", ("agora-cli-brain", "--", "gemini", "-p", "")),
+)
 
 # Per-invocation wall clock for the CLI agent. PASS-1 plan is a single completion; PASS-2 is one
 # completion per region. Modest so a hung agent can't wedge a run; overridable via --agent-timeout.

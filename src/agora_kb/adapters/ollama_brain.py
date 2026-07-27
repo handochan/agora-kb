@@ -26,6 +26,8 @@ prints ``plan.json`` to stdout; AUTHOR edits the worktree file in place).
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
 import json
 import os
 import re
@@ -47,8 +49,11 @@ from agora_kb.curator.subprocess_backend import (
 
 __all__ = [
     "BrainError",
+    "CONSOLE_SCRIPT",
+    "MODEL_ENV",
     "detect_mode",
     "select_model",
+    "parse_shim_args",
     "extract_json_object",
     "parse_taxonomy",
     "catch_all_domain",
@@ -65,11 +70,18 @@ __all__ = [
     "main",
 ]
 
+# The console-script name pyproject installs this shim under ([project.scripts]). PUBLIC because
+# `agora doctor`'s brain probe (#96) identifies "this backend IS the Ollama shim" from the
+# adapters.yaml argv[0] — matching a name it imports from here, never a string it re-spells.
+CONSOLE_SCRIPT = "agora-ollama-brain"
+
 # Default Ollama daemon endpoint (overridable by --host / $AGORA_OLLAMA_HOST).
 _DEFAULT_HOST = "http://localhost:11434"
 
 # Env var the model name may be pinned in (after the explicit --model flag, before auto-select).
-_MODEL_ENV = "AGORA_OLLAMA_MODEL"
+# PUBLIC for the same reason as CONSOLE_SCRIPT: doctor reports WHICH pin decided the model, and a
+# second spelling of the var name in the CLI would be a silent lie the moment either side moves.
+MODEL_ENV = "AGORA_OLLAMA_MODEL"
 
 # Optional path: when set, the shim APPENDS one JSON diagnostic record per pass (raw model output +
 # the normalized decision) so an operator can see WHY a run produced a given plan/prose without
@@ -776,15 +788,23 @@ def grounded_author_prompt(stdin_prompt: str) -> str | None:
 # --- Ollama HTTP (stdlib only) ----------------------------------------------------------------
 
 
-def list_ollama_models(host: str) -> list[str]:
+def list_ollama_models(host: str, *, timeout: float = 10.0) -> list[str]:
     """GET ``{host}/api/tags`` and return the installed model names (``[]`` on a missing list).
 
     Wraps transport errors in :class:`BrainError` with an actionable message (the daemon must be
     running) so model auto-selection fails cleanly.
+
+    ``timeout`` is KEYWORD-ONLY and defaults to the 10s this call has always used, so the single
+    production caller (:func:`_resolve_model`) is byte-identical. It exists for `agora doctor`'s
+    reachability probe (#96), which an operator is WAITING on and which therefore wants a much
+    shorter budget than a curate run. Honest bound: it caps connect and each socket read, NOT total
+    elapsed time — but the host is an operator-configured loopback, and the two failure modes #96
+    names are both bounded by it (a refused connection returns in ~9 ms; a SYN blackhole takes the
+    full budget).
     """
     url = f"{host.rstrip('/')}/api/tags"
     try:
-        with urllib.request.urlopen(url, timeout=10) as resp:  # noqa: S310 (configured local host)
+        with urllib.request.urlopen(url, timeout=timeout) as resp:  # noqa: S310 (local host)
             payload = json.loads(resp.read().decode("utf-8"))
     except (urllib.error.URLError, OSError, json.JSONDecodeError) as exc:
         raise BrainError(
@@ -880,7 +900,7 @@ def _resolve_model(model: str | None, host: str) -> str:
     """
     if model and model.strip():
         return model.strip()
-    return select_model(model, os.environ.get(_MODEL_ENV), list_ollama_models(host))
+    return select_model(model, os.environ.get(MODEL_ENV), list_ollama_models(host))
 
 
 def _load_taxonomy(cwd: Path) -> tuple[set[str], set[str], str | None]:
@@ -1288,7 +1308,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     spurious DROPs of clean novel captures. Raise ``--temperature`` for more exploratory behavior.
     """
     parser = argparse.ArgumentParser(
-        prog="agora-ollama-brain",
+        prog=CONSOLE_SCRIPT,
         description="Ollama curator-brain WRITE-adapter shim (PLAN + AUTHOR passes).",
     )
     parser.add_argument("--model", default=None)
@@ -1300,6 +1320,32 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="sampling temperature (default 0.0 = deterministic, reproducible curator plans)",
     )
     return parser
+
+
+def parse_shim_args(argv: list[str]) -> argparse.Namespace | None:
+    """Parse the shim's OWN argument tail with the shim's OWN parser; ``None`` when unparseable.
+
+    Exists so `agora doctor`'s brain probe (#96) learns a configured backend's ``--model`` /
+    ``--host`` from its ``adapters.yaml`` argv WITHOUT re-implementing this parser's flags,
+    defaults, or the ``$AGORA_OLLAMA_HOST`` host default (:func:`_build_arg_parser`) — a second copy
+    would drift and doctor would confidently report a model the run never uses. The parser is BUILT
+    INSIDE the call so the env-derived host default is the run's.
+
+    ``parse_known_args`` ignores arguments this shim does not define, but does NOT contain
+    argparse's exits: a malformed known flag calls ``sys.exit`` (usage → stderr) and ``-h`` calls
+    ``sys.exit(0)`` after printing HELP TO STDOUT. Both are caught here with stdout AND stderr
+    redirected, so a hostile/typo'd argv can never inject bytes into a caller's report.
+    ``argparse.ArgumentError`` is caught too — whether a given argparse version exits or raises is
+    a version detail this contract must not depend on. (``SystemExit`` is a ``BaseException``, so
+    containment MUST live here, not in the caller's ``except Exception``.)
+    """
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+            namespace, _unknown = _build_arg_parser().parse_known_args(argv)
+    except (SystemExit, argparse.ArgumentError):
+        return None
+    return namespace
 
 
 def main(argv: list[str] | None = None) -> int:

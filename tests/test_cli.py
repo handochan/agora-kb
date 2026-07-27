@@ -9,17 +9,24 @@ not on PATH.
 from __future__ import annotations
 
 import json
+import os
+import re
 import shutil
 import subprocess
 import sys
+import textwrap
 from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 import yaml
 
+from agora_kb import cli as cli_mod
+from agora_kb.adapters import cli_agent_brain, ollama_brain
 from agora_kb.cli import main
-from agora_kb.core import Inbox, Repo, RepoLayout
+from agora_kb.config import load_backend_registry
+from agora_kb.core import Inbox, Repo, RepoLayout, StateStore, failed_event_count
+from agora_kb.core.state import LastFailure
 from agora_kb.core.wiki import Wiki
 from agora_kb.schema import lint
 
@@ -185,6 +192,185 @@ def test_status_reflects_a_pending_write(
     assert "inbox depth: 1" in capsys.readouterr().out
 
 
+# --- status: the #96 failure surface -------------------------------------------------------------
+def _plant_failure(
+    layout: RepoLayout,
+    *,
+    when: datetime = datetime(2026, 6, 13, 3, 0, 12, tzinfo=UTC),
+    run_id: str = "2026-06-13T03-00-12.000Z--3f2a1b",
+    last_run: datetime | None = None,
+    last_attempt: datetime | None = None,
+) -> None:
+    """Write a ``state.json`` carrying ONE recorded curator failure (the criterion-7 shape).
+
+    Planted rather than driven through a real run so the rendering tests can byte-lock a FIXED
+    timestamp and run id; the end-to-end path that actually produces this state is covered by
+    ``test_status_surfaces_a_non_terminal_failure_end_to_end``.
+    """
+    store = StateStore(layout)
+    state = store.load()
+    state.last_attempt = last_attempt if last_attempt is not None else when
+    state.last_run = last_run
+    state.last_failure = LastFailure.from_run_failure(
+        when=when,
+        run_id=run_id,
+        phase="claimed",
+        reasons=["TAXONOMY: unknown domain 'not-a-real-domain'"],
+        record_path=f"_kb/failed/2026-06-13/{run_id}/error.json",
+    )
+    store.save(state)
+
+
+def test_status_fresh_repo_shows_never_and_none(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The whole fresh-repo report, byte-for-byte — the three #96 lines in their empty form."""
+    layout = RepoLayout(tmp_path)
+
+    assert main(["status", "--repo", str(tmp_path)]) == 0
+
+    assert capsys.readouterr().out.splitlines() == [
+        f"repo: {layout.root}",
+        "inbox depth: 0",
+        "last_run: never",
+        "last_commit: -",
+        "counters: ingested=0 merged=0 dropped=0 failed=0",
+        "last_attempt: never",
+        "last_failure: none",
+        "failed_events: 0",
+    ]
+
+
+def test_status_first_five_lines_are_unchanged(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """#96 crit 9 (CLI half): the new lines are APPENDED — the pre-#96 five are byte-identical.
+
+    Driven with a planted failure on purpose: the regression this guards is a rendering change
+    that reorders or reformats the existing report when the new fields have CONTENT, which an
+    empty-state assertion would never catch. Operators and scripts parse those five lines.
+    """
+    layout = RepoLayout(tmp_path)
+    Inbox(layout).write(text="remember this", writer="tester", source="manual")
+    _plant_failure(layout)
+
+    assert main(["status", "--repo", str(tmp_path)]) == 0
+
+    assert capsys.readouterr().out.splitlines()[:5] == [
+        f"repo: {layout.root}",
+        "inbox depth: 1",
+        "last_run: never",
+        "last_commit: -",
+        "counters: ingested=0 merged=0 dropped=0 failed=0",
+    ]
+
+
+def test_status_marks_a_superseded_failure(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``last_failure`` is STICKY, so the VERDICT WORD is what separates broken from recovered.
+
+    Both renderings are locked in one test against the SAME planted failure: the only delta a
+    later successful publish may make is ``UNRESOLVED`` → ``superseded``. Anything else (a
+    disappearing line, a reformatted tail) would break `agora status | grep UNRESOLVED`.
+    """
+    layout = RepoLayout(tmp_path)
+    tail = (
+        "2026-06-13T03:00:12Z run=2026-06-13T03-00-12.000Z--3f2a1b phase=claimed reasons=1 "
+        "record=_kb/failed/2026-06-13/2026-06-13T03-00-12.000Z--3f2a1b/error.json "
+        "first=TAXONOMY: unknown domain 'not-a-real-domain'"
+    )
+
+    _plant_failure(layout)  # never published → the failure is the current state of the repo
+    assert main(["status", "--repo", str(tmp_path)]) == 0
+    assert f"last_failure: UNRESOLVED {tail}" in capsys.readouterr().out
+
+    # A later successful publish supersedes it, but does NOT erase it (it is a historical fact).
+    _plant_failure(layout, last_run=datetime(2026, 6, 13, 4, 0, 0, tzinfo=UTC))
+    assert main(["status", "--repo", str(tmp_path)]) == 0
+    assert f"last_failure: superseded {tail}" in capsys.readouterr().out
+
+
+def test_status_prints_failed_events(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """#96 crit 8 (CLI half): the TERMINAL-failure backlog, via the ONE shared helper.
+
+    The worker nests terminal failures at ``failed/<date>/<run-id>/<event>.md`` with an
+    ``error.json`` alongside, so the count must be recursive and must not count the record.
+    Asserting against ``failed_event_count`` itself is the "same helper as kb_status" lock.
+    """
+    layout = RepoLayout(tmp_path)
+    run_dir = layout.failed_dir / "2026-06-13" / "2026-06-13T03-00-12.000Z--3f2a1b"
+    run_dir.mkdir(parents=True)
+    (run_dir / "a.md").write_text("event a", encoding="utf-8")
+    (run_dir / "b.md").write_text("event b", encoding="utf-8")
+    (run_dir / "error.json").write_text("{}", encoding="utf-8")
+
+    assert main(["status", "--repo", str(tmp_path)]) == 0
+
+    out = capsys.readouterr().out
+    assert "failed_events: 2" in out
+    assert f"failed_events: {failed_event_count(layout)}" in out
+
+
+def test_status_failed_events_calls_the_shared_helper(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#96 crit 8 is a "same HELPER" claim, and value equality cannot prove one.
+
+    A re-inlined copy of the same recursive glob would keep every count assertion green. Forcing
+    the shared function to an impossible value is what makes "by construction, not by two copies"
+    testable: if the CLI ever grows its own glob again, this fails.
+    """
+    monkeypatch.setattr(cli_mod, "failed_event_count", lambda layout: 99)
+
+    assert main(["status", "--repo", str(tmp_path)]) == 0
+    assert "failed_events: 99" in capsys.readouterr().out
+
+
+def test_status_on_corrupt_state_json_is_a_clean_error(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A corrupt ``state.json`` is REPORTED, not tracebacked — #96's own surface must not die on
+    #97's headline trigger. The rc is unchanged (an uncaught exception already exited 1)."""
+    layout = RepoLayout(tmp_path)
+    layout.state_file.parent.mkdir(parents=True, exist_ok=True)
+    layout.state_file.write_text("not json at all", encoding="utf-8")
+
+    rc = main(["status", "--repo", str(tmp_path)])
+
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert "Traceback" not in captured.err
+    assert "agora status: _kb/state.json is unreadable — " in captured.err
+    assert "1 validation error for CuratorState" in captured.err
+    # ONE bounded line: the pydantic message is multi-line and would otherwise flood the report.
+    assert captured.err.rstrip("\n").count("\n") == 0
+    # The two facts that need no state.json are still reported.
+    assert f"repo: {layout.root}" in captured.out
+    assert "inbox depth: 0" in captured.out
+
+
+def test_status_on_a_non_utf8_state_json_is_also_a_clean_error(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``StateStore.load`` READS before it validates, so a truncated/half-written/FS-corrupted file
+    raises ``UnicodeDecodeError`` — not ``ValidationError``. `agora doctor` and `agora watch` both
+    report that shape cleanly; `agora status`, the command #96 criterion 7 routes the operator to,
+    must not be the one surface that still tracebacks on it."""
+    layout = RepoLayout(tmp_path)
+    layout.state_file.parent.mkdir(parents=True, exist_ok=True)
+    layout.state_file.write_bytes(b"\xff\xfe\x00binary garbage")
+
+    rc = main(["status", "--repo", str(tmp_path)])
+
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert "Traceback" not in captured.err
+    assert "agora status: _kb/state.json is unreadable — " in captured.err
+    assert "codec can't decode byte" in captured.err
+    assert f"repo: {layout.root}" in captured.out
+
+
 # --- curate -------------------------------------------------------------------------------------
 def test_curate_on_empty_repo_should_not_run(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
@@ -226,7 +412,9 @@ def test_doctor_prints_the_routing_table(
     assert main(["repo", "init", str(target), "--domain", "ai-tech"]) == 0
     capsys.readouterr()
 
-    main(["doctor", "--repo", str(target)])
+    # --skip-probe: this test is about the routing TABLE, not brain reachability — without it the
+    # fresh repo's `agora-ollama-brain` backend would make a live loopback call (#96 §6.8).
+    main(["doctor", "--repo", str(target), "--skip-probe"])
     out = capsys.readouterr().out
     assert "routing:" in out
     assert "plan=qwen" in out
@@ -269,20 +457,36 @@ def test_curate_invalid_routing_block_is_a_clean_error(
 
 @requires_git
 def test_doctor_tolerates_a_malformed_adapters_yaml(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], probe_env: None
 ) -> None:
     """`agora doctor` never crashes on a malformed adapters.yaml — it notes it on the routing line
-    and still reports a status."""
+    and still reports a status.
+
+    (``probe_env`` since #96: the verdict assertion below is about the CONFIG-error path, so the
+    other verdict contributor — the per-platform sandbox self-test — is pinned green.)"""
     target = tmp_path / "kb"
     assert main(["repo", "init", str(target), "--domain", "ai-tech"]) == 0
     capsys.readouterr()
     (target / "adapters.yaml").write_text('a: "unterminated', encoding="utf-8")
 
-    main(["doctor", "--repo", str(target)])
+    rc = main(["doctor", "--repo", str(target)])
     out = capsys.readouterr().out
     assert "routing:" in out
     assert "unreadable" in out
     assert "status:" in out
+    # #96: the brain probe shares that ONE failed parse — it never re-reads the file and never
+    # probes. It DOES fail the verdict: `adapters.yaml` is the only definition of every brain, so a
+    # malformed one makes `_build_backend` return None and `agora curate` exit 1 (locked below).
+    # Reporting `healthy` for a repo that cannot curate is issue #96's opening complaint.
+    assert "brains: NOT CONFIGURED (adapters.yaml unreadable — see the routing line above)" in out
+    assert "status: unhealthy" in out
+    assert rc == 1
+    # The operator gets the same actionable next step as any other brain failure (AMENDMENT A1).
+    assert "fix (no download" in out
+
+    # The verdict is not a guess: curation really is structurally impossible on this repo.
+    capsys.readouterr()
+    assert main(["curate", "--repo", str(target), "--force"]) == 1
 
 
 @requires_git
@@ -398,6 +602,151 @@ def test_curate_warns_loudly_when_pass2_authors_no_prose(
     assert "_summary pending_" in theme.read_text(encoding="utf-8")
 
 
+# A brain that cannot run at all — the shape of an absent/dead Ollama daemon (#96 criterion 6).
+# A non-zero PASS 1 makes SubprocessBackend.plan raise BackendUnavailableError → worker._fail with
+# a `PLAN-BACKEND:` reason.
+_DEAD_BRAIN = 'import sys\nsys.stderr.write("ollama: connection refused\\n")\nsys.exit(1)\n'
+
+
+def _dead_brain_repo(target: Path) -> RepoLayout:
+    """A stub repo whose brain dies on PASS 1, with one event waiting — the first-run failure."""
+    layout = _init_stub_repo(target)
+    (target / "stub_brain.py").write_text(_DEAD_BRAIN, encoding="utf-8")
+    Inbox(layout).write(
+        text="One curator advances the branch under a lock.",
+        writer="dochan",
+        source="claude-code",
+        domain="ai-tech",
+        now=datetime(2026, 6, 13, 2, 40, 10, tzinfo=UTC),
+    )
+    return layout
+
+
+@requires_git
+def test_curate_failed_run_prints_error_record_path_and_checks(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """#96 crit 6: a failed run points at its record and shows the head of it — on STDOUT.
+
+    Before this, `agora curate` printed `status: failed` and stopped: the verdict was there but
+    nothing led from it to the cause, and the lossless record under `_kb/failed/` was
+    undiscoverable without knowing the layout. The two lines are fixed-arity `key: value` pairs in
+    the same grammar as the `status:`/`counts:` lines they follow, so the machine-readable stdout
+    summary is EXTENDED, not broken.
+    """
+    target = tmp_path / "kb"
+    _dead_brain_repo(target)
+    capsys.readouterr()
+
+    assert main(["curate", "--repo", str(target), "--force"]) == 0
+
+    captured = capsys.readouterr()
+    out, err = captured.out, captured.err
+    assert "status: failed" in out
+    records = [ln for ln in out.splitlines() if ln.startswith("failed_record: ")]
+    checks = [ln for ln in out.splitlines() if ln.startswith("failed_checks: ")]
+    assert len(records) == 1  # exactly one, deterministic — not one per failed check
+    assert len(checks) == 1
+
+    printed = records[0].removeprefix("failed_record: ")
+    # Repo-RELATIVE POSIX (invariant 5: no host layout inside a repo-scoped string), in exactly the
+    # `_kb/failed/<date>/<run-id>/error.json` shape criterion 6 names.
+    parts = printed.split("/")
+    assert parts[0] == "_kb"
+    assert parts[1] == "failed"
+    assert len(parts) == 5
+    assert parts[-1] == "error.json"
+    record = target / printed
+    assert record.is_file()
+    assert record.name == "error.json"
+    assert json.loads(record.read_text(encoding="utf-8"))["failed_checks"]
+    # ...and the printed head genuinely names the cause the operator has to act on.
+    assert "PLAN-BACKEND" in checks[0]
+    # STREAM DISCIPLINE: criterion 6 says stdout, and the cause is not duplicated onto stderr.
+    assert "failed_record:" not in err
+
+
+@requires_git
+def test_curate_published_run_prints_no_failure_lines(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A run that PUBLISHED emits zero failure lines — the stdout arity of the happy path is
+    byte-identical to pre-#96, so a machine consumer of `agora curate` cannot break."""
+    target = tmp_path / "kb"
+    layout = _init_stub_repo(target)
+    Inbox(layout).write(
+        text="One curator advances the branch under a lock.",
+        writer="dochan",
+        source="claude-code",
+        domain="ai-tech",
+        now=datetime(2026, 6, 13, 2, 40, 10, tzinfo=UTC),
+    )
+    capsys.readouterr()
+
+    assert main(["curate", "--repo", str(target), "--force"]) == 0
+
+    out = capsys.readouterr().out
+    assert "status: published" in out
+    assert "failed_record:" not in out
+    assert "failed_checks:" not in out
+
+
+@requires_git
+def test_curate_dead_brain_stdout_carries_no_warning_prose(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The two channels stay separated: the FATAL cause is on stdout, and the free-form #115
+    ``warning:`` prose never leaks into the machine-readable summary (nor is it duplicated —
+    a PLAN failure that recorded its state cleanly produces no warning at all)."""
+    target = tmp_path / "kb"
+    _dead_brain_repo(target)
+    capsys.readouterr()
+
+    assert main(["curate", "--repo", str(target), "--force"]) == 0
+
+    captured = capsys.readouterr()
+    assert "warning:" not in captured.out
+    assert "warning:" not in captured.err
+
+
+@requires_git
+def test_status_surfaces_a_non_terminal_failure_end_to_end(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """#96 crit 7, driven through `agora status` as the criterion words it — the core gate.
+
+    A failure INSIDE the retry budget is the blind spot: the events go back to ``inbox/`` (depth
+    unchanged), ``last_run`` stays ``never`` because nothing PUBLISHED, ``counters.failed`` is not
+    bumped, and nothing lands under ``_kb/failed/`` as a terminally-failed event. Before #96 the
+    whole report was therefore indistinguishable from a repo that had simply never been curated.
+    ``last_attempt`` + ``last_failure`` are the only signals that separate the two.
+
+    (Lives next to the dead-brain curate tests because it is a curate → status end-to-end, not a
+    rendering test: the state it reads was written by a REAL failed run, never planted.)
+    """
+    target = tmp_path / "kb"
+    _dead_brain_repo(target)
+    assert main(["curate", "--repo", str(target), "--force"]) == 0
+    capsys.readouterr()
+
+    assert main(["status", "--repo", str(target)]) == 0
+
+    out = capsys.readouterr().out
+    lines = out.splitlines()
+    assert "last_run: never" in lines  # nothing published, and `last_run` must NOT lie about that
+    assert "last_attempt: never" not in out  # ...yet the curator DID attempt a consolidation
+    assert any(ln.startswith("last_attempt: 20") for ln in lines)
+    assert any(ln.startswith("last_failure: UNRESOLVED ") for ln in lines)
+    # Non-terminal: the event returned to the inbox, so the terminal backlog is still empty — which
+    # is exactly why `failed_events` alone could never have surfaced this run.
+    assert "failed_events: 0" in lines
+    assert "inbox depth: 1" in lines
+    assert "counters: ingested=0 merged=0 dropped=0 failed=0" in lines
+    # The rendered pointer resolves to the real, lossless record.
+    record = next(ln for ln in lines if ln.startswith("last_failure: ")).split("record=", 1)[1]
+    assert (target / record.split(" first=", 1)[0]).is_file()
+
+
 # --- doctor -------------------------------------------------------------------------------------
 def test_doctor_prints_report_and_returns_health_code(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
@@ -422,6 +771,1029 @@ def test_doctor_reports_initialized_repo(
     rc = main(["doctor", "--repo", str(target)])
     assert rc in (0, 1)
     assert "initialized" in capsys.readouterr().out
+
+
+def test_doctor_failures_line(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """#96 (doctor half): the failure backlog + last attempt/failure, print-only and crash-free.
+
+    All three renderings in one test because the third is the point: doctor is what an operator
+    runs when things are broken, so a corrupt ``state.json`` — the single most likely tick failure
+    — must degrade to a REPORT and still let the run reach its `status:` verdict. The line never
+    touches the verdict either way (an unreadable derived file is not ill health; `agora status`
+    and `agora watch` report it loudly).
+
+    (No ``--skip-probe``: a bare directory has no adapters.yaml, so the brain probe never runs and
+    this test makes no network call.)
+    """
+    layout = RepoLayout(tmp_path)
+
+    main(["doctor", "--repo", str(tmp_path)])
+    assert "  failures: events=0 last_attempt=never last_failure=none" in capsys.readouterr().out
+
+    run_dir = layout.failed_dir / "2026-06-13" / "r1"
+    run_dir.mkdir(parents=True)
+    (run_dir / "a.md").write_text("event a", encoding="utf-8")
+    (run_dir / "b.md").write_text("event b", encoding="utf-8")
+    _plant_failure(layout, run_id="r1")
+
+    main(["doctor", "--repo", str(tmp_path)])
+    assert (
+        "  failures: events=2 last_attempt=2026-06-13T03:00:12Z last_failure=UNRESOLVED run=r1 "
+        "record=_kb/failed/2026-06-13/r1/error.json"
+    ) in capsys.readouterr().out
+
+    layout.state_file.write_text("not json at all", encoding="utf-8")
+
+    main(["doctor", "--repo", str(tmp_path)])
+    captured = capsys.readouterr()
+    assert "  failures: events=2 state.json unreadable (" in captured.out
+    assert "status:" in captured.out  # the verdict is still reached — that is the whole point
+    assert "Traceback" not in captured.err
+
+
+# --- doctor: the brain-availability probe (#96 criteria 1-5) -------------------------------------
+# `repo init` wires the OSS default brain, so this is the shape doctor probes out of the box.
+_OLLAMA_ADAPTERS = (
+    "backends:\n  qwen: { argv: [agora-ollama-brain], network: loopback }\ndefault_backend: qwen\n"
+)
+
+
+def _probe_repo(target: Path, adapters: str, *, backend: str = "qwen") -> Path:
+    """An initialized repo whose adapters.yaml is exactly ``adapters`` — the probe's only input.
+
+    ``backend`` rewrites repo.yaml's ``curator.backend``, which is the ADR-0015 precedence a real
+    run uses (``routing[act]`` → repo default → registry default): leaving it at the init-time
+    ``qwen`` while the registry defines something else would resolve to an UNKNOWN backend, which
+    is a different test.
+    """
+    assert main(["repo", "init", str(target), "--domain", "ai-tech"]) == 0
+    (target / "adapters.yaml").write_text(adapters, encoding="utf-8")
+    repo_yaml = RepoLayout(target).kb_dir / "repo.yaml"
+    repo_yaml.write_text(
+        repo_yaml.read_text(encoding="utf-8").replace("backend: qwen", f"backend: {backend}"),
+        encoding="utf-8",
+    )
+    return target
+
+
+def _dead_daemon(message: str = "boom"):  # type: ignore[no-untyped-def]
+    """A ``list_ollama_models`` stand-in for a daemon that cannot be reached.
+
+    Keyword-ONLY ``timeout`` on every fake in this section is deliberate: a positional call from
+    the probe would raise ``TypeError`` here, so the #96 criterion-5 call shape is locked by
+    construction rather than by one dedicated assertion.
+    """
+
+    def fake(host: str, *, timeout: float) -> list[str]:
+        raise ollama_brain.BrainError(message)
+
+    return fake
+
+
+def _installed_models(*names: str):  # type: ignore[no-untyped-def]
+    """A ``list_ollama_models`` stand-in for a reachable daemon carrying ``names``."""
+
+    def fake(host: str, *, timeout: float) -> list[str]:
+        return list(names)
+
+    return fake
+
+
+def _which_only(installed: set[str]):  # type: ignore[no-untyped-def]
+    """A ``shutil.which`` that pins WHICH known CLI agents resolve; everything else stays real.
+
+    Whether ``claude`` / ``codex`` / ``gemini`` are on PATH is a property of the DEVELOPER's host,
+    and it decides which remediation branch (AMENDMENT A1) doctor prints — so the tests that assert
+    those bytes must own the answer. ``git`` and the interpreter still resolve for real.
+    """
+    real = shutil.which
+
+    def which(cmd, mode=os.F_OK | os.X_OK, path=None):  # type: ignore[no-untyped-def]
+        if cmd in {name for name, _ in cli_agent_brain.KNOWN_CLI_AGENTS}:
+            return f"/usr/local/bin/{cmd}" if cmd in installed else None
+        return real(cmd, mode, path)
+
+    return which
+
+
+@pytest.fixture
+def probe_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make doctor's verdict a pure function of the BRAIN probe, on any host.
+
+    Four host dependencies are pinned:
+
+    * the ADR-0013 sandbox leg is forced green (it is the other verdict contributor and it
+      legitimately differs per platform);
+    * ``$AGORA_OLLAMA_MODEL`` is unset (a dev machine with a pinned model would otherwise change
+      the ``would use`` rendering);
+    * ``$AGORA_OLLAMA_HOST`` is unset — ``parse_shim_args`` builds the shim's parser at probe time,
+      so the ``--host`` default is read from the environment and every ``http://localhost:11434``
+      assertion below would fail on a developer running Ollama elsewhere;
+    * ``agora-ollama-brain`` resolves to a real executable, because the probe now asks the argv[0]
+      question for the shim too (#96 crit 4) and whether the console script is on THIS host's PATH
+      is not what these tests are about. Everything else still resolves for real.
+    """
+    monkeypatch.setattr(cli_mod, "_doctor_sandbox", lambda *a, **k: True)
+    monkeypatch.delenv(ollama_brain.MODEL_ENV, raising=False)
+    monkeypatch.delenv("AGORA_OLLAMA_HOST", raising=False)
+    monkeypatch.setattr(shutil, "which", _shim_which())
+
+
+def _shim_which():  # type: ignore[no-untyped-def]
+    """A ``shutil.which`` that resolves the Ollama shim to a real executable; the rest is real."""
+    real = shutil.which
+
+    def which(cmd, mode=os.F_OK | os.X_OK, path=None):  # type: ignore[no-untyped-def]
+        if cmd == ollama_brain.CONSOLE_SCRIPT:
+            return sys.executable
+        return real(cmd, mode, path)
+
+    return which
+
+
+@requires_git
+def test_doctor_unreachable_ollama_is_unhealthy(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    probe_env: None,
+) -> None:
+    """#96 crit 1: an unreachable Ollama daemon makes `agora doctor` RED.
+
+    The paired control in the same test (a reachable daemon → healthy) is what proves the probe IS
+    the verdict rather than decoration: without it, a doctor that always returned 1 would pass.
+    """
+    target = _probe_repo(tmp_path / "kb", _OLLAMA_ADAPTERS)
+    monkeypatch.setattr(ollama_brain, "list_ollama_models", _dead_daemon())
+    capsys.readouterr()
+
+    rc = main(["doctor", "--repo", str(target)])
+
+    out = capsys.readouterr().out
+    assert "  brain qwen: ollama http://localhost:11434 UNREACHABLE (boom)" in out
+    assert "status: unhealthy" in out
+    assert rc == 1
+
+    monkeypatch.setattr(ollama_brain, "list_ollama_models", _installed_models("qwen3.6:35b-a3b"))
+    capsys.readouterr()
+
+    rc = main(["doctor", "--repo", str(target)])
+
+    out = capsys.readouterr().out
+    assert "  brain qwen: ollama http://localhost:11434 reachable, 1 models, would use " in out
+    assert "status: healthy" in out
+    assert rc == 0
+
+
+def test_doctor_brains_returns_false_on_unreachable(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The unit under the crit-1 CLI test: the probe RESULT is what returns False (no repo/rc)."""
+    from agora_kb.curator.backends import BackendRegistry
+
+    monkeypatch.delenv(ollama_brain.MODEL_ENV, raising=False)
+    monkeypatch.delenv("AGORA_OLLAMA_HOST", raising=False)
+    monkeypatch.setattr(shutil, "which", _shim_which())
+    monkeypatch.setattr(ollama_brain, "list_ollama_models", _dead_daemon("nope"))
+    registry = BackendRegistry.from_yaml(_OLLAMA_ADAPTERS)
+
+    assert cli_mod._doctor_brains(registry, "qwen") is False
+    assert "UNREACHABLE (nope)" in capsys.readouterr().out
+
+
+@requires_git
+def test_doctor_warns_on_alphabetical_fallback_when_no_qwen(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    probe_env: None,
+) -> None:
+    """#96 crit 2: a qwen-less host still PASSES (the brain answers) but is told what it will get.
+
+    The expected model is computed by calling the REAL ``select_model``: doctor must report the
+    model a run would actually pick, and re-spelling the selection rule here would let the two
+    drift silently — the whole reason the probe calls the shim's own functions.
+    """
+    target = _probe_repo(tmp_path / "kb", _OLLAMA_ADAPTERS)
+    available = ["zephyr:7b", "llama3:8b", "mistral:7b"]
+    monkeypatch.setattr(ollama_brain, "list_ollama_models", _installed_models(*available))
+    monkeypatch.delenv(ollama_brain.MODEL_ENV, raising=False)
+    capsys.readouterr()
+
+    rc = main(["doctor", "--repo", str(target)])
+
+    out = capsys.readouterr().out
+    assert f"would use {ollama_brain.select_model(None, None, available)!r}" in out
+    assert "3 models" in out
+    assert "WARNING no qwen model installed" in out
+    assert "alphabetical fallback" in out
+    assert rc == 0
+
+
+@requires_git
+def test_doctor_pinned_model_skips_the_tags_probe(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    probe_env: None,
+) -> None:
+    """#96 crit 3: an explicit ``--model`` short-circuits /api/tags — because the RUN does too.
+
+    Probing the daemon here would establish a fact the run never establishes, so doctor would be
+    reporting on something the curator does not depend on.
+    """
+    target = _probe_repo(
+        tmp_path / "kb",
+        "backends:\n"
+        '  qwen: { argv: [agora-ollama-brain, --model, "pinned:1b"], network: loopback }\n'
+        "default_backend: qwen\n",
+    )
+    calls: list[str] = []
+
+    def recorder(host: str, *, timeout: float) -> list[str]:
+        calls.append(host)
+        return ["whatever:1b"]
+
+    monkeypatch.setattr(ollama_brain, "list_ollama_models", recorder)
+    capsys.readouterr()
+
+    rc = main(["doctor", "--repo", str(target)])
+
+    out = capsys.readouterr().out
+    assert calls == []
+    assert "model pinned to 'pinned:1b' by adapters.yaml argv" in out
+    # The parenthetical must not claim the daemon is irrelevant: the RUN still POSTs /api/generate,
+    # so this path establishes nothing about reachability and has to say so.
+    assert "no /api/tags probe — the run lists no models either; reachability NOT checked" in out
+    assert rc == 0
+
+
+@requires_git
+def test_doctor_env_pinned_model_still_contacts_the_daemon(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    probe_env: None,
+) -> None:
+    """The inverse of crit 3, and a real asymmetry: an ENV pin does NOT skip the /api/tags call.
+
+    ``_resolve_model`` evaluates ``list_ollama_models(host)`` as an ARGUMENT to ``select_model``,
+    so a down daemon fails a run even with $AGORA_OLLAMA_MODEL set — and doctor reproduces that
+    rather than quietly reporting a model the run could never reach.
+    """
+    target = _probe_repo(tmp_path / "kb", _OLLAMA_ADAPTERS)
+    called: list[str] = []
+
+    def recorder(host: str, *, timeout: float) -> list[str]:
+        called.append(host)
+        return ["llama3:8b"]
+
+    monkeypatch.setattr(ollama_brain, "list_ollama_models", recorder)
+    monkeypatch.setenv(ollama_brain.MODEL_ENV, "custom:1b")
+    capsys.readouterr()
+
+    rc = main(["doctor", "--repo", str(target)])
+
+    out = capsys.readouterr().out
+    assert called == ["http://localhost:11434"]
+    assert "would use 'custom:1b' (pinned by $AGORA_OLLAMA_MODEL)" in out
+    assert "WARNING no qwen" not in out  # an explicit pin is not an accidental fallback
+    assert rc == 0
+
+
+@requires_git
+def test_doctor_reports_a_missing_non_ollama_brain_program(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], probe_env: None
+) -> None:
+    """#96 crit 4: a configured brain whose argv[0] is on no PATH is a RED verdict, not a surprise
+    at the first curate run."""
+    target = _probe_repo(
+        tmp_path / "kb",
+        "backends:\n  custom: { argv: [definitely-not-installed-xyz] }\ndefault_backend: custom\n",
+        backend="custom",
+    )
+    capsys.readouterr()
+
+    rc = main(["doctor", "--repo", str(target)])
+
+    out = capsys.readouterr().out
+    assert (
+        "  brain custom: 'definitely-not-installed-xyz' NOT FOUND on PATH — "
+        "install it or fix the adapters.yaml argv" in out
+    )
+    assert rc == 1
+
+
+@requires_git
+def test_doctor_reports_a_present_non_ollama_brain_program(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], probe_env: None
+) -> None:
+    """A resolvable, executable argv[0] passes and names the path a spawn would use."""
+    target = _probe_repo(
+        tmp_path / "kb",
+        f"backends:\n  custom: {{ argv: [{sys.executable!r}, -c, pass] }}\n"
+        "default_backend: custom\n",
+        backend="custom",
+    )
+    capsys.readouterr()
+
+    rc = main(["doctor", "--repo", str(target)])
+
+    out = capsys.readouterr().out
+    assert f"on PATH ({sys.executable})" in out
+    assert rc == 0
+
+
+@requires_git
+def test_doctor_reports_a_missing_ollama_shim_before_probing_the_daemon(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    probe_env: None,
+) -> None:
+    """#96 crit 4 applies to the OLLAMA shim too — the one backend `repo init` actually writes.
+
+    The reported first-run shape: `pip install --user` puts ``agora-ollama-brain`` in a bin dir
+    that is not on the curator's PATH while Ollama itself is up and healthy. `agora curate` then
+    dies with ``BackendUnavailableError`` at execvp — so a daemon-only probe answering `healthy`
+    is verbatim the issue's opening complaint. The daemon must not even be contacted: the spawn
+    could never happen.
+    """
+    target = _probe_repo(
+        tmp_path / "kb",
+        "backends:\n  qwen: { argv: [agora-ollama-brain], network: loopback }\n"
+        "default_backend: qwen\n",
+    )
+    calls: list[str] = []
+
+    def recorder(host: str, *, timeout: float) -> list[str]:
+        calls.append(host)
+        return ["qwen3.6:35b-a3b"]
+
+    monkeypatch.setattr(ollama_brain, "list_ollama_models", recorder)
+    monkeypatch.setattr(shutil, "which", lambda *a, **k: None)  # nothing at all resolves
+    capsys.readouterr()
+
+    rc = main(["doctor", "--repo", str(target)])
+
+    out = capsys.readouterr().out
+    assert (
+        "  brain qwen: 'agora-ollama-brain' NOT FOUND on PATH — "
+        "install it or fix the adapters.yaml argv" in out
+    )
+    assert calls == []  # an unspawnable brain's daemon is not the question
+    assert "fix (no download" in out  # the FAIL still earns a remediation block
+    assert "status: unhealthy" in out
+    assert rc == 1
+
+
+@requires_git
+def test_doctor_does_not_probe_a_worktree_placeholder_argv(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], probe_env: None
+) -> None:
+    """The ``{worktree}`` verdict-matrix row: unprobeable (the dir does not exist until a run) is
+    an inability to probe, and the governing rule never fails a verdict on one."""
+    target = _probe_repo(
+        tmp_path / "kb",
+        "backends:\n  custom: { argv: ['{worktree}/bin/brain'] }\ndefault_backend: custom\n",
+        backend="custom",
+    )
+    capsys.readouterr()
+
+    rc = main(["doctor", "--repo", str(target)])
+
+    out = capsys.readouterr().out
+    assert (
+        "  brain custom: not probed (argv[0] '{worktree}/bin/brain' is resolved per-run "
+        "from {worktree})" in out
+    )
+    assert "fix (" not in out
+    assert rc == 0
+
+
+@requires_git
+def test_doctor_reports_a_resolvable_but_non_executable_brain_program(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], probe_env: None
+) -> None:
+    """The ``NOT EXECUTABLE`` row — the ONLY thing between a path-ish argv[0] and a false PASS.
+
+    ``resolve_program_on_path`` returns a path-ish argv[0] UNCHANGED without touching the
+    filesystem (that is what the spawn does too), so without the ``is_file() and X_OK`` check a
+    mode-0644 file would report `on PATH` and fail at execvp instead.
+    """
+    brain = tmp_path / "brain-not-executable"
+    brain.write_text("#!/bin/sh\n", encoding="utf-8")
+    brain.chmod(0o644)
+    target = _probe_repo(
+        tmp_path / "kb",
+        f"backends:\n  custom: {{ argv: [{str(brain)!r}] }}\ndefault_backend: custom\n",
+        backend="custom",
+    )
+    capsys.readouterr()
+
+    rc = main(["doctor", "--repo", str(target)])
+
+    out = capsys.readouterr().out
+    assert f"  brain custom: '{brain}' at {brain} is NOT EXECUTABLE — " in out
+    assert "fix (no download" in out
+    assert rc == 1
+
+
+@requires_git
+def test_doctor_scheme_less_ollama_host_reads_as_unreachable(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], probe_env: None
+) -> None:
+    """A host with NO url scheme at all (``--host ollama-box``) is a first-run config typo, not a
+    bug.
+
+    ``urlopen`` raises a bare ``ValueError`` when it cannot find a url type, and
+    ``list_ollama_models`` wraps only URLError/OSError/JSONDecodeError — so this used to land on
+    the ``probe ERROR`` branch, which reads as an internal defect and, by design, prints NO
+    remediation. (``localhost:11434`` is NOT this case: urlopen reads ``localhost`` as the scheme
+    and fails with a URLError the shim already wraps.)
+    """
+    target = _probe_repo(
+        tmp_path / "kb",
+        "backends:\n  qwen: { argv: [agora-ollama-brain, --host, ollama-box] }\n"
+        "default_backend: qwen\n",
+    )
+    capsys.readouterr()
+
+    rc = main(["doctor", "--repo", str(target)])
+
+    out = capsys.readouterr().out
+    assert "  brain qwen: ollama ollama-box UNREACHABLE (ValueError: " in out
+    assert "probe ERROR" not in out
+    assert "fix (no download" in out
+    assert rc == 1
+
+
+@requires_git
+def test_doctor_survives_a_remediation_block_that_raises(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    probe_env: None,
+) -> None:
+    """The fix HINT sits outside the probe's own guard, so it carries its own (A1.5).
+
+    A hint that cannot be built is a footnote; losing the ``status:`` line over it would defeat the
+    whole point of a diagnostic command.
+    """
+    target = _probe_repo(tmp_path / "kb", _OLLAMA_ADAPTERS)
+    monkeypatch.setattr(ollama_brain, "list_ollama_models", _dead_daemon())
+
+    def boom(*a: object, **k: object) -> None:
+        raise RuntimeError("which exploded")
+
+    monkeypatch.setattr(cli_mod, "_print_brain_remediation", boom)
+    capsys.readouterr()
+
+    rc = main(["doctor", "--repo", str(target)])
+
+    captured = capsys.readouterr()
+    assert "  brain qwen: ollama http://localhost:11434 UNREACHABLE (boom)" in captured.out
+    assert "    fix: unavailable (RuntimeError: which exploded)" in captured.out
+    assert "status: unhealthy" in captured.out
+    assert "Traceback" not in captured.err
+    assert rc == 1
+
+
+@requires_git
+def test_doctor_probe_passes_a_bounded_timeout(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    probe_env: None,
+) -> None:
+    """#96 crit 5: the probe is time-BOUNDED, and by a budget an operator is willing to wait on.
+
+    A blackholed daemon (SYN dropped, not refused) would otherwise hang doctor for the shim's 10s
+    runtime default per routed brain.
+    """
+    target = _probe_repo(tmp_path / "kb", _OLLAMA_ADAPTERS)
+    recorded: list[float] = []
+
+    def recorder(host: str, *, timeout: float) -> list[str]:
+        recorded.append(timeout)
+        return ["qwen3.6:35b-a3b"]
+
+    monkeypatch.setattr(ollama_brain, "list_ollama_models", recorder)
+    capsys.readouterr()
+
+    assert main(["doctor", "--repo", str(target)]) == 0
+    assert recorded == [3.0]
+    assert cli_mod._BRAIN_PROBE_TIMEOUT_S == 3.0
+
+
+@requires_git
+def test_doctor_skip_probe_bypasses_the_probe_entirely(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    probe_env: None,
+) -> None:
+    """#96 crit 5: ``--skip-probe`` makes NO daemon or PATH lookup at all (the brain-less node /
+    CI escape hatch), and the verdict then simply ignores brain reachability."""
+
+    def must_not_run(host: str, *, timeout: float) -> list[str]:
+        raise AssertionError("probe must not run")
+
+    target = _probe_repo(tmp_path / "kb", _OLLAMA_ADAPTERS)
+    monkeypatch.setattr(ollama_brain, "list_ollama_models", must_not_run)
+    capsys.readouterr()
+
+    rc = main(["doctor", "--repo", str(target), "--skip-probe"])
+
+    out = capsys.readouterr().out
+    assert "  brains: probe skipped (--skip-probe)" in out
+    assert rc == 0
+
+
+def test_doctor_brains_line_when_no_adapters_yaml(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """No adapters.yaml = nothing configured to probe: reported, never a failed verdict."""
+    main(["doctor", "--repo", str(tmp_path)])
+    out = capsys.readouterr().out
+    assert "  brains: not probed (no adapters.yaml — no backend configured)" in out
+
+
+@requires_git
+def test_doctor_brains_unknown_backend_is_unhealthy(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    probe_env: None,
+) -> None:
+    """A repo.yaml ``curator.backend`` naming no defined brain FAILS: that is an established fact,
+    not an inability to probe — ``agora curate`` cannot run at all in this repo."""
+    target = _probe_repo(tmp_path / "kb", _OLLAMA_ADAPTERS, backend="ghost")
+    monkeypatch.setattr(ollama_brain, "list_ollama_models", _dead_daemon("must not be called"))
+    capsys.readouterr()
+
+    rc = main(["doctor", "--repo", str(target)])
+
+    out = capsys.readouterr().out
+    assert "plan=ghost (UNKNOWN backend)" in out
+    assert (
+        "  brain ghost: UNKNOWN backend — not defined in adapters.yaml; "
+        "'agora curate' cannot run" in out
+    )
+    assert rc == 1
+
+
+@requires_git
+def test_doctor_brains_dedupes_and_orders_by_act(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], probe_env: None
+) -> None:
+    """One line per DISTINCT routed brain, in act order (plan, then author) — not one per act.
+
+    Both acts on one brain must probe once (a two-line report would imply two round trips); two
+    brains must appear in a deterministic order, which is what makes the report test-lockable.
+    """
+    two = (
+        "backends:\n"
+        f"  a: {{ argv: [{sys.executable!r}] }}\n"
+        f"  b: {{ argv: [{sys.executable!r}] }}\n"
+        "routing:\n  plan: a\n  author: b\n"
+        "default_backend: a\n"
+    )
+    target = _probe_repo(tmp_path / "kb", two, backend="a")
+    capsys.readouterr()
+
+    main(["doctor", "--repo", str(target)])
+
+    out = capsys.readouterr().out
+    lines = [ln for ln in out.splitlines() if ln.lstrip().startswith("brain ")]
+    assert len(lines) == 2
+    assert lines[0].lstrip().startswith("brain a:")
+    assert lines[1].lstrip().startswith("brain b:")
+
+    (target / "adapters.yaml").write_text(two.replace("author: b", "author: a"), encoding="utf-8")
+    capsys.readouterr()
+
+    main(["doctor", "--repo", str(target)])
+
+    out = capsys.readouterr().out
+    assert len([ln for ln in out.splitlines() if ln.lstrip().startswith("brain ")]) == 1
+
+
+@requires_git
+def test_doctor_brains_zero_models_is_unhealthy(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    probe_env: None,
+) -> None:
+    """A daemon that answers but has pulled NOTHING is still a curator that cannot run."""
+    target = _probe_repo(tmp_path / "kb", _OLLAMA_ADAPTERS)
+    monkeypatch.setattr(ollama_brain, "list_ollama_models", _installed_models())
+    capsys.readouterr()
+
+    rc = main(["doctor", "--repo", str(target)])
+
+    out = capsys.readouterr().out
+    assert (
+        "  brain qwen: ollama http://localhost:11434 reachable, 0 models installed "
+        "(the curator has no model to run)" in out
+    )
+    assert rc == 1
+
+
+@requires_git
+def test_doctor_brains_zero_models_with_env_pin_passes(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    probe_env: None,
+) -> None:
+    """``select_model`` honors the env pin BEFORE the empty-list guard, so an empty /api/tags with
+    $AGORA_OLLAMA_MODEL set is a run that proceeds — doctor must not contradict it. The pin is
+    reported as unverified: /api/tags is not a sound existence test for an unqualified name."""
+    target = _probe_repo(tmp_path / "kb", _OLLAMA_ADAPTERS)
+    monkeypatch.setattr(ollama_brain, "list_ollama_models", _installed_models())
+    monkeypatch.setenv(ollama_brain.MODEL_ENV, "custom:1b")
+    capsys.readouterr()
+
+    rc = main(["doctor", "--repo", str(target)])
+
+    out = capsys.readouterr().out
+    assert (
+        "reachable, 0 models installed, would use 'custom:1b' "
+        "(pinned by $AGORA_OLLAMA_MODEL — NOT installed here)" in out
+    )
+    assert rc == 0
+
+
+@requires_git
+def test_doctor_brains_never_crashes_on_an_unexpected_probe_error(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    probe_env: None,
+) -> None:
+    """An unexpected exception inside the probe is REPORTED and fails the verdict (a probe that
+    cannot answer is not a healthy host), but never tracebacks out of doctor — and prints no
+    remediation, because a fix for an internal defect would be a guess."""
+    target = _probe_repo(tmp_path / "kb", _OLLAMA_ADAPTERS)
+
+    def boom(host: str, *, timeout: float) -> list[str]:
+        return [1 / 0]  # type: ignore[list-item]
+
+    monkeypatch.setattr(ollama_brain, "list_ollama_models", boom)
+    capsys.readouterr()
+
+    rc = main(["doctor", "--repo", str(target)])
+
+    captured = capsys.readouterr()
+    assert "  brain qwen: probe ERROR — ZeroDivisionError" in captured.out
+    assert "fix (" not in captured.out
+    assert "Traceback" not in captured.err
+    assert rc == 1
+
+
+@requires_git
+def test_doctor_identifies_the_shim_via_python_m(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    probe_env: None,
+) -> None:
+    """The ``python -m agora_kb.adapters.ollama_brain`` form is the same shim under any interpreter
+    path, so its own ``--host`` must be read by the shim's own parser."""
+    target = _probe_repo(
+        tmp_path / "kb",
+        "backends:\n"
+        f"  qwen: {{ argv: [{sys.executable!r}, -m, {ollama_brain.__name__!r}, "
+        '--host, "http://elsewhere:1"] }\n'
+        "default_backend: qwen\n",
+    )
+    seen: list[str] = []
+
+    def recorder(host: str, *, timeout: float) -> list[str]:
+        seen.append(host)
+        return ["qwen3.6:35b-a3b"]
+
+    monkeypatch.setattr(ollama_brain, "list_ollama_models", recorder)
+    capsys.readouterr()
+
+    rc = main(["doctor", "--repo", str(target)])
+
+    out = capsys.readouterr().out
+    assert seen == ["http://elsewhere:1"]
+    assert "  brain qwen: ollama http://elsewhere:1 reachable, 1 models, would use " in out
+    assert rc == 0
+
+
+@pytest.mark.parametrize(
+    "program",
+    ["agora-ollama-brain.exe", "Agora-Ollama-Brain.exe", "AGORA-OLLAMA-BRAIN.EXE"],
+)
+def test_ollama_argv_tail_matches_the_windows_shim_case_insensitively(program: str) -> None:
+    """Windows' filesystem is case-insensitive, so a differently-cased ``.exe`` is the SAME shim.
+
+    A case-sensitive match would silently drop the Windows leg (epic #85) to the generic PATH
+    probe, losing the ``--model``/``--host`` reporting that criteria 2 and 3 are about.
+    """
+    assert cli_mod._ollama_argv_tail((program, "--model", "x")) == ("--model", "x")
+    assert cli_mod._ollama_argv_tail(("something-else.exe", "--model", "x")) is None
+
+
+@requires_git
+def test_doctor_wrapper_argv_degrades_to_the_path_probe(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    probe_env: None,
+) -> None:
+    """A WRAPPED shim (``uv run agora-ollama-brain --model x``) is probed as a plain program.
+
+    The flags after a wrapper belong to the WRAPPER, so feeding them to the shim's parser would
+    report a model the run never uses — a confident wrong answer, strictly worse than the honest
+    generic argv[0]-on-PATH fallback.
+    """
+    target = _probe_repo(
+        tmp_path / "kb",
+        "backends:\n"
+        "  qwen: { argv: [uv, run, agora-ollama-brain, --model, x], network: loopback }\n"
+        "default_backend: qwen\n",
+    )
+
+    def must_not_run(host: str, *, timeout: float) -> list[str]:
+        raise AssertionError("a wrapped argv must not be parsed as the shim's own")
+
+    monkeypatch.setattr(ollama_brain, "list_ollama_models", must_not_run)
+    capsys.readouterr()
+
+    main(["doctor", "--repo", str(target)])
+
+    out = capsys.readouterr().out
+    assert "  brain qwen: 'uv'" in out  # the WRAPPER is what gets probed
+    assert "model pinned" not in out
+
+
+@requires_git
+def test_doctor_unparseable_shim_argv_leaks_no_usage_text(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], probe_env: None
+) -> None:
+    """A typo'd/hostile shim argv is reported, and argparse's own exit path leaks NO bytes.
+
+    ``parse_known_args`` writes usage to stderr and exits on a malformed known flag; that output
+    must never land in a health report a machine or an operator reads.
+    """
+    target = _probe_repo(
+        tmp_path / "kb",
+        "backends:\n  qwen: { argv: [agora-ollama-brain, --model] }\ndefault_backend: qwen\n",
+    )
+    capsys.readouterr()
+
+    rc = main(["doctor", "--repo", str(target)])
+
+    captured = capsys.readouterr()
+    assert (
+        "  brain qwen: ollama shim argv UNPARSEABLE by the shim's own parser — "
+        "check the adapters.yaml argv" in captured.out
+    )
+    assert "usage: agora-ollama-brain" not in captured.out
+    assert "usage: agora-ollama-brain" not in captured.err
+    assert rc == 1
+
+
+@requires_git
+def test_doctor_shim_help_flag_in_argv_prints_no_help(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], probe_env: None
+) -> None:
+    """``-h`` in a configured argv exits argparse with 0 after printing HELP TO STDOUT — the one
+    exit path that would otherwise inject a whole help screen into doctor's report."""
+    target = _probe_repo(
+        tmp_path / "kb",
+        "backends:\n  qwen: { argv: [agora-ollama-brain, -h] }\ndefault_backend: qwen\n",
+    )
+    capsys.readouterr()
+
+    rc = main(["doctor", "--repo", str(target)])
+
+    captured = capsys.readouterr()
+    assert "UNPARSEABLE by the shim's own parser" in captured.out
+    assert "show this help message" not in captured.out
+    assert "show this help message" not in captured.err
+    assert rc == 1
+
+
+@requires_git
+def test_doctor_survives_a_malformed_repo_yaml(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`agora doctor` must ALWAYS reach its ``status:`` line — a YAML typo in repo.yaml is exactly
+    the state an operator runs doctor in, and before #96 it tracebacked out instead (leaving the
+    verdict unreachable). `agora curate` still fails loudly on the same file."""
+    target = tmp_path / "kb"
+    assert main(["repo", "init", str(target), "--domain", "ai-tech"]) == 0
+    repo_yaml = RepoLayout(target).kb_dir / "repo.yaml"
+    repo_yaml.write_text(repo_yaml.read_text(encoding="utf-8") + "\ncron: @daily\n", "utf-8")
+    capsys.readouterr()
+
+    rc = main(["doctor", "--repo", str(target), "--skip-probe"])
+
+    captured = capsys.readouterr()
+    assert "  repo.yaml: unreadable (" in captured.out
+    assert ") — using defaults" in captured.out
+    assert "status:" in captured.out
+    assert "Traceback" not in captured.err
+    assert rc in (0, 1)
+
+    # A file that is not even UTF-8 — a CP949/Windows editor writing a Korean `name:` (epic #85 /
+    # issue #57). `load_repo_config` wraps only yaml.YAMLError, so this raises UnicodeDecodeError
+    # straight through the ConfigError guard; doctor must still reach its verdict line.
+    repo_yaml.write_bytes(b"name: kb\n\xff\xfe: bad\n")
+    capsys.readouterr()
+
+    rc = main(["doctor", "--repo", str(target), "--skip-probe"])
+
+    captured = capsys.readouterr()
+    assert "  repo.yaml: unreadable (" in captured.out
+    assert "status:" in captured.out
+    assert "Traceback" not in captured.err
+    assert rc in (0, 1)
+
+
+# --- doctor: the tool-agnostic brain remediation block (owner ruling A1) --------------------------
+@requires_git
+def test_doctor_remediation_names_an_installed_cli_agent(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    probe_env: None,
+) -> None:
+    """The CHEAP recovery comes first: a headless CLI agent already on PATH, wired via ADR-0016's
+    ``agora-cli-brain``. Telling a beta user to pull a ~20 GB model is the most expensive fix
+    available, so Ollama is retained but demoted to "instead"."""
+    target = _probe_repo(tmp_path / "kb", _OLLAMA_ADAPTERS)
+    monkeypatch.setattr(ollama_brain, "list_ollama_models", _dead_daemon())
+    monkeypatch.setattr(shutil, "which", _which_only({"claude"}))
+    capsys.readouterr()
+
+    main(["doctor", "--repo", str(target)])
+
+    out = capsys.readouterr().out
+    assert "    fix (no download — 'claude' is already installed): add to adapters.yaml" in out
+    assert "        claude: { argv: [agora-cli-brain, --, claude, -p], network: loopback }" in out
+    assert "      then set  curator.backend: claude  in _kb/repo.yaml (ADR-0016) — i.e." in out
+    assert "    fix (local model instead): ollama serve  &&  ollama pull qwen3.6:35b-a3b" in out
+    assert out.index("fix (no download") < out.index("ollama serve")
+
+
+@requires_git
+def test_doctor_remediation_snippet_is_actually_paste_able(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    probe_env: None,
+) -> None:
+    """FOLLOWING the advice must produce a repo the loaders accept — the whole point of A1.4.
+
+    The entries alone are not paste-able: ``adapters.yaml`` nests backends under ``backends:`` and
+    ``repo.yaml`` nests the default under ``curator:``. A bare entry appended verbatim makes
+    adapters.yaml UNPARSEABLE, and a literal top-level ``curator.backend:`` key is silently ignored
+    by ``load_repo_config`` — so the beta user reruns doctor, sees the identical FAIL, and has no
+    signal that their edit did nothing. This drives the emitted block through the real loaders.
+    """
+    target = _probe_repo(tmp_path / "kb", _OLLAMA_ADAPTERS)
+    monkeypatch.setattr(ollama_brain, "list_ollama_models", _dead_daemon())
+    monkeypatch.setattr(shutil, "which", _which_only({"claude"}))
+    capsys.readouterr()
+
+    main(["doctor", "--repo", str(target)])
+
+    block = [ln for ln in capsys.readouterr().out.splitlines() if ln.startswith("      ")]
+    # The two YAML fragments the operator pastes, minus the prose line that joins them. Dedented
+    # by the block's own 6-space report indent, which is what a copy-paste drops.
+    adapters_snippet = textwrap.dedent("\n".join(block[:2]))
+    repo_snippet = textwrap.dedent("\n".join(block[3:5]))
+
+    # adapters.yaml: through the REAL loader, not just a YAML parse — `backends:` is the key the
+    # registry reads, and an entry pasted without it is silently ignored.
+    pasted = tmp_path / "pasted-adapters.yaml"
+    pasted.write_text(f"{adapters_snippet}\ndefault_backend: claude\n", encoding="utf-8")
+    assert load_backend_registry(pasted).get("claude").argv == (
+        "agora-cli-brain",
+        "--",
+        "claude",
+        "-p",
+    )
+    # repo.yaml: the shorthand `curator.backend` is TWO nested keys — a literal dotted top-level
+    # key parses fine and is then dropped on the floor by load_repo_config.
+    assert yaml.safe_load(repo_snippet) == {"curator": {"backend": "claude"}}
+
+
+@requires_git
+def test_doctor_remediation_without_any_installed_agent(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    probe_env: None,
+) -> None:
+    """With no known agent on PATH the advice stays tool-agnostic — a list, not one vendor."""
+    target = _probe_repo(tmp_path / "kb", _OLLAMA_ADAPTERS)
+    monkeypatch.setattr(ollama_brain, "list_ollama_models", _dead_daemon())
+    monkeypatch.setattr(shutil, "which", _which_only(set()))
+    capsys.readouterr()
+
+    main(["doctor", "--repo", str(target)])
+
+    out = capsys.readouterr().out
+    assert (
+        "    fix (no download): install a headless CLI agent (claude, codex, gemini) "
+        "and drive it via" in out
+    )
+    assert "      agora-cli-brain — see ADR-0016" in out
+    assert "    fix (local model instead): ollama serve  &&  ollama pull qwen3.6:35b-a3b" in out
+
+
+@requires_git
+def test_doctor_remediation_lists_all_installed_agents(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    probe_env: None,
+) -> None:
+    """Every installed agent is named (the operator picks), while the copy-pasteable snippet uses
+    the first — one snippet, no menu of near-identical YAML blocks."""
+    target = _probe_repo(tmp_path / "kb", _OLLAMA_ADAPTERS)
+    monkeypatch.setattr(ollama_brain, "list_ollama_models", _dead_daemon())
+    monkeypatch.setattr(shutil, "which", _which_only({"claude", "codex"}))
+    capsys.readouterr()
+
+    main(["doctor", "--repo", str(target)])
+
+    out = capsys.readouterr().out
+    assert "fix (no download — 'claude', 'codex' are already installed)" in out
+    assert "      claude: { argv: [agora-cli-brain, --, claude, -p], network: loopback }" in out
+
+
+@requires_git
+def test_doctor_remediation_is_printed_once_per_run(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], probe_env: None
+) -> None:
+    """Two dead brains produce two diagnoses but ONE fix block — the advice is about the repo, not
+    about each backend, and repeating it is noise in the report an operator is trying to read."""
+    target = _probe_repo(
+        tmp_path / "kb",
+        "backends:\n"
+        "  a: { argv: [definitely-not-installed-xyz-a] }\n"
+        "  b: { argv: [definitely-not-installed-xyz-b] }\n"
+        "routing:\n  plan: a\n  author: b\n"
+        "default_backend: a\n",
+        backend="a",
+    )
+    capsys.readouterr()
+
+    rc = main(["doctor", "--repo", str(target)])
+
+    out = capsys.readouterr().out
+    assert len([ln for ln in out.splitlines() if ln.lstrip().startswith("brain ")]) == 2
+    assert out.count("fix (no download") == 1
+    assert rc == 1
+
+
+@requires_git
+def test_doctor_healthy_run_prints_no_remediation(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    probe_env: None,
+) -> None:
+    """A usable brain gets a one-line PASS and nothing else: remediation is for FAILURES only."""
+    target = _probe_repo(tmp_path / "kb", _OLLAMA_ADAPTERS)
+    monkeypatch.setattr(ollama_brain, "list_ollama_models", _installed_models("qwen3.6:35b-a3b"))
+    capsys.readouterr()
+
+    assert main(["doctor", "--repo", str(target)]) == 0
+    assert "fix (" not in capsys.readouterr().out
+
+
+def test_known_cli_agents_match_the_module_docstring() -> None:
+    """The ADR-0016 invocations exist ONCE, as data. The shim's docstring table drifted from them
+    before (codex's flags lived only in DATA-MODEL.md §8) and doctor's hint now renders from the
+    same tuple, so this pins the doc to the data rather than to a reviewer's memory."""
+    doc = cli_agent_brain.__doc__ or ""
+    for name, argv in cli_agent_brain.KNOWN_CLI_AGENTS:
+        assert f"{name}:" in doc
+        assert f"argv: {cli_mod._argv_yaml(argv)}" in doc
+
+
+def test_known_cli_agents_match_the_data_model_table() -> None:
+    """The THIRD copy: ``docs/DATA-MODEL.md`` §8's adapters.yaml example.
+
+    It is the copy that drifted last time (it carried codex's flags while the shim docstring did
+    not), and "one source of truth" is only true while every copy is locked to it.
+    """
+    doc = (Path(__file__).resolve().parents[1] / "docs" / "DATA-MODEL.md").read_text(
+        encoding="utf-8"
+    )
+    for name, argv in cli_agent_brain.KNOWN_CLI_AGENTS:
+        assert f"argv: {cli_mod._argv_yaml(argv)}" in doc, name
 
 
 # --- serve --------------------------------------------------------------------------------------
@@ -511,6 +1883,34 @@ def _init_stub_repo(target: Path) -> RepoLayout:
     return layout
 
 
+class _FakeSleeper:
+    """Records the sleep schedule; ends the loop with a Ctrl-C after ``stop_after`` calls.
+
+    The `agora watch` loop is otherwise unbounded, so #97's backoff/reset behaviour is only
+    observable through the one indirection that owns ``time.sleep`` (``cli._watch_sleep``). Raising
+    ``KeyboardInterrupt`` from the sleeper is the honest terminator: it is exactly how an operator
+    stops the daemon, so the tests drive the real exit path instead of a synthetic one.
+
+    ``on_call`` fires BEFORE recording, so a test can repair the repo mid-loop.
+    """
+
+    def __init__(self, stop_after: int, on_call=None) -> None:  # type: ignore[no-untyped-def]
+        self.calls: list[float] = []
+        self._stop_after, self._on_call = stop_after, on_call
+
+    def __call__(self, seconds: float) -> None:
+        if self._on_call is not None:
+            self._on_call(len(self.calls))
+        self.calls.append(seconds)
+        if len(self.calls) >= self._stop_after:
+            raise KeyboardInterrupt
+
+
+def _fail_if_slept(seconds: float) -> None:
+    """A ``_watch_sleep`` stand-in for the paths that must never reach a sleep (``--once``)."""
+    raise AssertionError(f"_watch_sleep must not be called (got {seconds})")
+
+
 @requires_git
 def test_watch_once_is_idle_on_empty_repo(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
@@ -553,6 +1953,42 @@ def test_watch_once_runs_when_threshold_met(
     out = capsys.readouterr().out
     assert "ran (threshold)" in out
     assert "status=published" in out
+
+
+@requires_git
+def test_watch_tick_reports_a_failed_run_cause(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The #96 failure lines ride the tick log's ``{stamp} <verb>:`` grammar, so
+    `journalctl -u agora-watch` stays ONE stream — and a failed RUN is still a successful TICK.
+
+    An always-on watch loop is precisely where a repeatedly-failing curator would otherwise
+    accumulate `status=failed` with no way to reach the cause. The rc assertion is the #97 boundary
+    in miniature: the run failed, the tick did not raise, so the scheduler exits 0.
+    """
+    target = tmp_path / "kb"
+    layout = _dead_brain_repo(target)
+    repo_yaml = layout.kb_dir / "repo.yaml"
+    repo_yaml.write_text(
+        repo_yaml.read_text(encoding="utf-8").replace("threshold: 10", "threshold: 1"),
+        encoding="utf-8",
+    )
+    capsys.readouterr()
+
+    assert main(["watch", "--repo", str(target), "--once"]) == 0
+
+    lines = capsys.readouterr().out.splitlines()
+    ran = [ln for ln in lines if " ran (" in ln]
+    records = [ln for ln in lines if " failed_record: " in ln]
+    checks = [ln for ln in lines if " failed_checks: " in ln]
+    assert len(ran) == 1
+    assert len(records) == 1
+    assert len(checks) == 1
+    assert "status=failed" in ran[0]
+    # Same stamp as the `ran (...)` line it explains — the lines are one event, not three.
+    stamp = ran[0].split(" ", 1)[0]
+    assert records[0].startswith(f"{stamp} failed_record: _kb/failed/")
+    assert checks[0].startswith(f"{stamp} failed_checks: PLAN-BACKEND")
 
 
 @requires_git
@@ -621,6 +2057,416 @@ def test_watch_once_runs_on_cron_due(tmp_path: Path, capsys: pytest.CaptureFixtu
     out = capsys.readouterr().out
     assert "ran (cron)" in out
     assert "status=published" in out
+
+
+# --- watch: the #97 tick guard + backoff ---------------------------------------------------------
+# One `{stamp} tick failed: <Type>: <detail>` line per failed tick, on stderr.
+_TICK_FAILED_RE = re.compile(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ tick failed: ", re.MULTILINE)
+
+
+@pytest.fixture()
+def no_watch_traceback(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`AGORA_WATCH_TRACEBACK` is a HOST env var — unset it so "no traceback" asserts are real."""
+    monkeypatch.delenv("AGORA_WATCH_TRACEBACK", raising=False)
+
+
+@requires_git
+@pytest.mark.usefixtures("no_watch_traceback")
+def test_watch_survives_a_corrupt_state_json_without_dying(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """#97 criterion 1: a DETERMINISTIC per-tick raise reports and backs off — it never exits.
+
+    A corrupt ``_kb/state.json`` is fail-loud by design (``StateStore.load`` never silently
+    discards ``published_runs``/``event_keys``), so ``recover()`` raises on EVERY tick. Before the
+    guard this exited non-zero into `Restart=on-failure`/`KeepAlive`, converting a 60s scheduler
+    into a 10s crash loop that could never fix the file.
+    """
+    target = tmp_path / "kb"
+    layout = _init_stub_repo(target)
+    layout.state_file.parent.mkdir(parents=True, exist_ok=True)
+    layout.state_file.write_text("not json at all", encoding="utf-8")
+    sleeper = _FakeSleeper(stop_after=3)
+    monkeypatch.setattr(cli_mod, "_watch_sleep", sleeper)
+    capsys.readouterr()
+
+    assert main(["watch", "--repo", str(target), "--interval", "1"]) == 0
+
+    captured = capsys.readouterr()
+    err = captured.err
+    assert len(_TICK_FAILED_RE.findall(err)) == 3  # three ticks, three reports, no exit
+    assert "tick failed: ValidationError: " in err
+    assert "1 validation error for CuratorState" in err
+    # The DIAGNOSIS is on pydantic's line 2 — this is the assertion that fails if the renderer ever
+    # truncates at the first newline instead of collapsing whitespace (_one_line).
+    assert "Invalid JSON" in err
+    assert "Traceback (most recent call last)" not in err
+    assert "agora watch: stopped" in captured.out
+
+
+@requires_git
+@pytest.mark.usefixtures("no_watch_traceback")
+def test_watch_recovers_and_resets_backoff_after_the_repo_is_repaired(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """#97 criterion 2: the FIRST clean tick after a repair resets the backoff to ``interval``.
+
+    ``on_call(n)`` runs during sleep ``n+1``, i.e. AFTER tick ``n+1`` has already computed its
+    delay — so repairing at ``n == 1`` makes tick 3 the first clean one and yields [2, 4, 1, 1].
+    """
+    target = tmp_path / "kb"
+    layout = _init_stub_repo(target)
+    layout.state_file.parent.mkdir(parents=True, exist_ok=True)
+    layout.state_file.write_text("not json at all", encoding="utf-8")
+
+    def repair(n: int) -> None:
+        if n == 1:  # during the 2nd sleep: ticks 1-2 failed, tick 3 will be clean
+            layout.state_file.unlink()  # a missing state.json is a fresh empty state
+
+    sleeper = _FakeSleeper(stop_after=4, on_call=repair)
+    monkeypatch.setattr(cli_mod, "_watch_sleep", sleeper)
+    capsys.readouterr()
+
+    assert main(["watch", "--repo", str(target), "--interval", "1"]) == 0
+
+    captured = capsys.readouterr()
+    assert sleeper.calls == [2, 4, 1, 1]  # backoff 2x, 4x, then RESET to the plain interval
+    assert len(_TICK_FAILED_RE.findall(captured.err)) == 2
+    assert "idle: depth=0" in captured.out  # the repaired ticks do their normal work
+
+
+@requires_git
+@pytest.mark.usefixtures("no_watch_traceback")
+def test_watch_survives_malformed_repo_yaml(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """#97 criterion 3: a `repo.yaml` typo is a reported tick failure, not a dead scheduler.
+
+    ``load_repo_config`` is the tick's FIRST statement, so this raise precedes ``worker.run``
+    entirely — there is no ``RunReport`` to carry it and the loop must own the rendering.
+    """
+    target = tmp_path / "kb"
+    layout = _init_stub_repo(target)
+    repo_yaml = layout.kb_dir / "repo.yaml"
+    with repo_yaml.open("a", encoding="utf-8") as fh:
+        fh.write("\ncron: @daily\n")  # '@' cannot start a YAML token
+    sleeper = _FakeSleeper(stop_after=1)
+    monkeypatch.setattr(cli_mod, "_watch_sleep", sleeper)
+    capsys.readouterr()
+
+    assert main(["watch", "--repo", str(target), "--interval", "1"]) == 0
+
+    captured = capsys.readouterr()
+    lines = [ln for ln in captured.err.splitlines() if " tick failed: " in ln]
+    assert len(lines) == 1
+    assert _TICK_FAILED_RE.match(lines[0])
+    assert "tick failed: ConfigError: malformed YAML in " in lines[0]
+    assert str(repo_yaml) in lines[0]  # WHICH file — the operator's next action
+    assert "Traceback (most recent call last)" not in captured.err
+    assert "agora watch: stopped" in captured.out
+
+
+@requires_git
+@pytest.mark.usefixtures("no_watch_traceback")
+def test_watch_recovers_and_resets_backoff_after_repo_yaml_is_repaired(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """#97 criterion 3 in full: a malformed `repo.yaml` behaves like criteria 1 AND 2.
+
+    The ConfigError path is a DIFFERENT raise site from the ValidationError one — it fires on the
+    tick's first statement, before ``recover()`` — so "recovers without a restart and resets the
+    backoff" has to be driven here too. Mirrors the criterion-2 schedule exactly: repair during
+    sleep 2 ⇒ [2, 4, 1, 1] with two failed ticks.
+    """
+    target = tmp_path / "kb"
+    layout = _init_stub_repo(target)
+    repo_yaml = layout.kb_dir / "repo.yaml"
+    good = repo_yaml.read_text(encoding="utf-8")
+    repo_yaml.write_text(f"{good}\ncron: @daily\n", encoding="utf-8")  # '@' starts no YAML token
+
+    def repair(n: int) -> None:
+        if n == 1:  # during the 2nd sleep: ticks 1-2 failed, tick 3 will be clean
+            repo_yaml.write_text(good, encoding="utf-8")
+
+    sleeper = _FakeSleeper(stop_after=4, on_call=repair)
+    monkeypatch.setattr(cli_mod, "_watch_sleep", sleeper)
+    capsys.readouterr()
+
+    assert main(["watch", "--repo", str(target), "--interval", "1"]) == 0
+
+    captured = capsys.readouterr()
+    assert sleeper.calls == [2, 4, 1, 1]  # backoff 2x, 4x, then RESET to the plain interval
+    assert len(_TICK_FAILED_RE.findall(captured.err)) == 2
+    assert "idle: depth=0" in captured.out  # the repaired ticks do their normal work
+
+
+@requires_git
+@pytest.mark.usefixtures("no_watch_traceback")
+def test_watch_ctrl_c_still_stops_cleanly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """#97 criterion 4 (sleep half): Ctrl-C during the sleep exits 0 with the same farewell line."""
+    target = tmp_path / "kb"
+    _init_stub_repo(target)
+    monkeypatch.setattr(cli_mod, "_watch_sleep", _FakeSleeper(stop_after=1))
+    capsys.readouterr()
+
+    assert main(["watch", "--repo", str(target), "--interval", "1"]) == 0
+
+    captured = capsys.readouterr()
+    assert captured.out.rstrip().endswith("agora watch: stopped")
+    assert "tick failed:" not in captured.err
+
+
+def test_watch_ctrl_c_from_inside_a_failing_tick_still_stops(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """#97 criterion 4, the REAL lock: the new ``except Exception`` must not swallow Ctrl-C.
+
+    ``KeyboardInterrupt`` is a ``BaseException``, so ``except Exception`` provably cannot see it —
+    this test is what keeps that property from silently regressing into an unkillable daemon (the
+    sleeper trick above only exercises the outer handler, since the sleep sits OUTSIDE the guard).
+    """
+
+    def interrupted(repo) -> None:  # type: ignore[no-untyped-def]
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(cli_mod, "_watch_tick", interrupted)
+    monkeypatch.setattr(cli_mod, "_watch_sleep", _fail_if_slept)
+    capsys.readouterr()
+
+    assert main(["watch", "--repo", str(tmp_path), "--interval", "1"]) == 0
+
+    captured = capsys.readouterr()
+    assert captured.out.rstrip().endswith("agora watch: stopped")
+    assert "tick failed:" not in captured.err
+
+
+def test_watch_backoff_delay_schedule() -> None:
+    """#97 criterion 5a: the backoff is a PURE function — schedule, cap, and shift clamp."""
+    assert [cli_mod._watch_backoff_delay(60, n) for n in range(7)] == [
+        60,
+        120,
+        240,
+        480,
+        900,
+        900,
+        900,
+    ]
+    assert cli_mod._watch_backoff_delay(60, 0) == 60  # a clean tick keeps the happy path exact
+    # The cap is max(interval, 900), never a bare 900: backoff may only ever SLOW the loop down.
+    assert cli_mod._watch_backoff_delay(3600, 5) == 3600
+    # The shift clamp: without it this allocates a ~10**8-bit integer instead of returning.
+    assert cli_mod._watch_backoff_delay(1, 10**9) == 900
+    assert all(cli_mod._watch_backoff_delay(1, n) >= 1 for n in range(20))
+
+
+@pytest.mark.usefixtures("no_watch_traceback")
+def test_watch_never_reproduces_the_ten_second_crash_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """#97 criterion 5b: a PERMANENTLY failing tick backs off — it never polls faster than
+    ``--interval`` and never floods, which is literally "no 10-second crash loop"."""
+
+    def always_raises(repo) -> None:  # type: ignore[no-untyped-def]
+        raise RuntimeError("permanently broken")
+
+    monkeypatch.setattr(cli_mod, "_watch_tick", always_raises)
+    sleeper = _FakeSleeper(stop_after=5)
+    monkeypatch.setattr(cli_mod, "_watch_sleep", sleeper)
+    capsys.readouterr()
+
+    assert main(["watch", "--repo", str(tmp_path), "--interval", "60"]) == 0
+
+    captured = capsys.readouterr()
+    assert sleeper.calls == [120, 240, 480, 900, 900]
+    assert min(sleeper.calls) >= 60  # never faster than the configured interval
+    assert max(sleeper.calls) <= 900  # and bounded, so an operator's fix is seen within 15 min
+    assert len(_TICK_FAILED_RE.findall(captured.err)) == 5
+
+
+@requires_git
+def test_watch_backs_off_on_a_malformed_adapters_yaml_that_never_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """#97: the NON-raising dead end must back off too.
+
+    `_build_backend` catches the `adapters.yaml` ConfigError, prints it, and returns None, so this
+    tick never reaches the loop's `except Exception`. Before this was fixed the tick counted as a
+    success and RESET the backoff — reproduced live at `--interval 1` as 18 multi-line YAML parse
+    errors in 8 seconds, forever. That is #97's own disease (one typo amplified into a log flood),
+    so it gets #97's own cure: the schedule below is the same 2/4/8/16 curve a raising tick gets.
+    """
+    target = tmp_path / "kb"
+    layout = _init_stub_repo(target)
+    repo_yaml = layout.kb_dir / "repo.yaml"
+    repo_yaml.write_text(
+        repo_yaml.read_text(encoding="utf-8").replace("threshold: 10", "threshold: 1"),
+        encoding="utf-8",
+    )
+    Inbox(layout).write(
+        text="One curator advances the branch under a lock.",
+        writer="dochan",
+        source="claude-code",
+        domain="ai-tech",
+        now=datetime(2026, 6, 13, 2, 40, 10, tzinfo=UTC),
+    )
+    # Malformed AFTER the seed, so the tick is genuinely due and reaches _build_backend.
+    (target / "adapters.yaml").write_text("backends:\n  qwen: { argv: [x]\n", encoding="utf-8")
+    sleeper = _FakeSleeper(stop_after=4)
+    monkeypatch.setattr(cli_mod, "_watch_sleep", sleeper)
+    capsys.readouterr()
+
+    assert main(["watch", "--repo", str(target), "--interval", "1"]) == 0
+
+    captured = capsys.readouterr()
+    assert sleeper.calls == [2, 4, 8, 16]
+    # It is a degraded tick, NOT a raised one: the tick prints its own line and the loop must not
+    # relabel it as an exception.
+    assert len(_TICK_FAILED_RE.findall(captured.err)) == 0
+    assert captured.out.count("but no usable backend") == 4
+
+
+@requires_git
+def test_watch_idle_ticks_do_not_back_off(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The backoff must not punish the steady state: an empty queue is a correct decision, so
+    `idle:` keeps polling at exactly ``--interval`` (the regression guard for the fix above)."""
+    target = tmp_path / "kb"
+    assert main(["repo", "init", str(target)]) == 0
+    sleeper = _FakeSleeper(stop_after=3)
+    monkeypatch.setattr(cli_mod, "_watch_sleep", sleeper)
+    capsys.readouterr()
+
+    assert main(["watch", "--repo", str(target), "--interval", "5"]) == 0
+
+    assert sleeper.calls == [5, 5, 5]
+    assert "idle: depth=0" in capsys.readouterr().out
+
+
+@requires_git
+def test_watch_line_buffers_stdout_so_a_supervisor_sees_the_tick_log(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`agora watch` must not block-buffer stdout (#96/#97 — reproduced live).
+
+    Python block-buffers stdout whenever it is not a TTY, and BOTH shipped units capture it
+    (deploy/systemd/agora-watch.service, deploy/launchd/com.agora.watch.plist). Redirected to a
+    file, an 8-second run emitted **0 bytes** of stdout while stderr — line-buffered by default —
+    came through: the whole `idle:`/`ran (…)` log AND #96's `failed_record:`/`failed_checks:` pair
+    were invisible in exactly the deployment they were written for.
+    """
+    reconfigured: list[object] = []
+    real = sys.stdout.reconfigure
+
+    def spy(**kwargs: object) -> None:
+        reconfigured.append(kwargs.get("line_buffering"))
+        real(**kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(sys.stdout, "reconfigure", spy, raising=False)
+    monkeypatch.setattr(cli_mod, "_watch_sleep", _fail_if_slept)
+    capsys.readouterr()
+
+    assert main(["watch", "--repo", str(tmp_path), "--once"]) == 0
+    assert reconfigured == [True]
+
+
+@requires_git
+@pytest.mark.usefixtures("no_watch_traceback")
+def test_watch_once_returns_one_when_the_tick_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """#97 criterion 6: ``--once`` still FAILS — same one line, rc 1, and no sleep.
+
+    rc 1 is identical to the pre-guard uncaught-traceback path (the console-script wrapper does not
+    catch, so CPython exits 1), so an external scheduler sees exactly what it saw before; what
+    changes is that the failure now renders in the SAME grammar as the loop's, keeping one log
+    filter for one class of failure.
+    """
+    target = tmp_path / "kb"
+    layout = _init_stub_repo(target)
+    layout.state_file.parent.mkdir(parents=True, exist_ok=True)
+    layout.state_file.write_text("not json at all", encoding="utf-8")
+    monkeypatch.setattr(cli_mod, "_watch_sleep", _fail_if_slept)
+    capsys.readouterr()
+
+    assert main(["watch", "--repo", str(target), "--once"]) == 1
+
+    captured = capsys.readouterr()
+    assert len(_TICK_FAILED_RE.findall(captured.err)) == 1
+    assert "tick failed: ValidationError: " in captured.err
+    assert "Traceback (most recent call last)" not in captured.err
+
+
+@requires_git
+def test_watch_startup_banner_is_unchanged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """#97 criterion 7: both banner forms are byte-identical — the guard added no output."""
+    target = tmp_path / "kb"
+    _init_stub_repo(target)
+    root = Repo.resolve(str(target)).layout.root
+    capsys.readouterr()
+
+    assert main(["watch", "--repo", str(target), "--once"]) == 0
+    assert capsys.readouterr().out.splitlines()[0] == f"agora watch: {root} [once]"
+
+    monkeypatch.setattr(cli_mod, "_watch_sleep", _FakeSleeper(stop_after=1))
+    assert main(["watch", "--repo", str(target), "--interval", "60"]) == 0
+    assert capsys.readouterr().out.splitlines()[0] == f"agora watch: {root} (interval=60s)"
+
+
+@requires_git
+def test_watch_traceback_env_prints_a_traceback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``AGORA_WATCH_TRACEBACK`` ADDS a traceback for bug reports — it never REPLACES the line."""
+    target = tmp_path / "kb"
+    layout = _init_stub_repo(target)
+    layout.state_file.parent.mkdir(parents=True, exist_ok=True)
+    layout.state_file.write_text("not json at all", encoding="utf-8")
+    monkeypatch.setenv("AGORA_WATCH_TRACEBACK", "1")
+    monkeypatch.setattr(cli_mod, "_watch_sleep", _fail_if_slept)
+    capsys.readouterr()
+
+    assert main(["watch", "--repo", str(target), "--once"]) == 1
+
+    err = capsys.readouterr().err
+    assert "Traceback (most recent call last)" in err
+    assert len(_TICK_FAILED_RE.findall(err)) == 1  # the one-line summary is still there
+
+
+@requires_git
+@pytest.mark.parametrize("value", ["0", "false", "no", "off", " "])
+def test_watch_traceback_env_falsey_values_are_off(
+    value: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Truthiness is EXPLICIT: ``AGORA_WATCH_TRACEBACK=0`` meaning "on" would be a footgun."""
+    target = tmp_path / "kb"
+    layout = _init_stub_repo(target)
+    layout.state_file.parent.mkdir(parents=True, exist_ok=True)
+    layout.state_file.write_text("not json at all", encoding="utf-8")
+    monkeypatch.setenv("AGORA_WATCH_TRACEBACK", value)
+    monkeypatch.setattr(cli_mod, "_watch_sleep", _fail_if_slept)
+    capsys.readouterr()
+
+    assert main(["watch", "--repo", str(target), "--once"]) == 1
+
+    err = capsys.readouterr().err
+    assert "Traceback (most recent call last)" not in err
+    assert len(_TICK_FAILED_RE.findall(err)) == 1
+
+
+def test_tick_failure_detail_is_one_bounded_line() -> None:
+    """The tick detail is ONE line and BOUNDED — an unbounded exception must not flood a journal."""
+    long_line = cli_mod._tick_failure_detail(RuntimeError("X" * 5000))
+    assert "\n" not in long_line
+    assert len(long_line) <= cli_mod._TICK_DETAIL_CHARS + len("RuntimeError: ") + 1
+    assert long_line.endswith("…")
+    # Whitespace-COLLAPSED, not first-line-truncated: the diagnosis is routinely on line 2.
+    assert cli_mod._tick_failure_detail(RuntimeError("a\nb")) == "RuntimeError: a b"
+    assert cli_mod._tick_failure_detail(RuntimeError()) == "RuntimeError: <no message>"
 
 
 # --- import (the opt-in Obsidian/markdown vault normalizer, ADR-0014 D5) ------------------------
@@ -835,7 +2681,7 @@ def test_doctor_prints_the_connectors_line(
 ) -> None:
     target, _ = _setup_harvest_repo(tmp_path)
     capsys.readouterr()
-    main(["doctor", "--repo", str(target)])
+    main(["doctor", "--repo", str(target), "--skip-probe"])
     out = capsys.readouterr().out
     assert "harvest: enabled (scope_lock=personal)" in out
     assert "file:demo (scope=personal)" in out
@@ -950,7 +2796,7 @@ def test_cli_doctor_reports_gold_line(tmp_path: Path, capsys: pytest.CaptureFixt
     target = _gold_repo(tmp_path)
     assert main(["gold", "build", "--repo", str(target)]) == 0
     capsys.readouterr()
-    main(["doctor", "--repo", str(target)])
+    main(["doctor", "--repo", str(target), "--skip-probe"])
     out = capsys.readouterr().out
     assert "gold: pack=fresh" in out and "_kb/gold/" in out
 
@@ -1041,7 +2887,7 @@ def test_sync_push_failure_is_a_clean_error(
 
     # doctor renders the recorded failure as ONE compressed line (first error line only — a
     # multi-line git stderr must never flood the health report; the full text stays in the file).
-    main(["doctor", "--repo", str(target)])
+    main(["doctor", "--repo", str(target), "--skip-probe"])
     out = capsys.readouterr().out
     backup_lines = [ln for ln in out.splitlines() if ln.lstrip().startswith("backup: remote=")]
     assert len(backup_lines) == 1
@@ -1253,7 +3099,7 @@ def test_doctor_prints_the_backup_line(tmp_path: Path, capsys: pytest.CaptureFix
     target = tmp_path / "kb"
     assert main(["repo", "init", str(target)]) == 0
     capsys.readouterr()
-    main(["doctor", "--repo", str(target)])
+    main(["doctor", "--repo", str(target), "--skip-probe"])
     assert "backup: no remote configured" in capsys.readouterr().out
 
     layout = RepoLayout(target)
@@ -1261,7 +3107,7 @@ def test_doctor_prints_the_backup_line(tmp_path: Path, capsys: pytest.CaptureFix
     _set_backup(layout, remote=str(remote), auto=True)
     assert main(["sync", "--repo", str(target)]) == 0
     capsys.readouterr()
-    main(["doctor", "--repo", str(target)])
+    main(["doctor", "--repo", str(target), "--skip-probe"])
     out = capsys.readouterr().out
     assert f"backup: remote={remote} auto=True" in out
     assert "last_push=" in out and " ok @ " in out
@@ -1295,7 +3141,7 @@ def test_doctor_backup_line_compresses_and_survives_corrupt_state(
     )
     capsys.readouterr()
 
-    main(["doctor", "--repo", str(target)])
+    main(["doctor", "--repo", str(target), "--skip-probe"])
     out = capsys.readouterr().out
     [line] = [ln for ln in out.splitlines() if ln.lstrip().startswith("backup: remote=")]
     assert "FAILED (" in line
@@ -1306,5 +3152,5 @@ def test_doctor_backup_line_compresses_and_survives_corrupt_state(
     for corrupt in ('{"ok": true, "commit": 12345}', "{not json"):
         state.write_text(corrupt, encoding="utf-8")
         capsys.readouterr()
-        main(["doctor", "--repo", str(target)])
+        main(["doctor", "--repo", str(target), "--skip-probe"])
         assert "last_push=unreadable" in capsys.readouterr().out
