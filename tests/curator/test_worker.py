@@ -29,7 +29,7 @@ from agora_kb.core.ids import new_event_id
 from agora_kb.core.inbox import Inbox
 from agora_kb.core.layout import RepoLayout
 from agora_kb.core.repo import Repo
-from agora_kb.core.state import StateStore
+from agora_kb.core.state import LastFailure, StateStore
 from agora_kb.curator.apply import body_sentinels, region_sentinel_id
 from agora_kb.curator.claim import curator_lock
 from agora_kb.curator.manifest import RunManifest, manifest_path, read_manifest, write_manifest
@@ -38,6 +38,7 @@ from agora_kb.curator.worker import (
     AuthorRegion,
     Backend,
     FakeBackend,
+    RunFailure,
     RunReport,
     _unauthored_regions,
     recover,
@@ -2202,3 +2203,552 @@ def test_recovery_clears_stale_last_batch_when_state_save_never_landed(tmp_path:
     state = StateStore(layout).load()
     assert state.last_commit == repo.branch_commit()
     assert state.last_batch is None
+
+
+# --- (17) #96: the failure vehicle on RunReport + the state.json failure fields ------------------
+
+NOW2 = datetime(2026, 6, 13, 3, 1, 0, tzinfo=UTC)
+
+
+def _bad_domain_plan(event_id: str) -> str:
+    """A plan naming a domain OUTSIDE the taxonomy — the §4.1 TAXONOMY rejection (a PLAN failure).
+
+    Fails BEFORE apply, so the run's phase stays ``claimed`` and (at the default max_attempts=3)
+    the event returns to ``inbox/`` — the NON-TERMINAL failure #96 exists to make visible.
+    """
+    return json.dumps(
+        {
+            "schema_version": 1,
+            "run_id": "ignored",
+            "finished": True,
+            "dispositions": [
+                {
+                    "candidate_id": "c1",
+                    "event_ids": [event_id],
+                    "op": "CREATE_THEME",
+                    "domain": "not-a-real-domain",
+                    "basename": "rogue-theme",
+                    "title": "Rogue",
+                    "summary": "Should never be created.",
+                    "status": "active",
+                    "tags": [],
+                    "aliases": [],
+                    "links": [],
+                    "needs_prose": True,
+                    "reason": "Invalid domain.",
+                }
+            ],
+        }
+    )
+
+
+def _lint_failure_event(inbox: Inbox) -> str:
+    """Write a capture whose cited raw/ source will NOT exist, so §4.4 LINT fails AFTER apply.
+
+    The explicit ``raw_ref`` points at an uploaded file the engine does not materialize (only
+    free-text captures are written from the body, ADR-0010 D3), so APPLY cites a source that lint
+    L1-8 cannot resolve — a real APPLY + commit happen first, then the whole diff is discarded.
+    """
+    return inbox.write(
+        text="One curator advances the branch under a lock.",
+        writer="dochan",
+        source="claude-code",
+        domain="ai-tech",
+        raw_ref="raw/ai-tech/missing-upload.md",
+        now=datetime(2026, 6, 13, 2, 40, 10, tzinfo=UTC),
+    ).id
+
+
+class _HugeStderrPlanBackend:
+    """A backend whose PASS 1 dies with a multi-KILOBYTE multi-line message.
+
+    The shape of a real dead brain: ``SubprocessBackend.plan`` embeds the child's stderr VERBATIM
+    with no cap, so this is exactly what reaches ``_fail``'s ``reasons`` in production.
+    """
+
+    def __init__(self, blob: str) -> None:
+        self._blob = blob
+
+    def plan(self, bundle_dir: Path) -> str:  # noqa: ARG002
+        from agora_kb.curator.subprocess_backend import BackendUnavailableError
+
+        raise BackendUnavailableError(self._blob)
+
+    def author(
+        self,
+        worktree: Path,  # noqa: ARG002
+        needs_prose: dict[str, list[str]],  # noqa: ARG002
+        context: dict[str, AuthorRegion],  # noqa: ARG002
+    ) -> None:
+        raise AssertionError("author must never be reached when PASS 1 fails to run")
+
+
+def test_run_failure_summary_shape() -> None:
+    """(#96) The ONE elision renderer: first 3 checks, then ``… +N more``, each clipped at 140.
+
+    Pure unit — it lives on the report (not in a face) precisely so `agora curate`, the `agora
+    watch` tick and MCP emit the SAME bytes for the same failure.
+    """
+    five = RunFailure(run_id="r", phase="claimed", reasons=("a", "b", "c", "d", "e"))
+    assert five.summary() == "a | b | c | … +2 more"
+
+    assert RunFailure(run_id="r", phase="claimed").summary() == "-"  # no reasons ⇒ the absent idiom
+
+    three = RunFailure(run_id="r", phase="claimed", reasons=("a", "b", "c"))
+    assert three.summary() == "a | b | c"  # exactly `limit` ⇒ no "+N more" suffix
+
+    long_reason = "y" * 200
+    rendered = RunFailure(run_id="r", phase="claimed", reasons=(long_reason,)).summary()
+    assert rendered == long_reason[:140].rstrip() + "…"
+    assert len(rendered) <= 141
+
+
+def test_failed_run_report_carries_the_error_record_path(tmp_path: Path) -> None:
+    """(#96 crit 6) A failed run points at its own durable error record, repo-RELATIVE.
+
+    Repo-relative + POSIX so the same string can be persisted in ``state.json`` without leaking the
+    host layout into a repo-scoped file (invariant 5) and without breaking when the repo moves.
+    """
+    repo = _init_repo(tmp_path)
+    layout = repo.layout
+    inbox = Inbox(layout)
+    e1 = _write_capture(inbox, text="A fact in a non-existent domain.", second=10)
+    _seed_raw(repo, e1)
+
+    report = _run(repo, FakeBackend(_bad_domain_plan(e1), prose={"c1": "unreachable"}))
+
+    assert report.status == "failed"
+    failure = report.failure
+    assert failure is not None
+    assert failure.run_id == report.run_id
+    assert failure.record_path == f"_kb/failed/{RUN_DATE}/{report.run_id}/error.json"
+    # The pointer RESOLVES against the repo root — that is the whole point of printing it.
+    assert (repo.root / failure.record_path).is_file()
+    assert failure.cas_conflict is False
+    assert failure.phase == "claimed"  # a PLAN failure never reached APPLY
+    assert failure.reasons and failure.reasons[0].startswith("TAXONOMY")
+    # The report's counts shape is UNCHANGED: the failure rides a new FIELD, never a new count key.
+    assert report.counts == {"retried": 1, "failed": 0}
+
+
+def test_cas_conflict_report_has_no_error_record(tmp_path: Path) -> None:
+    """(#96) A CAS conflict is the ONE failure that writes no durable record — ``record_path`` None.
+
+    The events are valid and simply stale: they return to ``inbox/``, no retry budget is burned and
+    nothing needs auditing later, so the reason line itself IS the full explanation.
+    """
+    repo = _init_repo(tmp_path)
+    layout = repo.layout
+    inbox = Inbox(layout)
+    e1 = _write_capture(inbox, text="One curator advances the branch under a lock.", second=10)
+    _seed_raw(repo, e1)
+    repo.compare_and_swap_branch = lambda *, expected, new, branch=None: False  # type: ignore[method-assign]
+
+    report = _run(repo, FakeBackend(_create_theme_plan("ignored", "c1", e1), prose={"c1": "x"}))
+
+    assert report.status == "failed"
+    failure = report.failure
+    assert failure is not None
+    assert failure.record_path is None
+    assert failure.cas_conflict is True
+    assert failure.reasons[0].startswith("CAS:")
+    assert not list(layout.failed_dir.rglob("error.json"))
+    assert report.counts == {"retried": 1}
+
+
+def test_non_failed_reports_carry_no_failure(tmp_path: Path) -> None:
+    """(#96) ``failure`` is set ONLY by ``_fail`` — published / noop / recovered reports carry None.
+
+    Covers every non-failed construction site: the happy publish, BOTH noop shapes (lock held,
+    nothing to claim) and BOTH recovery shapes (finalize-published, return-to-inbox).
+    """
+    repo = _init_repo(tmp_path)
+    layout = repo.layout
+    inbox = Inbox(layout)
+
+    # noop — nothing to claim (empty inbox).
+    assert _run(repo, FakeBackend("{}")).failure is None
+
+    # noop — the per-repo lock is already held by another run.
+    with curator_lock(layout):
+        held = _run(repo, FakeBackend("{}"))
+    assert held.status == "noop"
+    assert held.failure is None
+
+    # published — the happy path.
+    e1 = _write_capture(inbox, text="One curator advances the branch under a lock.", second=10)
+    _seed_raw(repo, e1)
+    published = _run(
+        repo,
+        FakeBackend(
+            _create_theme_plan("ignored", "c1", e1),
+            prose={region_sentinel_id("ignored", "c1"): "One curator holds a per-repo flock."},
+        ),
+    )
+    assert published.status == "published"
+    assert published.failure is None
+    tip = published.published_commit
+    assert tip is not None
+
+    # recovered — hand-place BOTH §9 shapes: a published-but-unfinalized run (finalize) and a
+    # claimed run that never published (return to inbox).
+    crashed_published = new_event_id(now=datetime(2026, 6, 13, 4, 0, 0, tzinfo=UTC))
+    crashed_claimed = new_event_id(now=datetime(2026, 6, 13, 5, 0, 0, tzinfo=UTC))
+    for run_id, phase, commit, second in (
+        (crashed_published, "published", tip, 20),
+        (crashed_claimed, "claimed", None, 21),
+    ):
+        event_id = _write_capture(inbox, text=f"A fact for {run_id}.", second=second)
+        events_dir = layout.processing_dir / run_id / "events"
+        events_dir.mkdir(parents=True, exist_ok=True)
+        os.replace(layout.inbox_item_path("dochan", event_id), events_dir / f"{event_id}.md")
+        write_manifest(
+            layout,
+            RunManifest(
+                run_id=run_id,
+                base_commit=tip,
+                event_ids=(event_id,),
+                phase=phase,  # type: ignore[arg-type]
+                prose_complete=phase == "published",
+                published_commit=commit,
+                started="2026-06-13T04:00:00Z",
+            ),
+        )
+
+    reports = recover(repo, state_store=StateStore(layout))
+    recovered_ids = {r.run_id for r in reports}
+    assert {crashed_published, crashed_claimed} <= recovered_ids
+    assert all(r.status == "recovered" for r in reports)
+    assert all(r.failure is None for r in reports)
+
+
+def test_report_reasons_are_flattened_and_bounded_but_error_json_is_lossless(
+    tmp_path: Path,
+) -> None:
+    """(#96) The REPORT echo is one bounded line; ``error.json`` keeps the raw multi-line text.
+
+    A dead brain's stderr is routinely a multi-kilobyte traceback, and every consumer renders the
+    report's reasons (a terminal, an agent's context window, ``state.json``). The bound lives at
+    construction, ONCE — and the untruncated text is always one ``record_path`` away.
+    """
+    repo = _init_repo(tmp_path)
+    layout = repo.layout
+    inbox = Inbox(layout)
+    e1 = _write_capture(inbox, text="One curator advances the branch under a lock.", second=10)
+    _seed_raw(repo, e1)
+
+    # Space-FREE segments so the clip lands on a non-whitespace char (rstrip cannot shorten it),
+    # newline-SEPARATED so flattening is observable.
+    blob = "X" * 2500 + "\n" + "Y" * 2500
+
+    report = _run(repo, _HugeStderrPlanBackend(blob))
+
+    assert report.status == "failed"
+    assert report.failure is not None
+    reason = report.failure.reasons[0]
+    assert "\n" not in reason  # whitespace-COLLAPSED, not first-line-truncated
+    assert len(reason) <= 401  # 400 chars + the U+2026 elision marker
+    assert reason.endswith("…")
+    assert reason.startswith("PLAN-BACKEND: XXX")
+
+    # The durable record is LOSSLESS — the report echo only points at it.
+    record = json.loads((repo.root / report.failure.record_path).read_text(encoding="utf-8"))
+    assert blob in record["failed_checks"][0]
+    assert "\n" in record["failed_checks"][0]
+
+
+def test_failure_phase_distinguishes_pre_and_post_apply(tmp_path: Path) -> None:
+    """(#96) ``phase`` is truthful: ``claimed`` = failed BEFORE apply, ``applied`` = failed after.
+
+    Regression lock for the ``_advance`` return-value bug: both callers discarded the advanced
+    manifest, so the in-memory phase was pinned at ``claimed`` and BOTH ``RunFailure.phase`` and
+    ``error.json``'s ``"phase"`` reported ``claimed`` for LINT / AUTHOR / CAS failures.
+    """
+    repo = _init_repo(tmp_path)
+    layout = repo.layout
+    inbox = Inbox(layout)
+
+    # PLAN failure — rejected at the §4.1 gate, long before APPLY.
+    e1 = _write_capture(inbox, text="A fact in a non-existent domain.", second=10)
+    _seed_raw(repo, e1)
+    plan_report = _run(repo, FakeBackend(_bad_domain_plan(e1), prose={"c1": "unreachable"}))
+    assert plan_report.failure is not None
+    assert plan_report.failure.phase == "claimed"
+
+    # LINT failure — a real APPLY + commit happened on the detached worktree first.
+    repo2 = _init_repo(tmp_path / "kb2")
+    e2 = _lint_failure_event(Inbox(repo2.layout))
+    lint_report = _run(repo2, FakeBackend(_create_theme_plan("ignored", "c1", e2), prose={}))
+    assert lint_report.status == "failed"
+    assert lint_report.failure is not None
+    assert lint_report.failure.phase == "applied"
+    record = json.loads((repo2.root / lint_report.failure.record_path).read_text(encoding="utf-8"))
+    assert record["phase"] == "applied"  # the on-disk record agrees with the report
+
+
+def test_non_terminal_failure_is_visible_in_state(tmp_path: Path) -> None:
+    """(#96 crit 7) A failure INSIDE the retry budget is visible in state.json — the blind spot.
+
+    Nothing else moves: ``last_run``/``last_commit`` stay unset (mark_run fires only on publish),
+    ``counters.failed`` stays 0 (retries are not failures yet, §5.1) and the event goes back to
+    ``inbox/`` so the depth is unchanged. ``last_attempt`` + ``last_failure`` are the ONLY evidence.
+    """
+    repo = _init_repo(tmp_path)
+    layout = repo.layout
+    inbox = Inbox(layout)
+    e1 = _write_capture(inbox, text="A fact in a non-existent domain.", second=10)
+    _seed_raw(repo, e1)
+
+    report = _run(repo, FakeBackend(_bad_domain_plan(e1), prose={"c1": "unreachable"}))
+    assert report.status == "failed"
+
+    st = StateStore(layout).load()
+    # The pre-#96 surface is unmoved — this is what made the failure invisible.
+    assert st.last_run is None
+    assert st.last_commit is None
+    assert st.counters.failed == 0
+    assert layout.inbox_item_path("dochan", e1).is_file()
+
+    # ...yet the attempt and its cause are both recorded.
+    assert st.last_attempt == NOW
+    lf = st.last_failure
+    assert lf is not None
+    assert lf.when == NOW
+    assert lf.run_id == report.run_id
+    assert lf.phase == "claimed"
+    assert lf.reasons[0].startswith("TAXONOMY")
+    assert lf.reasons_total == len(lf.reasons)
+    assert lf.record_path == f"_kb/failed/{RUN_DATE}/{report.run_id}/error.json"
+    assert (repo.root / lf.record_path).is_file()
+    assert st.failure_is_current is True
+
+
+def test_last_attempt_is_stamped_even_when_the_run_crashes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """(#96) The stamp sits right after the CLAIM, so a crash-shaped run is still honest.
+
+    Stamping at each terminus instead would leave `last_attempt` silent for exactly the runs an
+    operator most needs to see: the ones that died before reaching any terminus at all.
+    """
+    repo = _init_repo(tmp_path)
+    layout = repo.layout
+    inbox = Inbox(layout)
+    e1 = _write_capture(inbox, text="One curator advances the branch under a lock.", second=10)
+    _seed_raw(repo, e1)
+
+    def boom(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("simulated crash before any terminus")
+
+    monkeypatch.setattr(worker_mod, "build_bundle", boom)
+
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        _run(repo, FakeBackend("{}"))
+
+    st = StateStore(layout).load()
+    assert st.last_attempt == NOW
+    # No _fail ran, so there is no cause to record — the attempt alone is the signal.
+    assert st.last_failure is None
+
+
+def test_publish_leaves_state_semantics_unchanged(tmp_path: Path) -> None:
+    """(#96 crit 9) A later publish moves last_run/last_commit and NOTHING about last_failure.
+
+    ``last_failure`` is sticky like ``counters`` — a publish over DIFFERENT events resolves nothing,
+    so clearing it would manufacture a false all-clear. ``failure_is_current`` is what answers
+    "is it still broken?", and it flips on its own.
+    """
+    repo = _init_repo(tmp_path)
+    layout = repo.layout
+    inbox = Inbox(layout)
+    e1 = _write_capture(inbox, text="One curator advances the branch under a lock.", second=10)
+    _seed_raw(repo, e1)
+
+    failed = _run(repo, FakeBackend(_bad_domain_plan(e1), prose={"c1": "unreachable"}), now=NOW)
+    assert failed.status == "failed"
+
+    # The event came back to inbox/; run 2 re-claims it with a VALID plan.
+    published = _run(
+        repo,
+        FakeBackend(
+            _create_theme_plan("ignored", "c1", e1),
+            prose={region_sentinel_id("ignored", "c1"): "One curator holds a per-repo flock."},
+        ),
+        now=NOW2,
+    )
+    assert published.status == "published"
+
+    st = StateStore(layout).load()
+    assert st.last_run == NOW2
+    assert st.last_attempt == NOW2  # one stamp per claimed run ⇒ equal after a publish
+    assert st.last_commit == published.published_commit
+    lf = st.last_failure
+    assert lf is not None  # STICKY: the historical fact survives the publish
+    assert lf.when == NOW
+    assert lf.run_id == failed.run_id
+    assert st.failure_is_current is False  # ...but it is no longer the current verdict
+    assert st.counters.failed == 0
+
+
+def test_cas_conflict_stamps_attempt_but_records_no_failure(tmp_path: Path) -> None:
+    """(#96) A CAS conflict is not a failure: it burns no budget and writes no ``last_failure``.
+
+    ``last_attempt`` still moves — the curator genuinely attempted a consolidation — which is the
+    honest reading of a repo where a concurrent writer keeps winning the race.
+    """
+    repo = _init_repo(tmp_path)
+    layout = repo.layout
+    inbox = Inbox(layout)
+    e1 = _write_capture(inbox, text="One curator advances the branch under a lock.", second=10)
+    _seed_raw(repo, e1)
+    repo.compare_and_swap_branch = lambda *, expected, new, branch=None: False  # type: ignore[method-assign]
+
+    report = _run(repo, FakeBackend(_create_theme_plan("ignored", "c1", e1), prose={"c1": "x"}))
+    assert report.status == "failed"
+
+    st = StateStore(layout).load()
+    assert st.last_attempt == NOW
+    assert st.last_failure is None
+    assert st.failure_is_current is False
+    assert st.counters.failed == 0
+    assert not list(layout.failed_dir.rglob("error.json"))
+
+
+def test_terminal_failure_records_counter_and_last_failure_together(tmp_path: Path) -> None:
+    """(#96) At budget exhaustion the counter bump and the failure record land in ONE state save.
+
+    Two facts about the SAME run written separately could disagree after a crash between them; one
+    save makes that unrepresentable.
+    """
+    repo = _init_repo(tmp_path)
+    layout = repo.layout
+    inbox = Inbox(layout)
+    e1 = _write_capture(inbox, text="A fact in a non-existent domain.", second=10)
+    _seed_raw(repo, e1)
+
+    last = None
+    for _ in range(3):  # curator.max_attempts defaults to 3
+        last = _run(repo, FakeBackend(_bad_domain_plan(e1), prose={"c1": "x"}))
+        assert last.status == "failed"
+    assert last is not None
+
+    st = StateStore(layout).load()
+    assert st.counters.failed == 1  # the event went TERMINAL on the third attempt
+    assert st.last_failure is not None
+    assert st.last_failure.run_id == last.run_id
+    assert st.last_run is None  # a failure is never a "last successful publish"
+    assert st.failure_is_current is True
+
+
+def test_recovery_leaves_the_failure_fields_untouched(tmp_path: Path) -> None:
+    """(#96) Recovery neither writes nor clears ``last_attempt``/``last_failure``.
+
+    ``recover()`` reads no clock (ADR-0010 D1) so it has no honest value to stamp, and it already
+    declines the analogous ``last_run`` write. ``last_batch`` IS cleared — it labels the run being
+    finalized, whereas ``last_failure`` is a standalone historical fact whose analogue is
+    ``counters``, which recovery deliberately does not replay either.
+    """
+    repo = _init_repo(tmp_path)
+    layout = repo.layout
+    inbox = Inbox(layout)
+    e1 = _write_capture(inbox, text="One curator advances the branch under a lock.", second=10)
+    _seed_raw(repo, e1)
+    published = _run(
+        repo,
+        FakeBackend(
+            _create_theme_plan("ignored", "c1", e1),
+            prose={region_sentinel_id("ignored", "c1"): "One curator holds a per-repo flock."},
+        ),
+    )
+    tip = published.published_commit
+    assert tip is not None
+
+    # Seed both fields with a KNOWN older failure, then crash-and-recover over the top of it.
+    store = StateStore(layout)
+    seeded = store.load()
+    seeded.last_attempt = NOW
+    seeded.last_failure = LastFailure.from_run_failure(
+        when=NOW,
+        run_id="2026-06-13T02-00-00.000Z--seeded",
+        phase="claimed",
+        reasons=("TAXONOMY: unknown domain 'x'",),
+        record_path="_kb/failed/2026-06-13/2026-06-13T02-00-00.000Z--seeded/error.json",
+    )
+    store.save(seeded)
+
+    # The §9 "CAS succeeded but state.json wasn't recorded" row: manifest applied + the ref tip.
+    crashed = new_event_id(now=datetime(2026, 6, 13, 4, 0, 0, tzinfo=UTC))
+    e2 = _write_capture(inbox, text="A second fact.", second=20)
+    events_dir = layout.processing_dir / crashed / "events"
+    events_dir.mkdir(parents=True, exist_ok=True)
+    os.replace(layout.inbox_item_path("dochan", e2), events_dir / f"{e2}.md")
+    write_manifest(
+        layout,
+        RunManifest(
+            run_id=crashed,
+            base_commit=tip,
+            event_ids=(e2,),
+            phase="applied",
+            prose_complete=True,
+            published_commit=tip,
+            started="2026-06-13T04:00:00Z",
+        ),
+    )
+
+    reports = recover(repo, state_store=store)
+    assert any(r.run_id == crashed and r.status == "recovered" for r in reports)
+
+    st = store.load()
+    assert st.last_attempt == seeded.last_attempt
+    assert st.last_failure == seeded.last_failure
+    assert st.last_batch is None  # cleared: the recovered run's batch shape is unknowable
+
+
+def test_noop_run_does_not_write_state(tmp_path: Path) -> None:
+    """(#96) An idle tick writes NOTHING — ``last_attempt`` marks a CLAIM, not a poll.
+
+    ``agora watch`` runs ~1440 ticks/day on an empty inbox; stamping each one would rewrite
+    state.json all day and would answer a question nobody asked ("when did the curator last look?").
+    """
+    repo = _init_repo(tmp_path)
+    layout = repo.layout
+    assert not layout.state_file.exists()  # `repo init` writes no state.json
+
+    report = _run(repo, FakeBackend("{}"))
+
+    assert report.status == "noop"
+    assert not layout.state_file.exists()
+
+
+def test_failure_state_write_error_becomes_a_warning_not_a_crash(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """(#96) A failed state write degrades to a #115 warning — a FAILED run never becomes CRASHED.
+
+    Before #96 ``_fail`` touched state only at budget exhaustion, so making the save unconditional
+    would hand `agora curate` / MCP `kb_curate` an uncaught OSError on a full or read-only disk.
+    """
+    repo = _init_repo(tmp_path)
+    layout = repo.layout
+    inbox = Inbox(layout)
+    e1 = _write_capture(inbox, text="A fact in a non-existent domain.", second=10)
+    _seed_raw(repo, e1)
+
+    real_save = StateStore.save
+
+    def flaky_save(self: StateStore, state: object) -> None:
+        # Fail ONLY the _fail-time save: the claim-time stamp is deliberately unguarded (the
+        # filesystem was just proven writable by claim()), so breaking it would test nothing here.
+        if getattr(state, "last_failure", None) is not None:
+            raise OSError("No space left on device")
+        real_save(self, state)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(StateStore, "save", flaky_save)
+
+    report = _run(repo, FakeBackend(_bad_domain_plan(e1), prose={"c1": "unreachable"}))
+
+    assert report.status == "failed"  # the terminal verdict is unchanged...
+    assert report.failure is not None  # ...and the cause still reaches the operator
+    assert "could not record this failure in _kb/state.json" in report.warnings[0]
+    assert "No space left on device" in report.warnings[0]
+    assert StateStore(layout).load().last_failure is None  # the write genuinely did not land
