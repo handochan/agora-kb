@@ -60,9 +60,9 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal, Protocol
 
 from ..core import frontmatter
-from ..core.ids import new_event_id
+from ..core.ids import is_valid_event_id, new_event_id
 from ..core.inbox import Inbox
-from ..core.layout import RepoLayout
+from ..core.layout import InvalidWriterError, RepoLayout
 from ..core.repo import GitError, Repo
 from ..core.state import CuratorState, LastBatch, LastFailure, StateStore
 from ..schema.emit import Taxonomy
@@ -1044,10 +1044,18 @@ def _return_to_inbox(repo: Repo, manifest: RunManifest) -> RunReport:
     scratch) is removed entirely.
     """
     layout = repo.layout
-    run_dir = layout.processing_dir / manifest.run_id
-    returned = _return_events_to_inbox(layout, run_dir / "events")
+    run_id = manifest.run_id
+    run_dir = layout.processing_dir / run_id
+    returned, preserved = _return_events_to_inbox(
+        layout, run_dir / "events", preserve_dir=layout.failed_dir / run_id[:10] / run_id
+    )
     shutil.rmtree(run_dir, ignore_errors=True)
-    return RunReport(run_id=manifest.run_id, status="recovered", counts={"returned": returned})
+    return RunReport(
+        run_id=run_id,
+        status="recovered",
+        # `preserved` only when non-zero (issue #124) — a clean recovery's counts are unchanged.
+        counts={"returned": returned} | ({"preserved": preserved} if preserved else {}),
+    )
 
 
 # --- failure handling (ADR-0011 §4.3 / §5.1) ---------------------------------------------------
@@ -1087,7 +1095,9 @@ def _fail(
     events_dir = layout.processing_dir / run_id / "events"
 
     if cas_conflict:
-        returned = _return_events_to_inbox(layout, events_dir)
+        returned, preserved = _return_events_to_inbox(
+            layout, events_dir, preserve_dir=layout.failed_dir / run_date / run_id
+        )
         shutil.rmtree(layout.processing_dir / run_id, ignore_errors=True)
         # BYTE-IDENTICAL to pre-#96 apart from the additive `failure`: a CAS conflict writes NO
         # error record and NO `last_failure` (no budget burned, nothing an operator must fix), and
@@ -1095,7 +1105,9 @@ def _fail(
         return RunReport(
             run_id=run_id,
             status="failed",
-            counts={"retried": returned},
+            # `preserved` is emitted ONLY when non-zero (issue #124), so the ordinary CAS conflict
+            # keeps its exact pre-#124 counts mapping and the strict-equality assertions on it hold.
+            counts={"retried": returned} | ({"preserved": preserved} if preserved else {}),
             failure=RunFailure(
                 run_id=run_id,
                 phase=manifest.phase,
@@ -1137,14 +1149,18 @@ def _fail(
         for event_path in sorted(events_dir.glob("*.md")):
             event_id = event_path.stem
             attempt = prior.get(event_id, 0) + 1  # this run is attempt N
-            if attempt < max_attempts:
+            if attempt < max_attempts and _return_one_to_inbox(layout, event_path):
                 # Within budget: return the unchanged event to inbox/ (re-claimed next run, §5.1).
                 # The error.json above stays as the durable retry counter even though the event
                 # leaves failed/.
-                if _return_one_to_inbox(layout, event_path):
-                    retried += 1
+                retried += 1
             else:
-                # Budget exhausted: the event stays TERMINAL in failed/ alongside the error record.
+                # Budget exhausted OR the return was REFUSED (issue #124's no-loss floor — this
+                # branch used to be reachable only by the budget, so a refusal fell through to the
+                # rmtree below and destroyed the event). Either way the event stays TERMINAL in
+                # failed/ beside the error record. A preserved event IS a terminal disposition, so
+                # it counts as one: `counts["failed"]` and `counters.failed` stay honest, and no
+                # counts KEY changes (the #123 strict-equality assertions hold).
                 os.replace(event_path, failed_dir / event_path.name)
                 failed += 1
 
@@ -1221,14 +1237,58 @@ def _event_attempt_counts(layout: RepoLayout) -> dict[str, int]:
     return counts
 
 
-def _return_events_to_inbox(layout: RepoLayout, events_dir: Path) -> int:
-    """Return every event under ``events_dir`` to its frontmatter writer-namespace in ``inbox/``."""
+def _return_events_to_inbox(
+    layout: RepoLayout, events_dir: Path, *, preserve_dir: Path
+) -> tuple[int, int]:
+    """Return every event under ``events_dir`` to its writer namespace; PRESERVE any refusal.
+
+    Returns ``(returned, preserved)``.
+
+    THE NO-LOSS FLOOR (issue #124). Every caller of this function clears the processing dir with
+    ``shutil.rmtree`` immediately afterwards, so an event that is neither returned nor moved
+    elsewhere is **destroyed** — silently, and counted by nothing: not ``RunReport.counts``, not
+    ``counters.failed``, not ``failed_event_count``. That contradicts invariants 1 and 3 (markdown
+    is the source of truth; events are immutable) and :func:`_fail`'s own contract that "only the
+    events' LOCATION changes". A refusal is not exotic: an occupied destination
+    (``dest.exists()`` — an idempotent duplicate) reaches it with no attacker involved.
+
+    So a refused event is moved to ``preserve_dir`` instead — ``_kb/failed/<date>/<run-id>/``, where
+    ``failed_event_count`` sees it, ``agora status`` reports it, and (once #99 lands) ``agora
+    requeue`` can retrieve it. Preservation is best-effort in that it never raises: if even THAT
+    rename fails, the event is left in ``processing/`` where ``rmtree(ignore_errors=True)`` may
+    or may not remove it — but the far more likely outcomes (occupied inbox slot, unaddressable
+    frontmatter) are now lossless.
+    """
     returned = 0
+    preserved = 0
     if events_dir.is_dir():
         for event_path in sorted(events_dir.glob("*.md")):
             if _return_one_to_inbox(layout, event_path):
                 returned += 1
-    return returned
+            elif _preserve_one_event(event_path, preserve_dir):
+                preserved += 1
+    return returned, preserved
+
+
+def _preserve_one_event(event_path: Path, preserve_dir: Path) -> bool:
+    """Move ONE unreturnable event under ``preserve_dir``, byte-for-byte (issue #124).
+
+    Rename-only, like every other event disposition (DATA-MODEL §1): the bytes are never rewritten,
+    so a preserved event is indistinguishable from the original an operator captured. Never raises —
+    it runs on the failure/recovery paths, where an exception would strand the events after it in
+    the disposal loop, turning a one-event problem into a whole-run one.
+    """
+    try:
+        preserve_dir.mkdir(parents=True, exist_ok=True)
+        dest = preserve_dir / event_path.name
+        if dest.exists():
+            # Already preserved under this run (a re-walked directory) — nothing to do, and
+            # clobbering would overwrite an immutable event.
+            return False
+        os.replace(event_path, dest)
+    except OSError:
+        return False
+    return True
 
 
 def _return_one_to_inbox(layout: RepoLayout, event_path: Path) -> bool:
@@ -1237,6 +1297,18 @@ def _return_one_to_inbox(layout: RepoLayout, event_path: Path) -> bool:
     The destination writer namespace is recovered from the event's immutable frontmatter
     (DATA-MODEL §1), so a returned event is re-claimed FIFO next run. An already-present inbox event
     (an idempotent duplicate) is never clobbered. Returns True iff the event moved.
+
+    A False return means the caller MUST preserve the event rather than let it be swept up by the
+    ``rmtree`` that clears the processing dir — see :func:`_return_events_to_inbox` and the no-loss
+    floor in :func:`_fail` (issue #124). This function never deletes, edits or truncates the source.
+
+    BOTH address components are validated, not just the writer. ``layout.inbox_item_path`` validates
+    ``writer`` (:func:`validate_writer`) but interpolates ``event_id`` verbatim, so a frontmatter
+    ``id: ../../../wiki/PWNED`` would resolve INSIDE the git-tracked read model that only the
+    curator may write (invariant 2). ``Inbox.write`` generates ids itself, so the normal write path
+    could never produce one — but ``_kb/failed/`` is operator-editable and becomes an INPUT the
+    moment ``agora requeue`` (#99) lands, so the guard is closed here, ahead of it, by reusing the
+    canonical :func:`~agora_kb.core.ids.is_valid_event_id` rather than inventing a second rule.
     """
     try:
         fm, _ = frontmatter.parse(event_path.read_text(encoding="utf-8"))
@@ -1246,11 +1318,22 @@ def _return_one_to_inbox(layout: RepoLayout, event_path: Path) -> bool:
     event_id = fm.get("id")
     if not isinstance(writer, str) or not isinstance(event_id, str):
         return False
-    dest = layout.inbox_item_path(writer, event_id)
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    if dest.exists():
+    if not is_valid_event_id(event_id):
         return False
-    os.replace(event_path, dest)
+    try:
+        dest = layout.inbox_item_path(writer, event_id)
+    except InvalidWriterError:
+        # An unaddressable writer is a refusal, NOT a crash: this runs on the failure/recovery
+        # paths, where raising would abort the disposal loop and strand every remaining event.
+        return False
+    if dest.exists():
+        # Checked BEFORE mkdir so a refusal leaves the filesystem untouched.
+        return False
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.replace(event_path, dest)
+    except OSError:
+        return False
     return True
 
 
