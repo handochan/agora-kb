@@ -55,7 +55,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from agora_kb.config import load_backend_registry, load_repo_config
-from agora_kb.core import Inbox, Repo, StateStore, Wiki
+from agora_kb.core import Inbox, Repo, StateStore, Wiki, failed_event_count
 from agora_kb.curator.constants import DEFAULT_BODY_BYTE_BOUND
 from agora_kb.curator.subprocess_backend import (
     RoutedBackend,
@@ -803,18 +803,15 @@ class AgoraHandlers:
         return entries[:limit]
 
     def _failed_count(self) -> int:
-        """Number of terminal-failure events under ``_kb/failed/`` (0 if the dir is absent).
+        """The ``_kb/failed/`` event count behind ``kb_status.failed`` — see
+        :func:`agora_kb.core.failed_event_count`.
 
-        The worker writes terminal failures NESTED at ``failed/<date>/<run-id>/<event>.md`` (with
-        an ``error.json`` retry record alongside, ``worker._fail``), NOT as direct children of
-        ``failed/`` — so this RECURSIVELY globs ``*.md`` to count the real on-disk layout. Events
-        are the only ``.md`` under ``failed/`` (the retry record is ``error.json``), so the count
-        tracks terminally-failed events exactly.
+        A one-line delegate since #96 crit 8: the CLI's ``agora status`` prints the SAME number as
+        ``failed_events``, and the two must agree BY CONSTRUCTION rather than by two copies of the
+        same recursive glob drifting apart. The count itself is byte-identical to what this method
+        computed inline before the promotion.
         """
-        failed_dir = self._repo.layout.failed_dir
-        if not failed_dir.is_dir():
-            return 0
-        return sum(1 for _ in failed_dir.rglob("*.md"))
+        return failed_event_count(self._repo.layout)
 
     def _processed_today_count(self) -> int:
         """Number of items consolidated today under ``_kb/processed/<today-UTC>/`` (0 if absent).
@@ -888,6 +885,20 @@ class AgoraHandlers:
             # prose, the bodies are placeholders" (#115). An agent reading only ``status`` would
             # otherwise be told the consolidation succeeded while every new note is empty.
             "warnings": report.warnings,
+            # #96: the fatal counterpart to ``warnings``. An agent that sees ``status: "failed"``
+            # and nothing else is in exactly the position the human operator was in — it now gets
+            # the bounded reason echo plus the repo-relative path to the lossless record.
+            "failure": (
+                None
+                if report.failure is None
+                else {
+                    "run_id": report.failure.run_id,
+                    "phase": report.failure.phase,
+                    "reasons": list(report.failure.reasons),
+                    "record_path": report.failure.record_path,
+                    "cas_conflict": report.failure.cas_conflict,
+                }
+            ),
             "recovered": recovered,
         }
 

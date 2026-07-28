@@ -1624,6 +1624,99 @@ def test_arg_parser_temperature_defaults_to_zero() -> None:
     assert ob._build_arg_parser().parse_args(["--temperature", "0.7"]).temperature == 0.7
 
 
+# --- parse_shim_args: the shim's own parser, reused by `agora doctor` (#96) ---------------------
+
+
+def test_parse_shim_args_reads_model_and_host() -> None:
+    ns = ob.parse_shim_args(["--model", "m:1b", "--host", "http://h:1"])
+    assert ns is not None
+    assert (ns.model, ns.host) == ("m:1b", "http://h:1")
+
+
+def test_parse_shim_args_ignores_unknown_arguments() -> None:
+    # parse_KNOWN_args: an operator's extra flag (or a future one) must not make the whole argv
+    # unreadable to doctor — the fields doctor asks about are still authoritative.
+    ns = ob.parse_shim_args(["--model", "m:1b", "--not-a-flag", "x"])
+    assert ns is not None
+    assert ns.model == "m:1b"
+
+
+def test_parse_shim_args_returns_none_on_a_malformed_flag(capsys) -> None:
+    # argparse EXITS (SystemExit, a BaseException) and writes usage to stderr; both are contained
+    # here so a typo'd adapters.yaml argv cannot inject bytes into a caller's report.
+    assert ob.parse_shim_args(["--model"]) is None
+    assert capsys.readouterr() == ("", "")
+
+
+def test_parse_shim_args_returns_none_on_help_and_prints_nothing(capsys) -> None:
+    # `-h` is the nastier leak: argparse prints a full help screen to STDOUT and exits 0.
+    assert ob.parse_shim_args(["-h"]) is None
+    assert capsys.readouterr() == ("", "")
+
+
+def test_parse_shim_args_host_default_follows_the_env(monkeypatch) -> None:
+    # The parser is built INSIDE the call, so the env-derived host default is the RUN's, not one
+    # frozen at import time — doctor must report the host a run would actually contact.
+    monkeypatch.setenv("AGORA_OLLAMA_HOST", "http://env-host:9")
+    ns = ob.parse_shim_args([])
+    assert ns is not None
+    assert ns.host == "http://env-host:9"
+
+
+def test_console_script_name_matches_pyproject() -> None:
+    """`agora doctor` identifies this shim by CONSOLE_SCRIPT, so it must be the installed name."""
+    import tomllib
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    doc = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
+    assert doc["project"]["scripts"][ob.CONSOLE_SCRIPT] == "agora_kb.adapters.ollama_brain:main"
+
+
+# --- list_ollama_models timeout (the doctor probe must not hang, #96 crit 5) --------------------
+
+
+class _FakeTagsResponse:
+    """Minimal urlopen() context manager returning one canned /api/tags payload."""
+
+    def __init__(self, payload: bytes) -> None:
+        self._payload = payload
+
+    def __enter__(self) -> _FakeTagsResponse:
+        return self
+
+    def __exit__(self, *exc: object) -> bool:
+        return False
+
+    def read(self) -> bytes:
+        return self._payload
+
+
+def _recording_urlopen(seen: dict):  # type: ignore[no-untyped-def]
+    def urlopen(url, timeout=None):  # type: ignore[no-untyped-def]
+        seen["url"] = url
+        seen["timeout"] = timeout
+        return _FakeTagsResponse(b'{"models": [{"name": "qwen3:8b"}]}')
+
+    return urlopen
+
+
+def test_list_ollama_models_default_timeout_is_ten(monkeypatch) -> None:
+    # The RUNTIME caller passes no timeout, so the curate path must be byte-identical to pre-#96.
+    seen: dict = {}
+    monkeypatch.setattr(ob.urllib.request, "urlopen", _recording_urlopen(seen))
+    assert ob.list_ollama_models("http://h:1") == ["qwen3:8b"]
+    assert seen["timeout"] == 10.0
+    assert seen["url"] == "http://h:1/api/tags"
+
+
+def test_list_ollama_models_honors_an_explicit_timeout(monkeypatch) -> None:
+    seen: dict = {}
+    monkeypatch.setattr(ob.urllib.request, "urlopen", _recording_urlopen(seen))
+    assert ob.list_ollama_models("http://h:1", timeout=3.0) == ["qwen3:8b"]
+    assert seen["timeout"] == 3.0
+
+
 def test_debug_dump_noop_when_env_unset(monkeypatch, tmp_path) -> None:
     monkeypatch.delenv(ob._DEBUG_ENV, raising=False)
     # Must not raise and must not create any file.

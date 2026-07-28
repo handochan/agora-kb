@@ -351,6 +351,17 @@ repo `kind`가 **미선언이면 team으로 취급**되므로, personal 소스(�
    → 검증: `uv run agora doctor --repo /path/team-kb` (init 상태·git 라인 정상)
 2. **§1 종합 예시로 `_kb/repo.yaml` 구성** (kind/backup/curator.limits/web)
    → 검증: `uv run agora doctor --repo /path/team-kb` 가 ConfigError 없이 backup 라인 표시
+
+   > **#96 이후 `agora doctor`는 브레인까지 판정에 포함한다.** 설정된 백엔드의 `argv[0]`이
+   > PATH에 있고 실행 가능한지, `agora-ollama-brain`이라면 데몬이 `/api/tags`에 응답하는지까지
+   > 확인해서, 쓸 수 없으면 `status: unhealthy` + **exit 1**이다(큐레이션이 불가능한 노드가
+   > healthy로 보이면 안 되므로 의도된 동작). 따라서 **브레인이 없는 노드에서는 doctor 게이트가
+   > 실패한다** — 브레인을 고치거나(doctor가 PATH에 이미 있는 헤드리스 CLI 에이전트를
+   > `agora-cli-brain`으로 붙이는 복붙 가능한 블록을 출력한다, ADR-0016; Ollama는 더 무거운
+   > 대안으로 함께 안내), 브레인이 없는 것이 정상인 노드(웹 전용·CI·큐레이션을 다른 곳에서
+   > 하는 허브)에서는 `uv run agora doctor --repo /path/team-kb --skip-probe`로 검증한다.
+   > `--skip-probe`는 브레인 도달성만 판정에서 제외하며 나머지 검사는 그대로다. 이 허브 문서의
+   > 다른 `agora doctor` 검증 단계도 같은 규칙을 따른다.
 3. **상시 구동 유닛 설치** (watch·web·harvest — [`deploy/README.md`](../deploy/README.md) 절차)
    → 검증: `curl -s http://127.0.0.1:8000/api/status` 응답 + 유닛 상태
    (`launchctl print` / `systemctl --user status`) + 재부팅 후 재확인

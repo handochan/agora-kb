@@ -64,7 +64,7 @@ from ..core.ids import new_event_id
 from ..core.inbox import Inbox
 from ..core.layout import RepoLayout
 from ..core.repo import GitError, Repo
-from ..core.state import CuratorState, LastBatch, StateStore
+from ..core.state import CuratorState, LastBatch, LastFailure, StateStore
 from ..schema.emit import Taxonomy
 from ..schema.lint import lint
 from ..schema.notes import Note, parse_all_notes
@@ -86,7 +86,7 @@ from .constants import (
     SCRATCH_DIRNAME,
     is_allowlisted_path,
 )
-from .manifest import RunManifest, list_processing, write_manifest
+from .manifest import Phase, RunManifest, list_processing, write_manifest
 from .plan import Disposition, Plan, PlanParseError, validate_plan
 from .subprocess_backend import BackendUnavailableError
 
@@ -98,6 +98,7 @@ __all__ = [
     "Backend",
     "FakeBackend",
     "HarvestCursorDelta",
+    "RunFailure",
     "RunReport",
     "compute_harvest_cursor_deltas",
     "run",
@@ -311,6 +312,77 @@ def _replace_sentinel_region(text: str, candidate_id: str, prose: str) -> str:
 
 
 @dataclass(frozen=True)
+class RunFailure:
+    """WHY a ``failed`` run failed — the fatal counterpart to :attr:`RunReport.warnings` (#96).
+
+    Companion, not replacement: ``warnings`` (#115) carries NON-FATAL diagnostics — normally those
+    of a run that STILL published, and since #96 also those of a failed run whose own observability
+    write failed; this carries the FATAL cause of a run that published nothing. Both ride the
+    SAME :class:`RunReport` and are rendered by the SAME single face-side printer
+    (``cli._print_run_diagnostics``), so no face can render one and forget the other.
+
+    ``record_path`` is the repo-RELATIVE, POSIX-separated path of the
+    ``_kb/failed/<date>/<run-id>/error.json`` :func:`_fail` just wrote — the durable, LOSSLESS
+    record (every ``failed_checks`` entry, the event ids, the base commit). Relative because the
+    same string is persisted in ``state.json`` (:class:`~agora_kb.core.state.LastFailure`), which
+    must survive a repo move and must not leak the host layout into a repo-scoped file
+    (invariant 5). ``None`` on the ONE path that writes no record: a CAS conflict, where the events
+    are valid, return to ``inbox/``, and never burn the §5.1 retry budget.
+
+    ``reasons`` is a BOUNDED echo of that record's ``failed_checks`` (:func:`_bounded_reasons`),
+    never the source of truth.
+    """
+
+    run_id: str
+    phase: Phase
+    reasons: tuple[str, ...] = ()
+    record_path: str | None = None
+    cas_conflict: bool = False
+
+    def summary(self, *, limit: int = 3, width: int = 140) -> str:
+        """One-line ``failed_checks`` rendering: first ``limit`` checks, then ``… +N more``.
+
+        Lives HERE, not in a face, so ``agora curate``, the ``agora watch`` tick and any future
+        surface emit the SAME bytes for the same failure — re-implementing the elision per face is
+        precisely the scatter #115 removed. The full list is behind :attr:`record_path`.
+        """
+        if not self.reasons:
+            return "-"
+        shown = [r if len(r) <= width else r[:width].rstrip() + "…" for r in self.reasons[:limit]]
+        extra = len(self.reasons) - len(shown)
+        if extra > 0:
+            shown.append(f"… +{extra} more")
+        return " | ".join(shown)
+
+
+# The RunReport's reasons echo is BOUNDED. A ``PLAN-BACKEND`` reason embeds the brain's raw stderr
+# VERBATIM (SubprocessBackend.plan applies NO cap — unlike PASS-2's ``_FAILURE_DETAIL_CHARS``),
+# which is routinely a multi-kilobyte traceback. Every consumer renders this list — an operator's
+# terminal, an agent's kb_curate context window, and `_kb/state.json` via LastFailure — so the bound
+# lives HERE, ONCE, at construction. The un-truncated text always stays in error.json. This is the
+# ONLY truncator of the STORED/echoed reason text in the curator layer; `LastFailure` caps the LIST
+# LENGTH but never re-clips a string (one rule, no double-truncation, and `reasons_total` therefore
+# cannot lie). `RunFailure.summary` elides too, but at DISPLAY time only — it renders this already-
+# bounded echo onto one terminal line and feeds no persisted field.
+_REASON_CHARS = 400
+
+
+def _bounded_reasons(reasons: list[str]) -> tuple[str, ...]:
+    """Flatten each reason to ONE line and cap it at :data:`_REASON_CHARS` for the report echo.
+
+    Whitespace-COLLAPSED, not first-line-truncated: for a brain traceback the first line
+    (``Traceback (most recent call last):``) is the least informative one, so dropping the tail is
+    strictly worse than flattening it. Entry COUNT is preserved (only each string is clipped), so
+    ``len(result) == len(reasons)`` always.
+    """
+    out: list[str] = []
+    for reason in reasons:
+        flat = " ".join(str(reason).split())
+        out.append(flat if len(flat) <= _REASON_CHARS else flat[:_REASON_CHARS].rstrip() + "…")
+    return tuple(out)
+
+
+@dataclass(frozen=True)
 class RunReport:
     """The outcome of one :func:`run` (or a single :func:`recover` step).
 
@@ -331,7 +403,16 @@ class RunReport:
     A PASS-2 that authors nothing publishes structurally-valid notes with placeholder bodies by
     design (§4.2 degrade) — but reporting that as an unqualified success is how a Linux operator
     accumulated an entire KB of empty bodies without a single error line. The faces print these;
-    they never change the terminal ``status``."""
+    they never change the terminal ``status``.
+
+    Since #96 a ``failed`` report may carry these too — but only for the failure of an
+    OBSERVABILITY write (:func:`_fail`'s ``state.json`` save), which must never turn a FAILED run
+    into a CRASHED one. The invariant is unchanged: an entry here is always survivable."""
+    failure: RunFailure | None = None
+    """The fatal cause of a ``failed`` run — ``None`` for published/noop/recovered (#96).
+
+    ``status`` says a run failed; this says WHY and WHERE the durable record is. Set ONLY by
+    :func:`_fail`, so every ``status == "failed"`` report carries one and no other status does."""
 
 
 def run(
@@ -435,6 +516,21 @@ def _run_locked(
     )
     if manifest is None:
         return RunReport(run_id=run_id, status="noop", counts={"claimed": 0})
+
+    # #96: this run has CLAIMED work, so the curator has ATTEMPTED a consolidation — record it NOW,
+    # before the first thing that can fail. ONE stamp for all outcomes (publish, _fail, and an
+    # UNCAUGHT crash such as the strict parse_all_notes below) rather than one per terminus, so
+    # `last_attempt` can never be older than `last_run` and a crash-shaped run is still honest.
+    # `state` is byte-equal to disk here (loaded above; `claim` is read-only w.r.t. it), and the
+    # publish path re-loads before its own save, so this early save is neither premature nor
+    # clobbered. NOT stamped on a noop — an idle `agora watch` tick must not rewrite state.json
+    # 1440x/day, and "last time the curator polled" is not the fact an operator needs.
+    #
+    # DELIBERATELY UNGUARDED: `claim()` has already moved events into `processing/` and written a
+    # manifest immediately before this, so the filesystem is proven writable at this instant; an
+    # OSError here is the same class as one from `write_manifest`, which already propagates today.
+    state.last_attempt = now
+    state_store.save(state)
 
     # ADR-0011 §1 / §5 tier-2: build the read-only bundle (candidates + provenance + related/).
     bundle = build_bundle(layout, repo, manifest, related_k=related_k)
@@ -550,7 +646,14 @@ def _run_locked(
         # rows applied|*|no): the dropped worktree took plan.json with it, so re-PLAN is the safe
         # default. Do NOT "optimize" this into a partial PASS-2 resume — that would risk a partial
         # publish. The candidate sha is recorded in a SECOND advance just before the CAS (below).
-        _advance(layout, manifest, phase="applied", prose_complete=False)
+        # REBOUND (#96): _advance returns the advanced COPY (RunManifest is frozen), and discarding
+        # it pinned the in-memory ``manifest.phase`` at the constant ``claimed`` for every
+        # downstream reader — including _fail's ``error.json`` ``"phase"`` and RunFailure.phase, so
+        # a LINT/AUTHOR/CAS failure has been mis-reporting ``claimed`` since that field was written.
+        # Rebinding makes the phase truthful: ``claimed`` = failed BEFORE apply, ``applied`` =
+        # failed after. Nothing else reads the rebound value (run_id/base_commit/event_ids are
+        # preserved by model_copy), and the on-disk manifest is byte-identical either way.
+        manifest = _advance(layout, manifest, phase="applied", prose_complete=False)
 
         # PASS 2 — DELEGATED: author prose between the candidate-id sentinels, then validate the
         # diff. The §8.2 context grounds each region in its candidate's verbatim source + op; it is
@@ -688,7 +791,9 @@ def _run_locked(
         # recorded sha, checks repo.is_published, and FINALIZES instead of re-running PASS 1 and
         # double-publishing (ADR-0011 §9 "git ref already advanced" row). commit_worktree only moved
         # the detached HEAD, so recording the sha pre-CAS is safe even if the CAS then loses.
-        _advance(
+        # REBOUND for the same #96 reason as the first advance above: a CAS conflict must report
+        # ``phase=applied``, not the claim-time constant.
+        manifest = _advance(
             layout,
             manifest,
             phase="applied",
@@ -984,7 +1089,21 @@ def _fail(
     if cas_conflict:
         returned = _return_events_to_inbox(layout, events_dir)
         shutil.rmtree(layout.processing_dir / run_id, ignore_errors=True)
-        return RunReport(run_id=run_id, status="failed", counts={"retried": returned})
+        # BYTE-IDENTICAL to pre-#96 apart from the additive `failure`: a CAS conflict writes NO
+        # error record and NO `last_failure` (no budget burned, nothing an operator must fix), and
+        # `last_attempt` was already stamped at claim time.
+        return RunReport(
+            run_id=run_id,
+            status="failed",
+            counts={"retried": returned},
+            failure=RunFailure(
+                run_id=run_id,
+                phase=manifest.phase,
+                reasons=_bounded_reasons(reasons),
+                record_path=None,  # this path writes NO error record — see the docstring
+                cas_conflict=True,
+            ),
+        )
 
     # Prior attempt count per event = number of retained failed/ error records already referencing
     # it (§5.1). THIS run is one more attempt, so attempt N = prior + 1. We ALWAYS write this run's
@@ -994,6 +1113,13 @@ def _fail(
 
     failed_dir = layout.failed_dir / run_date / run_id
     failed_dir.mkdir(parents=True, exist_ok=True)
+    error_path = failed_dir / "error.json"
+    # #96: repo-RELATIVE, POSIX-separated. THE canonical string — the same value goes to
+    # RunFailure.record_path AND CuratorState.last_failure.record_path, so they cannot drift.
+    # Derived from layout, never hardcoded; layout.root is `.absolute()` so relative_to() is total.
+    record_path = error_path.relative_to(layout.root).as_posix()
+    # The record receives the RAW, un-truncated reasons: error.json is the LOSSLESS source of truth
+    # the bounded report echo points AT (the `…` clipping happens only in _bounded_reasons below).
     error_record = {
         "run_id": run_id,
         "base_commit": manifest.base_commit,
@@ -1001,7 +1127,7 @@ def _fail(
         "phase": manifest.phase,
         "failed_checks": reasons,
     }
-    (failed_dir / "error.json").write_text(
+    error_path.write_text(
         json.dumps(error_record, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
     )
 
@@ -1022,15 +1148,52 @@ def _fail(
                 os.replace(event_path, failed_dir / event_path.name)
                 failed += 1
 
-    # Record terminal failures in the cumulative counters (retries are not failures yet, §5.1).
-    if failed:
+    bounded = _bounded_reasons(reasons)
+
+    # #96: record the failure in ONE atomic state save, ALWAYS — not only at budget exhaustion.
+    # Non-terminal failures are the blind spot: the event returns to inbox/ (depth unchanged),
+    # mark_run never fires (last_run stays `never`, and it MUST — that is "last successful publish",
+    # explicitly out of scope), and counters.failed is untouched. `last_failure` is the only
+    # surviving signal. ONE save, so counters.failed and last_failure can never disagree about the
+    # same run. The load cannot raise on a corrupt state.json: _run_locked already loaded it before
+    # the claim, so a corrupt file fails the run before any _fail site is reachable.
+    #
+    # OSError-CONTAINED on purpose: before #96 _fail touched state only when `failed > 0`, so an
+    # unconditional save would turn a clean `status: failed` RunReport into an UNCAUGHT traceback
+    # out of run() (for `agora curate` AND MCP `kb_curate`) on a full/read-only disk. An
+    # observability write must never convert a FAILED run into a CRASHED one — so the write's own
+    # failure rides the #115 warnings channel instead.
+    state_warnings: list[str] = []
+    try:
         state = state_store.load()
-        state.counters.failed += failed
+        state.last_failure = LastFailure.from_run_failure(
+            when=now,
+            run_id=run_id,
+            phase=manifest.phase,
+            reasons=bounded,
+            record_path=record_path,
+        )
+        if failed:
+            # Terminal failures only (retries are not failures yet, §5.1) — semantics UNCHANGED.
+            state.counters.failed += failed
         state_store.save(state)
+    except OSError as exc:
+        state_warnings.append(f"could not record this failure in _kb/state.json: {exc}")
 
     # Remove the run's processing dir (manifest + bundle); events now live under inbox/ or failed/.
     shutil.rmtree(layout.processing_dir / run_id, ignore_errors=True)
-    return RunReport(run_id=run_id, status="failed", counts={"retried": retried, "failed": failed})
+    return RunReport(
+        run_id=run_id,
+        status="failed",
+        counts={"retried": retried, "failed": failed},
+        warnings=state_warnings,
+        failure=RunFailure(
+            run_id=run_id,
+            phase=manifest.phase,
+            reasons=bounded,
+            record_path=record_path,
+        ),
+    )
 
 
 def _event_attempt_counts(layout: RepoLayout) -> dict[str, int]:

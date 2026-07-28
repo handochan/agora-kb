@@ -32,15 +32,20 @@ from __future__ import annotations
 import argparse
 import importlib
 import json
+import os
 import shutil
 import sys
 import tempfile
 import time
+import traceback
 from datetime import UTC, datetime
 from pathlib import Path
 
+from pydantic import ValidationError
+
 from .config import (
     ConfigError,
+    RepoConfig,
     load_backend_registry,
     load_backup_policy,
     load_connector_specs,
@@ -51,13 +56,20 @@ from .config import (
     write_default_adapters_yaml,
     write_default_repo_config,
 )
-from .core import Inbox, Repo, RepoLayout, StateStore, atomic_write_text
+from .core import Inbox, Repo, RepoLayout, StateStore, atomic_write_text, failed_event_count
 from .core.repo import GitError
+from .core.state import CuratorState
 from .curator import evaluate
+from .curator.backends import _WORKTREE_TOKEN, BackendRegistry
 from .curator.constants import DEFAULT_BODY_BYTE_BOUND
 from .curator.cron import is_cron_due
 from .curator.isolation import SandboxUnavailable, select_backend_isolation
-from .curator.subprocess_backend import RoutedBackend, SubprocessBackend, build_routed_backend
+from .curator.subprocess_backend import (
+    RoutedBackend,
+    SubprocessBackend,
+    build_routed_backend,
+    resolve_program_on_path,
+)
 from .curator.worker import RunReport, recover, run
 from .schema import Taxonomy, emit_schema, lint
 
@@ -258,6 +270,12 @@ def build_parser() -> argparse.ArgumentParser:
     # doctor
     p_doctor = sub.add_parser("doctor", help="print a health report")
     p_doctor.add_argument("--repo", default=".", help="repo root to check (default: .)")
+    p_doctor.add_argument(
+        "--skip-probe",
+        action="store_true",
+        help="skip the brain-availability probe (no daemon or PATH lookups; the health "
+        "verdict then ignores brain reachability)",
+    )
     p_doctor.set_defaults(func=_cmd_doctor)
 
     return parser
@@ -403,7 +421,26 @@ def _cmd_import(args: argparse.Namespace) -> int:
 def _cmd_status(args: argparse.Namespace) -> int:
     layout = RepoLayout(Path(args.repo))
     depth = Inbox(layout).depth()
-    state = StateStore(layout).load()
+    try:
+        state = StateStore(layout).load()
+    except (ValidationError, OSError, ValueError) as exc:
+        # StateStore.load RAISES on a corrupt/invalid file BY DESIGN — it never silently discards
+        # published_runs/event_keys. `agora status` is the command an operator reaches for when
+        # "nothing is happening", so it must REPORT that, not traceback. rc is unchanged (an
+        # uncaught exception already exits 1); only the traceback is removed (#96/#97).
+        #
+        # ALL THREE classes, because `load` reads before it validates: invalid JSON/schema raises
+        # ValidationError, a non-UTF-8 (truncated / half-written / FS-corrupted) file raises
+        # UnicodeDecodeError, and an unreadable one raises OSError. Catching only the first would
+        # leave `agora status` tracebacking on the same corruption that `agora doctor` and
+        # `agora watch` both report cleanly.
+        print(f"repo: {layout.root}")
+        print(f"inbox depth: {depth}")
+        print(
+            f"{_PROG} status: _kb/state.json is unreadable — {_one_line(str(exc), 200)}",
+            file=sys.stderr,
+        )
+        return 1
     c = state.counters
     print(f"repo: {layout.root}")
     print(f"inbox depth: {depth}")
@@ -412,7 +449,31 @@ def _cmd_status(args: argparse.Namespace) -> int:
     print(
         f"counters: ingested={c.ingested} merged={c.merged} dropped={c.dropped} failed={c.failed}"
     )
+    # #96: the failure surface. `last_run` is "last successful PUBLISH", so a repo whose curator
+    # fails every run shows `never` forever — these three lines are the only place a non-terminal
+    # failure (which returns its events to inbox/ and burns no counter) is visible from the CLI.
+    print(f"last_attempt: {_fmt_dt(state.last_attempt)}")
+    print(f"last_failure: {_fmt_last_failure(state)}")
+    print(f"failed_events: {failed_event_count(layout)}")
     return 0
+
+
+def _fmt_last_failure(state: CuratorState) -> str:
+    """One line for the last curator failure, or ``none`` (#96).
+
+    The VERDICT WORD comes FIRST so `agora status | grep UNRESOLVED` works and the operator can
+    tell "currently broken" from "already superseded by a later successful run" at a glance. The
+    reason is already whitespace-collapsed and length-capped upstream, so this stays ONE line.
+    """
+    lf = state.last_failure
+    if lf is None:
+        return "none"
+    verdict = "UNRESOLVED" if state.failure_is_current else "superseded"
+    first = lf.reasons[0] if lf.reasons else "-"
+    return (
+        f"{verdict} {_fmt_dt(lf.when)} run={lf.run_id} phase={lf.phase} "
+        f"reasons={lf.reasons_total} record={lf.record_path} first={first}"
+    )
 
 
 def _cmd_curate(args: argparse.Namespace) -> int:
@@ -425,6 +486,14 @@ def _cmd_curate(args: argparse.Namespace) -> int:
     is the worker's (the backend is outside the boundary), so this prints the resulting RunReport
     (status / published commit / per-op counts). A missing/absent ``adapters.yaml`` is a clear
     error, not a crash.
+
+    EXIT CODE: a ``status: failed`` run still returns **0** — deliberately, do not "fix" it (#96).
+    ``failed`` is not a synonym for "something is wrong": a CAS conflict and a within-budget retry
+    both leave the events valid and back in ``inbox/``, i.e. normal self-healing operation. Making
+    those non-zero would fire cron mail on every benign retry and trip ``Restart=on-failure`` on a
+    supervising unit — manufacturing exactly the crash loop #97 removes. The setup failures that
+    ARE the operator's problem (no/unknown backend) already return 1 above; the CAUSE of a failed
+    run is now on stdout via :func:`_print_run_diagnostics`.
     """
     repo = Repo.resolve(args.repo)
     layout = repo.layout
@@ -487,17 +556,35 @@ def _cmd_curate(args: argparse.Namespace) -> int:
     print(f"status: {report.status}")
     print(f"published_commit: {report.published_commit or '-'}")
     print(f"counts: {counts}")
-    _print_run_warnings(report)
+    _print_run_diagnostics(report)
     return 0
 
 
-def _print_run_warnings(report: RunReport) -> None:
-    """Print a published run's non-fatal diagnostics to STDERR (issue #115).
+def _print_run_diagnostics(report: RunReport, *, prefix: str = "") -> None:
+    """Render ONE run's operator-facing diagnostics — the single #115 channel, extended by #96.
 
-    A run that publishes placeholder bodies is still ``status: published`` by design (§4.2), so the
-    ONLY thing standing between an operator and a silently-empty KB is this line. STDERR keeps the
-    machine-readable ``status:``/``counts:`` stdout contract byte-identical.
+    Two message classes, two streams, ONE call per face, so no face can render one and forget the
+    other:
+
+    * a FATAL cause (``report.failure``) → STDOUT, in the same ``key: value`` grammar as the
+      ``status:``/``published_commit:``/``counts:`` lines it follows. Exactly two deterministic
+      lines: WHERE the durable record is (repo-relative), and the head of WHAT it says. This
+      EXTENDS the machine-readable stdout summary rather than breaking it — ``status: failed`` was
+      already there; the missing piece was any way to get from that verdict to the cause (#96
+      criterion 6, which names stdout explicitly).
+    * NON-FATAL diagnostics (``report.warnings``) → STDERR, byte-identical to #115: free-form,
+      unbounded-count prose that must never sit inside the machine-readable stdout summary. A run
+      that publishes placeholder bodies is still ``status: published`` by design (§4.2), so this
+      line is the only thing between an operator and a silently-empty KB.
+
+    ``prefix`` stamps the stdout lines for the ``agora watch`` tick, whose whole log obeys a
+    ``{stamp} <verb>:`` grammar so ``journalctl -u agora-watch`` reads as ONE stream. The stderr
+    ``warning:`` lines are deliberately NOT prefixed: their bytes are the #115 contract and are
+    already test-locked, and prefixing them would buy nothing on a stream that carries no timeline.
     """
+    if report.failure is not None:
+        print(f"{prefix}failed_record: {report.failure.record_path or '-'}")
+        print(f"{prefix}failed_checks: {report.failure.summary()}")
     for warning in report.warnings:
         print(f"warning: {warning}", file=sys.stderr)
 
@@ -768,23 +855,145 @@ def _cmd_watch(args: argparse.Namespace) -> int:
     — system cron / launchd — owns the cadence); otherwise it loops every ``--interval`` seconds
     until interrupted (Ctrl-C exits cleanly). This is the OSS-pure scheduler: no daemon framework,
     just a loop over the deterministic trigger policy.
+
+    A tick that RAISES no longer kills the scheduler (issue #97): it is reported on stderr as one
+    bounded line and the loop backs off exponentially instead of exiting into a supervisor's
+    restart policy. ``--once`` keeps the single-shot contract — it reports the same line and
+    returns 1, so an external scheduler still sees the failure in the exit code.
     """
     repo = Repo.resolve(args.repo)
     interval = max(1, args.interval)
+    # Python block-buffers stdout whenever it is not a TTY, and BOTH shipped units capture it to a
+    # file/journal (deploy/systemd/agora-watch.service, deploy/launchd/com.agora.watch.plist) — so
+    # by default an operator running `journalctl -u agora-watch` sees NOTHING until 8 KB of tick
+    # lines accumulate, which at one short line per minute is hours. Every stdout line this loop
+    # emits is a timeline event that is worthless late: the `idle:`/`ran (…)` log and, since #96,
+    # the `failed_record:`/`failed_checks:` pair. stderr is already line-buffered, which is why the
+    # #115 `warning:` lines and #97's `tick failed:` line were the only ones that ever showed up.
+    # Line-buffering ONLY here: `agora watch` is the one long-running command — every other command
+    # exits promptly and flushes on exit, so this stays a daemon concern, not a global one.
+    sys.stdout.reconfigure(line_buffering=True)
     mode = " [once]" if args.once else f" (interval={interval}s)"
     print(f"agora watch: {repo.layout.root}{mode}")
+    failures = 0
     try:
         while True:
-            _watch_tick(repo)
-            if args.once:
-                break
-            time.sleep(interval)
-    except KeyboardInterrupt:  # pragma: no cover - interactive stop
+            try:
+                productive = _watch_tick(repo)
+            except Exception as exc:  # noqa: BLE001 — one bad tick must never kill the scheduler
+                # Issue #97: a DETERMINISTIC per-tick raise (a corrupt state.json — StateStore.load
+                # is fail-loud by design; a repo.yaml typo — load_repo_config raises ConfigError)
+                # would otherwise exit non-zero into `Restart=on-failure`/`RestartSec=10`
+                # (deploy/systemd/agora-watch.service) or launchd `KeepAlive`
+                # (deploy/launchd/com.agora.watch.plist), turning a 60s scheduler into a 10s crash
+                # loop that never fixes the YAML. Report once, back off, stay alive.
+                _print_tick_failure(exc)
+                if args.once:
+                    return 1
+                failures += 1
+            else:
+                if args.once:
+                    break
+                # A tick that could not build a backend did NOT raise — `_build_backend` catches the
+                # ConfigError, prints it, and returns None — so without this it counted as success
+                # and RESET the backoff. Reproduced: a malformed `adapters.yaml` at `--interval 1`
+                # emitted 18 multi-line parse errors in 8 seconds, forever, with zero `tick failed:`
+                # lines. That is #97's own disease (one typo amplified into a log flood) wearing a
+                # different hat, so it gets #97's own cure. It is NOT reported as a failed tick —
+                # the tick already printed its own `due (…) but no usable backend` line, and calling
+                # it a raise would be a lie — it only feeds the backoff.
+                failures = 0 if productive else failures + 1
+            # OUTSIDE the guard on purpose: a FAILED tick must still sleep. Sleeping only in the
+            # `else` branch would busy-spin at 100% CPU on a permanent failure — strictly worse
+            # than the crash loop this removes.
+            _watch_sleep(_watch_backoff_delay(interval, failures))
+    except KeyboardInterrupt:
+        # NOT re-raised from the inner guard: `KeyboardInterrupt` is a `BaseException`, so the
+        # `except Exception` above provably cannot see it. Ctrl-C during a tick OR during a sleep
+        # lands here, exactly as before #97.
         print("agora watch: stopped")
     return 0
 
 
-def _watch_tick(repo: Repo) -> None:
+# Issue #97. How much of a tick exception rides on the ONE stderr line. Larger than
+# _doctor_backup's 140 because we COLLAPSE whitespace rather than truncate at the first newline
+# (see _one_line): the two exceptions that actually reach this path — pydantic's ValidationError
+# and a ConfigError wrapping a yaml.YAMLError — both put the diagnosis on LINE 2.
+_TICK_DETAIL_CHARS = 200
+
+# Opt-in traceback for bug reports. Same posture and naming family as AGORA_BRAIN_DEBUG
+# (adapters/ollama_brain.py) — a debug hook, NOT a supported CLI surface: the one-line summary is
+# the operator's test-locked contract, whereas a traceback's content is a CPython/pydantic
+# implementation detail we must not promise. An env var also leaves `p_watch` untouched, which is
+# what keeps #97's "nothing else changes" criterion structural rather than a claim.
+_WATCH_TRACEBACK_ENV = "AGORA_WATCH_TRACEBACK"
+# Explicit falsey set (case-folded) rather than bare truthiness: `AGORA_WATCH_TRACEBACK=0` meaning
+# "on" is a footgun.
+_FALSEY = frozenset({"", "0", "false", "no", "off"})
+
+
+def _tick_failure_detail(exc: BaseException) -> str:
+    """One bounded single-line rendering of a tick exception: ``Type: message``."""
+    return f"{type(exc).__name__}: {_one_line(str(exc), _TICK_DETAIL_CHARS)}"
+
+
+def _print_tick_failure(exc: BaseException) -> None:
+    """Report ONE failed ``agora watch`` tick on STDERR — the #115 channel, extended (issue #97).
+
+    Same sink and same discipline as :func:`_print_run_diagnostics`' warnings half: one bounded
+    line, no traceback, stdout's machine-readable tick log untouched. It CANNOT ride on
+    ``RunReport.warnings`` — a tick that raises produces no ``RunReport`` at all, because the raise
+    routinely PRECEDES ``worker.run`` entirely (``load_repo_config`` is the tick's FIRST statement
+    and ``recover()`` its second).
+
+    The stamp is taken HERE, not from the tick: :func:`_watch_tick` computes its own stamp one line
+    AFTER the config load that is the most likely thing to raise, so on the failure path no tick
+    stamp exists. The loop owns this one, in the tick log's ``{stamp} <verb>:`` grammar so
+    `journalctl -u agora-watch` stays ONE stream.
+    """
+    print(f"{_fmt_dt(datetime.now(UTC))} tick failed: {_tick_failure_detail(exc)}", file=sys.stderr)
+    if os.environ.get(_WATCH_TRACEBACK_ENV, "").strip().lower() not in _FALSEY:
+        traceback.print_exception(exc, file=sys.stderr)
+
+
+# Issue #97. 15 minutes: at the 60s default this bounds a permanently-broken repo to ~96 stderr
+# lines/day (vs ~1440 unbounded, vs ~8640 under the RestartSec=10 crash loop this replaces), while
+# staying short enough that an operator who fixes repo.yaml sees recovery within one coffee.
+_WATCH_BACKOFF_CAP_S = 900
+
+# 2**n with unbounded n is a real hazard (Python ints are arbitrary-precision: a month-long broken
+# loop would allocate a multi-megabyte integer every tick). Clamp the SHIFT, not just the product.
+# 10 is provably sufficient: the smallest interval is 1 (`max(1, args.interval)`) and 1*2**10 =
+# 1024 > 900 = the cap, so no larger shift can ever change the result.
+_WATCH_BACKOFF_MAX_SHIFT = 10
+
+
+def _watch_backoff_delay(interval: int, consecutive_failures: int) -> int:
+    """Seconds to sleep before the next ``agora watch`` tick — PURE, no clock, no sleep (#97).
+
+    ``interval * 2**n`` capped, ``n`` = consecutive failed ticks so far (1-based on the FIRST
+    failure, per #97). ``n == 0`` (a clean tick) returns ``interval`` unchanged — that is what keeps
+    the happy path byte-identical AND lets the loop hold exactly ONE sleep expression.
+
+    The cap is ``max(interval, _WATCH_BACKOFF_CAP_S)``, never the bare constant: backoff must only
+    ever make the loop SLOWER. With ``--interval 3600`` a bare 900s cap would SPEED THE SCHEDULER UP
+    4x on failure — a change nobody asked for, and pointless besides (an hourly loop cannot flood).
+    """
+    shift = min(max(consecutive_failures, 0), _WATCH_BACKOFF_MAX_SHIFT)
+    return min(interval * (2**shift), max(interval, _WATCH_BACKOFF_CAP_S))
+
+
+def _watch_sleep(seconds: float) -> None:
+    """Indirection so the ``agora watch`` loop is drivable in tests (#97 criteria 1-3, 5).
+
+    ``time.sleep`` is called ONLY here; a test replaces this module attribute to record the schedule
+    and to terminate the loop deterministically. Same idiom as
+    ``monkeypatch.setattr(cli_mod, "run", …)`` in tests/test_cli.py.
+    """
+    time.sleep(seconds)
+
+
+def _watch_tick(repo: Repo) -> bool:
     """One scheduler iteration: recover, evaluate the triggers, and run ONE consolidation if due.
 
     Loads the repo config fresh, evaluates ``threshold``/``idle``/``cron`` (``cron_due`` derived
@@ -792,6 +1001,13 @@ def _watch_tick(repo: Repo) -> None:
     sandbox-confined backend and executes :func:`agora_kb.curator.worker.run`. Prints one concise,
     timestamped status line per tick (idle / ran / due-but-no-backend). The integrity verdict is the
     worker's; this only decides *when* to wake it.
+
+    Returns whether the tick was PRODUCTIVE — ``False`` only for the one non-raising dead end, a due
+    tick with no usable backend (issue #97). A `ConfigError` in ``adapters.yaml`` never reaches the
+    loop's guard because ``_build_backend`` catches and prints it, so that state would otherwise
+    repeat at the full interval forever with no backoff; the loop feeds this flag to
+    :func:`_watch_backoff_delay` instead. ``True`` for every other outcome INCLUDING ``idle:`` — an
+    idle tick is a correct decision on an empty queue, i.e. the steady state, not a degradation.
     """
     layout = repo.layout
     cfg = load_repo_config(layout)
@@ -814,7 +1030,7 @@ def _watch_tick(repo: Repo) -> None:
     )
     if not decision.should_run:
         print(f"{stamp} idle: depth={depth} reason={decision.reason}")
-        return
+        return True
 
     backend = _build_backend(
         layout,
@@ -825,7 +1041,7 @@ def _watch_tick(repo: Repo) -> None:
     )
     if backend is None:
         print(f"{stamp} due ({decision.reason}) but no usable backend — skipping this tick")
-        return
+        return False
 
     report = run(
         repo,
@@ -844,12 +1060,18 @@ def _watch_tick(repo: Repo) -> None:
         f"{stamp} ran ({decision.reason}): status={report.status} commit={commit} counts={counts}"
     )
     # An always-on watch loop is exactly where a silently prose-less run would accumulate unnoticed
-    # (#115) — the per-tick line above says "published" either way.
-    _print_run_warnings(report)
+    # (#115) — the per-tick line above says "published" either way. The #96 failure lines are
+    # STAMPED so they stay inside the tick log's `{stamp} <verb>:` grammar; the `warning:` lines
+    # keep their unprefixed #115 bytes.
+    _print_run_diagnostics(report, prefix=f"{stamp} ")
     # Issue #64: best-effort backup push, ONLY after a curation that actually published and ONLY
     # when backup.auto is opted in (default off → this call is side-effect-free, byte-identical).
     if report.status == "published":
         _auto_backup_push(repo, stamp=stamp)
+    # A run that FAILED is still a productive tick: the backend answered, the retry budget moved,
+    # and `_print_run_diagnostics` just pointed at the error record. Backoff is for the dead ends
+    # that repeat identically forever, not for work that is progressing badly.
+    return True
 
 
 def _cmd_serve(args: argparse.Namespace) -> int:
@@ -1064,6 +1286,18 @@ def _cmd_gold_missing(args: argparse.Namespace) -> int:
     return 2
 
 
+# agora doctor's brain probe budget (#96 criterion 5). Deliberately SHORTER than the shim's own 10s
+# runtime default: 10s is the right budget for a real curate run, 3s for a yes/no reachability
+# question an operator is waiting on. 3.0 (the top of #96's 2-3s band) because a loopback daemon
+# mid model-load can take >2s to answer /api/tags and a false UNREACHABLE is the expensive error.
+_BRAIN_PROBE_TIMEOUT_S = 3.0
+
+# Remediation hint reused across the probe's failure renderings. The example model mirrors the one
+# the shim's OWN no-models BrainError already names (ollama_brain.select_model). A HINT only — never
+# routing (invariant 6: the model used always comes from select_model / adapters.yaml).
+_OLLAMA_PULL_HINT = "ollama pull qwen3.6:35b-a3b"
+
+
 def _cmd_doctor(args: argparse.Namespace) -> int:
     ok = True
     print("agora doctor")
@@ -1101,11 +1335,24 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
     # assertions), rather than assume it. A sandbox that is present but does NOT actually confine is
     # a real health failure; a platform with no kernel sandbox is reported (fail-closed only bites a
     # network: none backend at curate time) without flagging the whole host unhealthy.
-    ok = _doctor_sandbox(load_repo_config(layout).allow_reduced_isolation) and ok
+    cfg = _doctor_repo_config(layout)
+
+    ok = _doctor_sandbox(cfg.allow_reduced_isolation) and ok
 
     # ADR-0015: observability — which brain runs each cognitive act (default or routed). Reporting
     # only; never affects the health verdict.
-    _doctor_routing(layout, load_repo_config(layout).default_backend)
+    registry, registry_error = _doctor_backend_registry(layout)
+    _doctor_routing(registry, registry_error, cfg.default_backend)
+
+    # Issue #96: is that brain actually ANSWERABLE? The first verdict contributor that asks the
+    # question a first-run failure actually turns on. Same AND-form and operand ORDER as
+    # _doctor_sandbox above — the probe must run even when `ok` is already False.
+    ok = (
+        _doctor_brains(
+            registry, cfg.default_backend, registry_error=registry_error, skip_probe=args.skip_probe
+        )
+        and ok
+    )
 
     # ADR-0007: observability — the harvester policy + configured connectors with cursor state.
     # Reporting only; never affects the health verdict and never crashes on malformed config.
@@ -1122,6 +1369,10 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
     # Issue #64: observability — push-only backup config + the last recorded push outcome.
     # Reporting only; never affects the health verdict and never crashes on malformed config.
     _doctor_backup(layout)
+
+    # Issue #96: observability — the failure backlog + the last attempt/failure the curator
+    # recorded. Reporting only; never affects the health verdict and never crashes.
+    _doctor_failures(layout)
 
     print(f"status: {'healthy' if ok else 'unhealthy'}")
     return 0 if ok else 1
@@ -1279,7 +1530,77 @@ def _doctor_backup(layout: RepoLayout) -> None:
     print(f"  backup: remote={policy.remote} auto={policy.auto} {last}")
 
 
-def _doctor_routing(layout: RepoLayout, default_backend: str | None = None) -> None:
+def _doctor_failures(layout: RepoLayout) -> None:
+    """Print the failure backlog + last attempt/last failure (issue #96: doctor half).
+
+    Observability only — never affects the health verdict and never crashes. A corrupt
+    ``state.json`` is REPORTED here rather than raised: it is exactly the state in which an
+    operator runs `agora doctor`, and `agora status`/`agora watch` already tell them loudly.
+    """
+    try:
+        events = failed_event_count(layout)
+    except Exception as exc:  # noqa: BLE001 — doctor must never crash.
+        print(f"  failures: unreadable ({_one_line(str(exc), 140)})")
+        return
+    try:
+        state = StateStore(layout).load()
+    except Exception as exc:  # noqa: BLE001 — a corrupt state.json is a REPORT, not a crash.
+        print(f"  failures: events={events} state.json unreadable ({_one_line(str(exc), 140)})")
+        return
+    lf = state.last_failure
+    tail = (
+        "none"
+        if lf is None
+        else (
+            f"{'UNRESOLVED' if state.failure_is_current else 'superseded'} run={lf.run_id} "
+            f"record={lf.record_path}"
+        )
+    )
+    print(
+        f"  failures: events={events} last_attempt={_fmt_dt(state.last_attempt)} "
+        f"last_failure={tail}"
+    )
+
+
+def _doctor_repo_config(layout: RepoLayout) -> RepoConfig:
+    """Load ``_kb/repo.yaml`` for doctor, falling back to DEFAULTS on a malformed file.
+
+    `agora doctor` must ALWAYS reach its ``status:`` line — a machine consuming the report needs a
+    verdict, and a YAML typo is precisely the state an operator runs doctor in. `agora curate`
+    still fails loudly on the same file. Loaded ONCE here for both the sandbox probe and the
+    routing/brains lines, so a config problem is reported once, in one place.
+
+    Catches BROADLY, like every sibling ``_doctor_*`` helper: ``load_repo_config`` wraps only
+    ``yaml.YAMLError`` in ``ConfigError``, so a file that is unreadable or not UTF-8 (a CP949
+    editor writing a Korean ``name:`` — epic #85 / issue #57) still raises straight through and
+    would kill doctor BEFORE the verdict line, which is the exact failure this guard exists to
+    remove.
+    """
+    try:
+        return load_repo_config(layout)
+    except Exception as exc:  # noqa: BLE001 — doctor must never crash on a malformed repo.yaml.
+        print(f"  repo.yaml: unreadable ({_one_line(str(exc), 140)}) — using defaults")
+        return RepoConfig()
+
+
+def _doctor_backend_registry(layout: RepoLayout) -> tuple[BackendRegistry | None, str | None]:
+    """Load ``adapters.yaml`` ONCE for both the routing table and the brain probe. Never raises.
+
+    ``(None, None)`` = file ABSENT; ``(None, "<msg>")`` = present but unreadable;
+    ``(registry, None)`` otherwise. One parse means the two lines cannot contradict each other and
+    a config problem is reported once (#96: "reuse the set _doctor_routing already resolved").
+    """
+    try:
+        return load_backend_registry(layout.root / "adapters.yaml"), None
+    except Exception as exc:  # noqa: BLE001 — doctor must never crash on a malformed adapters.yaml.
+        return None, str(exc)
+
+
+def _doctor_routing(
+    registry: BackendRegistry | None,
+    load_error: str | None,
+    default_backend: str | None = None,
+) -> None:
     """Print the ADR-0015 per-act routing table (which brain runs ``plan`` / ``author``).
 
     Observability only — never affects the health verdict and never crashes: an absent
@@ -1289,12 +1610,12 @@ def _doctor_routing(layout: RepoLayout, default_backend: str | None = None) -> N
     an operator see BEFORE a run that e.g. routing an act to a ``network: 'none'`` brain on a
     sandbox-less host will fail closed (ADR-0013), or that routing ``author`` to a metered API
     multiplies cost (PASS-2 runs per region).
+
+    A PURE RENDERER since #96: the parse itself moved to :func:`_doctor_backend_registry` so this
+    line and the ``brains:`` line below it are two views of ONE registry and cannot disagree.
     """
-    adapters_path = layout.root / "adapters.yaml"
-    try:
-        registry = load_backend_registry(adapters_path)
-    except Exception as exc:  # noqa: BLE001 — doctor must never crash on a malformed adapters.yaml.
-        print(f"  routing: adapters.yaml present but unreadable ({exc})")
+    if load_error is not None:
+        print(f"  routing: adapters.yaml present but unreadable ({load_error})")
         return
     if registry is None:
         print("  routing: no adapters.yaml (no backend configured)")
@@ -1307,6 +1628,310 @@ def _doctor_routing(layout: RepoLayout, default_backend: str | None = None) -> N
             # repo.yaml curator.backend names no defined brain — surface it, don't crash.
             parts.append(f"{act}={name} (UNKNOWN backend)")
     print(f"  routing: {'  '.join(parts)}")
+
+
+def _routed_brain_names(registry: BackendRegistry, default_backend: str | None) -> list[str]:
+    """Unique backend names across the routable acts, in FIRST-SEEN act order (plan, then author).
+
+    ``routed_backends`` is a dict comp over ``_ROUTABLE_ACTS = ("plan", "author")``
+    (curator/backends.py), so plan=X/author=X yields ``["X"]`` (ONE probe) and plan=X/author=Y
+    yields ``["X", "Y"]``. ``dict.fromkeys`` is the dedupe: insertion-ordered and deterministic —
+    the output is test-locked, so an unordered ``set`` would be a flaky test.
+    """
+    return list(dict.fromkeys(registry.routed_backends(default=default_backend).values()))
+
+
+def _ollama_argv_tail(argv: tuple[str, ...]) -> tuple[str, ...] | None:
+    """Return the shim's OWN argument tail when ``argv`` invokes the Ollama brain, else ``None``.
+
+    Two ACCEPTED shapes, both unambiguous:
+
+    * ``argv[0]``'s basename (minus a Windows ``.exe``) == ``ollama_brain.CONSOLE_SCRIPT`` —
+      covers the bare name ``repo init`` emits (config.write_default_adapters_yaml) AND any path to
+      the installed console script. Tail = ``argv[1:]``.
+    * an adjacent ``-m <ollama_brain.__name__>`` pair — the ``python -m`` form under ANY
+      interpreter path. Tail = everything after the module name.
+
+    Every other shape returns ``None`` ON PURPOSE — in particular wrappers (``uv run …``,
+    ``sh -c …``, ``env FOO=1 …``, ``docker run …``). For a wrapper the flags belong to the WRAPPER,
+    and feeding them to the shim's parser yields a confidently WRONG model/host report, which is
+    strictly worse than the honest generic ``argv[0]``-on-PATH fallback (#96 criterion 4). No
+    heuristic scan for the script name anywhere in argv: guessing where the shim's own arguments
+    begin is exactly the guess that produces the wrong answer.
+    """
+    from .adapters import ollama_brain
+
+    # BackendSpec.argv is validated non-empty (backends.BackendSpec._check_argv), so argv[0] cannot
+    # IndexError; Path("").name == "" simply falls through to the generic probe.
+    program = Path(argv[0]).name
+    if program.lower().endswith(".exe"):
+        program = program[: -len(".exe")]
+    # Case-INSENSITIVE: the `.exe` shape only exists on Windows, whose filesystem is
+    # case-insensitive, so `Agora-Ollama-Brain.exe` is the same program (epic #85). A case-folded
+    # match on POSIX costs nothing — a differently-cased file there would be a different program,
+    # but treating it as the shim only means parsing its tail with the shim's own parser.
+    if program.casefold() == ollama_brain.CONSOLE_SCRIPT.casefold():
+        return tuple(argv[1:])
+    module = ollama_brain.__name__
+    for index, token in enumerate(argv[:-1]):
+        if token == "-m" and argv[index + 1] == module:
+            return tuple(argv[index + 2 :])
+    return None
+
+
+def _probe_ollama(tail: tuple[str, ...], *, timeout: float) -> tuple[str, bool]:
+    """Probe an Ollama-shim backend; return ``(rendering, healthy)``.
+
+    Mirrors :func:`ollama_brain._resolve_model` EXACTLY so doctor's answer and the run's answer
+    cannot diverge:
+
+    * an explicit ``--model`` short-circuits ``/api/tags`` ENTIRELY (#96 criterion 3) — doctor must
+      not contact the daemon either, because "the daemon is up" is a fact the run never establishes
+      on this path;
+    * otherwise ``list_ollama_models(host)`` runs FIRST and its result is fed VERBATIM to
+      ``select_model(None, $AGORA_OLLAMA_MODEL, available)``. Note the consequence, which is why
+      #96 mandates calling the real functions: an ENV-pinned model does NOT short-circuit the
+      daemon call (argument evaluation order in ``_resolve_model``), so a down daemon fails a run
+      even with the model pinned in the environment — and doctor reproduces that.
+
+    A model named by ``--model`` / ``$AGORA_OLLAMA_MODEL`` is reported but NOT verified to be
+    installed: ``/api/tags`` returns fully-qualified ``name:tag`` while Ollama resolves an
+    unqualified name to ``:latest``, so exact membership is not a sound existence test and would
+    paint a working host UNHEALTHY. The blind spot is stated in the rendered line itself.
+    """
+    from .adapters import ollama_brain
+
+    args = ollama_brain.parse_shim_args(list(tail))
+    if args is None:
+        return (
+            "ollama shim argv UNPARSEABLE by the shim's own parser — check the adapters.yaml argv",
+            False,
+        )
+    host = args.host
+    if args.model and args.model.strip():
+        # The parenthetical is deliberately about /api/TAGS, not about the daemon: a real run does
+        # POST /api/generate, so the daemon is still required — this path simply establishes
+        # nothing about it, and saying otherwise would tell an operator the opposite of the truth.
+        return (
+            f"ollama {host}, model pinned to {args.model.strip()!r} by adapters.yaml argv "
+            "(no /api/tags probe — the run lists no models either; reachability NOT checked)",
+            True,
+        )
+    try:
+        available = ollama_brain.list_ollama_models(host, timeout=timeout)
+    except ollama_brain.BrainError as exc:
+        return (f"ollama {host} UNREACHABLE ({exc})", False)
+    except ValueError as exc:
+        # A host with no URL scheme (`AGORA_OLLAMA_HOST=localhost:11434`) makes urlopen raise a
+        # bare ValueError, which list_ollama_models does NOT wrap — the exact first-run config
+        # typo #96 exists to diagnose. Rendered as UNREACHABLE (with the remediation block) rather
+        # than as `probe ERROR`, which reads as an internal defect and offers no fix.
+        return (f"ollama {host} UNREACHABLE ({type(exc).__name__}: {exc})", False)
+    env = os.environ.get(ollama_brain.MODEL_ENV)
+    try:
+        model = ollama_brain.select_model(None, env, available)
+    except ollama_brain.BrainError:
+        # The ONLY way select_model raises: no env pin AND an empty install list. The daemon
+        # answered, so this is not a reachability problem — the curator simply has nothing to run.
+        return (
+            f"ollama {host} reachable, 0 models installed (the curator has no model to run)",
+            False,
+        )
+    if env and env.strip():
+        # Pinned by env: report which pin decided it, and (the honest half) that an env pin is
+        # never checked against the install list — see the "not verified" note above.
+        if not available:
+            return (
+                f"ollama {host} reachable, 0 models installed, would use {model!r} "
+                f"(pinned by ${ollama_brain.MODEL_ENV} — NOT installed here)",
+                True,
+            )
+        return (
+            f"ollama {host} reachable, {len(available)} models, would use {model!r} "
+            f"(pinned by ${ollama_brain.MODEL_ENV})",
+            True,
+        )
+    if "qwen" not in model.lower():
+        # PASSES with a WARNING: the brain answers, and model quality is not a health binary —
+        # reddening a working llama-only host has no action short of a multi-GB pull. Mirrors the
+        # sandbox probe's "unproven, not a failure" precedent.
+        return (
+            f"ollama {host} reachable, {len(available)} models, would use {model!r} — WARNING no "
+            f"qwen model installed, this is the alphabetical fallback (run '{_OLLAMA_PULL_HINT}' "
+            "for the probed-good family)",
+            True,
+        )
+    return (f"ollama {host} reachable, {len(available)} models, would use {model!r}", True)
+
+
+def _probe_program(program: str) -> tuple[str, bool]:
+    """Probe ANY backend's ``argv[0]``: is it there and runnable? ``(rendering, healthy)``.
+
+    Resolution is :func:`~agora_kb.curator.subprocess_backend.resolve_program_on_path` — the very
+    function the spawn uses — plus ONE extra check the spawn does not do up front: a path-ish
+    ``argv[0]`` passes through resolution UNCHECKED, and that is exactly where a real run discovers
+    the problem only at ``execvp`` time. An argv[0] carrying the
+    :data:`~agora_kb.curator.backends._WORKTREE_TOKEN` placeholder is resolved per-run against a
+    directory that does not exist yet, so it is unprobeable: reported, and PASSED (an inability to
+    probe is never a verdict). The token is IMPORTED, never re-spelled: a second copy would
+    silently stop matching if backends renamed it, and every placeholder argv would then read
+    ``NOT FOUND on PATH`` on a perfectly good repo.
+    """
+    if _WORKTREE_TOKEN in program:
+        return (
+            f"not probed (argv[0] {program!r} is resolved per-run from {_WORKTREE_TOKEN})",
+            True,
+        )
+    resolved = resolve_program_on_path(program)
+    if resolved is None:
+        return (f"{program!r} NOT FOUND on PATH — install it or fix the adapters.yaml argv", False)
+    if not (Path(resolved).is_file() and os.access(resolved, os.X_OK)):
+        return (f"{program!r} at {resolved} is NOT EXECUTABLE — fix the adapters.yaml argv", False)
+    return (f"{program!r} on PATH ({resolved})", True)
+
+
+def _argv_yaml(argv: tuple[str, ...]) -> str:
+    """Render an argv tuple as the YAML flow list an operator pastes into ``adapters.yaml``.
+
+    Only an EMPTY token is quoted (``gemini -p ""``), which is the one token in
+    :data:`~agora_kb.adapters.cli_agent_brain.KNOWN_CLI_AGENTS` that plain flow style would lose.
+    ONE renderer: the doctor remediation snippet and the anti-drift docstring lock share it.
+    """
+    return "[" + ", ".join(token if token else '""' for token in argv) + "]"
+
+
+def _print_brain_remediation() -> None:
+    """Print the TOOL-AGNOSTIC recovery block for an unusable brain (#96, owner ruling A1).
+
+    Agora is brain-agnostic (invariant 6): ``repo init`` writing ``curator.backend: qwen`` is a
+    DEFAULT, not a requirement, and ADR-0016's ``agora-cli-brain`` drives any headless CLI agent as
+    a pure text generator. Telling a beta user whose FIRST run just failed to install a daemon and
+    pull a ~20 GB model is the most expensive recovery available — and usually an unnecessary one,
+    because the developer hitting this very likely already has ``claude`` or ``codex`` on PATH. So
+    the agent path is printed FIRST and Ollama is demoted to "instead".
+
+    Kept OFF the diagnosis line (a separate indented block) so every byte-locked ``brain X:`` line
+    is unchanged and the fix has room to be copy-pasteable. Pure ``shutil.which`` + string building:
+    it cannot raise, and the caller prints it at most ONCE per doctor run.
+    """
+    from .adapters.cli_agent_brain import KNOWN_CLI_AGENTS
+
+    installed = [(name, argv) for name, argv in KNOWN_CLI_AGENTS if shutil.which(argv[2])]
+    if installed:
+        names = ", ".join(repr(name) for name, _ in installed)
+        verb = "is" if len(installed) == 1 else "are"
+        first_name, first_argv = installed[0]
+        # The parent keys are printed WITH the entries on purpose: `adapters.yaml` nests the
+        # backends under a `backends:` mapping and `repo.yaml` nests the default under `curator:`,
+        # so the bare entry alone is not paste-able — appending it verbatim makes adapters.yaml
+        # unparseable, and a literal top-level `curator.backend:` key is silently IGNORED by
+        # load_repo_config. A fix an operator can follow to no effect is worse than no fix.
+        print(f"    fix (no download — {names} {verb} already installed): add to adapters.yaml")
+        print("      backends:          # merge into the existing key, do not add a second one")
+        print(f"        {first_name}: {{ argv: {_argv_yaml(first_argv)}, network: loopback }}")
+        print(f"      then set  curator.backend: {first_name}  in _kb/repo.yaml (ADR-0016) — i.e.")
+        print("      curator:           # merge into the existing key")
+        print(f"        backend: {first_name}")
+    else:
+        known = ", ".join(name for name, _ in KNOWN_CLI_AGENTS)
+        print(f"    fix (no download): install a headless CLI agent ({known}) and drive it via")
+        print("      agora-cli-brain — see ADR-0016")
+    print(f"    fix (local model instead): ollama serve  &&  {_OLLAMA_PULL_HINT}")
+
+
+def _doctor_brains(
+    registry: BackendRegistry | None,
+    default_backend: str | None,
+    *,
+    registry_error: str | None = None,
+    skip_probe: bool = False,
+    timeout: float = _BRAIN_PROBE_TIMEOUT_S,
+) -> bool:
+    """Probe each routed brain's AVAILABILITY and contribute the result to doctor's verdict (#96).
+
+    GOVERNING RULE: the probe fails the verdict only on a probe RESULT — a fact established about
+    the configured brain — never on an inability to probe. The one deliberate exception is an
+    unexpected exception inside the probe, which fails, exactly as :func:`_doctor_sandbox`'s own
+    catch-all does.
+
+    Cannot raise: ``routed_backends`` is a pure dict comp, ``registry.get`` raises only ``KeyError``
+    (caught), ``parse_shim_args`` swallows ``SystemExit``/``ArgumentError`` internally, the probe
+    body is inside a per-brain ``except Exception``, and the remediation block — which sits outside
+    it — carries its own. ``KeyboardInterrupt`` still propagates (correct for an interactive
+    command).
+    Cannot hang: the only blocking call is the ``/api/tags`` GET under ``timeout``, and the per-name
+    dedupe caps a two-different-brains repo at 2 × that. Doctor never EXECUTES a brain.
+    """
+    if registry_error is not None:
+        # FAILS the verdict, like the UNKNOWN-backend row and unlike the absent-file row below.
+        # This is an established FACT, not an inability to probe: `adapters.yaml` is the only
+        # definition of every brain, so a malformed one means `load_backend_registry` raises out of
+        # `_build_backend`, which returns None, and `agora curate` exits 1 (verified live). The
+        # brain is not merely unprobeable — it does not exist. Reporting `healthy` for a repo where
+        # curation is structurally impossible is verbatim issue #96's opening complaint, so the
+        # same reasoning that fails an UNKNOWN backend applies here a fortiori.
+        print("  brains: NOT CONFIGURED (adapters.yaml unreadable — see the routing line above)")
+        _print_brain_remediation()
+        return False
+    if registry is None:
+        # PASSES, deliberately: an ABSENT file is a setup-not-done state, not a typo in work the
+        # operator believes they finished. Failing it would redden `agora doctor` in any directory
+        # that is not an agora repo — noise, not diagnosis — and `repo init` always writes the file
+        # (config.write_default_adapters_yaml), so this row means "not wired yet", which the line
+        # itself says.
+        print("  brains: not probed (no adapters.yaml — no backend configured)")
+        return True
+    if skip_probe:
+        print("  brains: probe skipped (--skip-probe)")
+        return True
+
+    ok = True
+    remediated = False
+    for name in _routed_brain_names(registry, default_backend):
+        try:
+            spec = registry.get(name)
+        except KeyError:
+            # An ESTABLISHED fact, not an inability to probe: build_routed_backend catches this
+            # same KeyError and returns None → _build_backend returns None → `agora curate` exits
+            # 1. A `healthy` verdict on a repo that cannot curate is #96's opening complaint.
+            rendering, healthy = (
+                "UNKNOWN backend — not defined in adapters.yaml; 'agora curate' cannot run",
+                False,
+            )
+        else:
+            try:
+                # The program question comes FIRST for EVERY shape, including the Ollama shim
+                # (#96 criterion 4). `agora-ollama-brain` is a console script: a `pip install
+                # --user` whose bin dir is off the curator's PATH leaves it unspawnable while the
+                # daemon is perfectly up — `agora curate` dies at execvp with
+                # BackendUnavailableError while a daemon-only probe reports `healthy`, which is
+                # verbatim #96's opening complaint. Only when argv[0] resolves (or is the
+                # unprobeable {worktree} shape, which PASSES) does the daemon rendering replace it,
+                # so every byte-locked PASS line in the verdict matrix is unchanged.
+                tail = _ollama_argv_tail(spec.argv)
+                rendering, healthy = _probe_program(spec.argv[0])
+                if healthy and tail is not None:
+                    rendering, healthy = _probe_ollama(tail, timeout=timeout)
+            except Exception as exc:  # noqa: BLE001 — doctor must never crash on a probe.
+                # A defect in the PROBE, not a fact about the brain: it fails the verdict but gets
+                # NO remediation block — any fix we could suggest here would be a guess (A1 §A1.5).
+                print(f"  brain {name}: probe ERROR — {type(exc).__name__}: {exc}")
+                ok = False
+                continue
+        print(f"  brain {name}: {rendering}")
+        if not healthy:
+            ok = False
+            if not remediated:
+                # Once per doctor run: a repo with two dead brains must not print the fix twice.
+                remediated = True
+                try:
+                    _print_brain_remediation()
+                except Exception as exc:  # noqa: BLE001 — the HINT must never crash doctor.
+                    # A1.5 asserts the block is contained; it sits OUTSIDE the probe's own guard
+                    # (that one `continue`s), so the containment has to be written here. A fix hint
+                    # that fails is a footnote, never a reason to lose the `status:` line.
+                    print(f"    fix: unavailable ({type(exc).__name__}: {_one_line(str(exc), 80)})")
+    return ok
 
 
 def _doctor_sandbox(allow_reduced_isolation: bool) -> bool:
@@ -1367,6 +1992,21 @@ def _fmt_dt(value: datetime | None) -> str:
     if value is None:
         return "never"
     return value.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _one_line(text: str, limit: int) -> str:
+    """Collapse ``text`` to ONE whitespace-normalized line, clipped to ``limit`` chars.
+
+    Whitespace-COLLAPSED, not first-line-truncated (the ``_doctor_backup`` shape): the exceptions
+    that actually reach these call sites carry a useless first line — pydantic's ``1 validation
+    error for CuratorState`` and ConfigError's ``malformed YAML in <path>: while scanning for the
+    next token`` — with the diagnosis on line 2. Verified against real exception objects from this
+    tree. Elision is U+2026, matching the backup line's own truncation.
+    """
+    flat = " ".join(str(text).split())
+    if not flat:
+        return "<no message>"
+    return flat if len(flat) <= limit else flat[:limit].rstrip() + "…"
 
 
 def _can_import(module: str) -> bool:

@@ -10,7 +10,7 @@ import pytest
 from agora_kb.core.frontmatter import parse
 from agora_kb.core.hashing import content_sha256
 from agora_kb.core.ids import is_valid_event_id
-from agora_kb.core.inbox import Inbox
+from agora_kb.core.inbox import Inbox, failed_event_count
 from agora_kb.core.layout import InvalidWriterError, RepoLayout
 from agora_kb.core.models import Confidence, InboxItem, Kind
 
@@ -310,3 +310,24 @@ def test_last_write_ignores_foreign_filenames(inbox: Inbox) -> None:
     inbox.write(text="a", writer="dochan", source="manual", now=ts)
     inbox.layout.inbox_dir.joinpath("dochan", "not-an-event.md").write_text("x", encoding="utf-8")
     assert inbox.last_write() == ts
+
+
+def test_failed_event_count_counts_the_nested_layout(tmp_path: Path) -> None:
+    """Terminal failures are NESTED at ``failed/<date>/<run-id>/<event>.md`` — so count RECURSIVELY.
+
+    #96 crit 8, half 1: ``agora status``'s ``failed_events`` and MCP ``kb_status.failed`` now share
+    THIS one function, so the on-disk shape it has to understand is locked here. A direct-children
+    ``glob("*.md")`` reports 0 on exactly this (real) layout — that was the bug the promotion must
+    not re-introduce — and the sibling ``error.json`` retry record is not an event.
+    """
+    layout = RepoLayout(tmp_path)
+    assert failed_event_count(layout) == 0  # absent dir: a fresh repo has never failed
+
+    run_dir = layout.failed_dir / "2026-06-13" / "20260613T000000Z-deadbeef"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "20260613T024010Z-a1b2c3.md").write_text("oops\n", encoding="utf-8")
+    (run_dir / "20260613T024011Z-d4e5f6.md").write_text("oops\n", encoding="utf-8")
+    (run_dir / "error.json").write_text('{"failed_checks": []}\n', encoding="utf-8")
+
+    assert failed_event_count(layout) == 2
+    assert list(layout.failed_dir.glob("*.md")) == []  # the non-recursive glob would say 0

@@ -81,6 +81,16 @@ launchctl bootout gui/$(id -u)/com.agora.watch
 *any* exit, crash or clean). `com.agora.harvest` runs at load and then every `StartInterval`
 seconds (3600 = hourly; edit to taste).
 
+**A failing watch tick no longer restarts the process** (#97): since a deterministic per-tick raise
+(a corrupt `_kb/state.json`, a `repo.yaml` typo) recurs on every restart, `agora watch` now reports
+one bounded `<stamp> tick failed: <Type>: <message>` line on **stderr**, backs off exponentially
+(interval → 2× → 4× … capped at 15 min, and never faster than your `--interval`), and keeps
+running; the next clean tick resets the backoff immediately, so a repaired repo recovers without a
+restart. Exit code stays 0, so `KeepAlive`/`Restart=on-failure` no longer turn a 60 s scheduler
+into a 10 s crash loop. The unit files are unchanged and still correct — those policies exist for a
+genuine process death (OOM, SIGKILL). Set `AGORA_WATCH_TRACEBACK=1` to add a full traceback to that
+stderr line when filing a bug.
+
 ## Linux (systemd, user units)
 
 ```bash
@@ -237,8 +247,20 @@ of the unauthenticated premise, and it closes *browser-mediated* attacks only.
   passphrase-less deploy key / credential helper instead. (macOS launchd injects
   `SSH_AUTH_SOCK` into the gui domain itself, so the agent route works as-is there.)
 - **Health check**: `uv run --directory /ABSOLUTE/PATH/TO/agora-kb agora doctor --repo
-  /ABSOLUTE/PATH/TO/knowledge-repo` — git/deps/sandbox self-test, routing + connectors tables,
-  backup line. Run it after installing units and whenever a log shows repeated failures.
+  /ABSOLUTE/PATH/TO/knowledge-repo` — git/deps/sandbox self-test, routing + **brains** + connectors
+  tables, backup + failures lines. Run it after installing units and whenever a log shows repeated
+  failures.
+  - **Since #96 the brain probe is part of the verdict**: doctor asks whether the configured
+    backend's `argv[0]` is on PATH and (for `agora-ollama-brain`) whether the daemon answers
+    `/api/tags`, and prints `status: unhealthy` + **exit 1** when it cannot be used. That is the
+    point — a node whose curator cannot run should not report healthy — but it means **a node with
+    no brain now fails a `doctor`-based gate**. Two ways out: fix the brain (doctor prints a
+    copy-pasteable block naming any headless CLI agent already on your PATH — `claude` / `codex` /
+    `gemini` via `agora-cli-brain`, ADR-0016 — with `ollama serve` + `ollama pull` as the
+    heavier alternative), or run `agora doctor --skip-probe` on nodes that legitimately have none
+    (web-only, CI, a hub whose curation happens elsewhere). `--skip-probe` makes the verdict ignore
+    brain reachability and performs no daemon or PATH lookups; every other check is unchanged.
+  - The probe is bounded (3 s per distinct routed brain) and never *executes* a brain.
 - **Reboot check** (the #65 acceptance): reboot, wait a minute, then confirm
   (macOS: LaunchAgents start at *login* — log back in first, or nothing runs)
   `launchctl print gui/$(id -u)/com.agora.watch` shows `state = running` (macOS) or

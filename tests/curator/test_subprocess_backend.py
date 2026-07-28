@@ -14,6 +14,7 @@ module owns TODAY (the deterministic gates own success):
 
 from __future__ import annotations
 
+import shutil
 import sys
 from pathlib import Path
 
@@ -24,6 +25,8 @@ from agora_kb.curator.apply import body_sentinels
 from agora_kb.curator.backends import BackendSpec
 from agora_kb.curator.subprocess_backend import BackendUnavailableError, SubprocessBackend
 from agora_kb.curator.worker import AuthorRegion
+
+requires_git = pytest.mark.skipif(shutil.which("git") is None, reason="git not available")
 
 
 def _python_spec(name: str, code: str) -> BackendSpec:
@@ -300,3 +303,26 @@ def test_pass2_prompts_have_no_directive_without_language(tmp_path: Path) -> Non
     assert len(prompts) == 2
     for prompt in prompts:
         assert "LANGUAGE:" not in prompt
+
+
+# --- resolve_program_on_path (shared with `agora doctor`'s brain probe, #96) ---------------------
+
+
+@requires_git
+def test_resolve_program_on_path_resolves_a_bare_name() -> None:
+    """A bare name goes through ``shutil.which`` — the same lookup the operator's PATH already did
+    when they configured it, and the answer a spawn would use."""
+    found = sb.resolve_program_on_path("git")
+    assert found is not None
+    assert Path(found).is_absolute()
+
+
+def test_resolve_program_on_path_passes_a_path_ish_program_through() -> None:
+    """A path-ish argv[0] is already unambiguous and is returned UNCHANGED — including one that
+    does not exist, which is why doctor's probe adds its own is_file/X_OK check on top."""
+    assert sb.resolve_program_on_path("/no/such/x") == "/no/such/x"
+
+
+def test_resolve_program_on_path_returns_none_for_an_unresolvable_name() -> None:
+    """``None`` is the shared signal: ``_absolute_program`` RAISES on it, doctor REPORTS it."""
+    assert sb.resolve_program_on_path("agora-definitely-not-installed-xyz") is None

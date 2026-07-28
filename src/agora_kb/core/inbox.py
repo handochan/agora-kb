@@ -32,7 +32,7 @@ from .ids import event_id_timestamp, is_valid_event_id, new_event_id
 from .layout import RepoLayout, validate_writer
 from .models import Confidence, InboxItem, Kind
 
-__all__ = ["Inbox", "WriteReceipt"]
+__all__ = ["Inbox", "WriteReceipt", "failed_event_count"]
 
 
 @dataclass(frozen=True)
@@ -171,3 +171,24 @@ class Inbox:
                 found = fm.get("id")
                 return found if isinstance(found, str) else None
         return None
+
+
+# --- the other spool count ----------------------------------------------------------------------
+def failed_event_count(layout: RepoLayout) -> int:
+    """Number of TERMINAL-failure events under ``_kb/failed/`` (0 when the dir is absent).
+
+    The worker writes terminal failures NESTED at ``failed/<date>/<run-id>/<event>.md`` (with an
+    ``error.json`` retry record alongside, ``worker._fail``), NOT as direct children of ``failed/``
+    — so this RECURSIVELY globs ``*.md``. Events are the only ``.md`` under ``failed/``, so the
+    count tracks terminally-failed events exactly.
+
+    ONE implementation for the MCP face (``kb_status.failed``) and the CLI (``agora status``'s
+    ``failed_events``) — issue #96 crit 8 requires the two to agree by construction, not by two
+    copies of the same glob. Cost is O(retained failure history): ``_kb/failed/`` is never pruned,
+    so this is a linear scan on a monotonically growing tree, bounded per event by
+    ``curator.max_attempts``. Fine at beta scale; a retention policy is a separate issue.
+    """
+    failed_dir = layout.failed_dir
+    if not failed_dir.is_dir():
+        return 0
+    return sum(1 for _ in failed_dir.rglob("*.md"))
