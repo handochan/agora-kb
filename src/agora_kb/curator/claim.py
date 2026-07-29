@@ -35,6 +35,7 @@ from pathlib import Path
 
 from ..core import frontmatter
 from ..core.hashing import content_sha256
+from ..core.ids import is_valid_event_id
 from ..core.layout import RepoLayout
 from ..core.state import CuratorState
 from .constants import DEFAULT_MAX_CANDIDATES_PER_RUN
@@ -179,7 +180,14 @@ def _fifo_snapshot(layout: RepoLayout) -> list[tuple[str, str, str | None, str, 
         except (OSError, ValueError):
             continue
         event_id = fm.get("id")
-        if not isinstance(event_id, str):
+        if not isinstance(event_id, str) or not is_valid_event_id(event_id):
+            # The id is interpolated straight into the claim destination
+            # (``processing/<run>/events/<id>.md``), so an unvalidated one escapes the processing
+            # dir — ``id: ../../../../wiki/PWNED`` lands in the git-tracked read model that only the
+            # curator may write (invariant 2, issue #124). ``Inbox.write`` GENERATES ids, so no
+            # normal write path can produce this; a hand-placed or imported file can. Skipping is
+            # the same fail-closed posture as the unparseable-frontmatter branch above and loses
+            # nothing: the event stays in ``inbox/``, still counted by ``depth()``.
             continue
         fm_writer = fm.get("writer")
         writer = fm_writer if isinstance(fm_writer, str) and fm_writer else path.parent.name

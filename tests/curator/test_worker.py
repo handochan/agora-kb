@@ -26,7 +26,7 @@ import pytest
 import agora_kb.curator.worker as worker_mod
 from agora_kb.core import frontmatter
 from agora_kb.core.ids import new_event_id
-from agora_kb.core.inbox import Inbox
+from agora_kb.core.inbox import Inbox, failed_event_count
 from agora_kb.core.layout import RepoLayout
 from agora_kb.core.repo import Repo
 from agora_kb.core.state import LastFailure, StateStore
@@ -2752,3 +2752,166 @@ def test_failure_state_write_error_becomes_a_warning_not_a_crash(
     assert "could not record this failure in _kb/state.json" in report.warnings[0]
     assert "No space left on device" in report.warnings[0]
     assert StateStore(layout).load().last_failure is None  # the write genuinely did not land
+
+
+# --- issue #124: the no-loss floor ---------------------------------------------------------------
+def test_fail_preserves_an_event_whose_inbox_return_is_refused(tmp_path: Path) -> None:
+    """(#124 crit 1) A REFUSED within-budget return preserves the event; it is never destroyed.
+
+    Before #124 this branch had no ``else``: a refused ``_return_one_to_inbox`` left the event in
+    ``processing/``, which ``_fail`` then ``rmtree``d. The event vanished and NOTHING recorded it —
+    ``counts`` said ``{"retried": 0, "failed": 0}``, ``failed_event_count`` said 0. The refusal is
+    reached with no attacker involved: an inbox slot occupied by an idempotent duplicate is enough.
+    """
+    repo = _init_repo(tmp_path)
+    layout = repo.layout
+    inbox = Inbox(layout)
+    e1 = _write_capture(inbox, text="A fact in a non-existent domain.", second=10)
+    _seed_raw(repo, e1)
+    original = layout.inbox_item_path("dochan", e1).read_bytes()
+
+    # Occupy the destination so the return is refused: claim() moves the event out of the inbox, so
+    # re-creating the path mid-run is what a duplicate id would look like from _fail's side.
+    real_return = worker_mod._return_one_to_inbox
+
+    def occupy_then_return(layout_arg: RepoLayout, event_path: Path) -> bool:
+        dest = layout_arg.inbox_item_path("dochan", e1)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text("an idempotent duplicate already sitting in the slot\n", encoding="utf-8")
+        return real_return(layout_arg, event_path)
+
+    worker_mod._return_one_to_inbox = occupy_then_return  # type: ignore[assignment]
+    try:
+        report = _run(repo, FakeBackend(_bad_domain_plan(e1), prose={"c1": "unreachable"}))
+    finally:
+        worker_mod._return_one_to_inbox = real_return  # type: ignore[assignment]
+
+    assert report.status == "failed"
+    # The refusal is now a TERMINAL disposition, so it is counted as one — no new counts KEY.
+    assert report.counts == {"retried": 0, "failed": 1}
+    preserved = list(layout.failed_dir.rglob(f"{e1}.md"))
+    assert len(preserved) == 1
+    # Rename-only: the preserved event is byte-for-byte the original (DATA-MODEL §1 immutability).
+    assert preserved[0].read_bytes() == original
+    assert preserved[0].parent == layout.failed_dir / RUN_DATE / report.run_id
+    # It is visible to every operator surface that counts terminal failures.
+    assert failed_event_count(layout) == 1
+    assert not (layout.processing_dir / report.run_id).exists()
+
+
+@pytest.mark.parametrize(
+    "hostile_id",
+    ["../../../../wiki/PWNED", "../escape", "..", "a/b", "with space", ""],
+)
+def test_a_traversing_frontmatter_id_is_refused_at_claim(tmp_path: Path, hostile_id: str) -> None:
+    """(#124 crit 4) A hostile frontmatter ``id`` never becomes a path component.
+
+    The id is interpolated into TWO destinations with no validation between them:
+    ``claim`` builds ``processing/<run>/events/<id>.md`` (claim.py) and ``_return_one_to_inbox``
+    builds ``inbox/<writer>/<id>.md`` (worker.py). ``inbox_item_path`` validates the WRITER but
+    passes the id through verbatim, so ``id: ../../../../wiki/PWNED`` resolves inside the
+    git-tracked read model only the curator may write (invariant 2).
+
+    Claim is the FIRST gate and therefore the one that fires: a rejected event is skipped, so it
+    stays in ``inbox/`` — still counted by ``depth()``, still on disk, nothing lost. That is the
+    same fail-closed posture claim already used for unparseable frontmatter.
+    """
+    repo = _init_repo(tmp_path)
+    layout = repo.layout
+    inbox = Inbox(layout)
+    e1 = _write_capture(inbox, text="A fact in a non-existent domain.", second=10)
+    _seed_raw(repo, e1)
+
+    src = layout.inbox_item_path("dochan", e1)
+    fm, body = frontmatter.parse(src.read_text(encoding="utf-8"))
+    fm["id"] = hostile_id
+    src.write_text(frontmatter.render(fm, body), encoding="utf-8")
+    before = src.read_bytes()
+
+    report = _run(repo, FakeBackend(_bad_domain_plan(e1), prose={"c1": "unreachable"}))
+
+    # Nothing was claimable, so the run is a clean noop — no crash, no traceback out of run().
+    assert report.status == "noop"
+    # NOTHING escaped: not into the curated read model, not anywhere outside _kb/.
+    assert not list(repo.root.glob("wiki/**/PWNED*"))
+    assert not (repo.root / "PWNED.md").exists()
+    assert not list(layout.processing_dir.rglob("PWNED*"))
+    # And the event is untouched, in place, still visible as backlog.
+    assert src.read_bytes() == before
+    assert inbox.depth() == 1
+    assert failed_event_count(layout) == 0
+
+
+def test_cas_conflict_preserves_an_event_whose_return_is_refused(tmp_path: Path) -> None:
+    """(#124 crit 2) The CAS path shares the floor; a clean CAS conflict's counts stay unchanged.
+
+    ``_return_events_to_inbox`` + ``rmtree`` is the same shape as the budget path, so the same
+    refusal destroyed events here too. ``preserved`` is emitted ONLY when non-zero, which is why
+    ``test_cas_conflict_report_has_no_error_record`` still asserts ``{"retried": 1}`` unmodified.
+    """
+    repo = _init_repo(tmp_path)
+    layout = repo.layout
+    inbox = Inbox(layout)
+    e1 = _write_capture(inbox, text="One curator advances the branch under a lock.", second=10)
+    _seed_raw(repo, e1)
+    original = layout.inbox_item_path("dochan", e1).read_bytes()
+    repo.compare_and_swap_branch = lambda *, expected, new, branch=None: False  # type: ignore[method-assign]
+
+    real_return = worker_mod._return_one_to_inbox
+    worker_mod._return_one_to_inbox = lambda layout_arg, event_path: False  # type: ignore[assignment]
+    try:
+        report = _run(repo, FakeBackend(_create_theme_plan("ignored", "c1", e1), prose={"c1": "x"}))
+    finally:
+        worker_mod._return_one_to_inbox = real_return  # type: ignore[assignment]
+
+    assert report.status == "failed"
+    assert report.counts == {"retried": 0, "preserved": 1}
+    preserved = list(layout.failed_dir.rglob(f"{e1}.md"))
+    assert len(preserved) == 1
+    assert preserved[0].read_bytes() == original
+    assert failed_event_count(layout) == 1
+
+
+def test_recovery_preserves_an_event_whose_return_is_refused(tmp_path: Path) -> None:
+    """(#124 crit 3) The ADR-0011 §9 recovery path shares the floor.
+
+    ``_return_to_inbox`` runs on events that are byte-identical originals from ``claim``, so a
+    refusal there loses a capture the operator never got back — the worst of the three shapes.
+    """
+    repo = _init_repo(tmp_path)
+    layout = repo.layout
+    inbox = Inbox(layout)
+    base = repo.branch_commit()
+    run_id = new_event_id(now=datetime(2026, 6, 13, 4, 0, 0, tzinfo=UTC))
+    e2 = _write_capture(inbox, text="An unpublished claimed event.", second=20)
+    events_dir = layout.processing_dir / run_id / "events"
+    events_dir.mkdir(parents=True, exist_ok=True)
+    src = layout.inbox_item_path("dochan", e2)
+    original = src.read_bytes()
+    os.replace(src, events_dir / f"{e2}.md")
+    write_manifest(
+        layout,
+        RunManifest(
+            run_id=run_id,
+            base_commit=base,
+            event_ids=(e2,),
+            phase="claimed",
+            prose_complete=False,
+            published_commit=None,
+            started="2026-06-13T04:00:00Z",
+        ),
+    )
+    # Occupy the inbox destination so the recovery return is refused.
+    src.parent.mkdir(parents=True, exist_ok=True)
+    src.write_text("a duplicate holding the slot\n", encoding="utf-8")
+
+    reports = recover(repo, state_store=StateStore(layout))
+
+    rec = [r for r in reports if r.run_id == run_id]
+    assert len(rec) == 1
+    assert rec[0].counts == {"returned": 0, "preserved": 1}
+    preserved = layout.failed_dir / run_id[:10] / run_id / f"{e2}.md"
+    assert preserved.is_file()
+    assert preserved.read_bytes() == original
+    assert failed_event_count(layout) == 1
+    assert not (layout.processing_dir / run_id).exists()
