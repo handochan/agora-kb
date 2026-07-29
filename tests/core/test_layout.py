@@ -42,3 +42,26 @@ def test_path_traversal_blocked_in_layout(tmp_path: Path) -> None:
     lo = RepoLayout(tmp_path)
     with pytest.raises(InvalidWriterError):
         lo.inbox_writer_dir("../../etc")
+
+
+def test_requeued_record_path_guards_its_components(tmp_path: Path) -> None:
+    """(#99) The ``_kb/requeued/`` twin is built from directory names read off an editable tree.
+
+    ``agora requeue --reset-attempts`` derives ``date``/``run_id`` from the ``_kb/failed/`` path it
+    is archiving, and ``_kb/failed/`` is operator-editable, so both components go through
+    :func:`safe_path_component` before they are interpolated (DESIGN §7). The archive ALSO has to
+    live outside ``failed_dir``: the retry budget is ``failed_dir.rglob("error.json")`` and
+    ``rglob`` descends into dotted directories, so an in-tree archive would still be counted.
+    """
+    lo = RepoLayout(tmp_path)
+    run_id = "2026-06-13T03-00-00.000Z--04e370"
+
+    assert lo.requeued_dir == tmp_path / "_kb" / "requeued"
+    assert lo.failed_dir not in lo.requeued_dir.parents
+    assert lo.requeued_record_path(date="2026-06-13", run_id=run_id) == (
+        tmp_path / "_kb" / "requeued" / "2026-06-13" / run_id / "error.json"
+    )
+
+    for date, bad_run in (("..", run_id), ("2026-06-13", "../../etc"), ("/abs", run_id)):
+        with pytest.raises(InvalidWriterError):
+            lo.requeued_record_path(date=date, run_id=bad_run)

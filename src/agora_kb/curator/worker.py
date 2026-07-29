@@ -54,15 +54,16 @@ import os
 import re
 import shutil
 import subprocess
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, Protocol
 
 from ..core import frontmatter
-from ..core.ids import is_valid_event_id, new_event_id
-from ..core.inbox import Inbox
-from ..core.layout import InvalidWriterError, RepoLayout
+from ..core.ids import new_event_id
+from ..core.inbox import Inbox, return_event_to_inbox
+from ..core.layout import RepoLayout
 from ..core.repo import GitError, Repo
 from ..core.state import CuratorState, LastBatch, LastFailure, StateStore
 from ..schema.emit import Taxonomy
@@ -101,6 +102,7 @@ __all__ = [
     "RunFailure",
     "RunReport",
     "compute_harvest_cursor_deltas",
+    "iter_attempt_records",
     "run",
     "recover",
 ]
@@ -1149,7 +1151,7 @@ def _fail(
         for event_path in sorted(events_dir.glob("*.md")):
             event_id = event_path.stem
             attempt = prior.get(event_id, 0) + 1  # this run is attempt N
-            if attempt < max_attempts and _return_one_to_inbox(layout, event_path):
+            if attempt < max_attempts and return_event_to_inbox(layout, event_path).ok:
                 # Within budget: return the unchanged event to inbox/ (re-claimed next run, §5.1).
                 # The error.json above stays as the durable retry counter even though the event
                 # leaves failed/.
@@ -1222,19 +1224,41 @@ def _event_attempt_counts(layout: RepoLayout) -> dict[str, int]:
     (DATA-MODEL §1 / §4). Returns ``{event_id: prior_attempts}`` (THIS run not yet counted).
     """
     counts: dict[str, int] = {}
+    for _record_path, event_ids in iter_attempt_records(layout):
+        # One attempt per distinct error record, regardless of how many event_ids it lists.
+        for event_id in event_ids:
+            counts[event_id] = counts.get(event_id, 0) + 1
+    return counts
+
+
+def iter_attempt_records(layout: RepoLayout) -> Iterator[tuple[Path, list[str]]]:
+    """Every readable ``failed/**/error.json`` with the event ids it governs (ADR-0011 §5.1).
+
+    THE single derivation of the retry budget. :func:`_event_attempt_counts` tallies it, and
+    ``agora requeue --reset-attempts`` (#99) walks the SAME enumeration to decide which records it
+    may archive — two readers of one enumeration, so the budget a requeue releases can never
+    disagree with the budget the next run charges. Records that cannot be read are SKIPPED, matching
+    the pre-existing tolerance: an unreadable record must not fail a curator run, and a budget
+    derived from the readable ones under-counts (more attempts, never fewer), which is the safe
+    direction. Sorted by path so both readers walk them in one deterministic order.
+    """
     failed_root = layout.failed_dir
     if not failed_root.exists():
-        return counts
+        return
     for error_path in sorted(failed_root.rglob("error.json")):
         try:
             record = json.loads(error_path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             continue
-        # One attempt per distinct error record, regardless of how many event_ids it lists.
-        for event_id in record.get("event_ids", []):
-            if isinstance(event_id, str):
-                counts[event_id] = counts.get(event_id, 0) + 1
-    return counts
+        raw = record.get("event_ids", []) if isinstance(record, dict) else []
+        # A bare string is tolerated as a one-element list: this is an on-disk audit record an
+        # operator can hand-edit, and treating "abc" as ['a','b','c'] would silently inflate the
+        # budget of three events that do not exist.
+        if isinstance(raw, str):
+            raw = [raw]
+        if not isinstance(raw, list):
+            continue
+        yield error_path, [e for e in raw if isinstance(e, str)]
 
 
 def _return_events_to_inbox(
@@ -1263,7 +1287,7 @@ def _return_events_to_inbox(
     preserved = 0
     if events_dir.is_dir():
         for event_path in sorted(events_dir.glob("*.md")):
-            if _return_one_to_inbox(layout, event_path):
+            if return_event_to_inbox(layout, event_path).ok:
                 returned += 1
             elif _preserve_one_event(event_path, preserve_dir):
                 preserved += 1
@@ -1285,52 +1309,6 @@ def _preserve_one_event(event_path: Path, preserve_dir: Path) -> bool:
             # Already preserved under this run (a re-walked directory) — nothing to do, and
             # clobbering would overwrite an immutable event.
             return False
-        os.replace(event_path, dest)
-    except OSError:
-        return False
-    return True
-
-
-def _return_one_to_inbox(layout: RepoLayout, event_path: Path) -> bool:
-    """Rename one claimed event back to ``inbox/<writer>/<id>.md`` (writer from frontmatter).
-
-    The destination writer namespace is recovered from the event's immutable frontmatter
-    (DATA-MODEL §1), so a returned event is re-claimed FIFO next run. An already-present inbox event
-    (an idempotent duplicate) is never clobbered. Returns True iff the event moved.
-
-    A False return means the caller MUST preserve the event rather than let it be swept up by the
-    ``rmtree`` that clears the processing dir — see :func:`_return_events_to_inbox` and the no-loss
-    floor in :func:`_fail` (issue #124). This function never deletes, edits or truncates the source.
-
-    BOTH address components are validated, not just the writer. ``layout.inbox_item_path`` validates
-    ``writer`` (:func:`validate_writer`) but interpolates ``event_id`` verbatim, so a frontmatter
-    ``id: ../../../wiki/PWNED`` would resolve INSIDE the git-tracked read model that only the
-    curator may write (invariant 2). ``Inbox.write`` generates ids itself, so the normal write path
-    could never produce one — but ``_kb/failed/`` is operator-editable and becomes an INPUT the
-    moment ``agora requeue`` (#99) lands, so the guard is closed here, ahead of it, by reusing the
-    canonical :func:`~agora_kb.core.ids.is_valid_event_id` rather than inventing a second rule.
-    """
-    try:
-        fm, _ = frontmatter.parse(event_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return False
-    writer = fm.get("writer")
-    event_id = fm.get("id")
-    if not isinstance(writer, str) or not isinstance(event_id, str):
-        return False
-    if not is_valid_event_id(event_id):
-        return False
-    try:
-        dest = layout.inbox_item_path(writer, event_id)
-    except InvalidWriterError:
-        # An unaddressable writer is a refusal, NOT a crash: this runs on the failure/recovery
-        # paths, where raising would abort the disposal loop and strand every remaining event.
-        return False
-    if dest.exists():
-        # Checked BEFORE mkdir so a refusal leaves the filesystem untouched.
-        return False
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    try:
         os.replace(event_path, dest)
     except OSError:
         return False

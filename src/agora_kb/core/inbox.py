@@ -17,22 +17,40 @@ Invariants upheld here:
 the existing event instead of creating a duplicate. Per ADR-0011 the **authoritative** dedup
 happens at claim time inside the curator lock; this write-time check is a best-effort optimization,
 so it is a plain scan of the writer's pending inbox (race-tolerant by design).
+
+The module also owns the one operation that puts an **already-existing** event back into the inbox
+(:func:`return_event_to_inbox`, issue #99): the curator's retry/recovery paths and ``agora requeue``
+both need it, and it is the single operation that could break the append-only rule stated above, so
+it lives beside that rule rather than in a caller. It is a *location-only* transition — one
+``os.replace`` of an immutable file, never a rewrite and never an ``Inbox.write`` (which would mint
+a NEW id and duplicate the knowledge). See the ADR-0002 spool-custodian appendix.
 """
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Literal
 
 from . import frontmatter
 from .atomicio import atomic_write_text
 from .hashing import content_sha256
 from .ids import event_id_timestamp, is_valid_event_id, new_event_id
-from .layout import RepoLayout, validate_writer
+from .layout import InvalidWriterError, RepoLayout, validate_writer
 from .models import Confidence, InboxItem, Kind
 
-__all__ = ["Inbox", "WriteReceipt", "failed_event_count"]
+__all__ = [
+    "Inbox",
+    "WriteReceipt",
+    "failed_event_count",
+    "iter_failed_events",
+    "InboxReturn",
+    "InboxReturnStatus",
+    "resolve_inbox_return",
+    "return_event_to_inbox",
+]
 
 
 @dataclass(frozen=True)
@@ -192,3 +210,127 @@ def failed_event_count(layout: RepoLayout) -> int:
     if not failed_dir.is_dir():
         return 0
     return sum(1 for _ in failed_dir.rglob("*.md"))
+
+
+def iter_failed_events(layout: RepoLayout) -> list[Path]:
+    """Every TERMINAL-failure event under ``_kb/failed/``, FIFO (empty when the dir is absent).
+
+    The SAME set :func:`failed_event_count` counts, materialized and ordered for
+    ``agora requeue``'s selector (#99 crit 7/9). Sorted by event id (time-sortable ⇒ chronological,
+    DATA-MODEL §10) then by path as a total-order tiebreak, so requeue's preview and its execution
+    walk one list in one order. ``failed_event_count`` deliberately does NOT call this: it is on
+    the Prometheus scrape path (``faces/web/metrics.py``) and MCP ``kb_status``, and must stay a
+    lazy count with no sort. ``tests/core/test_inbox_return.py`` locks the two to the same set.
+    """
+    failed_dir = layout.failed_dir
+    if not failed_dir.is_dir():
+        return []
+    return sorted(failed_dir.rglob("*.md"), key=lambda path: (path.stem, path.as_posix()))
+
+
+# --- the back-edge: returning an EXISTING event to the inbox (#99, ADR-0002 appendix) ------------
+InboxReturnStatus = Literal["ok", "occupied", "unreadable", "unaddressable", "error"]
+
+
+@dataclass(frozen=True)
+class InboxReturn:
+    """Verdict for returning ONE immutable event file to its inbox address (location-only).
+
+    Five statuses, not a ``bool``, because the callers must tell the outcomes apart: ``agora
+    requeue`` reports an ``occupied`` destination as a non-destructive skip (#99 crit 3) while an
+    ``unreadable``/``unaddressable`` file is an operator problem and an ``error`` is a filesystem
+    problem — and the curator's no-loss floor (#124) must treat all four alike as "preserve, never
+    drop". One symbol carries both readings.
+    """
+
+    status: InboxReturnStatus
+    source: Path
+    dest: Path | None  # None iff the address could not be derived
+    detail: str = ""  # ONE line, operator-facing; "" when status == "ok"
+
+    @property
+    def ok(self) -> bool:
+        return self.status == "ok"
+
+
+def _one_line(text: object) -> str:
+    """Collapse a detail to a single operator-facing line (exception texts can be multi-line)."""
+    return " ".join(str(text).split())
+
+
+def resolve_inbox_return(layout: RepoLayout, event_path: Path) -> InboxReturn:
+    """PURE verdict: where this event WOULD go, or why it cannot. Creates nothing, writes nothing.
+
+    Never calls ``dest.parent.mkdir`` — that is why ``agora requeue --dry-run`` can promise a
+    byte-identical filesystem (#99 crit 5). The writer AND the event id come from the event's own
+    immutable frontmatter (DATA-MODEL §1) and BOTH are validated: ``validate_writer`` via
+    ``layout.inbox_item_path`` and ``core.ids.is_valid_event_id`` here. Without the id guard a
+    frontmatter ``id: ../../../wiki/PWNED`` writes into the git-tracked read model — reachable the
+    moment ``_kb/failed/`` (an operator-editable directory) becomes an input.
+    """
+    try:
+        fm, _ = frontmatter.parse(event_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        return InboxReturn(
+            status="unreadable",
+            source=event_path,
+            dest=None,
+            detail=_one_line(f"frontmatter is unreadable: {exc}"),
+        )
+    writer = fm.get("writer")
+    event_id = fm.get("id")
+    if not isinstance(writer, str) or not isinstance(event_id, str):
+        return InboxReturn(
+            status="unreadable",
+            source=event_path,
+            dest=None,
+            detail="frontmatter is missing a string 'writer' or 'id'",
+        )
+    if not is_valid_event_id(event_id):
+        return InboxReturn(
+            status="unaddressable",
+            source=event_path,
+            dest=None,
+            detail=_one_line(f"not a valid event id: {event_id!r}"),
+        )
+    try:
+        dest = layout.inbox_item_path(writer, event_id)
+    except InvalidWriterError as exc:
+        # An unaddressable writer is a VERDICT, not a raise: every caller runs a disposal loop
+        # (the curator's failure/recovery paths, requeue's batch) where an exception would strand
+        # every event after this one.
+        return InboxReturn(
+            status="unaddressable", source=event_path, dest=None, detail=_one_line(exc)
+        )
+    if dest.exists():
+        # An idempotent duplicate already holds the slot. Reported, never clobbered: overwriting it
+        # would destroy an immutable event (invariant 3).
+        return InboxReturn(
+            status="occupied",
+            source=event_path,
+            dest=dest,
+            detail="an inbox event with this id is already present — not overwritten",
+        )
+    return InboxReturn(status="ok", source=event_path, dest=dest)
+
+
+def return_event_to_inbox(layout: RepoLayout, event_path: Path) -> InboxReturn:
+    """Rename one event back to ``inbox/<writer>/<id>.md`` — the ONE mover (#99).
+
+    Calls :func:`resolve_inbox_return`; on ``ok`` creates the writer dir and ``os.replace``s, then
+    returns the SAME verdict the resolver produced — so a dry-run plan and a real run are produced
+    by one code path, never two. An ``OSError`` from the mkdir/replace is caught and returned as
+    ``error`` (the caller reports it; the curator's ``_fail`` treats it as a refusal and preserves
+    the event terminally, #99 WU-0 / #124). The source is never deleted, never edited, never
+    truncated.
+    """
+    verdict = resolve_inbox_return(layout, event_path)
+    dest = verdict.dest
+    if not verdict.ok or dest is None:
+        return verdict
+    try:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(event_path, dest)
+    except OSError as exc:
+        return InboxReturn(status="error", source=event_path, dest=dest, detail=_one_line(exc))
+    return verdict

@@ -26,7 +26,7 @@ import pytest
 import agora_kb.curator.worker as worker_mod
 from agora_kb.core import frontmatter
 from agora_kb.core.ids import new_event_id
-from agora_kb.core.inbox import Inbox, failed_event_count
+from agora_kb.core.inbox import Inbox, InboxReturn, failed_event_count
 from agora_kb.core.layout import RepoLayout
 from agora_kb.core.repo import Repo
 from agora_kb.core.state import LastFailure, StateStore
@@ -2758,7 +2758,7 @@ def test_failure_state_write_error_becomes_a_warning_not_a_crash(
 def test_fail_preserves_an_event_whose_inbox_return_is_refused(tmp_path: Path) -> None:
     """(#124 crit 1) A REFUSED within-budget return preserves the event; it is never destroyed.
 
-    Before #124 this branch had no ``else``: a refused ``_return_one_to_inbox`` left the event in
+    Before #124 this branch had no ``else``: a refused inbox return left the event in
     ``processing/``, which ``_fail`` then ``rmtree``d. The event vanished and NOTHING recorded it —
     ``counts`` said ``{"retried": 0, "failed": 0}``, ``failed_event_count`` said 0. The refusal is
     reached with no attacker involved: an inbox slot occupied by an idempotent duplicate is enough.
@@ -2772,19 +2772,19 @@ def test_fail_preserves_an_event_whose_inbox_return_is_refused(tmp_path: Path) -
 
     # Occupy the destination so the return is refused: claim() moves the event out of the inbox, so
     # re-creating the path mid-run is what a duplicate id would look like from _fail's side.
-    real_return = worker_mod._return_one_to_inbox
+    real_return = worker_mod.return_event_to_inbox
 
-    def occupy_then_return(layout_arg: RepoLayout, event_path: Path) -> bool:
+    def occupy_then_return(layout_arg: RepoLayout, event_path: Path) -> InboxReturn:
         dest = layout_arg.inbox_item_path("dochan", e1)
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_text("an idempotent duplicate already sitting in the slot\n", encoding="utf-8")
         return real_return(layout_arg, event_path)
 
-    worker_mod._return_one_to_inbox = occupy_then_return  # type: ignore[assignment]
+    worker_mod.return_event_to_inbox = occupy_then_return  # type: ignore[assignment]
     try:
         report = _run(repo, FakeBackend(_bad_domain_plan(e1), prose={"c1": "unreachable"}))
     finally:
-        worker_mod._return_one_to_inbox = real_return  # type: ignore[assignment]
+        worker_mod.return_event_to_inbox = real_return  # type: ignore[assignment]
 
     assert report.status == "failed"
     # The refusal is now a TERMINAL disposition, so it is counted as one — no new counts KEY.
@@ -2807,8 +2807,8 @@ def test_a_traversing_frontmatter_id_is_refused_at_claim(tmp_path: Path, hostile
     """(#124 crit 4) A hostile frontmatter ``id`` never becomes a path component.
 
     The id is interpolated into TWO destinations with no validation between them:
-    ``claim`` builds ``processing/<run>/events/<id>.md`` (claim.py) and ``_return_one_to_inbox``
-    builds ``inbox/<writer>/<id>.md`` (worker.py). ``inbox_item_path`` validates the WRITER but
+    ``claim`` builds ``processing/<run>/events/<id>.md`` (claim.py) and ``return_event_to_inbox``
+    builds ``inbox/<writer>/<id>.md`` (core/inbox.py). ``inbox_item_path`` validates the WRITER but
     passes the id through verbatim, so ``id: ../../../../wiki/PWNED`` resolves inside the
     git-tracked read model only the curator may write (invariant 2).
 
@@ -2857,12 +2857,14 @@ def test_cas_conflict_preserves_an_event_whose_return_is_refused(tmp_path: Path)
     original = layout.inbox_item_path("dochan", e1).read_bytes()
     repo.compare_and_swap_branch = lambda *, expected, new, branch=None: False  # type: ignore[method-assign]
 
-    real_return = worker_mod._return_one_to_inbox
-    worker_mod._return_one_to_inbox = lambda layout_arg, event_path: False  # type: ignore[assignment]
+    real_return = worker_mod.return_event_to_inbox
+    worker_mod.return_event_to_inbox = lambda layout_arg, event_path: InboxReturn(  # type: ignore[assignment]
+        status="unreadable", source=event_path, dest=None, detail="refused, for the test"
+    )
     try:
         report = _run(repo, FakeBackend(_create_theme_plan("ignored", "c1", e1), prose={"c1": "x"}))
     finally:
-        worker_mod._return_one_to_inbox = real_return  # type: ignore[assignment]
+        worker_mod.return_event_to_inbox = real_return  # type: ignore[assignment]
 
     assert report.status == "failed"
     assert report.counts == {"retried": 0, "preserved": 1}
@@ -2915,3 +2917,41 @@ def test_recovery_preserves_an_event_whose_return_is_refused(tmp_path: Path) -> 
     assert preserved.read_bytes() == original
     assert failed_event_count(layout) == 1
     assert not (layout.processing_dir / run_id).exists()
+
+
+# --- issue #99: ONE budget derivation ------------------------------------------------------------
+def test_iter_attempt_records_is_the_single_budget_derivation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """(#99 R13) ``_event_attempt_counts`` DERIVES from ``iter_attempt_records`` — one enumeration.
+
+    ``agora requeue --reset-attempts`` archives against the same generator, so "what counts as one
+    spent attempt" (ADR-0011 §5.1) exists in exactly one place: a future change to the count is
+    necessarily a change to the reset. Two copies would drift, and the drift would surface as a
+    ``--reset-attempts`` that reports success while resetting nothing.
+    """
+    repo = _init_repo(tmp_path)
+    layout = repo.layout
+    inbox = Inbox(layout)
+    e1 = _write_capture(inbox, text="A fact in a non-existent domain.", second=10)
+    _seed_raw(repo, e1)
+    for _ in range(2):
+        assert _run(repo, FakeBackend(_bad_domain_plan(e1), prose={"c1": "x"})).status == "failed"
+
+    records = list(worker_mod.iter_attempt_records(layout))
+
+    assert [ids for _path, ids in records] == [[e1], [e1]]  # one record per attempt
+    assert all(path.name == "error.json" for path, _ids in records)
+    assert worker_mod._event_attempt_counts(layout) == {e1: 2}
+
+    # A malformed record is skipped by the generator, so the counter never sees it either.
+    stray = layout.failed_dir / RUN_DATE / "hand-made" / "error.json"
+    stray.parent.mkdir(parents=True, exist_ok=True)
+    stray.write_text("[not, an, object]", encoding="utf-8")
+    assert worker_mod._event_attempt_counts(layout) == {e1: 2}
+
+    # ...and the counter routes THROUGH the generator rather than re-globbing beside it.
+    monkeypatch.setattr(
+        worker_mod, "iter_attempt_records", lambda _layout: iter([(Path("x"), ["spliced"])])
+    )
+    assert worker_mod._event_attempt_counts(layout) == {"spliced": 1}

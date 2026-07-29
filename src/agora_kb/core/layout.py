@@ -117,6 +117,34 @@ class RepoLayout:
         return self.kb_dir / "failed"
 
     @property
+    def requeued_dir(self) -> Path:
+        """Archived retry-budget records ``_kb/requeued/`` (issue #99, ADR-0011 §5.1).
+
+        MUST live outside :attr:`failed_dir`: the budget derivation is
+        ``failed_dir.rglob("error.json")`` and ``rglob`` descends into dotted dirs, so a tidier
+        ``_kb/failed/.archive/`` would still be counted and ``agora requeue --reset-attempts``
+        would silently reset nothing (verified; locked by a regression test). Not created here.
+        """
+        return self.kb_dir / "requeued"
+
+    def requeued_record_path(self, *, date: str, run_id: str) -> Path:
+        """Archive destination of one run's error record — the ``_kb/failed/`` twin (#99).
+
+        The shape is preserved EXACTLY (``<date>/<run-id>/error.json``) so the mapping from a
+        stored ``last_failure.record_path`` to its archived twin is structural rather than a string
+        guess, and so two runs on one date can never collide. Both components come from a directory
+        name read off disk — ``_kb/failed/`` is operator-editable — so both go through
+        :func:`safe_path_component` (the DESIGN §7 guard the inbox/harvest/gold/index namespaces
+        use); an unsafe component raises :class:`InvalidWriterError` and the caller reports + skips.
+        """
+        return (
+            self.requeued_dir
+            / safe_path_component(date)
+            / safe_path_component(run_id)
+            / "error.json"
+        )
+
+    @property
     def harvest_dir(self) -> Path:
         """Per-connector harvester cursor directory ``_kb/harvest/`` (ADR-0007, DATA-MODEL §6)."""
         return self.kb_dir / "harvest"
