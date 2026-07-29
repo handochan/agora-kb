@@ -8,7 +8,7 @@ Format: lightweight [MADR](https://adr.github.io/madr/)-style.
 | ADR | Decision | Status |
 |---|---|---|
 | [0001](0001-markdown-git-source-of-truth.md) | Markdown + git is the source of truth (no canonical DB) | Accepted |
-| [0002](0002-cqrs-single-writer-curator.md) | CQRS + single-writer curator for concurrency | Accepted |
+| [0002](0002-cqrs-single-writer-curator.md) | CQRS + single-writer curator for concurrency | Accepted · scope clarified by the 2026-07-29 appendix (spool-custodian rule C1–C5, #99) |
 | [0003](0003-one-core-many-faces.md) | One core API, many faces (MCP / web / dashboard) | Accepted |
 | [0004](0004-pluggable-adapters.md) | Three pluggable adapter families (input / read / write) | Accepted |
 | [0005](0005-fully-oss-bom.md) | Fully-OSS BOM; proprietary pieces are optional plugins | Accepted |
@@ -17,7 +17,7 @@ Format: lightweight [MADR](https://adr.github.io/madr/)-style.
 | [0008](0008-transactional-sandboxed-curation.md) | Transactional, sandboxed curator runs | Accepted |
 | [0009](0009-deterministic-query-contract.md) | Deterministic query contract; synthesis is optional | Accepted |
 | [0010](0010-kb-wiki-schema.md) | KB wiki schema v1 (emitted AGENTS.md/SCHEMA.md) | Accepted · amended by 0014 |
-| [0011](0011-curator-ingest-contract.md) | Curator INGEST contract (plan-apply-author) | Accepted · §7.1 routing superseded by 0015 |
+| [0011](0011-curator-ingest-contract.md) | Curator INGEST contract (plan-apply-author) | Accepted · §7.1 routing superseded by 0015 · §5.1 corrected + §5.1a added 2026-07-29 (#99) |
 | [0012](0012-deterministic-query-ranking.md) | Deterministic query ranking for core.wiki | Accepted |
 | [0013](0013-curator-sandbox-mechanism.md) | Curator sandbox mechanism (macOS Seatbelt + cross-platform) | Accepted |
 | [0014](0014-okf-obsidian-interoperability.md) | OKF + Obsidian interoperability (strict producer / tolerant consumer) | Accepted |

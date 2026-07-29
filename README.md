@@ -204,7 +204,10 @@ units that start them at login/boot, restart them when they exit, and capture lo
 [`deploy/README.md`](deploy/README.md) for the install steps. Two rules baked into the examples:
 the web unit binds `127.0.0.1` **only** (the web face has no auth/TLS), and **harvest needs its
 own scheduled unit** — the `agora watch` loop evaluates only the curation triggers and never runs
-harvest. Sharing one KB with a small team (single hub, reverse proxy, SSH MCP writes, read-only
+harvest. If an unattended loop ever curates against a brain that has stopped answering, three
+consecutive failures move those captures to `_kb/failed/` — `agora requeue` moves them back, by
+rename, once you have fixed the cause ([`deploy/README.md`](deploy/README.md) → "Recovering terminal
+failures"). Sharing one KB with a small team (single hub, reverse proxy, SSH MCP writes, read-only
 clones) is covered by [`docs/DEPLOY-TEAM.md`](docs/DEPLOY-TEAM.md) (issue #68).
 
 ## Documentation
