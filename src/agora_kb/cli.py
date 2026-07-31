@@ -23,7 +23,12 @@ A dependency-light :mod:`argparse` front-end over the core API. Subcommands:
 - ``agora web [--repo PATH] [--host H] [--port P] [--writer W] [--user U]`` — run the FastAPI + HTMX
   web face (browse / search / upload; ADR-0019). Imported lazily (the optional ``web`` extra), so a
   missing fastapi gives a clean ``install agora-kb[web]`` message, not an import error.
-- ``agora doctor`` — print a health report (git, python, key deps, repo init state).
+- ``agora doctor`` — print a health report, headed by a paste-into-a-bug-report line carrying the
+  agora + python versions (then git, key deps, repo init state, sandbox, routing, …).
+
+``agora --version`` (top-level, no subcommand) prints ``agora <version>`` from the single source of
+truth :data:`agora_kb.__version__` — never from install metadata, which a source checkout lacks
+(issue #101).
 
 The MCP and web faces are imported lazily (only inside ``serve`` / ``web``) on purpose: it keeps
 ``repo init`` / ``status`` / ``curate`` / ``doctor`` usable in environments where the transport /
@@ -49,6 +54,7 @@ from pathlib import Path
 
 from pydantic import ValidationError
 
+from . import __version__
 from .config import (
     ConfigError,
     RepoConfig,
@@ -110,6 +116,12 @@ def build_parser() -> argparse.ArgumentParser:
         prog=_PROG,
         description="Agora — markdown + git shared-memory hub for AI agents.",
     )
+    # `--version` hangs on the TOP-LEVEL parser, not a subcommand: the question "what am I running?"
+    # is asked before the user knows any subcommand, and `agora --version` must answer it on a bare
+    # invocation (issue #101). argparse's `version` action prints to stdout and raises
+    # `SystemExit(0)` from inside `parse_args`, so it never reaches `main`'s dispatch — deliberate:
+    # it is the one flag that must work even if every subcommand's imports are broken.
+    parser.add_argument("--version", action="version", version=f"{_PROG} {__version__}")
     sub = parser.add_subparsers(dest="command", metavar="<command>")
 
     # repo (group) — currently only `repo init`.
@@ -1695,7 +1707,14 @@ _OLLAMA_PULL_HINT = "ollama pull qwen3.6:35b-a3b"
 
 def _cmd_doctor(args: argparse.Namespace) -> int:
     ok = True
-    print("agora doctor")
+
+    # The header doubles as the bug-report banner (issue #101): ONE line an operator can paste that
+    # answers the two questions every report starts with, "which build?" and "which interpreter?".
+    # Both facts also appear below in verdict form (the `python:` line owns the >= 3.12 check); the
+    # duplication is intentional — a header that a reporter can copy in isolation is worth more than
+    # the saved line, and the `agora doctor` prefix is preserved so existing greps still match.
+    v = sys.version_info
+    print(f"agora doctor (agora {__version__}, python {v.major}.{v.minor}.{v.micro})")
 
     git_path = shutil.which("git")
     if git_path:
@@ -1704,7 +1723,6 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
         print("  git: MISSING (required for the curated source of truth)")
         ok = False
 
-    v = sys.version_info
     py_ok = (v.major, v.minor) >= (3, 12)
     print(f"  python: {v.major}.{v.minor}.{v.micro} ({'ok' if py_ok else 'need >= 3.12'})")
     if not py_ok:

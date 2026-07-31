@@ -1,6 +1,11 @@
 [project]
 name = "agora-kb"
-version = "0.0.0"
+# The version is DERIVED, not declared here (issue #101). SSOT = `src/agora_kb/__init__.py`'s
+# `__version__`, read back by `[tool.hatch.version]` below. The direction matters: a dogfooder's
+# normal path is `git clone` + `uv run agora` on a source checkout, where the reverse arrangement
+# (static version here + `importlib.metadata.version("agora-kb")` at runtime) raises
+# `PackageNotFoundError` — the runtime must be able to name itself with no install metadata at all.
+dynamic = ["version"]
 description = "Self-hostable, OSS, multi-tenant shared memory hub for AI agents (markdown + git + MCP)"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -39,6 +44,7 @@ dev = [
     "ruff>=0.6",
     "mypy>=1.11",
     "types-PyYAML>=6.0",  # mypy stubs for pyyaml
+    "packaging>=22",      # PEP 440 parsing in tests/test_version.py (transitive via pytest; pinned so the version lock cannot silently lose it)
 ]
 
 [project.scripts]
@@ -49,6 +55,14 @@ agora-cli-brain = "agora_kb.adapters.cli_agent_brain:main"
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+# The one place the build learns the version (issue #101). hatchling's regex source reads
+# `__version__` straight out of the module, so `uv build` artifact names, the PyPI metadata and the
+# string `agora --version` prints can only ever come from the same literal. Moving this path (or
+# reintroducing a static `version =` above) re-opens the two-independent-constants hole this issue
+# closed — `tests/test_version.py` fails if either happens.
+[tool.hatch.version]
+path = "src/agora_kb/__init__.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/agora_kb"]

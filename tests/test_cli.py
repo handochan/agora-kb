@@ -22,6 +22,7 @@ import pytest
 import yaml
 
 import agora_kb.curator.requeue as requeue_mod
+from agora_kb import __version__
 from agora_kb import cli as cli_mod
 from agora_kb.adapters import cli_agent_brain, ollama_brain
 from agora_kb.cli import main
@@ -1662,6 +1663,25 @@ def test_doctor_prints_report_and_returns_health_code(
     assert "dep pydantic: ok" in out
     # Health is binary: 0 (healthy) or 1 (unhealthy); both are valid outcomes for this report.
     assert rc in (0, 1)
+
+
+def test_doctor_header_is_a_paste_ready_bug_report_line(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """#101 criterion 4: doctor's FIRST line names the build and the interpreter.
+
+    A bug report that opens with "which version?" costs a round trip, and before #101 doctor
+    reported python, git, deps, sandbox, routing — everything except agora's own version. The line
+    is asserted whole (not just "the version appears somewhere") because its value is that it can
+    be copied in isolation; and the ``agora doctor`` prefix is asserted to still LEAD it, since the
+    older assertions across this file — and any operator's grep — key on that token.
+    """
+    assert main(["doctor", "--repo", str(tmp_path)]) in (0, 1)
+    first = capsys.readouterr().out.splitlines()[0]
+
+    v = sys.version_info
+    assert first == f"agora doctor (agora {__version__}, python {v.major}.{v.minor}.{v.micro})"
+    assert first.startswith("agora doctor")
 
 
 @requires_git
@@ -3446,6 +3466,46 @@ def test_import_with_warnings_still_exits_0_and_prints_them(
     out = capsys.readouterr().out
     assert "moved to fit" in out
     assert "stripped tags: unknown-tag" in out
+
+
+# --- --version (issue #101) ----------------------------------------------------------------------
+def test_version_flag_prints_the_version_and_exits_zero(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """#101 criterion 1: ``agora --version`` → ``agora <ver>`` on stdout, exit 0, nothing else.
+
+    Three properties, each load-bearing. **No subcommand**: this is the first thing a confused user
+    types, so the flag lives on the top-level parser (before #101 it exited 2 as an unknown
+    argument). **Exit 0**: a version query is a success, and packaging/CI smoke checks branch on the
+    code. **Stdout, alone**: the line gets piped and pasted, so a stderr byte or a stray banner
+    would corrupt it.
+
+    The expected string is built from :data:`agora_kb.__version__` rather than the literal
+    ``0.1.0b1`` deliberately — hardcoding it here would create the SECOND copy of the version that
+    this issue exists to eliminate. The literal's own shape is locked in ``tests/test_version.py``.
+    """
+    with pytest.raises(SystemExit) as excinfo:
+        main(["--version"])
+
+    assert excinfo.value.code == 0
+    captured = capsys.readouterr()
+    assert captured.out == f"agora {__version__}\n"
+    assert captured.err == ""
+
+
+def test_version_flag_is_not_shadowed_by_a_subcommand(capsys: pytest.CaptureFixture[str]) -> None:
+    """The flag must be resolved by the top-level parser, i.e. accepted BEFORE any subcommand.
+
+    argparse gives a subparser its own namespace, so a `--version` placed after a subcommand name
+    would belong to that subcommand (and fail). Asserting the pre-subcommand position is what
+    documents the supported form; it also pins that adding subcommands later cannot silently
+    capture the flag.
+    """
+    with pytest.raises(SystemExit) as excinfo:
+        main(["--version", "status"])
+
+    assert excinfo.value.code == 0
+    assert capsys.readouterr().out == f"agora {__version__}\n"
 
 
 # --- no / unknown command -----------------------------------------------------------------------
