@@ -8,6 +8,10 @@ A dependency-light :mod:`argparse` front-end over the core API. Subcommands:
 - ``agora curate [--repo PATH] [--force]`` — recover any in-flight run, then execute ONE real
   consolidation run via :mod:`agora_kb.curator` ``worker`` against the configured ``adapters.yaml``
   backend, and print the resulting :class:`~agora_kb.curator.worker.RunReport`.
+- ``agora requeue [--repo PATH] (--run ID | --event ID | --all) [--dry-run] [--force]
+  [--reset-attempts]`` — return TERMINAL-failure events from ``_kb/failed/`` to the inbox (issue
+  #99). Rename-only under ``curator_lock``: the events keep their bytes and their ids, an occupied
+  inbox slot is reported rather than clobbered, and nothing is ever deleted.
 - ``agora watch [--repo PATH] [--interval N] [--once]`` — the in-process scheduler: loop, evaluating
   the cron + threshold + idle triggers each tick and consolidating when due (``--once`` for a single
   evaluation, e.g. driven by an external system cron / launchd).
@@ -30,6 +34,7 @@ optional).
 from __future__ import annotations
 
 import argparse
+import functools
 import importlib
 import json
 import os
@@ -38,6 +43,7 @@ import sys
 import tempfile
 import time
 import traceback
+from collections import Counter
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -56,14 +62,34 @@ from .config import (
     write_default_adapters_yaml,
     write_default_repo_config,
 )
-from .core import Inbox, Repo, RepoLayout, StateStore, atomic_write_text, failed_event_count
+from .core import (
+    Inbox,
+    InvalidWriterError,
+    Repo,
+    RepoLayout,
+    StateStore,
+    atomic_write_text,
+    failed_event_count,
+)
 from .core.repo import GitError
 from .core.state import CuratorState
 from .curator import evaluate
 from .curator.backends import _WORKTREE_TOKEN, BackendRegistry
+from .curator.claim import LockHeld
 from .curator.constants import DEFAULT_BODY_BYTE_BOUND
 from .curator.cron import is_cron_due
 from .curator.isolation import SandboxUnavailable, select_backend_isolation
+from .curator.requeue import _KEEP_ERROR as _REQUEUE_KEEP_ERROR
+from .curator.requeue import (
+    MOVING_OUTCOMES,
+    RequeueItem,
+    RequeueOutcome,
+    RequeueReport,
+    Selector,
+    StateUnreadable,
+    rel_to_repo,
+    run_requeue,
+)
 from .curator.subprocess_backend import (
     RoutedBackend,
     SubprocessBackend,
@@ -159,6 +185,52 @@ def build_parser() -> argparse.ArgumentParser:
         help="pin BOTH cognitive acts to this adapters.yaml backend, bypassing routing (ADR-0015)",
     )
     p_curate.set_defaults(func=_cmd_curate)
+
+    # requeue — the _kb/failed/ → _kb/inbox/ back-edge (issue #99, ADR-0002 spool-custodian
+    # appendix). A SELECTOR IS REQUIRED: nothing else in this CLI moves files en masse on a bare
+    # invocation, `agora status` / `agora doctor` already serve discovery, and `agora curate` hands
+    # the operator the exact `--run <id>` command — so the mass move stays a deliberate act.
+    p_requeue = sub.add_parser(
+        "requeue",
+        help="return terminal-failure events from _kb/failed/ to the inbox (rename-only; #99)",
+    )
+    p_requeue.add_argument("--repo", default=".", help="repo root (default: .)")
+    sel = p_requeue.add_mutually_exclusive_group(required=True)
+    sel.add_argument(
+        "--run",
+        default=None,
+        metavar="RUN_ID",
+        help="requeue only the events of this failed run (the id 'agora curate' prints as "
+        "failed_requeue)",
+    )
+    sel.add_argument("--event", default=None, metavar="EVENT_ID", help="requeue only this event")
+    sel.add_argument(
+        "--all",
+        action="store_true",
+        help="requeue every terminal-failure event under _kb/failed/",
+    )
+    p_requeue.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="report what WOULD move without changing one byte of the filesystem",
+    )
+    p_requeue.add_argument(
+        "--force",
+        action="store_true",
+        help="requeue events whose event_key is already in state.event_keys (the claim will still "
+        "drop them); never overwrites an existing inbox event",
+    )
+    # OUTSIDE the mutually-exclusive group on purpose: the budget flag is orthogonal to WHICH
+    # events are selected, and criterion 8 requires it to work with every selector.
+    p_requeue.add_argument(
+        "--reset-attempts",
+        action="store_true",
+        help="also archive to _kb/requeued/ every retry record none of whose events is still in "
+        "_kb/failed/, so they get the full curator.max_attempts budget again (by default a "
+        "requeued event keeps the attempts it already spent, so it gets exactly one more run); "
+        "every archived record is printed",
+    )
+    p_requeue.set_defaults(func=_cmd_requeue)
 
     # harvest — scan configured memory connectors into gated candidates (ADR-0007; opt-in).
     p_harvest = sub.add_parser(
@@ -453,17 +525,26 @@ def _cmd_status(args: argparse.Namespace) -> int:
     # fails every run shows `never` forever — these three lines are the only place a non-terminal
     # failure (which returns its events to inbox/ and burns no counter) is visible from the CLI.
     print(f"last_attempt: {_fmt_dt(state.last_attempt)}")
-    print(f"last_failure: {_fmt_last_failure(state)}")
+    print(f"last_failure: {_fmt_last_failure(state, layout)}")
     print(f"failed_events: {failed_event_count(layout)}")
+    # `agora status` deliberately does NOT advertise `agora requeue` (#99 §5.3): every line here is
+    # `key: <machine-readable value>` and a remediation sentence has no value slot, but the real
+    # reason is ordering — status has no CAUSE information, so it would send an operator to requeue
+    # BEFORE `agora doctor`, inverting the one sequencing the risk section demands. Locked by
+    # `test_status_does_not_advertise_requeue`.
     return 0
 
 
-def _fmt_last_failure(state: CuratorState) -> str:
+def _fmt_last_failure(state: CuratorState, layout: RepoLayout) -> str:
     """One line for the last curator failure, or ``none`` (#96).
 
     The VERDICT WORD comes FIRST so `agora status | grep UNRESOLVED` works and the operator can
     tell "currently broken" from "already superseded by a later successful run" at a glance. The
     reason is already whitespace-collapsed and length-capped upstream, so this stays ONE line.
+
+    ``layout`` is here only for :func:`_record_pointer`: ``last_failure`` is never cleared by a
+    later success, so after ``agora requeue --reset-attempts`` the stored ``record=`` would point
+    at a file that has moved to ``_kb/requeued/`` — indefinitely (#99).
     """
     lf = state.last_failure
     if lf is None:
@@ -472,8 +553,43 @@ def _fmt_last_failure(state: CuratorState) -> str:
     first = lf.reasons[0] if lf.reasons else "-"
     return (
         f"{verdict} {_fmt_dt(lf.when)} run={lf.run_id} phase={lf.phase} "
-        f"reasons={lf.reasons_total} record={lf.record_path} first={first}"
+        f"reasons={lf.reasons_total} record={_record_pointer(layout, lf.record_path)} "
+        f"first={first}"
     )
+
+
+def _record_pointer(layout: RepoLayout, record_path: str) -> str:
+    """The rendered ``record=`` value: the requeued twin when the original is gone (#99).
+
+    ``agora requeue --reset-attempts`` ARCHIVES a run's ``error.json`` to the ``_kb/requeued/``
+    twin instead of rewriting ``state.json`` (requeue is strictly rename-only and must never clear
+    a failure the operator has not fixed — that is the blind spot #96 closed). The cost is a stored
+    pointer to a moved file, and the fix belongs in the two renderers, not in the state.
+
+    Deliberately conservative — the twin is returned ONLY when (1) the stored string has the exact
+    ``_kb/failed/<date>/<run-id>/error.json`` shape, (2) the original is absent, and (3) the twin
+    exists. In every other case — including a record deleted by hand, which already dangles today —
+    the stored string is returned UNCHANGED, so existing output stays byte-identical.
+
+    OSError-GUARDED: ``record_path`` is an unconstrained ``str`` in an operator-editable
+    ``state.json`` and ``Path.exists()`` RAISES ``ENAMETOOLONG`` (it is not in pathlib's
+    ignored-errno set). :func:`_fmt_last_failure` is called OUTSIDE ``_cmd_status``'s try, so an
+    unguarded stat would re-introduce exactly the traceback #96 removed. Shape first, filesystem
+    second. The value is swapped with NO suffix: ``_kb/requeued/`` is self-describing, and a space
+    inside the value would break the ``record=… first=…`` grammar scripts already split on.
+    """
+    parts = record_path.split("/")
+    if len(parts) != 5 or parts[0] != "_kb" or parts[1] != "failed" or parts[4] != "error.json":
+        return record_path
+    try:
+        if (layout.root / record_path).exists():
+            return record_path
+        twin = layout.requeued_record_path(date=parts[2], run_id=parts[3])
+        if twin.exists():
+            return twin.relative_to(layout.root).as_posix()
+    except (OSError, InvalidWriterError):
+        return record_path
+    return record_path
 
 
 def _cmd_curate(args: argparse.Namespace) -> int:
@@ -581,10 +697,22 @@ def _print_run_diagnostics(report: RunReport, *, prefix: str = "") -> None:
     ``{stamp} <verb>:`` grammar so ``journalctl -u agora-watch`` reads as ONE stream. The stderr
     ``warning:`` lines are deliberately NOT prefixed: their bytes are the #115 contract and are
     already test-locked, and prefixing them would buy nothing on a stream that carries no timeline.
+
+    Since #99 a THIRD stdout line rides the same channel — the way BACK from a terminal failure —
+    gated on ``counts["failed"] > 0``, i.e. on this run having actually left events in
+    ``_kb/failed/``. That gate is the whole point: a WITHIN-BUDGET failure reports
+    ``retried=1 failed=0`` with the events back in ``inbox/``, where advertising requeue would not
+    be noise but WRONG ADVICE, and the CAS-conflict path (``record_path=None``, ``retried=N``) is
+    correctly silent for the same reason. ``failure.run_id`` IS the ``_kb/failed/<date>/<run-id>/``
+    directory name (``worker._fail``), so ``--run <that id>`` selects exactly the events this run
+    lost — the narrow selector doing the mass-move footgun mitigation structurally. Run ids contain
+    only ``[A-Za-z0-9.-]``, so the line pastes into any shell unquoted.
     """
     if report.failure is not None:
         print(f"{prefix}failed_record: {report.failure.record_path or '-'}")
         print(f"{prefix}failed_checks: {report.failure.summary()}")
+        if report.counts.get("failed", 0) > 0:
+            print(f"{prefix}failed_requeue: {_PROG} requeue --run {report.failure.run_id}")
     for warning in report.warnings:
         print(f"warning: {warning}", file=sys.stderr)
 
@@ -637,6 +765,273 @@ def _build_backend(
         body_byte_bound=body_byte_bound,
         language=language,
         report=lambda msg: print(f"{_PROG} curate: {msg}", file=sys.stderr),
+    )
+
+
+# --- requeue (issue #99) -------------------------------------------------------------------------
+#: The outcomes the report counts as a DECLINE — everything that neither moved nor errored. Kept as
+#: one frozenset so the `skipped:` count, its per-reason tally and the exit code cannot disagree.
+_REQUEUE_DECLINED: frozenset[RequeueOutcome] = frozenset(
+    {
+        RequeueOutcome.already_delivered,
+        RequeueOutcome.destination_exists,
+        RequeueOutcome.unreadable,
+    }
+)
+
+#: Printed only when at least one event moved (or would): requeueing into a still-broken curator is
+#: a non-destructive round trip, but it is pure noise, and the ordering fix → requeue → curate is
+#: the whole recovery procedure (`deploy/README.md`).
+_REQUEUE_NOTE = (
+    "note: fix the cause before curating again — 'agora status' shows the last failure, "
+    "'agora doctor' checks the brain"
+)
+
+
+def _cmd_requeue(args: argparse.Namespace) -> int:
+    """``agora requeue``: return TERMINAL-failure events from ``_kb/failed/`` to the inbox (#99).
+
+    The face is a thin renderer over :func:`~agora_kb.curator.requeue.run_requeue`, mirroring
+    ``_cmd_curate`` → ``worker.run``: every decision (the lock span, the tier-1 pre-check, the
+    drain rule) belongs to the curator domain, so a future ``kb_requeue`` MCP tool gets one call
+    site instead of a re-implementation.
+
+    Uses ``RepoLayout(Path(args.repo))`` and NOT ``Repo.resolve``: requeue publishes nothing and
+    must work when git is broken — a plausible co-morbidity of the outage that produced the
+    failures in the first place.
+
+    EXIT CODES (#99 crit 4/9): 0 when anything moved, when everything was legitimately declined, or
+    when ``--all`` found an empty spool (a decline means the command DID its job and correctly
+    refused — the ``_cmd_curate`` ruling that rc 1 means "could not do its job"); 1 for a held
+    lock, an unreadable ``state.json`` without ``--force``, a named selector that matched nothing
+    (it asserts the existence of a specific thing, unlike ``--all``), or any event that could not
+    be moved; 2 from argparse for a missing/duplicated selector.
+    """
+    layout = RepoLayout(Path(args.repo))
+    selector = _requeue_selector(args)
+    # A WARNING, never a guard (#99 §4.3): `failure_is_current` is True on 100% of legitimate
+    # recoveries — `last_run` is the last successful PUBLISH and the canonical order is fix →
+    # requeue → curate — so a "refuse unless --force" gate would fire every single time, train
+    # reflexive --force, and collide with criterion 6's use of the same flag. Silent for the narrow,
+    # advertised `--run`/`--event` selectors. Handed to `run_requeue` as a preflight hook so it
+    # prints BEFORE the batch moves, off the state the batch itself loaded under the lock: a second
+    # unlocked `StateStore.load()` here would both widen the pre-lock access budget and report a
+    # value the batch never saw. A held lock never reaches it — the lock is taken first, so crit 4's
+    # "one clean line and nothing else" survives.
+    preflight = (
+        functools.partial(_warn_unresolved_failure, layout) if selector.kind == "all" else None
+    )
+    try:
+        report = run_requeue(
+            layout,
+            selector=selector,
+            dry_run=args.dry_run,
+            force=args.force,
+            reset_attempts=args.reset_attempts,
+            preflight=preflight,
+        )
+    except LockHeld:
+        # ADR-0008 step 1: the lock is non-blocking, so contention is a REFUSAL, not a wait and
+        # not a traceback. Nothing was touched — run_requeue takes the lock before anything else.
+        print(
+            f"{_PROG} requeue: a curator run is in progress (_kb/curator.lock is held); "
+            "nothing was changed — try again when it finishes",
+            file=sys.stderr,
+        )
+        return 1
+    except StateUnreadable as exc:
+        print(
+            f"{_PROG} requeue: _kb/state.json is unreadable — {_one_line(str(exc), 200)} "
+            "(use --force to requeue without the tier-1 pre-check)",
+            file=sys.stderr,
+        )
+        return 1
+
+    if not report.items and selector.kind != "all":
+        # A named selector ASSERTS that a specific run/event exists; `--all` asserts nothing, so an
+        # empty spool is a clean 0 there (cron-safe) while this is an error. The decision rests on
+        # the SELECTION alone: `--reset-attempts` scopes RECORDS rather than events, so letting a
+        # drained record suppress this line would turn a mistyped run id into a silent rc 0 whose
+        # exit code depended on unrelated repo state. `run_requeue` correspondingly archives
+        # nothing when a named selector matched nothing, so there is never anything to suppress.
+        noun = "run" if selector.kind == "run" else "event"
+        print(
+            f"{_PROG} requeue: no failed {noun} {selector.value!r} under _kb/failed/",
+            file=sys.stderr,
+        )
+        return 1
+
+    if report.precheck_skipped:
+        print(
+            "warning: _kb/state.json could not be read — the already-delivered pre-check was "
+            "SKIPPED (--force); an event whose key is already published becomes an inbox zombie",
+            file=sys.stderr,
+        )
+
+    print(f"repo: {layout.root}")
+    _print_requeue_report(layout, report, reset_attempts=args.reset_attempts)
+
+    forced = [item for item in report.items if item.outcome is RequeueOutcome.forced]
+    if forced:
+        carry = "would carry" if report.dry_run else "carry"
+        print(
+            f"warning: {len(forced)} forced event(s) {carry} an event_key already in "
+            "state.event_keys — the claim will drop them again",
+            file=sys.stderr,
+        )
+    rc = _warn_reset_attempts(report, reset_attempts=args.reset_attempts)
+    stuck = [
+        item
+        for item in report.items
+        if item.outcome in (RequeueOutcome.unreadable, RequeueOutcome.error)
+    ]
+    if stuck:
+        tail = (
+            "cannot be requeued and would be left in place"
+            if report.dry_run
+            else "could not be requeued and were left in place"
+        )
+        print(f"warning: {len(stuck)} event(s) under _kb/failed/ {tail}", file=sys.stderr)
+        rc = 1
+    return rc
+
+
+def _warn_reset_attempts(report: RequeueReport, *, reset_attempts: bool) -> int:
+    """Say what ``--reset-attempts`` actually did when it did not archive; return the exit code.
+
+    Three states hide behind ``archived=0``, and naming the wrong one sends the operator away from
+    the fix: records genuinely shared with a still-terminal event (use a wider selector), no
+    records at all (nothing to reset — there is no wider selector to try), and records the
+    filesystem REFUSED (a read-only or full disk; the budget was NOT reset). Only the first is the
+    #99 §3.2 loud-null sentence, so it is now gated on the ``kept:`` lines it tells the operator to
+    read. The third is the one that also changes the exit code: `deploy/README.md` documents this
+    command inside a scripted recovery, and a wrapper must not see success when the budget it asked
+    for is still spent. A PARTIAL failure (some archived, some errored) reports too — the count of
+    archived records would otherwise read as a complete reset.
+    """
+    if not reset_attempts:
+        return 0
+    errored = [record for record in report.kept if record.reason.startswith(_REQUEUE_KEEP_ERROR)]
+    if errored:
+        print(
+            f"warning: {len(errored)} retry record(s) could not be archived — the budget of the "
+            "events they list was NOT reset (see the kept: lines for the reason)",
+            file=sys.stderr,
+        )
+        return 1
+    if report.archived or not report.moved:
+        return 0
+    # The LOUD null outcome: the flag ran, moved events, and reset nothing. Silence here would send
+    # an operator into the next run believing the budget was restored.
+    if report.kept:
+        print(
+            "warning: --reset-attempts reset nothing — every attempt record of the requeued "
+            "events is shared with an event that is still terminal (see the kept: lines); "
+            "use --run or --all to reset the whole set",
+            file=sys.stderr,
+        )
+    else:
+        print(
+            "warning: --reset-attempts reset nothing — the requeued events have no retry records "
+            "under _kb/failed/, so there was no spent budget to restore",
+            file=sys.stderr,
+        )
+    return 0
+
+
+def _requeue_selector(args: argparse.Namespace) -> Selector:
+    """Turn the mutually-exclusive flags into the ONE selector value the engine filters on."""
+    if args.run is not None:
+        return Selector(kind="run", value=args.run)
+    if args.event is not None:
+        return Selector(kind="event", value=args.event)
+    return Selector(kind="all")
+
+
+def _print_requeue_report(
+    layout: RepoLayout, report: RequeueReport, *, reset_attempts: bool
+) -> None:
+    """Render one :class:`RequeueReport` in the house grammar (#99 §4.3 — these bytes are locked).
+
+    ``key: value`` on stdout with a two-space indent for per-item lines (``_cmd_harvest``), paths
+    repo-relative POSIX (``worker._fail``'s ``record_path`` convention, so the output can be pasted
+    into an issue and matched against ``agora status``), and ``[dry-run]`` on the header.
+
+    The two summary lines print even at 0: a constant, greppable shape is what lets a script read
+    this report without parsing prose (the ``counters:`` precedent). ``failed_events:`` is the
+    PREDICTED post-count in BOTH modes — never the pre-count — because it is the number the dry run
+    is promising to produce, which is what makes the preview comparable to the result (crit 5).
+    """
+    dry = report.dry_run
+    print(
+        f"requeue{' [dry-run]' if dry else ''}: "
+        f"selector={report.selector.label} matched={len(report.items)}"
+    )
+    for item in report.items:
+        print(f"  {item.label}: {_requeue_item_line(layout, item, dry_run=dry)}")
+
+    moved = report.moved
+    print(f"{'would requeue' if dry else 'requeued'}: {len(moved)}")
+    declined = [item for item in report.items if item.outcome in _REQUEUE_DECLINED]
+    tally = ""
+    if declined:
+        counts = Counter(str(item.outcome) for item in declined)
+        tally = " (" + " ".join(f"{slug}={counts[slug]}" for slug in sorted(counts)) + ")"
+    print(f"{'would skip' if dry else 'skipped'}: {len(declined)}{tally}")
+    errors = sum(1 for item in report.items if item.outcome is RequeueOutcome.error)
+    if errors:
+        print(f"errors: {errors}")
+
+    if reset_attempts:
+        # The header carries the mode; the INDENTED lines are byte-identical in both modes, which
+        # turns "the dry-run list matches the result" into a literal string equality (crit 5 ∩ 8).
+        print(
+            f"reset_attempts{' [dry-run]' if dry else ''}: "
+            f"archived={len(report.archived)} kept={len(report.kept)}"
+        )
+        for archived in report.archived:
+            print(f"  archived: {archived.source} -> {archived.dest}")
+        for kept in report.kept:
+            print(f"  kept: {kept.source} ({kept.reason})")
+
+    print(f"failed_events: {report.failed_events_after}")
+    if moved:
+        print(_REQUEUE_NOTE)
+
+
+def _requeue_item_line(layout: RepoLayout, item: RequeueItem, *, dry_run: bool) -> str:
+    """One event's verdict, after the ``  <label>: `` prefix.
+
+    ``forced`` says WHY a known-doomed event moved rather than hiding it behind a plain
+    ``requeued``, and an ``error`` is deliberately NOT rendered as a skip: a skip is a correct
+    refusal, an error is work that could not be done.
+    """
+    if item.outcome in MOVING_OUTCOMES:
+        verb = "would requeue" if dry_run else "requeued"
+        why = " (already-delivered; forced)" if item.outcome is RequeueOutcome.forced else ""
+        return f"{verb}{why} -> {rel_to_repo(layout, item.dest)}"
+    if item.outcome is RequeueOutcome.error:
+        return f"error ({item.detail})"
+    return f"{'would skip' if dry_run else 'skipped'} ({item.outcome}: {item.detail})"
+
+
+def _warn_unresolved_failure(layout: RepoLayout, state: CuratorState) -> None:
+    """Warn that ``--all`` is requeueing into a curator whose last failure is still UNRESOLVED.
+
+    ``run_requeue``'s preflight hook, so it lands on stderr BEFORE the batch moves, off the very
+    state the batch used (a corrupt ``state.json`` means no state and therefore no preflight — not
+    this command's problem to report, since ``agora status`` and ``agora doctor`` both say so
+    loudly, and the whole point of requeue is to work in a broken repo). Never raises and never
+    changes the exit code.
+    """
+    lf = state.last_failure
+    if lf is None or not state.failure_is_current:
+        return
+    print(
+        f"warning: the last curator failure is still UNRESOLVED (run={lf.run_id} "
+        f"record={_record_pointer(layout, lf.record_path)}) — run 'agora doctor' first; "
+        "a requeued event goes terminal again on the next failing run",
+        file=sys.stderr,
     )
 
 
@@ -1536,6 +1931,13 @@ def _doctor_failures(layout: RepoLayout) -> None:
     Observability only — never affects the health verdict and never crashes. A corrupt
     ``state.json`` is REPORTED here rather than raised: it is exactly the state in which an
     operator runs `agora doctor`, and `agora status`/`agora watch` already tell them loudly.
+
+    Since #99 a backlog also gets a ``requeue:`` line. Doctor is the right PULL surface for it: it
+    is the only place that holds the CAUSE (#96's brain probe) and the backlog in one output, and
+    this helper runs LAST among the ``_doctor_*`` helpers, so "fix the cause above" is literally
+    true — the doctor-first ordering the #99 risk section demands. Still observability only: a
+    recoverable backlog is not ill health, so the verdict is untouched, and the count comes from
+    the SHARED ``failed_event_count`` (#99 crit 7), never a second glob.
     """
     try:
         events = failed_event_count(layout)
@@ -1546,6 +1948,11 @@ def _doctor_failures(layout: RepoLayout) -> None:
         state = StateStore(layout).load()
     except Exception as exc:  # noqa: BLE001 — a corrupt state.json is a REPORT, not a crash.
         print(f"  failures: events={events} state.json unreadable ({_one_line(str(exc), 140)})")
+        # The backlog line still prints: a corrupt state.json is precisely the repo where requeue
+        # (with `--force`, which relaxes the tier-1 pre-check's state load) is the next step, and
+        # `events` is already known. Only the "fix the cause above" prefix is dropped — there is no
+        # `failure_is_current` to consult.
+        _print_requeue_backlog(events, fix="")
         return
     lf = state.last_failure
     tail = (
@@ -1553,12 +1960,26 @@ def _doctor_failures(layout: RepoLayout) -> None:
         if lf is None
         else (
             f"{'UNRESOLVED' if state.failure_is_current else 'superseded'} run={lf.run_id} "
-            f"record={lf.record_path}"
+            f"record={_record_pointer(layout, lf.record_path)}"
         )
     )
     print(
         f"  failures: events={events} last_attempt={_fmt_dt(state.last_attempt)} "
         f"last_failure={tail}"
+    )
+    _print_requeue_backlog(
+        events, fix="fix the cause above, then " if state.failure_is_current else ""
+    )
+
+
+def _print_requeue_backlog(events: int, *, fix: str) -> None:
+    """The doctor's ``requeue:`` backlog line — ONE spelling for both ``_doctor_failures`` exits."""
+    if events <= 0:
+        return
+    plural = "" if events == 1 else "s"
+    print(
+        f"  requeue: {events} terminal event{plural} in _kb/failed/ — "
+        f"{fix}'{_PROG} requeue --all' returns the backlog to the inbox"
     )
 
 

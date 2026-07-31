@@ -21,13 +21,17 @@ from pathlib import Path
 import pytest
 import yaml
 
+import agora_kb.curator.requeue as requeue_mod
 from agora_kb import cli as cli_mod
 from agora_kb.adapters import cli_agent_brain, ollama_brain
 from agora_kb.cli import main
 from agora_kb.config import load_backend_registry
 from agora_kb.core import Inbox, Repo, RepoLayout, StateStore, failed_event_count
+from agora_kb.core.inbox import InboxReturn
 from agora_kb.core.state import LastFailure
 from agora_kb.core.wiki import Wiki
+from agora_kb.curator.claim import curator_lock
+from agora_kb.curator.worker import RunFailure, RunReport
 from agora_kb.schema import lint
 
 requires_git = pytest.mark.skipif(shutil.which("git") is None, reason="git not available")
@@ -689,6 +693,7 @@ def test_curate_published_run_prints_no_failure_lines(
     assert "status: published" in out
     assert "failed_record:" not in out
     assert "failed_checks:" not in out
+    assert "failed_requeue:" not in out  # #99: the hint rides the same gate, so it stays silent too
 
 
 @requires_git
@@ -745,6 +750,903 @@ def test_status_surfaces_a_non_terminal_failure_end_to_end(
     # The rendered pointer resolves to the real, lossless record.
     record = next(ln for ln in lines if ln.startswith("last_failure: ")).split("record=", 1)[1]
     assert (target / record.split(" first=", 1)[0]).is_file()
+
+
+# --- requeue: the _kb/failed/ → _kb/inbox/ back-edge (issue #99) ---------------------------------
+# What is locked here is the FACE: the byte-exact report block, the exit-code table, the stderr
+# warnings and the discoverability hints. The engine's own invariants (lock span, rename-only,
+# deletes-nothing, the drain rule) live in tests/curator/test_requeue.py.
+_REQUEUE_RUN = "2026-06-13T03-00-00.000Z--04e370"
+
+
+def _terminal_event(
+    layout: RepoLayout,
+    *,
+    second: int,
+    writer: str = "dochan",
+    run_id: str = _REQUEUE_RUN,
+    event_key: str | None = None,
+) -> str:
+    """Put ONE terminal-failure event where ``worker._fail`` leaves it; return its event id.
+
+    Built by ``Inbox.write`` and then MOVED, exactly as the curator produces one, so the bytes the
+    face reports on are a real event's bytes. ``lock_file.touch()`` reproduces the fact that a repo
+    which has EVER had a terminal failure has necessarily taken ``curator_lock`` at least once —
+    without it the "dry-run creates nothing" assertions would be about the documented R4 residual
+    rather than about requeue.
+    """
+    receipt = Inbox(layout).write(
+        text=f"A terminal capture at second {second}.",
+        writer=writer,
+        source="claude-code",
+        event_key=event_key,
+        now=datetime(2026, 6, 13, 2, 40, second, tzinfo=UTC),
+    )
+    dest_dir = layout.failed_dir / run_id[:10] / run_id
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    os.replace(layout.inbox_item_path(writer, receipt.id), dest_dir / f"{receipt.id}.md")
+    layout.lock_file.touch()
+    return receipt.id
+
+
+def _error_record(layout: RepoLayout, *, event_ids: list[str], run_id: str = _REQUEUE_RUN) -> Path:
+    """Write the ``error.json`` retry record ``worker._fail`` writes beside a terminal event."""
+    dest_dir = layout.failed_dir / run_id[:10] / run_id
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    path = dest_dir / "error.json"
+    path.write_text(
+        json.dumps(
+            {
+                "run_id": run_id,
+                "base_commit": "0" * 40,
+                "event_ids": event_ids,
+                "phase": "claimed",
+                "failed_checks": ["TAXONOMY: unknown domain 'not-a-real-domain'"],
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+def _deliver(layout: RepoLayout, *, writer: str, event_key: str, event_id: str) -> None:
+    """Record ``<writer>:<event_key>`` in ``state.event_keys`` — the tier-1 "already delivered"."""
+    store = StateStore(layout)
+    state = store.load()
+    state.record_event_key(writer, event_key, event_id)
+    store.save(state)
+
+
+def _undry(lines: list[str]) -> list[str]:
+    """Fold a dry-run report into its executed form — the ONLY difference a correct preview may
+    have from the result, so normalizing it away turns crit 5 into a plain list equality."""
+    return [
+        line.replace("requeue [dry-run]:", "requeue:")
+        .replace("reset_attempts [dry-run]:", "reset_attempts:")
+        .replace("would requeue", "requeued")
+        .replace("would skip", "skipped")
+        for line in lines
+    ]
+
+
+def test_requeue_requires_a_selector(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """(#99 crit 9) No bare mass move. Nothing else in this CLI moves files en masse on a bare
+    invocation, and `agora curate` hands the operator the exact `--run <id>` command, so the
+    all-events move stays a deliberate act rather than the default."""
+    with pytest.raises(SystemExit) as exc:
+        main(["requeue", "--repo", str(tmp_path)])
+
+    assert exc.value.code == 2
+    assert "one of the arguments --run --event --all is required" in capsys.readouterr().err
+
+
+def test_requeue_rejects_two_selectors(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """Two selectors is an argparse error, not a silent precedence rule the operator must learn.
+
+    Only the STABLE fragment is pinned: argparse names the LATER option, so the full sentence
+    depends on flag order and would make this test a spelling lock rather than a behaviour lock.
+    """
+    with pytest.raises(SystemExit) as exc:
+        main(["requeue", "--repo", str(tmp_path), "--run", "r1", "--all"])
+
+    assert exc.value.code == 2
+    assert "not allowed with argument" in capsys.readouterr().err
+
+
+def test_requeue_all_on_an_empty_spool_is_a_clean_zero_exit(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """(#99 crit 5/9) ``--all`` asserts nothing exists, so an empty spool is SUCCESS — cron-safe.
+
+    The whole zero block is locked because its point is a CONSTANT, greppable shape: a script
+    reading `requeued:`/`skipped:`/`failed_events:` must not have to special-case "nothing to do".
+    And the pristine repo stays pristine: the single permitted pre-lock filesystem access is the
+    pure ``failed_event_count`` read, so ``curator_lock`` never runs and never creates ``_kb/``
+    plus its 0-byte lock file (which would make criterion 5 literally false).
+    """
+    layout = RepoLayout(tmp_path)
+
+    assert main(["requeue", "--repo", str(tmp_path), "--all"]) == 0
+
+    assert capsys.readouterr().out.splitlines() == [
+        f"repo: {layout.root}",
+        "requeue: selector=all matched=0",
+        "requeued: 0",
+        "skipped: 0",
+        "failed_events: 0",
+    ]
+    assert not layout.kb_dir.exists()
+
+
+def test_requeue_unknown_run_id_is_a_clear_error(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A NAMED selector asserts a specific thing exists, so a miss is rc 1 — unlike ``--all``."""
+    layout = RepoLayout(tmp_path)
+    _terminal_event(layout, second=10)
+
+    assert main(["requeue", "--repo", str(tmp_path), "--run", "nope"]) == 1
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err.strip() == "agora requeue: no failed run 'nope' under _kb/failed/"
+    assert failed_event_count(layout) == 1  # ...and nothing was moved on the way to the error
+
+
+def test_requeue_unknown_event_id_is_a_clear_error(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The ``--event`` twin of the above — the operator pasted an id that is not in the spool."""
+    layout = RepoLayout(tmp_path)
+    _terminal_event(layout, second=10)
+
+    assert main(["requeue", "--repo", str(tmp_path), "--event", "not-an-id"]) == 1
+
+    assert (
+        capsys.readouterr().err.strip()
+        == "agora requeue: no failed event 'not-an-id' under _kb/failed/"
+    )
+
+
+def test_requeue_prints_the_locked_report_block(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """(#99 crit 3/6/7) The whole report, byte-for-byte, with all three verdicts in one run.
+
+    Every element of the §4.3 grammar is here at once because they only mean something together:
+    ``repo:`` first (the `agora status` house shape), one two-space-indented line per event LABELLED
+    BY ITS FRONTMATTER ID (what the operator pastes back into ``--event``), repo-relative POSIX
+    destinations (host-free, so the line can be pasted into an issue), the two summary lines that
+    print even at 0, the per-reason tally with slugs sorted alphabetically, and the predicted
+    ``failed_events:``. A decline is rc 0: the command DID its job and correctly refused.
+    """
+    layout = RepoLayout(tmp_path)
+    movable = _terminal_event(layout, second=10)
+    delivered = _terminal_event(layout, second=11, event_key="k2")
+    occupied = _terminal_event(layout, second=12, writer="web")
+    _deliver(layout, writer="dochan", event_key="k2", event_id=delivered)
+    # An idempotent duplicate already holds the inbox slot — the one thing --force must not undo.
+    taken = layout.inbox_item_path("web", occupied)
+    taken.parent.mkdir(parents=True, exist_ok=True)
+    taken.write_text("a different, immutable event\n", encoding="utf-8")
+
+    assert main(["requeue", "--repo", str(tmp_path), "--all"]) == 0
+
+    assert capsys.readouterr().out.splitlines() == [
+        f"repo: {layout.root}",
+        "requeue: selector=all matched=3",
+        f"  {movable}: requeued -> _kb/inbox/dochan/{movable}.md",
+        f"  {delivered}: skipped (already-delivered: dochan:k2 is already in state.event_keys — "
+        "the claim would drop it; use --force to move it anyway)",
+        f"  {occupied}: skipped (destination-exists: _kb/inbox/web/{occupied}.md is already "
+        "present — not overwritten)",
+        "requeued: 1",
+        "skipped: 2 (already-delivered=1 destination-exists=1)",
+        "failed_events: 2",
+        "note: fix the cause before curating again — 'agora status' shows the last failure, "
+        "'agora doctor' checks the brain",
+    ]
+    assert taken.read_text(encoding="utf-8") == "a different, immutable event\n"  # never clobbered
+
+
+def test_requeue_dry_run_report_predicts_the_real_run(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """(#99 crit 5) The preview IS the result: one resolver, two callers, one list.
+
+    Compared after folding ``would requeue``/``would skip`` back to their executed spelling — the
+    only difference a correct dry run may have. ``failed_events:`` is compared UNFOLDED on purpose:
+    it is the PREDICTED post-count in both modes (never the pre-count), which is the number the
+    preview is actually promising to produce.
+    """
+    layout = RepoLayout(tmp_path)
+    _terminal_event(layout, second=10)
+    delivered = _terminal_event(layout, second=11, event_key="k2")
+    _deliver(layout, writer="dochan", event_key="k2", event_id=delivered)
+
+    assert main(["requeue", "--repo", str(tmp_path), "--all", "--dry-run"]) == 0
+    preview = capsys.readouterr().out.splitlines()
+    assert main(["requeue", "--repo", str(tmp_path), "--all"]) == 0
+    real = capsys.readouterr().out.splitlines()
+
+    assert _undry(preview) == real
+    assert "failed_events: 1" in preview  # the PREDICTED post-count, not the pre-count of 2
+
+
+def test_requeue_failed_events_line_matches_status(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """(#99 crit 7) The backlog drops by exactly the moved count, and the two faces AGREE.
+
+    String equality against `agora status`'s own line, not just numeric equality: the criterion is
+    that an operator can run either command and read the same number off the same key.
+    """
+    layout = RepoLayout(tmp_path)
+    _terminal_event(layout, second=10)
+    _terminal_event(layout, second=11)
+    _terminal_event(layout, second=12, run_id="2026-06-13T04-00-00.000Z--b17c91")
+
+    assert main(["requeue", "--repo", str(tmp_path), "--run", _REQUEUE_RUN]) == 0
+    requeued_line = next(
+        ln for ln in capsys.readouterr().out.splitlines() if ln.startswith("failed_events: ")
+    )
+    assert main(["status", "--repo", str(tmp_path)]) == 0
+    status_line = next(
+        ln for ln in capsys.readouterr().out.splitlines() if ln.startswith("failed_events: ")
+    )
+
+    assert requeued_line == status_line == "failed_events: 1"
+    assert failed_event_count(layout) == 1
+
+
+def test_requeue_under_a_held_lock_is_a_clean_non_zero_exit(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """(#99 crit 4) A curate in flight ⇒ ONE stderr line, rc 1, no traceback, nothing moved.
+
+    ``curator_lock`` is non-blocking (ADR-0008 step 1), so contention surfaces as ``LockHeld``.
+    The face must translate it into a sentence an operator can act on — "try again when it
+    finishes" — rather than a stack trace that reads like a bug in requeue. ONE line and no others:
+    the repo below also has an UNRESOLVED failure, whose ``--all`` preflight warning runs as a hook
+    INSIDE the lock span, so contention cannot leak a second sentence in front of the refusal.
+    """
+    layout = RepoLayout(tmp_path)
+    _terminal_event(layout, second=10)
+    _plant_failure(layout, run_id="r1")
+    capsys.readouterr()
+
+    with curator_lock(layout):
+        rc = main(["requeue", "--repo", str(tmp_path), "--all"])
+
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert captured.out == ""
+    assert captured.err.strip() == (
+        "agora requeue: a curator run is in progress (_kb/curator.lock is held); "
+        "nothing was changed — try again when it finishes"
+    )
+    assert "Traceback" not in captured.err
+    assert failed_event_count(layout) == 1
+
+
+def test_requeue_force_moves_an_already_delivered_event_and_warns(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """(#99 crit 6, the ``--force`` half) The flag moves it AND names the consequence.
+
+    A forced event keeps its own verdict word through execution, so the report says WHY a
+    known-doomed event moved instead of hiding it behind a plain ``requeued`` — and the stderr line
+    states the outcome plainly: the claim will drop it again. Pinning the consequence rather than
+    suppressing it is what makes the flag safe to offer.
+    """
+    layout = RepoLayout(tmp_path)
+    delivered = _terminal_event(layout, second=10, event_key="k1")
+    _deliver(layout, writer="dochan", event_key="k1", event_id=delivered)
+
+    assert main(["requeue", "--repo", str(tmp_path), "--all", "--force"]) == 0
+
+    captured = capsys.readouterr()
+    assert (
+        f"  {delivered}: requeued (already-delivered; forced) -> _kb/inbox/dochan/{delivered}.md"
+    ) in captured.out
+    assert "requeued: 1" in captured.out
+    assert "skipped: 0" in captured.out
+    assert captured.err.strip() == (
+        "warning: 1 forced event(s) carry an event_key already in state.event_keys — "
+        "the claim will drop them again"
+    )
+    assert layout.inbox_item_path("dochan", delivered).is_file()
+
+
+def test_requeue_refuses_an_unreadable_state_json_and_force_proceeds_loudly(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A safety check that evaporates on a corrupt file is not a safety check (#99 crit 6).
+
+    Both halves in one test because they are one decision: WITHOUT ``--force`` the unreadable
+    state is a clean rc 1 with nothing moved (the pre-check cannot run, so requeue does not
+    pretend it did); WITH it the operator has explicitly accepted the zombie risk, so the move
+    proceeds — but the skipped pre-check is said out loud on stderr, never assumed understood.
+    """
+    layout = RepoLayout(tmp_path)
+    event = _terminal_event(layout, second=10)
+    layout.state_file.write_text("not json at all", encoding="utf-8")
+
+    assert main(["requeue", "--repo", str(tmp_path), "--all"]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err.startswith("agora requeue: _kb/state.json is unreadable — ")
+    assert "(use --force to requeue without the tier-1 pre-check)" in captured.err
+    assert "Traceback" not in captured.err
+    assert failed_event_count(layout) == 1
+
+    assert main(["requeue", "--repo", str(tmp_path), "--all", "--force"]) == 0
+    captured = capsys.readouterr()
+    assert "the already-delivered pre-check was SKIPPED (--force)" in captured.err
+    assert layout.inbox_item_path("dochan", event).is_file()
+
+
+def test_requeue_reports_an_event_it_could_not_move(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A file under ``_kb/failed/`` that is not a usable event is REPORTED and LEFT ALONE.
+
+    ``_kb/failed/`` is operator-editable, so this is a real shape: something hand-copied in, or an
+    event whose frontmatter was mangled. rc 1 because the command genuinely could not do its job
+    for that item, while the movable ones in the same batch still move — a batch must never be
+    all-or-nothing when the failure is per-file.
+    """
+    layout = RepoLayout(tmp_path)
+    good = _terminal_event(layout, second=10)
+    junk = layout.failed_dir / _REQUEUE_RUN[:10] / _REQUEUE_RUN / "0000-not-an-event.md"
+    junk.write_text("no frontmatter here\n", encoding="utf-8")
+
+    assert main(["requeue", "--repo", str(tmp_path), "--all"]) == 1
+
+    captured = capsys.readouterr()
+    assert "  0000-not-an-event: skipped (unreadable: " in captured.out
+    assert f"  {good}: requeued -> " in captured.out
+    assert "requeued: 1" in captured.out
+    assert "skipped: 1 (unreadable=1)" in captured.out
+    assert captured.err.strip() == (
+        "warning: 1 event(s) under _kb/failed/ could not be requeued and were left in place"
+    )
+    assert junk.read_text(encoding="utf-8") == "no frontmatter here\n"
+
+
+def test_requeue_all_warns_when_the_last_failure_is_unresolved(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``--all`` into a still-broken curator gets a warning; the narrow selectors stay silent.
+
+    The warning exists because a mass requeue with the cause unfixed re-terminalises the whole
+    batch on the next tick. It is deliberately NOT emitted for ``--run``/``--event``: those are the
+    narrow, advertised forms (`agora curate` prints the exact `--run` command), and warning on the
+    recommended path is how a warning becomes noise nobody reads.
+    """
+    layout = RepoLayout(tmp_path)
+    _terminal_event(layout, second=10)
+    _terminal_event(layout, second=11)
+    _plant_failure(layout, run_id="r1")
+    capsys.readouterr()
+
+    assert main(["requeue", "--repo", str(tmp_path), "--all", "--dry-run"]) == 0
+    assert capsys.readouterr().err.strip() == (
+        "warning: the last curator failure is still UNRESOLVED (run=r1 "
+        "record=_kb/failed/2026-06-13/r1/error.json) — run 'agora doctor' first; "
+        "a requeued event goes terminal again on the next failing run"
+    )
+
+    assert main(["requeue", "--repo", str(tmp_path), "--run", _REQUEUE_RUN]) == 0
+    assert "UNRESOLVED" not in capsys.readouterr().err
+
+
+def test_requeue_all_is_not_blocked_by_an_unresolved_failure(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The anti-guard lock: UNRESOLVED is a WARNING, never a refusal (#99 §4.3).
+
+    ``failure_is_current`` is True on 100% of legitimate recoveries — ``last_run`` is the last
+    successful PUBLISH and the canonical order is fix → requeue → curate — so a "refuse unless
+    --force" gate would fire every single time, train reflexive ``--force``, and collide with
+    criterion 6's use of the same flag. If a future change adds that gate, this fails.
+    """
+    layout = RepoLayout(tmp_path)
+    event = _terminal_event(layout, second=10)
+    _plant_failure(layout, run_id="r1")
+    capsys.readouterr()
+
+    assert main(["requeue", "--repo", str(tmp_path), "--all"]) == 0
+
+    assert layout.inbox_item_path("dochan", event).is_file()
+    assert failed_event_count(layout) == 0
+    assert "requeued: 1" in capsys.readouterr().out
+
+
+def test_requeue_reset_attempts_block_is_identical_in_both_modes(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """(#99 crit 5 ∩ 8) Only the HEADER carries ``[dry-run]``; the indented lines are byte-equal.
+
+    That is what makes "the archive list matches the result" a literal string equality rather than
+    a hope: the drain rule computes ``remaining`` the same way in both modes (planned moves in
+    dry-run, actual ones in a real run), so the ``archived:`` lines cannot drift.
+    """
+    layout = RepoLayout(tmp_path)
+    event = _terminal_event(layout, second=10)
+    _error_record(layout, event_ids=[event])
+    archived_line = (
+        f"  archived: _kb/failed/2026-06-13/{_REQUEUE_RUN}/error.json "
+        f"-> _kb/requeued/2026-06-13/{_REQUEUE_RUN}/error.json"
+    )
+
+    assert main(["requeue", "--repo", str(tmp_path), "--all", "--dry-run", "--reset-attempts"]) == 0
+    preview = capsys.readouterr().out.splitlines()
+    assert main(["requeue", "--repo", str(tmp_path), "--all", "--reset-attempts"]) == 0
+    real = capsys.readouterr().out.splitlines()
+
+    assert "reset_attempts [dry-run]: archived=1 kept=0" in preview
+    assert "reset_attempts: archived=1 kept=0" in real
+    assert archived_line in preview
+    assert archived_line in real
+    assert _undry(preview) == real
+    assert (layout.requeued_dir / "2026-06-13" / _REQUEUE_RUN / "error.json").is_file()
+
+
+def test_requeue_reset_attempts_that_reset_nothing_says_so_loudly(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A flag that moved events and reset NOTHING must say so — silence here is a trap.
+
+    One record governs two events and only one is selected, so the drain rule correctly KEEPS it
+    (criterion 9: no unselected event's budget may drop). The operator would otherwise walk into
+    the next run believing the budget was restored, and watch the event go terminal immediately.
+    """
+    layout = RepoLayout(tmp_path)
+    one = _terminal_event(layout, second=10)
+    two = _terminal_event(layout, second=11)
+    _error_record(layout, event_ids=[one, two])
+
+    assert main(["requeue", "--repo", str(tmp_path), "--event", one, "--reset-attempts"]) == 0
+
+    captured = capsys.readouterr()
+    assert "reset_attempts: archived=0 kept=1" in captured.out
+    assert (
+        f"  kept: _kb/failed/2026-06-13/{_REQUEUE_RUN}/error.json "
+        "(records an event that is still terminal)"
+    ) in captured.out
+    assert "warning: --reset-attempts reset nothing" in captured.err
+    assert "use --run or --all to reset the whole set" in captured.err
+    assert (layout.failed_dir / "2026-06-13" / _REQUEUE_RUN / "error.json").is_file()
+    assert not layout.requeued_dir.exists()
+    assert failed_event_count(layout) == 1  # `two` is untouched — the selector scoped the move
+
+
+def test_requeue_typo_in_a_named_selector_is_an_error_even_with_reset_attempts(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """(#99 §4.4) A mistyped ``--run`` is rc 1 and drains NOTHING, whatever else is drainable.
+
+    The two scopes differ — the selector picks EVENTS, the drain rule releases RECORDS — so a
+    "not found" decided on anything but the selection would make the exit code of one operator
+    mistake depend on unrelated repo state, and would silently reset a budget nobody asked about.
+    The repo here has a genuinely drainable record (crash residue: its event is back in the inbox),
+    which is exactly the state that used to turn this typo into a reported success.
+    """
+    layout = RepoLayout(tmp_path)
+    event = _terminal_event(layout, second=10)
+    _error_record(layout, event_ids=[event])
+    os.replace(
+        layout.failed_dir / "2026-06-13" / _REQUEUE_RUN / f"{event}.md",
+        layout.inbox_item_path("dochan", event),
+    )
+    capsys.readouterr()
+
+    rc = main(["requeue", "--repo", str(tmp_path), "--run", "no-such-run", "--reset-attempts"])
+
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert captured.out == ""
+    assert captured.err.strip() == "agora requeue: no failed run 'no-such-run' under _kb/failed/"
+    assert (layout.failed_dir / "2026-06-13" / _REQUEUE_RUN / "error.json").is_file()
+    assert not layout.requeued_dir.exists()
+
+
+def test_requeue_reset_attempts_with_no_records_at_all_says_that(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``archived=0`` has three causes and the warning must name the right one.
+
+    Here there is no ``error.json`` anywhere, so "every record is shared with an event that is still
+    terminal" would be flatly false and would send the operator to ``--all`` to be told the same
+    thing again. The ``kept:`` lines the other wording tells them to read do not exist either.
+    """
+    layout = RepoLayout(tmp_path)
+    _terminal_event(layout, second=10)
+    capsys.readouterr()
+
+    assert main(["requeue", "--repo", str(tmp_path), "--all", "--reset-attempts"]) == 0
+
+    captured = capsys.readouterr()
+    assert "reset_attempts: archived=0 kept=0" in captured.out
+    assert captured.err.strip() == (
+        "warning: --reset-attempts reset nothing — the requeued events have no retry records "
+        "under _kb/failed/, so there was no spent budget to restore"
+    )
+
+
+def test_requeue_reports_a_retry_record_it_could_not_archive_and_exits_one(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A read-only disk means the budget was NOT reset — say so, and do not exit 0.
+
+    `deploy/README.md` documents this command inside a scripted recovery, so rc 0 here would let a
+    cron/launchd wrapper record success over a reset that never happened. The old loud-null wording
+    made it worse than silence: it diagnosed a shared record and pointed at ``--all``, away from the
+    real cause. The events themselves DID move, which is why the report still prints.
+    """
+    layout = RepoLayout(tmp_path)
+    event = _terminal_event(layout, second=10)
+    _error_record(layout, event_ids=[event])
+    real_replace = os.replace
+
+    def _refuse_the_record(src: object, dst: object) -> None:
+        if str(src).endswith("error.json"):
+            raise OSError(30, "Read-only file system")
+        real_replace(src, dst)
+
+    monkeypatch.setattr(requeue_mod.os, "replace", _refuse_the_record)
+    capsys.readouterr()
+
+    assert main(["requeue", "--repo", str(tmp_path), "--all", "--reset-attempts"]) == 1
+
+    captured = capsys.readouterr()
+    assert "requeued: 1" in captured.out
+    assert "reset_attempts: archived=0 kept=1" in captured.out
+    assert "(could not be archived: [Errno 30] Read-only file system)" in captured.out
+    assert captured.err.strip() == (
+        "warning: 1 retry record(s) could not be archived — the budget of the events they list "
+        "was NOT reset (see the kept: lines for the reason)"
+    )
+    assert "reset nothing" not in captured.err
+
+
+def test_requeue_renders_an_error_outcome_and_exits_one(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """(#99 §4.3/§4.4) The ``error`` row and the ``errors:`` summary line, on the real renderer.
+
+    An error is deliberately NOT rendered as a skip: a skip is a correct refusal, an error is work
+    that could not be done. Both spellings and the rc-1 row were reachable but unlocked, so a
+    renderer refactor could have silently folded them into the ``skipped`` branch.
+    """
+    layout = RepoLayout(tmp_path)
+    _terminal_event(layout, second=10)
+
+    def _explode(layout: RepoLayout, event_path: Path) -> InboxReturn:  # noqa: ARG001
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(requeue_mod, "return_event_to_inbox", _explode)
+    capsys.readouterr()
+
+    assert main(["requeue", "--repo", str(tmp_path), "--all"]) == 1
+
+    captured = capsys.readouterr()
+    assert ": error ([Errno 28] No space left on device)" in captured.out
+    assert "errors: 1" in captured.out
+    assert "requeued: 0" in captured.out
+    assert failed_event_count(layout) == 1
+
+
+def test_requeue_dry_run_warnings_do_not_claim_completed_work(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Every other line of the report is mode-aware; the stderr warnings must be too.
+
+    A preview that says events "were left in place" or that forced ones "carry" a delivered key is
+    reporting a past tense for work nobody has done yet — and it is the same operator who is about
+    to decide whether to run it for real.
+    """
+    layout = RepoLayout(tmp_path)
+    delivered = _terminal_event(layout, second=10, event_key="k1")
+    _deliver(layout, writer="dochan", event_key="k1", event_id="older")
+    junk = layout.failed_dir / "2026-06-13" / _REQUEUE_RUN / "0000-not-an-event.md"
+    junk.write_text("no frontmatter here\n", encoding="utf-8")
+    capsys.readouterr()
+
+    assert main(["requeue", "--repo", str(tmp_path), "--all", "--force", "--dry-run"]) == 1
+
+    err = capsys.readouterr().err
+    assert "1 forced event(s) would carry an event_key already in state.event_keys" in err
+    assert "1 event(s) under _kb/failed/ cannot be requeued and would be left in place" in err
+    assert failed_event_count(layout) == 2  # the preview really previewed
+    assert not layout.inbox_item_path("dochan", delivered).exists()
+
+
+def test_doctor_offers_requeue_when_state_json_is_unreadable(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A corrupt ``state.json`` is the repo where requeue is MOST likely the next step.
+
+    ``agora requeue --all --force`` is built precisely for it (``--force`` relaxes the tier-1
+    pre-check's state load), and ``events`` is already known on this branch — withholding the
+    backlog line here would leave the designated pull surface silent about the one remedy. Only the
+    "fix the cause above" prefix is dropped: there is no ``failure_is_current`` to consult.
+    """
+    layout = RepoLayout(tmp_path)
+    _terminal_event(layout, second=10)
+    layout.state_file.write_text("{ not json", encoding="utf-8")
+
+    main(["doctor", "--repo", str(tmp_path)])
+
+    out = capsys.readouterr().out
+    assert "  failures: events=1 state.json unreadable (" in out
+    assert (
+        "  requeue: 1 terminal event in _kb/failed/ — "
+        "'agora requeue --all' returns the backlog to the inbox"
+    ) in out
+    assert "status:" in out  # the verdict is still reached
+
+
+# --- requeue: discoverability (#99 crit 10) ------------------------------------------------------
+@requires_git
+def test_curate_terminal_failure_advertises_requeue(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """(#99 crit 10) A run that left events in ``_kb/failed/`` prints the way BACK — and it works.
+
+    The hint is not asserted as a string and left there: the printed command is EXECUTED, and the
+    backlog it names really empties. That is the criterion ("curate 실패 출력에서 이 커맨드를
+    안내한다") tested as a round trip rather than as a spelling, so a rename of the selector or a
+    change to the run-id ⇄ ``_kb/failed/<date>/<run-id>/`` mapping fails here.
+    """
+    target = tmp_path / "kb"
+    layout = _dead_brain_repo(target)
+    repo_yaml = layout.kb_dir / "repo.yaml"
+    doc = yaml.safe_load(repo_yaml.read_text(encoding="utf-8"))
+    doc["curator"]["max_attempts"] = 1  # one failure is terminal — no waiting out the budget
+    repo_yaml.write_text(yaml.safe_dump(doc, sort_keys=False), encoding="utf-8")
+    capsys.readouterr()
+
+    assert main(["curate", "--repo", str(target), "--force"]) == 0
+
+    out = capsys.readouterr().out
+    assert "failed=1" in out
+    hints = [ln for ln in out.splitlines() if ln.startswith("failed_requeue: ")]
+    assert len(hints) == 1
+    run_id = hints[0].removeprefix("failed_requeue: agora requeue --run ")
+    assert (layout.failed_dir / run_id[:10] / run_id).is_dir()
+    assert failed_event_count(layout) == 1
+
+    assert main(["requeue", "--repo", str(target), "--run", run_id]) == 0
+    assert failed_event_count(layout) == 0
+
+
+@requires_git
+def test_curate_within_budget_failure_does_not_advertise_requeue(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The gate is ``counts["failed"] > 0``, not "the run failed" — advertising here is WRONG.
+
+    A within-budget failure returns its events to ``inbox/`` (``retried=1 failed=0``); there is
+    nothing under ``_kb/failed/`` to requeue, so the hint would send an operator to a command that
+    reports "no failed run" — worse than silence, because it implies the events were lost.
+    """
+    target = tmp_path / "kb"
+    layout = _dead_brain_repo(target)  # default curator.max_attempts=3 ⇒ attempt 1 is a retry
+    capsys.readouterr()
+
+    assert main(["curate", "--repo", str(target), "--force"]) == 0
+
+    out = capsys.readouterr().out
+    assert "retried=1" in out
+    assert "failed_record: " in out  # the CAUSE is still advertised — only the remedy is withheld
+    assert "failed_requeue:" not in out
+    assert failed_event_count(layout) == 0
+    assert Inbox(layout).depth() == 1
+
+
+def test_cas_conflict_failure_does_not_advertise_requeue(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The CAS-conflict shape — ``record_path=None``, events back in ``inbox/`` — stays silent.
+
+    Driven through the printer directly rather than through a manufactured concurrent publish: the
+    unit under test IS the face's gate, and the report shape it must gate on is fully specified by
+    ``worker._fail``'s CAS branch (no error record, ``counts={"retried": N}``, no ``failed`` key).
+    """
+    report = RunReport(
+        run_id=_REQUEUE_RUN,
+        status="failed",
+        counts={"retried": 2},
+        failure=RunFailure(
+            run_id=_REQUEUE_RUN,
+            phase="claimed",
+            reasons=("CAS: the curated ref moved since base_commit",),
+            record_path=None,
+            cas_conflict=True,
+        ),
+    )
+
+    cli_mod._print_run_diagnostics(report)
+
+    out = capsys.readouterr().out
+    assert "failed_record: -" in out
+    assert "failed_checks: CAS: " in out
+    assert "failed_requeue:" not in out
+
+
+@requires_git
+def test_watch_tick_stamps_the_requeue_hint(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The daemon is where terminalisation actually happens, so the hint must ride the tick log.
+
+    Stamped like the rest of the ``{stamp} <verb>:`` grammar — `journalctl -u agora-watch` stays
+    ONE stream — and inherited for free, because both faces render through the single
+    ``_print_run_diagnostics`` channel rather than each growing their own copy (#115's rule).
+    """
+    target = tmp_path / "kb"
+    layout = _dead_brain_repo(target)
+    repo_yaml = layout.kb_dir / "repo.yaml"
+    doc = yaml.safe_load(repo_yaml.read_text(encoding="utf-8"))
+    doc["curator"]["max_attempts"] = 1
+    doc["curator"]["triggers"]["threshold"] = 1
+    repo_yaml.write_text(yaml.safe_dump(doc, sort_keys=False), encoding="utf-8")
+    capsys.readouterr()
+
+    assert main(["watch", "--repo", str(target), "--once"]) == 0
+
+    lines = capsys.readouterr().out.splitlines()
+    ran = next(ln for ln in lines if " ran (" in ln)
+    hints = [ln for ln in lines if " failed_requeue: " in ln]
+    assert len(hints) == 1
+    stamp = ran.split(" ", 1)[0]
+    assert hints[0].startswith(f"{stamp} failed_requeue: agora requeue --run ")
+
+
+def test_doctor_offers_requeue_only_when_the_backlog_is_non_empty(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Doctor is the PULL surface for the backlog — the only one that also holds the CAUSE.
+
+    All three states in one test because the wording IS the sequencing: no backlog ⇒ no line at
+    all; a backlog with no current failure ⇒ a bare offer; a backlog with the failure still
+    UNRESOLVED ⇒ "fix the cause above, then …", which is literally true because ``_doctor_failures``
+    runs LAST among the ``_doctor_*`` helpers. Observability only — the verdict is untouched.
+    """
+    layout = RepoLayout(tmp_path)
+
+    main(["doctor", "--repo", str(tmp_path)])
+    assert "requeue:" not in capsys.readouterr().out
+
+    _terminal_event(layout, second=10)
+    main(["doctor", "--repo", str(tmp_path)])
+    assert (
+        "  requeue: 1 terminal event in _kb/failed/ — "
+        "'agora requeue --all' returns the backlog to the inbox"
+    ) in capsys.readouterr().out
+
+    _terminal_event(layout, second=11)
+    _plant_failure(layout, run_id="r1")
+    main(["doctor", "--repo", str(tmp_path)])
+    out = capsys.readouterr().out
+    assert (
+        "  requeue: 2 terminal events in _kb/failed/ — fix the cause above, then "
+        "'agora requeue --all' returns the backlog to the inbox"
+    ) in out
+    assert "status:" in out  # the verdict is still reached
+
+
+def test_doctor_requeue_count_uses_the_shared_helper(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """(#99 crit 7) "the same helper" is a claim value equality can never prove.
+
+    Forcing ``failed_event_count`` to an impossible value is what makes it testable: a doctor line
+    that grew its own ``rglob`` would keep every count assertion green while quietly diverging from
+    `agora status` and MCP ``kb_status``.
+    """
+    monkeypatch.setattr(cli_mod, "failed_event_count", lambda layout: 99)
+
+    main(["doctor", "--repo", str(tmp_path)])
+
+    assert "  requeue: 99 terminal events in _kb/failed/ — " in capsys.readouterr().out
+
+
+def test_status_does_not_advertise_requeue(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The NEGATIVE lock (#99 §5.3): a later drive-by addition has to argue with a test.
+
+    Every `agora status` line is ``key: <machine-readable value>`` and a remediation sentence has
+    no value slot — but the real reason is ORDERING: status carries no cause information, so
+    advertising requeue here would route the operator around `agora doctor`, inverting the exact
+    sequencing the #99 risk section demands.
+    """
+    layout = RepoLayout(tmp_path)
+    _terminal_event(layout, second=10)
+    _plant_failure(layout, run_id="r1")
+
+    assert main(["status", "--repo", str(tmp_path)]) == 0
+
+    out = capsys.readouterr().out
+    assert "failed_events: 1" in out
+    assert "requeue" not in out
+
+
+def test_status_and_doctor_follow_a_requeued_failure_record(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``--reset-attempts`` moves the record, so the two renderers follow it (#99 §3.5).
+
+    ``last_failure`` is never cleared by a later success and requeue is strictly rename-only (it
+    must NOT clear a failure the operator has not fixed — the blind spot #96 closed), so without
+    this the stored ``record=`` would point at nothing, indefinitely.
+
+    The COMPAT half runs first and is the load-bearing one: with no twin on disk the byte-identical
+    stored string is printed, which is why the two existing tests that lock a ``record=`` whose file
+    does not exist keep passing unmodified.
+    """
+    layout = RepoLayout(tmp_path)
+    _plant_failure(layout, run_id="r1")
+    original = "_kb/failed/2026-06-13/r1/error.json"
+    twin = "_kb/requeued/2026-06-13/r1/error.json"
+
+    assert main(["status", "--repo", str(tmp_path)]) == 0
+    assert f"record={original} first=" in capsys.readouterr().out
+    main(["doctor", "--repo", str(tmp_path)])
+    assert f"record={original}" in capsys.readouterr().out
+
+    (tmp_path / twin).parent.mkdir(parents=True)
+    (tmp_path / twin).write_text("{}\n", encoding="utf-8")
+
+    assert main(["status", "--repo", str(tmp_path)]) == 0
+    # No suffix, no annotation: `_kb/requeued/` is self-describing, and a space inside the value
+    # would break the `record=… first=…` grammar scripts already split on.
+    assert f"record={twin} first=" in capsys.readouterr().out
+    main(["doctor", "--repo", str(tmp_path)])
+    assert f"record={twin}" in capsys.readouterr().out
+
+
+def test_record_pointer_survives_a_hostile_record_path(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``record_path`` is an unconstrained str in an operator-editable file — stat it defensively.
+
+    ``Path.exists()`` RAISES ``ENAMETOOLONG`` (it is not in pathlib's ignored-errno set) and
+    ``_fmt_last_failure`` is called OUTSIDE ``_cmd_status``'s try, so an unguarded stat would
+    re-introduce exactly the traceback #96 removed. Driven twice: once end-to-end through a real
+    over-long component, and once with the OSError forced, so the guard is proven even on a
+    filesystem that would have tolerated the path.
+    """
+    layout = RepoLayout(tmp_path)
+    hostile = "_kb/failed/2026-06-13/" + "x" * 400 + "/error.json"
+    store = StateStore(layout)
+    state = store.load()
+    state.last_attempt = datetime(2026, 6, 13, 3, 0, 12, tzinfo=UTC)
+    state.last_failure = LastFailure.from_run_failure(
+        when=datetime(2026, 6, 13, 3, 0, 12, tzinfo=UTC),
+        run_id="r1",
+        phase="claimed",
+        reasons=["boom"],
+        record_path=hostile,
+    )
+    store.save(state)
+
+    assert main(["status", "--repo", str(tmp_path)]) == 0
+    captured = capsys.readouterr()
+    assert f"record={hostile} first=boom" in captured.out
+    assert "Traceback" not in captured.err
+
+    monkeypatch.setattr(
+        Path, "exists", lambda self, **kw: (_ for _ in ()).throw(OSError(63, "File name too long"))
+    )
+    assert cli_mod._record_pointer(layout, "_kb/failed/2026-06-13/r1/error.json") == (
+        "_kb/failed/2026-06-13/r1/error.json"
+    )
 
 
 # --- doctor -------------------------------------------------------------------------------------

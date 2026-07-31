@@ -1,6 +1,6 @@
 # ADR-0011 — Curator INGEST contract (plan-apply-author)
 
-**Status:** Accepted · 2026-06-13 · **§7.1 routing superseded by [ADR-0015](0015-per-task-brain-routing.md)**
+**Status:** Accepted · 2026-06-13 · **§7.1 routing superseded by [ADR-0015](0015-per-task-brain-routing.md)** · **§5.1 corrected + §5.1a added 2026-07-29 (issue #99)**
 
 ## Context
 The transactional curator loop (ADR-0008) delegates exactly one cognitive step — INGEST — to a
@@ -442,10 +442,34 @@ content** (invalidate-not-delete). Deterministic tiers run first so the model ad
 ambiguous semantic cases. The worker — not the model — writes the unioned `sources:` during APPLY.
 
 **§5.1 Retry budget.** An event's retry count is DERIVED, not stored in the immutable event: it equals the
-number of distinct `processing/<run-id>/` manifests (current + `failed/` error records) that reference the
-event_id. `repo.yaml curator.max_attempts` (default 3): when a PLAN/LINT failure would return events to
-`inbox/` but an event has already reached `max_attempts`, that event instead moves to `failed/` with a
-terminal error record. The counter is rebuildable by scanning retained manifests/error records.
+number of RETAINED `failed/**/error.json` records that list the event_id — one attempt per distinct record
+per listed id. `repo.yaml curator.max_attempts` (default 3): when a PLAN/LINT failure would return
+events to `inbox/` but an event has already reached `max_attempts`, that event instead moves to
+`failed/<date>/<run-id>/` with a terminal error record. The counter is rebuildable by scanning the retained
+records.
+
+> **Correction (2026-07-29, #99).** The sentence above previously read "distinct `processing/<run-id>/`
+> manifests (current + `failed/` error records)". The implementation has only ever counted `error.json`
+> records — a live processing manifest belongs to a run that has not failed yet, so counting it would
+> charge an attempt for work still in flight. The prose is corrected to match, because the drift is
+> load-bearing: `agora requeue --reset-attempts` restores a budget precisely by relocating those records,
+> so a future "fix" that made the code match the old prose would silently stop the reset from resetting
+> anything.
+
+**§5.1a Restoring the budget (#99).** `agora requeue` returns terminal events from `failed/` to `inbox/`
+without touching the records, so a requeued event keeps the attempts it already spent and gets exactly one
+more run — the loop break (the derived count is strictly monotone, so requeue↔fail cannot cycle).
+`--reset-attempts` archives the released records to `_kb/requeued/<date>/<run-id>/error.json`, which **must**
+be outside `failed/` because the derivation is `failed_dir.rglob("error.json")` and `rglob` descends into
+dotted directories. A record is released only once none of the event ids it lists is still terminal, so no
+event that is still in `failed/` can lose its budget — matched on both the file stem and the frontmatter
+`id`, because a hand-placed file's two can disagree. The rule sees only `failed/`, so it *does* release a
+record whose events are already back in `inbox/` with attempts spent: crash residue from an interrupted
+requeue is byte-identical on disk to an event the curator is mid-retry, and releasing both is deliberate —
+scoping it tighter would make crash residue permanently un-reclaimable, and the error direction is the safe
+one (more attempts, never fewer). Every released record is printed. A `--run`/`--event` selector that matched
+no events archives nothing at all, so a mistyped id cannot drain a budget. The move is rename-only and
+non-destructive under the ADR-0002 appendix spool-custodian rule; `error.json`'s bytes are never rewritten.
 
 ### 6. Candidate gating (harvester safety, ADR-0007 — enforced in BOTH prompt and validator)
 For any candidate with `is_gated == true` (`kind=candidate` OR `confidence=low`, i.e. harvested):

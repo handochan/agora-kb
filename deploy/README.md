@@ -261,6 +261,66 @@ of the unauthenticated premise, and it closes *browser-mediated* attacks only.
     (web-only, CI, a hub whose curation happens elsewhere). `--skip-probe` makes the verdict ignore
     brain reachability and performs no daemon or PATH lookups; every other check is unchanged.
   - The probe is bounded (3 s per distinct routed brain) and never *executes* a brain.
+- **Recovering terminal failures — `agora requeue` (#99).** A brain that is *configured but
+  unanswerable* (the Ollama daemon is down, the model was deleted, a typo in the `agora-cli-brain`
+  argv) fails a **real** curator run on every tick. The triggers do not consult `last_run`
+  (`curator/triggers.py`), so a threshold/idle trigger re-fires each time, and at
+  `curator.max_attempts: 3` with the default `--interval 60` the **third** consecutive failure moves
+  the captures **terminally** to `_kb/failed/<date>/<run-id>/` — two to three minutes from the first
+  failure. #97's crash-loop backoff does not slow that down: it backs off a tick that *raises*, and a
+  failed curator run is a perfectly productive tick. (The one brain problem that never reaches this
+  state is a brain that is **not configured at all** — the tick prints `due (…) but no usable
+  backend — skipping this tick`, no run executes, no attempt is burned, and the captures wait in the
+  inbox indefinitely.) Recovery, in this order — from a source checkout, prefix each line with
+  `uv run --directory /ABSOLUTE/PATH/TO/agora-kb`, as in the health check above:
+
+  ```bash
+  # 1. what is broken, and why
+  agora doctor --repo /ABSOLUTE/PATH/TO/knowledge-repo
+  # 2. fix the cause (start ollama / re-pull the model / correct adapters.yaml), then re-run doctor
+  # 3. preview the reinjection — changes not one byte
+  agora requeue --repo /ABSOLUTE/PATH/TO/knowledge-repo --all --dry-run
+  # 4. move them back to the inbox
+  agora requeue --repo /ABSOLUTE/PATH/TO/knowledge-repo --all
+  # 5. consolidate now, or just let the watch loop pick them up on its next tick
+  agora curate --repo /ABSOLUTE/PATH/TO/knowledge-repo --force
+  ```
+
+  `agora curate` and every `agora watch` tick print `failed_requeue: agora requeue --run <run-id>`
+  when a run actually left events terminal, and `agora doctor` offers `requeue:` whenever the backlog
+  is non-empty. Prefer that `--run` form: it requeues exactly the events one run lost.
+
+  - **It moves, it never rewrites.** The event lands at `_kb/inbox/<writer>/<id>.md` byte-identical,
+    with the same `id` and the same frontmatter, so nothing is duplicated and the append-only inbox
+    contract is untouched (ADR-0002's spool-custodian appendix). It holds the curator lock for the
+    whole batch and, while a run is in flight, refuses cleanly — one message, non-zero exit, nothing
+    changed — so it is safe to run against a live `agora watch`. It never overwrites an inbox file
+    that is already there, never writes `_kb/state.json`, and deletes nothing.
+  - **Fix the cause first — that ordering is not politeness.** The retry budget is *derived* from the
+    retained `error.json` records, so a requeued event keeps the attempts it already spent and gets
+    exactly **one** more run: if that run publishes, the capture is saved; if it fails, the event goes
+    straight back to `_kb/failed/` instead of retrying. Requeueing into a still-broken curator
+    therefore costs **one tick, not three** — non-destructive, but pure noise. `--reset-attempts`
+    gives the events the full `curator.max_attempts` budget again by *archiving* those records to
+    `_kb/requeued/` (never rewriting them); it is the right flag after a real fix, and the wrong one
+    before it. It scopes **records**, not events: a record is released once none of the events it
+    lists is still in `_kb/failed/`, so it can also restore the budget of an event that is already
+    back in the inbox. Every released record is printed on an `archived:` line, and a mistyped
+    `--run`/`--event` releases nothing at all (it exits 1 with `no failed run '<id>'`).
+  - **A large `--all` head-of-line-blocks new captures.** Requeued events keep their **old** ids, so
+    they sort to the FIFO head of the inbox and the claim's `max_candidates` cap (default 32) feeds
+    them to the curator first. Requeueing N events while the cause is still broken delays *new*
+    captures by `ceil(N / 32)` runs — and `--reset-attempts` roughly triples that, since each event
+    now burns three runs instead of one before going terminal again. Requeue in batches with
+    `--run <run-id>`, or fix first.
+  - **`counters.failed` will over-count; `failed_events` will not.** `counters.failed` is a lifetime
+    tally of terminal dispositions and is never decremented — requeue does not write `_kb/state.json`
+    at all — so one event that fails, is requeued, and fails again reads `failed=2`. The exact number
+    is `failed_events:`, the live count of what is sitting in `_kb/failed/` right now; `agora status`,
+    `agora doctor` and the requeue report all derive it from the same helper and always agree.
+    Likewise `last_failure` is **sticky** by design (#96): requeue never clears it, because requeue
+    did not fix the cause. After `--reset-attempts` its `record=` pointer follows the archived record
+    into `_kb/requeued/` rather than dangling.
 - **Reboot check** (the #65 acceptance): reboot, wait a minute, then confirm
   (macOS: LaunchAgents start at *login* — log back in first, or nothing runs)
   `launchctl print gui/$(id -u)/com.agora.watch` shows `state = running` (macOS) or

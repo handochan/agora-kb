@@ -18,6 +18,16 @@ from .manifest import (
     write_manifest,
 )
 from .plan import Disposition, Plan, PlanError, PlanParseError, validate_plan
+from .requeue import (
+    ArchivedRecord,
+    KeptRecord,
+    RequeueItem,
+    RequeueOutcome,
+    RequeueReport,
+    Selector,
+    StateUnreadable,
+    run_requeue,
+)
 from .subprocess_backend import BackendUnavailableError, SubprocessBackend
 from .triggers import TriggerConfig, TriggerDecision, TriggerReason, evaluate
 from .worker import (
@@ -57,6 +67,15 @@ __all__ = [
     "curator_lock",
     "claim",
     "LockHeld",
+    # `agora requeue` — the _kb/failed/ → _kb/inbox/ back-edge (issue #99, ADR-0002 appendix).
+    "ArchivedRecord",
+    "KeptRecord",
+    "RequeueItem",
+    "RequeueOutcome",
+    "RequeueReport",
+    "Selector",
+    "StateUnreadable",
+    "run_requeue",
     "Candidate",
     "BundleResult",
     "build_bundle",

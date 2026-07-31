@@ -7,7 +7,16 @@ Depends on nothing above it (ADR-0001/0003). Phase 1 implements the write path f
 from .atomicio import atomic_write_text, fsync_dir
 from .hashing import content_sha256, normalize_body
 from .ids import new_event_id
-from .inbox import Inbox, WriteReceipt, failed_event_count
+from .inbox import (
+    Inbox,
+    InboxReturn,
+    InboxReturnStatus,
+    WriteReceipt,
+    failed_event_count,
+    iter_failed_events,
+    resolve_inbox_return,
+    return_event_to_inbox,
+)
 from .layout import InvalidWriterError, RepoLayout, validate_writer
 from .models import Confidence, InboxItem, Kind
 from .repo import GitError, Repo
@@ -37,4 +46,9 @@ __all__ = [
     "SearchHit",
     "QueryResult",
     "failed_event_count",
+    "iter_failed_events",
+    "InboxReturn",
+    "InboxReturnStatus",
+    "resolve_inbox_return",
+    "return_event_to_inbox",
 ]

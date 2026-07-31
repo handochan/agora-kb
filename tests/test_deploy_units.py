@@ -8,17 +8,24 @@ keep the web face pinned to ``127.0.0.1`` (never ``0.0.0.0`` — no auth/SSRF-gu
 ``uv run --directory`` invocation form (the only supported run form while the package is
 unreleased), and retain the FIXED placeholder tokens so a future edit that drops one is caught.
 On macOS, ``plutil -lint`` additionally syntax-checks the plists (skipped where absent).
+
+``deploy/README.md`` is locked here too, for the same reason: since #99 it is the SSOT for the
+terminal-failure recovery procedure, and a documented command whose flag does not exist is worse
+than no documentation — so its fenced procedure is fed to the real ``agora`` parser.
 """
 
 from __future__ import annotations
 
 import configparser
 import plistlib
+import shlex
 import shutil
 import subprocess
 from pathlib import Path
 
 import pytest
+
+from agora_kb.cli import build_parser
 
 DEPLOY_DIR = Path(__file__).resolve().parents[1] / "deploy"
 LAUNCHD_DIR = DEPLOY_DIR / "launchd"
@@ -266,3 +273,64 @@ def test_plutil_lint_accepts_plist(name: str) -> None:
         timeout=30,
     )
     assert proc.returncode == 0, f"plutil -lint failed for {name}: {proc.stdout}{proc.stderr}"
+
+
+# --- operator procedures in deploy/README.md ------------------------------------------------------
+# `deploy/README.md` is the SSOT for the #99 recovery procedure (docs/GETTING-STARTED.md and
+# docs/LIMITATIONS.md are owned by the unwritten #104/#105). A procedure that names a flag which
+# does not exist is worse than no procedure, so the commands are run through the REAL parser.
+
+DEPLOY_README = DEPLOY_DIR / "README.md"
+REQUEUE_SECTION_MARKER = "Recovering terminal failures"
+
+
+def _fenced_bash_block(text: str, *, after: str) -> list[str]:
+    """The first ```bash block following ``after``, as command lines (comments/blanks dropped)."""
+    start = text.index(after)
+    fence = text.index("```bash", start)
+    body = text[fence + len("```bash") : text.index("```", fence + len("```bash"))]
+    return [
+        line.strip()
+        for line in body.splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
+
+
+def test_deploy_readme_documents_requeue_recovery() -> None:
+    """The #99 recovery procedure exists, is ordered doctor-first, and every argv really parses."""
+    text = DEPLOY_README.read_text(encoding="utf-8")
+    assert REQUEUE_SECTION_MARKER in text, (
+        "deploy/README.md must keep the 'Recovering terminal failures' subsection — it is the "
+        "documented recovery procedure for issue #99 (crit 10) and README/ROADMAP link to it"
+    )
+
+    commands = _fenced_bash_block(text, after=REQUEUE_SECTION_MARKER)
+    assert commands, "the recovery subsection must carry a fenced bash block with the procedure"
+
+    def _agora_argv(command: str) -> list[str]:
+        """``agora <sub> …`` with the documented ``uv run`` prefix stripped. ONE normalization for
+        both the parse loop and the ordering assertion: taking ``argv[1]`` unconditionally below
+        would blow up with a bare ``ValueError`` the day the block adopts the ``uv run`` form the
+        module docstring calls the only supported one while the package is unreleased."""
+        argv = shlex.split(command)
+        if argv[:2] == ["uv", "run"]:  # the documented checkout-prefixed form
+            argv = argv[2:]
+        assert argv[0] == "agora", f"unexpected command in the recovery procedure: {command!r}"
+        return argv
+
+    parser = build_parser()
+    for command in commands:
+        # SystemExit here = the docs name a flag that does not exist
+        parser.parse_args(_agora_argv(command)[1:])
+
+    subcommands = [_agora_argv(c)[1] for c in commands]
+    assert "doctor" in subcommands and "requeue" in subcommands
+    assert subcommands.index("doctor") < subcommands.index("requeue"), (
+        "the procedure must run 'agora doctor' BEFORE 'agora requeue': a requeued event goes "
+        "terminal again on the very next failing run, so fixing the cause comes first (#99)"
+    )
+    assert "--dry-run" in text[text.index(REQUEUE_SECTION_MARKER) :], (
+        "the procedure must preview with --dry-run before moving anything"
+    )
+    # `--reset-attempts` is named in the prose rather than the block; it must still be a real flag.
+    parser.parse_args(["requeue", "--repo", ".", "--all", "--reset-attempts"])

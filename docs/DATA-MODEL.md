@@ -32,9 +32,55 @@ raw_ref: raw/ai-tech/2026-06-13-foo.pdf    # optional: link to an immutable sour
 
 Rules: event contents are immutable and contain no mutable processing status. Lifecycle is represented
 by location: `_kb/inbox/` (pending) → `_kb/processing/<run-id>/` (claimed) →
-`_kb/processed/<date>/` or `_kb/failed/`. Recovery follows the run manifest in the processing
-directory. `event_key` provides delivery idempotency; identical `content_sha256` values are equivalent
-content whose distinct sources/writers must still be preserved and merged into provenance.
+`_kb/processed/<date>/` or `_kb/failed/<date>/<run-id>/` (terminal). Recovery follows the run manifest
+in the processing directory. `event_key` provides delivery idempotency; identical `content_sha256`
+values are equivalent content whose distinct sources/writers must still be preserved and merged into
+provenance.
+
+**Back-edges.** Two transitions return an event to `_kb/inbox/`. Both are a single `os.replace` — the
+bytes, the `id` and the frontmatter are preserved, so a back-edge never mints a second event for one
+capture (writing a new event through `Inbox.write` would duplicate the knowledge and break the
+immutability statement above):
+
+| Back-edge | Who | When |
+|---|---|---|
+| `_kb/processing/<run-id>/` → `_kb/inbox/<writer>/` | the curator | a run that did not publish, for events still inside the `curator.max_attempts` retry budget (ADR-0011 §5.1), and the §9 crash-recovery path |
+| `_kb/failed/<date>/<run-id>/` → `_kb/inbox/<writer>/` | `agora requeue` (#99) | an operator recovering a **terminal** failure, after fixing its cause |
+
+`agora requeue` is the only non-curator process that mutates the spool. It does so under
+`curator_lock` and inside the five-clause **spool-custodian rule** (ADR-0002 appendix): rename-only,
+destination derived from the event's own frontmatter through the DESIGN §7 guards, never touching
+`wiki/` / `raw/` / `log.md` / git / `_kb/state.json`, and non-destructive — an occupied inbox address
+is reported and skipped, never overwritten.
+
+**The requeued event's retry budget — and `_kb/requeued/`.** The budget is DERIVED from the
+`failed/**/error.json` records that are still retained (ADR-0011 §5.1), never stored on the event, so
+requeue's default of leaving those records in place is what gives a requeued event exactly **one**
+more run: publish and the capture is saved, fail and it returns to `_kb/failed/` immediately instead
+of burning three more ticks. That asymmetry is the loop break — the derived attempt count is strictly
+monotone, so requeue↔fail cannot cycle. `agora requeue --reset-attempts` restores the full
+`curator.max_attempts` budget by *archiving* the released records to
+**`_kb/requeued/<date>/<run-id>/error.json`** — the exact `_kb/failed/` twin, with `<date>` still the
+failure date. The archive **must** live outside `_kb/failed/`, because the budget derivation is
+`failed_dir.rglob("error.json")` and `rglob` descends into dotted directories: an `_kb/failed/.archive/`
+would still be counted and the reset would silently reset nothing. A record is released only once
+**none** of the event ids it lists is still terminal, so no event that is still in `_kb/failed/` can
+lose its budget; a retained record and the reason it was retained are both printed. The rule sees
+only `_kb/failed/`, so it also releases a record whose events are already back in `_kb/inbox/` with
+attempts spent — crash residue from an interrupted requeue and an event the curator is mid-retry are
+byte-identical on disk, and releasing both is deliberate: the alternative makes crash residue
+permanently un-reclaimable, and the error direction is the safe one (an event gets *more* attempts,
+never fewer). Every released record is printed on an `archived:` line, and a `--run`/`--event`
+selector that matched no events archives nothing at all.
+
+**No disposition deletes an event (#124).** When the curator cannot return an event — the inbox
+address is occupied, the frontmatter is unreadable, the `writer`/`id` is unaddressable, or the rename
+raises `OSError` — the event is **preserved** on disk instead of being dropped. All three refusal
+paths preserve it into the same `_kb/failed/<date>/<run-id>/` directory, byte-for-byte; they differ
+only in how the run reports it: the retry-budget path counts it as one terminal `failed` (preserving
+*is* a terminal disposition), while the CAS-conflict and crash-recovery paths add a distinct
+`preserved` count, emitted only when non-zero so an ordinary run's counters are unchanged. A
+preserved event is still counted by `failed_events` and still retrievable with `agora requeue`.
 
 ## 2. Raw source — `raw/<domain>/<date>-<slug>.<ext>` (+ sidecar for binaries)
 
@@ -249,14 +295,22 @@ fields nothing an operator can read moves at all.
   the repo-relative POSIX path of that run's `error.json`, which keeps the untruncated
   `failed_checks`. Repo-relative so the record survives a repo move and no host layout leaks into a
   repo-scoped file (invariant 5). `phase` is `claimed` for a failure BEFORE apply and `applied`
-  after it.
+  after it. Requeue never rewrites this field (it is strictly rename-only and must not clear a
+  failure nobody has fixed), so after `agora requeue --reset-attempts` the stored path names a file
+  that has moved; the two renderers — `agora status`'s `last_failure:` line and `agora doctor`'s
+  `failures:` line — follow it to the `_kb/requeued/` twin, and **only** when the original is gone
+  and the twin exists. In every other case the stored string is printed verbatim.
 - It is **sticky**: a later successful publish does NOT clear it (it is a historical fact, like
   `counters`). "Is it still broken?" is `CuratorState.failure_is_current` — a derived property,
   never serialized — which is true while `last_failure.when >= last_run` (or nothing has ever
   published). Crash recovery touches neither field (it replays no clock and no counters), and a CAS
   conflict is not a failure: it writes no `error.json` and no `last_failure`.
 - Surfaces: `agora status` (`last_attempt:` / `last_failure:` / `failed_events:`), `agora doctor`'s
-  `failures:` line, and `agora curate`'s `failed_record:` / `failed_checks:` lines.
+  `failures:` line, and `agora curate`'s `failed_record:` / `failed_checks:` lines. When a run
+  actually left events terminal, `agora curate` (and each `agora watch` tick) adds a
+  `failed_requeue: agora requeue --run <run-id>` line and `agora doctor` adds a `requeue:` line —
+  the way BACK, gated on `counts["failed"] > 0` so a within-budget failure, whose events are back in
+  `inbox/` already, is never sent to requeue (#99).
 
 > **Downgrade note.** A `state.json` written by this version is **not readable by a pre-#96 agora**
 > (the loader is deliberately fail-loud rather than dropping unknown keys). The remedy is to

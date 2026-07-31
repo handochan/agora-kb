@@ -159,12 +159,24 @@ recorded before anyone touches the code, and Track B gets its `windows-latest` s
 - [ ] **`schema_version` compatibility check (#98).** Read in three places (`config.py:174/909/915`) and
       compared against a supported range in **none**; no doctor line. A repo written by a future
       build must fail loudly. (`agora repo upgrade` itself stays #63.)
-- [ ] **`agora requeue` — failed-event reinjection (#99).** `rg requeue src/` → 0. With `watch --interval`
-      defaulting to 60s (`cli.py:228`), a threshold trigger that ignores `last_run` and fires every
-      tick (`curator/triggers.py:117-119`), and `max_attempts=3` (`config.py:127`), a backend outage
-      moves captures **terminally** into `_kb/failed/` in roughly three minutes with no supported way
-      back. Reinjection must reuse the existing `event_key` idempotency path — the inbox is
-      append-only (invariant 3).
+- [x] **`agora requeue` — failed-event reinjection (#99)** — DONE. A `watch --interval` of 60s, a
+      threshold trigger that ignores `last_run` and fires every tick (`curator/triggers.py`), and
+      `max_attempts=3` still move captures **terminally** into `_kb/failed/` in roughly three minutes
+      when a configured brain stops answering — but there is now a supported way back.
+      `agora requeue (--run ID | --event ID | --all) [--dry-run] [--force] [--reset-attempts]` moves
+      the events to `_kb/inbox/<writer>/<id>.md` by **rename only**: same bytes, same `id`, same
+      frontmatter, so no second event is minted and the append-only inbox contract (invariant 3) is
+      untouched. It runs under `curator_lock` for the whole batch and refuses cleanly while a run is
+      in flight; it skips an event whose `event_key` is already in `state.event_keys` (`--force`
+      overrides, and says why); it never overwrites an occupied inbox address, never writes
+      `state.json`, and deletes nothing. By default a requeued event keeps the attempts it already
+      spent — one more run, no requeue↔fail loop — and `--reset-attempts` archives the released
+      `error.json` records to `_kb/requeued/`, outside `failed_dir` because `rglob` descends into
+      dotted dirs. `agora curate` and each `agora watch` tick now print a
+      `failed_requeue: agora requeue --run <run-id>` line when a run actually left events terminal,
+      and `agora doctor` offers a `requeue:` line when the backlog is non-empty. Procedure:
+      [`deploy/README.md`](../deploy/README.md) → "Recovering terminal failures"; boundary rule:
+      ADR-0002's 2026-07-29 spool-custodian appendix (C1–C5).
 
 **Path safety (1 — new, carved out of #90)**
 - [ ] **Cross-platform path safety (#108).** Two defects that reproduce on **POSIX**, not just Windows.
@@ -228,10 +240,12 @@ recorded before anyone touches the code, and Track B gets its `windows-latest` s
       disappear, in one page: `repo init` git-ignores `_kb/` (`core/repo.py:52-54`) so nothing
       uncurated is backed up; the closed op vocabulary has no DELETE (`curator/plan.py:51-56`) so
       nothing is retractable; a retry no longer fails invisibly (#96 records `last_failure` on every
-      non-publishing run) but still leaves `last_run`/`counters.failed` untouched by design; and the
-      manual `_kb/failed/` reinjection procedure — including the trap that the retry budget is
-      derived from *retained `error.json` records*, not from the event file (`worker.py:917-930`) —
-      is documented here because no command exists for it yet.
+      non-publishing run) but still leaves `last_run`/`counters.failed` untouched by design. The
+      `_kb/failed/` section shrinks to a **link**: #99 shipped `agora requeue`, so the reinjection
+      procedure and the retry-budget trap (the budget is derived from *retained `error.json`
+      records*, not from the event file — which is why `--reset-attempts` exists) now live in
+      [`deploy/README.md`](../deploy/README.md) → "Recovering terminal failures" rather than being
+      re-documented here.
 - [ ] **README reconciliation + repo metadata + LICENSE (#106).** No `git clone` and no repository URL
       anywhere (`git clone|pip install|pypi` → 0 hits), no supported-OS statement, and a headline
       still reading "Phases 1–3 shipped" (`README.md:6`) that omits 3.5/3.6; `LICENSE:190` still
