@@ -1237,10 +1237,17 @@ def iter_attempt_records(layout: RepoLayout) -> Iterator[tuple[Path, list[str]]]
     THE single derivation of the retry budget. :func:`_event_attempt_counts` tallies it, and
     ``agora requeue --reset-attempts`` (#99) walks the SAME enumeration to decide which records it
     may archive — two readers of one enumeration, so the budget a requeue releases can never
-    disagree with the budget the next run charges. Records that cannot be read are SKIPPED, matching
-    the pre-existing tolerance: an unreadable record must not fail a curator run, and a budget
-    derived from the readable ones under-counts (more attempts, never fewer), which is the safe
-    direction. Sorted by path so both readers walk them in one deterministic order.
+    disagree with the budget the next run charges. Sorted by path so both readers walk them in one
+    deterministic order.
+
+    Tolerance is WIDER than the code this was extracted from, deliberately — ``_kb/failed/`` is
+    operator-editable, and the previous ``record.get("event_ids", [])`` raised an UNCAUGHT
+    ``AttributeError`` out of :func:`_fail` on any valid-JSON record whose top level was not an
+    object (only ``OSError``/``ValueError`` were caught). A hand-edited audit record could therefore
+    crash a curator run. Anything whose SHAPE cannot be read is now skipped exactly like a record
+    whose bytes cannot be read, so a malformed record costs a run nothing and requeue reports it
+    honestly as unreadable rather than as "governs no events". Skipping under-counts attempts (more
+    retries, never fewer) — the safe direction, since the alternative is dropping an event early.
     """
     failed_root = layout.failed_dir
     if not failed_root.exists():
@@ -1250,7 +1257,12 @@ def iter_attempt_records(layout: RepoLayout) -> Iterator[tuple[Path, list[str]]]
             record = json.loads(error_path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             continue
-        raw = record.get("event_ids", []) if isinstance(record, dict) else []
+        if not isinstance(record, dict):
+            # Valid JSON, wrong shape. NOT yielded (rather than yielded with no ids) so that
+            # `agora requeue` calls it an unreadable record instead of one that governs nothing —
+            # the two are different facts and only the first should hold a budget open.
+            continue
+        raw = record.get("event_ids", [])
         # A bare string is tolerated as a one-element list: this is an on-disk audit record an
         # operator can hand-edit, and treating "abc" as ['a','b','c'] would silently inflate the
         # budget of three events that do not exist.

@@ -2944,11 +2944,27 @@ def test_iter_attempt_records_is_the_single_budget_derivation(
     assert all(path.name == "error.json" for path, _ids in records)
     assert worker_mod._event_attempt_counts(layout) == {e1: 2}
 
-    # A malformed record is skipped by the generator, so the counter never sees it either.
+    # A record whose BYTES are unreadable is skipped by the generator (pre-existing tolerance).
     stray = layout.failed_dir / RUN_DATE / "hand-made" / "error.json"
     stray.parent.mkdir(parents=True, exist_ok=True)
-    stray.write_text("[not, an, object]", encoding="utf-8")
+    stray.write_text("[not, an, object]", encoding="utf-8")  # not valid JSON at all
     assert worker_mod._event_attempt_counts(layout) == {e1: 2}
+
+    # ...and so is a record that is valid JSON of the WRONG SHAPE. This is the branch that matters:
+    # `_kb/failed/` is operator-editable, and before #99 a top-level list reached
+    # `record.get("event_ids")` and raised an UNCAUGHT AttributeError out of _fail — a hand-edited
+    # audit record could crash a curator run. Each shape is asserted separately because they take
+    # different branches, and a single fixture would let one of them rot untested.
+    for shape in ('["evt-a", "evt-b"]', '"a string"', "42", "null", '{"event_ids": {"evt-a": 1}}'):
+        stray.write_text(shape, encoding="utf-8")
+        assert worker_mod._event_attempt_counts(layout) == {e1: 2}, shape
+        assert stray not in {path for path, _ids in worker_mod.iter_attempt_records(layout)}, shape
+
+    # A bare string is the one wrong-ish shape that IS tolerated — as one id, never as its letters
+    # (which would invent a budget for three events that do not exist).
+    stray.write_text('{"event_ids": "evt-solo"}', encoding="utf-8")
+    assert worker_mod._event_attempt_counts(layout) == {e1: 2, "evt-solo": 1}
+    stray.unlink()
 
     # ...and the counter routes THROUGH the generator rather than re-globbing beside it.
     monkeypatch.setattr(

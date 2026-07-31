@@ -624,6 +624,33 @@ def test_requeue_moves_an_unkeyed_event_the_precheck_does_not_apply(tmp_path: Pa
     assert layout.inbox_item_path("dochan", event.stem).is_file()
 
 
+def test_requeue_moves_an_unkeyed_event_even_when_state_holds_the_literal_none_composite(
+    tmp_path: Path,
+) -> None:
+    """(#99 crit 6) An un-keyed event must not be matched by the string ``"<writer>:None"``.
+
+    ``CuratorState`` addresses keys as ``f"{writer}:{event_key}"``, so asking the tier-1 predicate
+    about an event whose key is ``None`` degrades to the literal composite ``"dochan:None"`` —
+    which a client that wrote ``str(None)`` as its event_key can genuinely put in ``state.json``
+    (``_record_event_keys`` stores any truthy string). requeue would then refuse a perfectly movable
+    event, while ``claim._dedup_tier1`` — guarded by ``if event_key is not None`` — never even asks.
+    The two consumers of the "one predicate" would disagree, which is the one thing extracting it
+    was supposed to prevent.
+
+    The sibling test above seeds ``dochan:k1``, a composite the code never builds for an un-keyed
+    event, so it passes with or without the guard; this one seeds the poisoned composite itself.
+    """
+    layout = RepoLayout(tmp_path)
+    event = _terminal_event(layout, second=10)
+    _save_state(layout, dochan__None="2026-06-13T01-00-00.000Z--older1")
+
+    report = run_requeue(layout, selector=ALL)
+
+    assert report.items[0].event_key is None
+    assert [item.outcome for item in report.items] == [RequeueOutcome.requeued]
+    assert layout.inbox_item_path("dochan", event.stem).is_file()
+
+
 def test_requeue_refuses_on_an_unreadable_state_json_without_force(tmp_path: Path) -> None:
     """(#99 crit 6) A corrupt ``state.json`` REFUSES the run — a check that evaporates is no check.
 

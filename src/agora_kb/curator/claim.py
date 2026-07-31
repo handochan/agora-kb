@@ -222,7 +222,7 @@ def _dedup_tier1(
     return selected
 
 
-def is_already_delivered(state: CuratorState, *, writer: str, event_key: str) -> bool:
+def is_already_delivered(state: CuratorState, *, writer: str, event_key: str | None) -> bool:
     """True iff this ``writer:event_key`` was already delivered by a prior run (ADR-0011 §5 tier-1).
 
     Extracted so ``agora requeue`` (#99) can ASK the question claim will later answer, instead of
@@ -231,10 +231,19 @@ def is_already_delivered(state: CuratorState, *, writer: str, event_key: str) ->
     and says why. One predicate, so the warning and the drop can never disagree about what counts
     as delivered.
 
+    ``event_key=None`` (an event that carries no key) is ALWAYS False, mirroring ``_dedup_tier1``,
+    which guards the lookup behind ``if event_key is not None`` and therefore never asks. Without
+    this short-circuit the composite degrades to the literal string ``"<writer>:None"``, which a
+    client that wrote ``str(None)`` as its event_key can actually put in ``state.event_keys`` — and
+    requeue would then refuse a perfectly movable un-keyed event. Un-keyed events are never
+    de-duplicated (ADR-0011 §5), so the only correct answer here is False.
+
     BEST-EFFORT for that caller, by construction: ``recover()`` writes ``state.event_keys`` WITHOUT
     the curator lock, so a key can appear between requeue's check and the next claim. The check
     turns a silent loss into a reported skip; it does not make the race impossible.
     """
+    if event_key is None:
+        return False
     return state.event_key_id(writer, event_key) is not None
 
 
