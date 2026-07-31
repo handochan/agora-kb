@@ -4,7 +4,10 @@
 > Plain-markdown knowledge that many agents and people write to, that **organizes itself**,
 > and that any MCP-speaking tool can read and contribute to.
 
-**Status:** **Phases 1–3 shipped** — a local markdown KB with capture (`kb_remember`), deterministic
+**Status:** **Phases 1–3.6 shipped** · version **`0.1.0b1`** (pre-release; the `v0.1.0b1` tag is
+**not cut yet** — install from `main` and expect it to move; see
+[`CHANGELOG.md`](CHANGELOG.md) for what is in it, what is still gating the tag, and the
+**known limitations**) — a local markdown KB with capture (`kb_remember`), deterministic
 navigation query (`kb_query`), and a scheduled curator (`kb_curate`), exposed over an MCP stdio face
 and the `agora` CLI. The curator's brain is **pluggable/swappable via `adapters.yaml`** (a local
 Ollama model or any headless CLI agent) with per-act `plan`/`author` routing (ADR-0015/0016), and an
@@ -13,8 +16,11 @@ ADR-0007). Phase 3 adds the **web face** (`agora web`): URL/PDF/office upload ex
 FastAPI server with a server-rendered HTMX UI for browse/search/upload, an interactive **knowledge
 graph** (`/graph` + a per-note local graph; vendored MIT force-graph, no Node — ADR-0021), a
 read-only **dashboard** (KB health · curator · harvester), and a Prometheus `/metrics` exporter
-(ADR-0019/0020/0021). Phases 4–5
-(multi-tenant, auth, governance) are still ahead; see
+(ADR-0019/0020/0021). Phases 3.5/3.6 then added the retrieval and deployability floor: Korean
+search + no-loss capture, the derived `_kb/index` reader cache and `_kb/gold` context packs,
+`kb_read`/`kb_neighbors`/`kb_context`, bounded curator batches, `agora sync` push-only backup, and
+launchd/systemd units (ADR-0022/0024/0025/0027). Phases 4–5
+(multi-tenant, auth, governance) are still ahead — **this release has no authentication**; see
 [`docs/ROADMAP.md`](docs/ROADMAP.md). Package/distribution name: `agora-kb`.
 
 ---

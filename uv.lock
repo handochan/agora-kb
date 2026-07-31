@@ -14,7 +14,6 @@ resolution-markers = [
 
 [[package]]
 name = "agora-kb"
-version = "0.0.0"
 source = { editable = "." }
 dependencies = [
     { name = "fastmcp" },
@@ -25,6 +24,7 @@ dependencies = [
 [package.optional-dependencies]
 dev = [
     { name = "mypy" },
+    { name = "packaging" },
     { name = "pytest" },
     { name = "ruff" },
     { name = "types-pyyaml" },
@@ -51,8 +51,9 @@ requires-dist = [
     { name = "fastmcp", specifier = ">=2.0" },
     { name = "jinja2", marker = "extra == 'web'", specifier = ">=3.1" },
     { name = "markdown-it-py", marker = "extra == 'web'", specifier = ">=3.0" },
-    { name = "markitdown", extras = ["docx", "xlsx", "pptx"], marker = "extra == 'ingest'", specifier = ">=0.1" },
+    { name = "markitdown", extras = ["docx", "pptx", "xlsx"], marker = "extra == 'ingest'", specifier = ">=0.1" },
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.11" },
+    { name = "packaging", marker = "extra == 'dev'", specifier = ">=22" },
     { name = "pdfminer-six", marker = "extra == 'ingest'", specifier = ">=2024" },
     { name = "prometheus-client", marker = "extra == 'metrics'", specifier = ">=0.20" },
     { name = "pydantic", specifier = ">=2.0" },
@@ -64,7 +65,7 @@ requires-dist = [
     { name = "types-pyyaml", marker = "extra == 'dev'", specifier = ">=6.0" },
     { name = "uvicorn", marker = "extra == 'web'", specifier = ">=0.30" },
 ]
-provides-extras = ["web", "ingest", "metrics", "dev"]
+provides-extras = ["dev", "ingest", "metrics", "web"]
 
 [[package]]
 name = "aiofile"
