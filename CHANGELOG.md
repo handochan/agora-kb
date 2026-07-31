@@ -32,12 +32,15 @@ no git tag exists yet, so `git checkout v0.1.0b1` will not resolve and there is 
 artifact. Installing today means installing from `main`, which moves.
 
 The `0.1.0b1` notes below are the prepared release notes, not a shipped release. Remaining gates
-(epic [#93](https://github.com/handochan/agora-kb/issues/93), Track A): `SECURITY.md` (#95),
-the `schema_version` skew guard (#98), PyPI name reservation (#102), a friendly Windows failure
-(#103), `docs/GETTING-STARTED.md` (#104), `docs/LIMITATIONS.md` (#105), README + repo metadata
-(#106), and a clean-machine release smoke run by someone who is not the author (#107) — plus the
-`windows-latest` gate ruling that decides whether Windows ships in b1 or b2. Until #95 lands there
-is no private vulnerability-reporting channel; please do not file security issues publicly.
+(epic [#93](https://github.com/handochan/agora-kb/issues/93), Track A): the `schema_version` skew
+guard (#98), PyPI name reservation (#102), a friendly Windows failure (#103), repo metadata
+(description/topics, part of #106), and a clean-machine release smoke run by someone who is not the
+author (#107) — plus the `windows-latest` gate ruling that decides whether Windows ships in b1 or
+b2. Landed: [`SECURITY.md`](SECURITY.md) (#95), [`docs/GETTING-STARTED.md`](docs/GETTING-STARTED.md)
+(#104), [`docs/LIMITATIONS.md`](docs/LIMITATIONS.md) (#105), and the README reconciliation (#106).
+
+**Security reports go through [`SECURITY.md`](SECURITY.md)** — private vulnerability reporting, not
+a public issue.
 
 ## [Unreleased]
 
@@ -186,9 +189,11 @@ against the code. The normative version lives in
    **Do not capture secrets, credentials, or other people's personal data.**
 4. **Backup covers `wiki/`, not `_kb/` — and is push-only.** `agora repo init` writes a `.gitignore`
    containing `_kb/`, and `agora sync` (#64) pushes git history, so the *entire* operational spool
-   is outside the backup: the uncurated inbox, harvest cursors, gold packs, `_kb/failed/`, and
-   curator state. Most of that is derived and rebuildable (ADR-0001) — but the inbox is not, so
-   anything captured and not yet curated is not backed up. Sync also never pulls or merges: the
+   is outside the backup: the uncurated inbox, harvest cursors, gold packs, `_kb/failed/`,
+   `_kb/processed/`, curator state, and your `_kb/repo.yaml` policy. Only two of those are
+   rebuildable by command (`_kb/index/`, `_kb/gold/`) — the rest are not, so anything captured and
+   not yet curated, and anything sitting terminal in `_kb/failed/`, is not backed up (the full table
+   is [`docs/LIMITATIONS.md`](docs/LIMITATIONS.md) §1). Sync also never pulls or merges: the
    remote is a backup target, never a second writer (ADR-0002), and two machines writing the same KB
    is unsupported (#46). Widening the backup contract is a separate decision, not a beta patch.
 5. **You must supply a brain, and the out-of-box default assumes a local Ollama.** `repo init`

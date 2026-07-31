@@ -23,7 +23,7 @@ All files use the same fixed tokens — grep for them to catch a missed substitu
 | Token | Meaning |
 |---|---|
 | `/ABSOLUTE/PATH/TO/uv` | the `uv` binary (`which uv`; commonly `~/.local/bin/uv` or `/opt/homebrew/bin/uv`) — service managers do not search your shell `PATH` |
-| `/ABSOLUTE/PATH/TO/agora-kb` | this source checkout (`uv run --directory` is the current only run form; the package is unreleased, version 0.0.0) |
+| `/ABSOLUTE/PATH/TO/agora-kb` | this source checkout (`uv run --directory` is the current only run form; the package is unreleased — no tag, no PyPI — and reports version `0.1.0b1`) |
 | `/ABSOLUTE/PATH/TO/knowledge-repo` | the knowledge repo (`--repo`) |
 | `YOUR_USER` | your login user (launchd log paths, `loginctl enable-linger`) |
 
