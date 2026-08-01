@@ -2170,9 +2170,10 @@ def _probe_ollama(tail: tuple[str, ...], *, timeout: float) -> tuple[str, bool]:
         except ollama_brain.BrainError as exc:
             return (f"ollama {host} UNREACHABLE ({exc}) [model pinned to {pin!r}]", False)
         except ValueError as exc:
-            # A scheme-less host (`AGORA_OLLAMA_HOST=localhost:11434`) makes urlopen raise a bare
-            # ValueError that ping_ollama does NOT wrap — same first-run typo, same rendering as
-            # the auto-select branch below.
+            # A PORTLESS host (`AGORA_OLLAMA_HOST=localhost`) makes urlopen raise a bare ValueError
+            # that ping_ollama does NOT wrap — verified, and NOT the same shape as
+            # `localhost:11434`, which urlopen reads as scheme `localhost` and reports as a
+            # URLError. Same first-run typo family, same rendering as the auto-select branch below.
             return (
                 f"ollama {host} UNREACHABLE ({type(exc).__name__}: {exc}) "
                 f"[model pinned to {pin!r}]",
@@ -2401,8 +2402,23 @@ def _doctor_brains(
     return ok
 
 
+# Only PASS-2 can ever be confined: SubprocessBackend.plan() passes confine=False unconditionally
+# (curator/subprocess_backend.py:279), so PASS-1 runs outside the kernel sandbox even for a
+# `network: none` spec. Spelled once, here, because every rendering below turns on it.
+_CONFINABLE_ACT = "author"
+
+# The mechanisms that confine at the KERNEL level. `restricted` — the ADR-0013
+# allow_reduced_isolation fallback — is deliberately absent: it blocks neither network egress nor
+# out-of-worktree writes, so counting it here would be the overclaim #129 exists to remove.
+_KERNEL_SANDBOX_MECHANISMS = frozenset({"seatbelt", "bwrap"})
+
+
 def _sandbox_confinement(
-    registry: BackendRegistry | None, default_backend: str | None
+    registry: BackendRegistry | None,
+    default_backend: str | None,
+    *,
+    mechanism: str | None,
+    proven: bool = True,
 ) -> str | None:
     """Render whether the sandbox actually confines THIS repo's brains, or ``None`` if unknowable.
 
@@ -2414,30 +2430,75 @@ def _sandbox_confinement(
     reading; #129 exists because that misreading nearly reached SECURITY.md.
 
     Reporting only — never a verdict. An unconfined loopback brain is the designed default, not a
-    fault; what was faulty was leaving an operator to infer the opposite. Resolution reuses
-    :func:`_routed_brain_names` so this line and the `routing:` line below cannot disagree.
+    fault; what was faulty was leaving an operator to infer the opposite.
+
+    Resolution is PER ACT, over ``routed_backends`` — the same mapping the `routing:` line renders,
+    so the two cannot disagree. Per-act is not a refinement, it is the correctness condition:
+    ``spec.network == 'none'`` is a *request* for confinement, and three further facts decide
+    whether it is granted.
+
+    * **PASS-1 is never confined.** :meth:`SubprocessBackend.plan` passes ``confine=False``
+      UNCONDITIONALLY (``curator/subprocess_backend.py:279``); only
+      :meth:`~SubprocessBackend.author` passes ``confine=True``, and ``SECURITY.md`` states the
+      same rule in prose. So a ``network: none`` brain
+      reached through ``routing.plan`` is not confined at all, and an unqualified "yes" for a repo
+      is never true — which is why this function cannot emit one.
+    * **The mechanism must exist and be proven.** ``SandboxUnavailable`` means no act can even be
+      BUILT with ``network: none`` (``subprocess_backend.py:615-620`` returns ``None`` and
+      ``agora curate`` exits 1), and a self-test that FAILED is a confinement that lies.
+    * **``restricted`` is not kernel confinement.** The ``allow_reduced_isolation`` fallback blocks
+      neither network egress nor out-of-worktree writes, so calling it confined would re-introduce
+      exactly the overclaim this line exists to remove.
     """
     if registry is None:
         return None
+    kernel_ok = proven and mechanism in _KERNEL_SANDBOX_MECHANISMS
     confined: list[str] = []
     unconfined: list[str] = []
-    for name in _routed_brain_names(registry, default_backend):
+    blocked: list[str] = []
+    for act, name in registry.routed_backends(default=default_backend).items():
         try:
             network = registry.get(name).network
         except KeyError:
             # repo.yaml curator.backend names no defined brain — `routing:` and the brain probe
             # both surface that; saying anything about its confinement would be invention.
             continue
-        (confined if network == "none" else unconfined).append(f"{name} (network: {network})")
-    if not confined and not unconfined:
+        label = f"{act}={name} (network: {network})"
+        if network != "none":
+            unconfined.append(label)
+        elif mechanism is None:
+            blocked.append(label)
+        elif act != _CONFINABLE_ACT or not kernel_ok:
+            unconfined.append(label)
+        else:
+            confined.append(label)
+    if not (confined or unconfined or blocked):
         return None
-    if not unconfined:
-        return f"confines this repo's brains: yes — {', '.join(confined)}"
-    lead = "NO" if not confined else "PARTIAL"
-    detail = f"outside: {', '.join(unconfined)}"
-    if confined:
-        detail = f"{detail}; confined: {', '.join(confined)}"
-    return f"confines this repo's brains: {lead} — {detail} (only network: none is confined)"
+
+    head = "confines this repo's brains:"
+    if blocked:
+        tail = f"; outside: {', '.join(unconfined)}" if unconfined else ""
+        return (
+            f"{head} NO — no usable kernel sandbox on this host, so {', '.join(blocked)} "
+            f"cannot run at all ('agora curate' fails closed){tail}"
+        )
+    if not confined:
+        return (
+            f"{head} NO — outside: {', '.join(unconfined)} ({_why_unconfined(mechanism, proven)})"
+        )
+    return (
+        f"{head} PARTIAL — confined: {', '.join(confined)}; outside: {', '.join(unconfined)} "
+        "(PASS-1 is never confined on any path)"
+    )
+
+
+def _why_unconfined(mechanism: str | None, proven: bool) -> str:
+    """The one-clause reason nothing in this repo is confined — the actionable half of a `NO`."""
+    if mechanism is not None and mechanism not in _KERNEL_SANDBOX_MECHANISMS:
+        return f"the {mechanism} fallback is not kernel confinement, ADR-0013"
+    if not proven:
+        return "the sandbox self-test FAILED on this host"
+    return "only a network: none author is confined; PASS-1 never is"
 
 
 def _doctor_sandbox(
@@ -2451,16 +2512,20 @@ def _doctor_sandbox(
     Selects the OS-appropriate :class:`~agora_kb.curator.isolation.BackendIsolation` and runs the
     hardened self-test against a throwaway worktree + a SEPARATE throwaway tmp (the ADR's
     EPERM-specific probes: write-inside OK, write-outside denied, network denied to a reachable
-    target, Apple-shimmed binary runs). Returns ``False`` ONLY when a sandbox is present but its
-    self-test FAILS (a confinement that lies is worse than none). A platform with no kernel sandbox
-    (``SandboxUnavailable``) prints a fail-closed note and returns ``True`` — the default loopback
-    Ollama brain does inference outside the sandbox and never needs one; the fail-closed guard bites
-    only a ``network: none`` backend at curate time. Never raises: any unexpected error is reported.
+    target, Apple-shimmed binary runs). Returns ``False`` when a sandbox is present but its
+    self-test FAILS (a confinement that lies is worse than none), and — since #129 — when the host
+    has NO kernel sandbox while a routed act declares ``network: none``. That second case is the
+    issue's own headline restated: ``build_routed_backend`` refuses to build such an act
+    (``subprocess_backend.py:615-620``) so ``agora curate`` exits 1, and doctor reporting
+    ``healthy`` over it is precisely "green on a repo that cannot curate". A sandbox-less host
+    whose acts are all ``loopback`` still returns ``True`` — that is the case the fail-closed note
+    was always about, and nothing there needs a sandbox.
 
-    ``registry`` / ``default_backend`` are threaded in for the #129 sub-line only
-    (:func:`_sandbox_confinement`): the self-test answers "does the mechanism work HERE", which an
-    operator reads — wrongly — as "is my brain sandboxed". Both are optional so the self-test
-    remains callable on its own; omitting them just drops the sub-line.
+    ``registry`` / ``default_backend`` are threaded in for both of those: the #129 sub-line
+    (:func:`_sandbox_confinement`), and the verdict above. The self-test alone answers "does the
+    mechanism work HERE", which an operator reads — wrongly — as "is my brain sandboxed". Both stay
+    optional so the self-test remains callable on its own; omitting them drops the sub-line and
+    restores the pre-#129 always-``True`` behavior on a sandbox-less host.
     """
     from .curator.isolation.selftest import ollama_reachable, self_test
 
@@ -2468,8 +2533,8 @@ def _doctor_sandbox(
         isolation = select_backend_isolation(allow_reduced_isolation=allow_reduced_isolation)
     except SandboxUnavailable as exc:
         print(f"  sandbox: unavailable — fail-closed for network:none backends ({exc})")
-        _print_sandbox_confinement(registry, default_backend)
-        return True
+        _print_sandbox_confinement(registry, default_backend, mechanism=None)
+        return not _has_sandboxed_act(registry, default_backend)
 
     wt = Path(tempfile.mkdtemp(prefix="agora-doctor-wt-"))
     tmp = Path(tempfile.mkdtemp(prefix="agora-doctor-tmp-"))
@@ -2501,12 +2566,43 @@ def _doctor_sandbox(
     )
     net_note = "" if reachable else " (no reachable target — unproven, not a failure)"
     print(f"    network-denied={report.network_denied}{net_note}")
-    _print_sandbox_confinement(registry, default_backend)
+    _print_sandbox_confinement(
+        registry, default_backend, mechanism=report.mechanism, proven=healthy
+    )
     return healthy
 
 
+def _has_sandboxed_act(registry: BackendRegistry | None, default_backend: str | None) -> bool:
+    """Does any routed act ask for the sandbox (``network: none``)? Never raises.
+
+    The question is per ACT, not per backend, and it covers ``plan`` too: ``_build_one`` selects
+    isolation for ANY act whose spec says ``network: none``, so a sandboxed PLAN act fails to build
+    on a sandbox-less host just like a sandboxed AUTHOR one — even though PLAN would then run
+    unconfined. Confinement and buildability are different questions about the same flag.
+
+    Answers ``False`` on anything it cannot resolve (no registry, an undefined backend name, a
+    malformed registry): the verdict this feeds must never turn RED on doctor's own uncertainty.
+    """
+    if registry is None:
+        return False
+    try:
+        for name in registry.routed_backends(default=default_backend).values():
+            try:
+                if registry.get(name).network == "none":
+                    return True
+            except KeyError:
+                continue
+    except Exception:  # noqa: BLE001 — doctor's verdict never turns on a crash in this probe.
+        return False
+    return False
+
+
 def _print_sandbox_confinement(
-    registry: BackendRegistry | None, default_backend: str | None
+    registry: BackendRegistry | None,
+    default_backend: str | None,
+    *,
+    mechanism: str | None,
+    proven: bool = True,
 ) -> None:
     """Print the #129 confinement sub-line when it is knowable. Never raises, never a verdict.
 
@@ -2514,7 +2610,7 @@ def _print_sandbox_confinement(
     `sandbox:` block that was already printed, let alone the `status:` line.
     """
     try:
-        line = _sandbox_confinement(registry, default_backend)
+        line = _sandbox_confinement(registry, default_backend, mechanism=mechanism, proven=proven)
     except Exception as exc:  # noqa: BLE001 — an observability line never crashes doctor.
         print(f"    confines this repo's brains: unknown ({type(exc).__name__}: {exc})")
         return

@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import http.client
 import io
 import json
 import os
@@ -839,6 +840,12 @@ def ping_ollama(host: str, *, timeout: float = 10.0) -> None:
     failure (connection refused, DNS, timeout) is a dead daemon. That ordering matters —
     :class:`urllib.error.HTTPError` is a SUBCLASS of :class:`~urllib.error.URLError`, so catching
     the parent first would paint a live-but-unexpected daemon as unreachable.
+
+    :class:`http.client.HTTPException` is in the transport tuple even though it descends from
+    ``Exception`` alone: a mistyped port (``http://localhost:abc`` → ``InvalidURL``) or a service
+    that is not HTTP (``BadStatusLine``) would otherwise escape to `agora doctor`'s catch-all and
+    render as ``probe ERROR``, which reads as an internal defect and carries no remediation. A
+    server that cannot speak HTTP is exactly "not a reachable Ollama daemon".
     """
     url = f"{host.rstrip('/')}/"
     try:
@@ -846,7 +853,7 @@ def ping_ollama(host: str, *, timeout: float = 10.0) -> None:
             resp.read(_PING_READ_BYTES)
     except urllib.error.HTTPError:
         return
-    except (urllib.error.URLError, OSError) as exc:
+    except (urllib.error.URLError, OSError, http.client.HTTPException) as exc:
         raise BrainError(
             f"could not reach the Ollama daemon at {url}: {exc}; is the Ollama daemon running?"
         ) from exc

@@ -32,6 +32,7 @@ from agora_kb.core.inbox import InboxReturn
 from agora_kb.core.state import LastFailure
 from agora_kb.core.wiki import Wiki
 from agora_kb.curator.claim import curator_lock
+from agora_kb.curator.isolation import SandboxUnavailable
 from agora_kb.curator.worker import RunFailure, RunReport
 from agora_kb.schema import lint
 
@@ -2070,54 +2071,124 @@ def _registry(adapters: str):  # type: ignore[no-untyped-def]
     return BackendRegistry.from_yaml(adapters)
 
 
+_NONE_ADAPTERS = (
+    "backends:\n  q: { argv: [agora-ollama-brain], network: none }\ndefault_backend: q\n"
+)
+
+
+# Two brains with opposite postures and NO `routing:` block, so which one is used is decided by
+# the ADR-0015 repo-level precedence (`repo.yaml curator.backend`) rather than the registry default.
+_TWO_BRAIN_ADAPTERS = (
+    "backends:\n"
+    "  loud: { argv: [agora-ollama-brain], network: loopback }\n"
+    "  quiet: { argv: [agora-cli-brain], network: none }\n"
+    "default_backend: loud\n"
+)
+
+
+def _split_adapters(plan: str, author: str) -> str:
+    """The same two brains, routed per act. ``loud`` = loopback, ``quiet`` = none."""
+    return f"{_TWO_BRAIN_ADAPTERS}routing: {{ plan: {plan}, author: {author} }}\n"
+
+
 def test_sandbox_confinement_says_NO_for_the_default_loopback_repo() -> None:
-    """`repo init` writes ``network: loopback``, and only ``network: none`` is confined.
+    """`repo init` writes ``network: loopback``, so nothing in the default repo is confined.
 
-    So the DEFAULT repo runs its brain outside the sandbox while ``sandbox: seatbelt (ok)`` sits
-    right above — the misreading #129 exists to close, and the one that nearly put a false
-    confinement claim into SECURITY.md.
+    That is the misreading #129 exists to close — ``sandbox: seatbelt (ok)`` sits right above and
+    nearly put a false confinement claim into SECURITY.md.
     """
-    line = cli_mod._sandbox_confinement(_registry(_OLLAMA_ADAPTERS), "qwen")
+    line = cli_mod._sandbox_confinement(_registry(_OLLAMA_ADAPTERS), "qwen", mechanism="seatbelt")
 
     assert line == (
-        "confines this repo's brains: NO — outside: qwen (network: loopback) "
-        "(only network: none is confined)"
+        "confines this repo's brains: NO — outside: plan=qwen (network: loopback), "
+        "author=qwen (network: loopback) "
+        "(only a network: none author is confined; PASS-1 never is)"
     )
 
 
-def test_sandbox_confinement_says_yes_when_every_act_is_network_none() -> None:
-    adapters = "backends:\n  q: { argv: [agora-ollama-brain], network: none }\ndefault_backend: q\n"
+def test_sandbox_confinement_never_says_yes_because_PASS_1_is_never_confined() -> None:
+    """Even an all-``network: none`` repo is only PARTIAL — ``plan`` never enters the sandbox.
 
-    assert cli_mod._sandbox_confinement(_registry(adapters), "q") == (
-        "confines this repo's brains: yes — q (network: none)"
-    )
-
-
-def test_sandbox_confinement_reports_PARTIAL_on_split_routing() -> None:
-    """ADR-0015 routing can send ``plan`` and ``author`` to brains with different postures.
-
-    A single yes/no would then be a lie in one direction or the other, so both sides are named.
+    ``SubprocessBackend.plan`` passes ``confine=False`` unconditionally, so an unqualified "yes"
+    is not true in ANY configuration. An earlier draft of this line printed one; that is the same
+    class of overclaim #129 was filed to remove, one branch over.
     """
-    adapters = (
-        "backends:\n"
-        "  loud: { argv: [agora-ollama-brain], network: loopback }\n"
-        "  quiet: { argv: [agora-cli-brain], network: none }\n"
-        "default_backend: loud\n"
-        "routing: { plan: loud, author: quiet }\n"
-    )
-
-    line = cli_mod._sandbox_confinement(_registry(adapters), "loud")
+    line = cli_mod._sandbox_confinement(_registry(_NONE_ADAPTERS), "q", mechanism="seatbelt")
 
     assert line == (
-        "confines this repo's brains: PARTIAL — outside: loud (network: loopback); "
-        "confined: quiet (network: none) (only network: none is confined)"
+        "confines this repo's brains: PARTIAL — confined: author=q (network: none); "
+        "outside: plan=q (network: none) (PASS-1 is never confined on any path)"
     )
+    assert "yes" not in line
+
+
+def test_sandbox_confinement_reports_PARTIAL_when_the_AUTHOR_act_is_sandboxed() -> None:
+    line = cli_mod._sandbox_confinement(
+        _registry(_split_adapters(plan="loud", author="quiet")), "loud", mechanism="seatbelt"
+    )
+
+    assert line == (
+        "confines this repo's brains: PARTIAL — confined: author=quiet (network: none); "
+        "outside: plan=loud (network: loopback) (PASS-1 is never confined on any path)"
+    )
+
+
+def test_sandbox_confinement_says_NO_when_only_the_PLAN_act_is_network_none() -> None:
+    """The inverted split: a ``network: none`` brain reached ONLY through ``routing.plan``.
+
+    Nothing in this repo ever enters the sandbox, because PASS-1 is hard-coded ``confine=False``.
+    A per-BACKEND reading of the same config says PARTIAL and names ``quiet`` as confined — which
+    is flatly false and was the defect an adversarial review caught in the first draft.
+    """
+    line = cli_mod._sandbox_confinement(
+        _registry(_split_adapters(plan="quiet", author="loud")), "loud", mechanism="seatbelt"
+    )
+
+    assert line == (
+        "confines this repo's brains: NO — outside: plan=quiet (network: none), "
+        "author=loud (network: loopback) "
+        "(only a network: none author is confined; PASS-1 never is)"
+    )
+    assert "confined:" not in line
+
+
+def test_sandbox_confinement_says_NO_when_the_host_has_no_kernel_sandbox() -> None:
+    """``mechanism=None`` is ``SandboxUnavailable`` — and then the act cannot even be BUILT.
+
+    Printing an affirmative directly beneath ``sandbox: unavailable`` would have the two adjacent
+    lines contradict each other, with the operator acting on the stronger one.
+    """
+    line = cli_mod._sandbox_confinement(_registry(_NONE_ADAPTERS), "q", mechanism=None)
+
+    assert line == (
+        "confines this repo's brains: NO — no usable kernel sandbox on this host, so "
+        "plan=q (network: none), author=q (network: none) cannot run at all "
+        "('agora curate' fails closed)"
+    )
+
+
+def test_sandbox_confinement_does_not_count_the_restricted_fallback() -> None:
+    """``allow_reduced_isolation`` selects a mechanism that confines neither writes nor egress."""
+    line = cli_mod._sandbox_confinement(_registry(_NONE_ADAPTERS), "q", mechanism="restricted")
+
+    assert line.startswith("confines this repo's brains: NO —")
+    assert "the restricted fallback is not kernel confinement, ADR-0013" in line
+
+
+def test_sandbox_confinement_does_not_count_a_sandbox_whose_selftest_failed() -> None:
+    """A confinement that lies is worse than none — a FAILED self-test cannot yield `confined`."""
+    line = cli_mod._sandbox_confinement(
+        _registry(_NONE_ADAPTERS), "q", mechanism="seatbelt", proven=False
+    )
+
+    assert line.startswith("confines this repo's brains: NO —")
+    assert "the sandbox self-test FAILED on this host" in line
 
 
 def test_sandbox_confinement_is_silent_without_adapters_yaml() -> None:
     """No registry = nothing to say. Inventing a posture for a repo with no backend is worse than
     the missing line, and ``routing:`` already reports the absent file."""
-    assert cli_mod._sandbox_confinement(None, "qwen") is None
+    assert cli_mod._sandbox_confinement(None, "qwen", mechanism="seatbelt") is None
 
 
 def test_sandbox_confinement_skips_a_backend_that_is_not_defined() -> None:
@@ -2126,7 +2197,10 @@ def test_sandbox_confinement_skips_a_backend_that_is_not_defined() -> None:
     Claiming anything about its confinement would be invention, and raising here would cost the
     operator the sandbox block that was already printed.
     """
-    assert cli_mod._sandbox_confinement(_registry(_OLLAMA_ADAPTERS), "ghost") is None
+    assert (
+        cli_mod._sandbox_confinement(_registry(_OLLAMA_ADAPTERS), "ghost", mechanism="seatbelt")
+        is None
+    )
 
 
 def test_print_sandbox_confinement_never_crashes_doctor(
@@ -2134,15 +2208,64 @@ def test_print_sandbox_confinement_never_crashes_doctor(
 ) -> None:
     """An observability line is never a reason to lose the `sandbox:` block or `status:`."""
 
-    def boom(registry, default_backend):  # type: ignore[no-untyped-def]
+    def boom(*args, **kwargs):  # type: ignore[no-untyped-def]
         raise RuntimeError("kaboom")
 
     monkeypatch.setattr(cli_mod, "_sandbox_confinement", boom)
     capsys.readouterr()
 
-    cli_mod._print_sandbox_confinement(None, "qwen")
+    cli_mod._print_sandbox_confinement(None, "qwen", mechanism="seatbelt")
 
     assert "confines this repo's brains: unknown (RuntimeError: kaboom)" in capsys.readouterr().out
+
+
+# --- #129 third instance: a sandboxed act on a sandbox-less host is not `healthy` ----------------
+
+
+def test_has_sandboxed_act_detects_either_act_and_never_raises() -> None:
+    """Buildability, unlike confinement, turns on BOTH acts: ``_build_one`` selects isolation for
+    any ``network: none`` spec, so a sandboxed PLAN act fails to build too."""
+    assert cli_mod._has_sandboxed_act(_registry(_NONE_ADAPTERS), "q") is True
+    assert cli_mod._has_sandboxed_act(_registry(_split_adapters("quiet", "loud")), "loud") is True
+    assert cli_mod._has_sandboxed_act(_registry(_split_adapters("loud", "quiet")), "loud") is True
+    assert cli_mod._has_sandboxed_act(_registry(_OLLAMA_ADAPTERS), "qwen") is False
+    # Doctor's verdict must never turn RED on doctor's own uncertainty.
+    assert cli_mod._has_sandboxed_act(None, "qwen") is False
+    assert cli_mod._has_sandboxed_act(_registry(_OLLAMA_ADAPTERS), "ghost") is False
+
+
+def test_doctor_sandbox_is_unhealthy_when_a_sandboxed_act_cannot_be_built(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#129's headline, third instance: green on a repo where ``agora curate`` cannot run.
+
+    On a host with no kernel sandbox, ``build_routed_backend`` returns ``None`` for a
+    ``network: none`` act and ``agora curate`` exits 1. Doctor used to return ``True`` here on the
+    rationale that "the default loopback brain never needs a sandbox" — true for a loopback repo,
+    false for this one. The control below is the loopback repo, which must stay green.
+    """
+
+    def unavailable(*args, **kwargs):  # type: ignore[no-untyped-def]
+        raise SandboxUnavailable("no bwrap, no userns")
+
+    monkeypatch.setattr(cli_mod, "select_backend_isolation", unavailable)
+    capsys.readouterr()
+
+    assert (
+        cli_mod._doctor_sandbox(False, registry=_registry(_NONE_ADAPTERS), default_backend="q")
+        is False
+    )
+    out = capsys.readouterr().out
+    assert "sandbox: unavailable" in out
+    assert "cannot run at all ('agora curate' fails closed)" in out
+
+    assert (
+        cli_mod._doctor_sandbox(False, registry=_registry(_OLLAMA_ADAPTERS), default_backend="qwen")
+        is True
+    )
+
+    # No registry at all = the pre-#129 behavior, unchanged: an inability to know is not a verdict.
+    assert cli_mod._doctor_sandbox(False) is True
 
 
 @requires_git
@@ -2154,8 +2277,13 @@ def test_doctor_prints_the_confinement_line_under_the_sandbox_block(
     ``_doctor_sandbox`` is NOT stubbed here (that is what carries the line), so the assertion is on
     the confinement text alone — whether this host's kernel sandbox self-test passes is a property
     of the developer's machine and a different test's business.
+
+    The repo defines TWO brains with opposite postures and points ``repo.yaml curator.backend`` at
+    the one that is NOT the registry default, so the rendered line proves ``cfg.default_backend``
+    (the ADR-0015 precedence the `routing:` line honours) actually reached the renderer. With a
+    single brain named by both files, passing ``None`` there would be invisible.
     """
-    target = _probe_repo(tmp_path / "kb", _OLLAMA_ADAPTERS)
+    target = _probe_repo(tmp_path / "kb", _TWO_BRAIN_ADAPTERS, backend="quiet")
     monkeypatch.setattr(shutil, "which", _shim_which())
     monkeypatch.setattr(ollama_brain, "list_ollama_models", _installed_models("qwen3.6:35b-a3b"))
     capsys.readouterr()
@@ -2163,7 +2291,41 @@ def test_doctor_prints_the_confinement_line_under_the_sandbox_block(
     main(["doctor", "--repo", str(target)])
 
     out = capsys.readouterr().out
-    assert "    confines this repo's brains: NO — outside: qwen (network: loopback)" in out
+    # `quiet` is repo.yaml's backend; `loud` is the registry default. Naming `quiet` is the proof
+    # that the repo-level precedence reached the renderer — `loud` would print a NO line instead.
+    assert "    confines this repo's brains: " in out
+    assert "author=quiet (network: none)" in out
+    assert "loud" not in out.split("confines this repo's brains: ")[1].split("\n")[0]
+
+
+@requires_git
+def test_doctor_prints_the_confinement_line_when_the_host_has_no_sandbox(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The `SandboxUnavailable` branch carries the line too, and it is the one that matters most.
+
+    Operators on a bwrap-less Linux box or native Windows (epic #85) are exactly the people who
+    need to know nothing is confined, and macOS CI never executes that branch on its own. Without
+    this test, deleting the call there would go unnoticed by a green suite.
+    """
+    target = _probe_repo(tmp_path / "kb", _NONE_ADAPTERS, backend="q")
+
+    def unavailable(*args, **kwargs):  # type: ignore[no-untyped-def]
+        raise SandboxUnavailable("no usable sandbox")
+
+    monkeypatch.setattr(cli_mod, "select_backend_isolation", unavailable)
+    monkeypatch.setattr(shutil, "which", _shim_which())
+    monkeypatch.setattr(ollama_brain, "list_ollama_models", _installed_models("qwen3.6:35b-a3b"))
+    capsys.readouterr()
+
+    rc = main(["doctor", "--repo", str(target)])
+
+    out = capsys.readouterr().out
+    assert "  sandbox: unavailable" in out
+    assert "confines this repo's brains: NO — no usable kernel sandbox on this host" in out
+    assert "cannot run at all ('agora curate' fails closed)" in out
+    assert "status: unhealthy" in out
+    assert rc == 1
 
 
 @requires_git
