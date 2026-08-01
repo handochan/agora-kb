@@ -251,8 +251,7 @@ of the unauthenticated premise, and it closes *browser-mediated* attacks only.
   tables, backup + failures lines. Run it after installing units and whenever a log shows repeated
   failures.
   - **Since #96 the brain probe is part of the verdict**: doctor asks whether the configured
-    backend's `argv[0]` is on PATH and (for `agora-ollama-brain`) whether the daemon answers
-    `/api/tags`, and prints `status: unhealthy` + **exit 1** when it cannot be used. That is the
+    backend's `argv[0]` is on PATH and (for `agora-ollama-brain`) whether the daemon answers, and prints `status: unhealthy` + **exit 1** when it cannot be used. That is the
     point — a node whose curator cannot run should not report healthy — but it means **a node with
     no brain now fails a `doctor`-based gate**. Two ways out: fix the brain (doctor prints a
     copy-pasteable block naming any headless CLI agent already on your PATH — `claude` / `codex` /

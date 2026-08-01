@@ -162,18 +162,24 @@ local, unauthenticated, and markdown-on-disk. Requires Python ≥ 3.12, git, and
   so an event that could not be returned (an already-occupied inbox address was enough) was lost,
   counted by nothing. Markdown is the source of truth; a run that cannot return an event now fails
   loudly rather than quietly shrinking the KB.
-- **`agora doctor` no longer reports green on a repo that cannot curate** (#129), in two cases that
-  a reader had no way to tell apart from a healthy one:
+- **`agora doctor` no longer reports green on a repo that cannot curate** (#129), in three cases a
+  reader had no way to tell apart from a healthy one:
   - Pinning the model with `--model` in the `adapters.yaml` argv skipped `/api/tags` — correctly,
     since a pinned run lists no models — but with it skipped *every* reachability check, so a repo
-    whose Ollama daemon was down printed `status: healthy` and exited `0`. Liveness is now probed
-    at `/` on every path (the model question stays skipped, because the run does not ask it), and
-    a dead daemon is `unhealthy`. **Behavior change:** a pinned repo with a dead daemon now
-    exits `1`.
+    whose Ollama daemon was down printed `status: healthy` and exited `0`. That path now establishes
+    liveness with a plain `GET /` (the model question stays skipped, because the run does not ask
+    it); the unpinned path already established it as a side effect of listing models. Either way a
+    dead daemon is `unhealthy`. **Behavior change:** a pinned repo with a dead daemon now exits `1`.
+  - A host with **no** kernel sandbox returned `healthy` even when a routed act declared
+    `network: none` — but `build_routed_backend` refuses to build such an act, so `agora curate`
+    exits 1 on that host. **Behavior change:** that combination is now `unhealthy`. A sandbox-less
+    host whose acts are all `loopback` is unaffected and stays green.
   - `sandbox: seatbelt (ok)` proves the mechanism works on the host, which reads as "my brain is
-    confined" — but a backend is confined only when its spec says `network: none`, and `repo init`
-    writes `network: loopback`. A `confines this repo's brains:` line now answers that question
-    directly (`NO` / `PARTIAL` / `yes`, naming each backend and its posture). Reporting only: an
+    confined". A `confines this repo's brains:` line now answers that separately, **per act**, and
+    never says `yes` — PASS-1 is unconfined on every path (`SubprocessBackend.plan` passes
+    `confine=False` unconditionally), so `PARTIAL` is the strongest true answer. It reads `NO` for
+    the default `network: loopback` repo, for a host with no kernel sandbox, for a failed self-test,
+    and for the `restricted` fallback, which is not kernel confinement. Reporting only: an
     unconfined loopback brain is the designed default, not a fault.
 
 ### Known limitations
@@ -227,12 +233,17 @@ against the code. The normative version lives in
    trigger that fires every tick, and `max_attempts=3`, a brain that stops answering moves captures
    *terminally* into `_kb/failed/` in roughly three minutes. Nothing recovers them for you: the
    failure output prints `agora requeue --run <id>`, and you run it.
-8. **The sandbox confines writes and network, not reads.** ADR-0013 confinement (macOS Seatbelt /
-   Linux bwrap) wraps the *authoring* subprocess only; the default Ollama brain does inference
-   outside it by design. On both platforms that subprocess can read the whole filesystem — it cannot
-   write outside its temporary worktree and has no network, so a read alone cannot leave the
-   machine, but read-hardening is a follow-up (#122), not shipped. The compensating control
-   ADR-0013 promises for `allow_reduced_isolation` (forced review mode) is not implemented (#91).
+8. **In the default configuration the sandbox confines neither curator pass.** ADR-0013 confinement
+   (macOS Seatbelt / Linux bwrap) applies only to the *authoring* pass of a `network: none` backend,
+   and `agora repo init` writes `network: loopback` because the local Ollama daemon needs the
+   loopback socket — so out of the box nothing goes through the kernel sandbox and the
+   deterministic FINAL-DIFF gate is the whole boundary. `agora doctor` states this per repo on its
+   `confines this repo's brains:` line (#129). Even with `network: none` configured, PASS-1 is never
+   confined on any path. Where confinement *does* apply it covers writes and network, not reads: the
+   subprocess can read the whole filesystem — it cannot write outside its temporary worktree and has
+   no network, so a read alone cannot leave the machine, but read-hardening is a follow-up (#122),
+   not shipped. The compensating control ADR-0013 promises for `allow_reduced_isolation` (forced
+   review mode) is not implemented (#91).
    The real last line of defense is the deterministic FINAL-DIFF gate, not the kernel.
 9. **No schema migration command.** `agora repo upgrade` is #63, still open, and `schema_version` is
    read but never compared against a supported range (#98). A repo initialized by this beta is

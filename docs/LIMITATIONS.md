@@ -237,13 +237,19 @@ ADR. Until it is written, multi-machine curation is unsupported, not merely undo
 > design, not an oversight — the Ollama shim couples inference and file-writing and needs loopback
 > to reach the daemon (ADR-0013 Context) — but it means `agora doctor`'s `sandbox: seatbelt (ok)`
 > line tells you *the mechanism works on this host*, **not** *your brain is confined*. Since #129
-> doctor answers the second question on its own line, so you never have to infer it:
+> doctor answers the second question on its own line, per act, so you never have to infer it:
 >
 > ```
 >   sandbox: seatbelt (ok)
 >     …
->     confines this repo's brains: NO — outside: qwen (network: loopback) (only network: none is confined)
+>     confines this repo's brains: NO — outside: plan=qwen (network: loopback), author=qwen (network: loopback) (only a network: none author is confined; PASS-1 never is)
 > ```
+>
+> **That line can never read `yes`**, in any configuration. `SubprocessBackend.plan` passes
+> `confine=False` unconditionally, so PASS-1 is outside the sandbox even for a `network: none`
+> backend; `PARTIAL` is the strongest true answer. It also reads `NO` — not `PARTIAL` — when the
+> host has no kernel sandbox, when the self-test failed, or when the flag below selected the
+> `restricted` fallback.
 >
 > Everything below is therefore about the configuration you opt into with `network: none`, plus the
 > flag that weakens it further.
@@ -422,7 +428,7 @@ agora status --repo /ABSOLUTE/PATH/TO/knowledge-repo
 **What a green `agora doctor` does and does not prove.** Step 3 is the step everything else depends
 on, so be precise about the evidence. Doctor's brain check establishes **presence**, not function:
 
-- For a non-Ollama argv it is a `shutil.which` PATH lookup and nothing more — a brain that is
+- For a non-Ollama argv it asks only whether `argv[0]` resolves and is executable — a brain that is
   installed but broken reads `status: healthy`.
 - For an Ollama backend it establishes that the daemon **answers**, on every path including a
   `--model` pin in the argv (#129). What it does not establish is that the *pinned tag is

@@ -140,7 +140,7 @@ recorded before anyone touches the code, and Track B gets its `windows-latest` s
       (`last_attempt:` / `last_failure: UNRESOLVED …` / `failed_events:`, the last via the ONE
       shared `core.failed_event_count` that `kb_status.failed` also uses) and in `agora doctor`'s
       `failures:` line. `agora doctor` now PROBES the configured brain (`brains:` line): argv[0] on
-      PATH + executable for any backend, plus `/api/tags` reachability and the model `select_model`
+      PATH + executable for any backend, plus daemon reachability and the model `select_model`
       would actually pick for `agora-ollama-brain`; an unusable brain is `status: unhealthy` + exit
       1 with a tool-agnostic, copy-pasteable fix block (a headless CLI agent already on PATH via
       `agora-cli-brain`/ADR-0016 first, Ollama demoted to "instead"), and `--skip-probe` is the
