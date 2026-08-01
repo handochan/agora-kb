@@ -32,12 +32,14 @@ no git tag exists yet, so `git checkout v0.1.0b1` will not resolve and there is 
 artifact. Installing today means installing from `main`, which moves.
 
 The `0.1.0b1` notes below are the prepared release notes, not a shipped release. Remaining gates
-(epic [#93](https://github.com/handochan/agora-kb/issues/93), Track A): the `schema_version` skew
-guard (#98), PyPI name reservation (#102), a friendly Windows failure (#103), repo metadata
+(epic [#93](https://github.com/handochan/agora-kb/issues/93), Track A): the frontmatter
+`body_status` invariant (#119) with its test-oracle repair (#121), the `schema_version` skew guard
+(#98), PyPI name reservation (#102), a friendly Windows failure (#103), repo metadata
 (description/topics, part of #106), and a clean-machine release smoke run by someone who is not the
 author (#107) — plus the `windows-latest` gate ruling that decides whether Windows ships in b1 or
 b2. Landed: [`SECURITY.md`](SECURITY.md) (#95), [`docs/GETTING-STARTED.md`](docs/GETTING-STARTED.md)
-(#104), [`docs/LIMITATIONS.md`](docs/LIMITATIONS.md) (#105), and the README reconciliation (#106).
+(#104), [`docs/LIMITATIONS.md`](docs/LIMITATIONS.md) (#105), the README reconciliation (#106), and
+the two `agora doctor` truthfulness fixes (#129).
 
 **Security reports go through [`SECURITY.md`](SECURITY.md)** — private vulnerability reporting, not
 a public issue.
@@ -160,6 +162,19 @@ local, unauthenticated, and markdown-on-disk. Requires Python ≥ 3.12, git, and
   so an event that could not be returned (an already-occupied inbox address was enough) was lost,
   counted by nothing. Markdown is the source of truth; a run that cannot return an event now fails
   loudly rather than quietly shrinking the KB.
+- **`agora doctor` no longer reports green on a repo that cannot curate** (#129), in two cases that
+  a reader had no way to tell apart from a healthy one:
+  - Pinning the model with `--model` in the `adapters.yaml` argv skipped `/api/tags` — correctly,
+    since a pinned run lists no models — but with it skipped *every* reachability check, so a repo
+    whose Ollama daemon was down printed `status: healthy` and exited `0`. Liveness is now probed
+    at `/` on every path (the model question stays skipped, because the run does not ask it), and
+    a dead daemon is `unhealthy`. **Behavior change:** a pinned repo with a dead daemon now
+    exits `1`.
+  - `sandbox: seatbelt (ok)` proves the mechanism works on the host, which reads as "my brain is
+    confined" — but a backend is confined only when its spec says `network: none`, and `repo init`
+    writes `network: loopback`. A `confines this repo's brains:` line now answers that question
+    directly (`NO` / `PARTIAL` / `yes`, naming each backend and its posture). Reporting only: an
+    unconfined loopback brain is the designed default, not a fault.
 
 ### Known limitations
 

@@ -366,14 +366,15 @@ uv run agora doctor --repo /tmp/my-kb | grep "brain qwen"
 ```
 
 ```
-  brain qwen: ollama http://localhost:11434, model pinned to 'qwen3.6:35b-a3b' by adapters.yaml argv (no /api/tags probe — the run lists no models either; reachability NOT checked)
+  brain qwen: ollama http://localhost:11434 reachable, model pinned to 'qwen3.6:35b-a3b' by adapters.yaml argv (no /api/tags probe — the run lists no models either; the pin is NOT verified installed)
 ```
 
-### The trade-off the argv pin makes — read this before you choose
+### What the argv pin does and does not check
 
-**Pinning in the argv turns off doctor's reachability probe.** Read the parenthetical in that line
-literally: an explicit `--model` short-circuits `/api/tags` *entirely*, so doctor returns a passing
-verdict without contacting the daemon at all (`cli.py:2150-2156`). Verified on this host with the
+**The daemon is still checked; the model list is not.** Read the parenthetical literally. An
+explicit `--model` short-circuits `/api/tags` because a pinned *run* never lists models either — so
+doctor does not answer a question the curator does not ask. But every run, pinned or not, still does
+`POST /api/generate`, so daemon liveness is a real precondition and doctor checks it. With the
 heredoc above applied and nothing listening:
 
 ```bash
@@ -381,28 +382,33 @@ AGORA_OLLAMA_HOST=http://localhost:1 uv run agora doctor --repo /tmp/my-kb
 ```
 
 ```
-  brain qwen: ollama http://localhost:1, model pinned to 'qwen3.6:35b-a3b' by adapters.yaml argv (no /api/tags probe — the run lists no models either; reachability NOT checked)
-status: healthy          # exit 0 — with the daemon completely down
+  brain qwen: ollama http://localhost:1 UNREACHABLE (could not reach the Ollama daemon at http://localhost:1/: <urlopen error [Errno 61] Connection refused>; is the Ollama daemon running?) [model pinned to 'qwen3.6:35b-a3b']
+status: unhealthy        # exit 1
 ```
 
-That is deliberate, not a bug (#96): on this path "the daemon is up" is a fact the *run* never
-establishes either, so claiming it would be a lie. But the consequence is yours to manage, and it is
-the opposite of what [§4 step 2](#step-2--health-check) can otherwise do for you.
+> **Changed in 0.1.0b1 (#129).** Earlier builds skipped reachability *entirely* on this path and
+> printed `status: healthy` with the daemon completely down. If you scripted around that, note that
+> a pinned repo with a dead daemon now exits `1`.
 
-The two pin forms are **not** equivalent:
-
-| | Travels with the repo | Doctor still probes reachability |
-|---|---|---|
-| `--model <tag>` in the `adapters.yaml` argv | **yes** — `agora watch` under launchd/systemd sees it | **no** |
-| `$AGORA_OLLAMA_MODEL` | no — it is process environment | **yes** (`_resolve_model` calls `list_ollama_models` first, `cli.py:2131-2134`) |
-
-Pick on that basis. The argv form is still the right default for an unattended deployment — a pin
-the scheduler cannot see is worse than a blind spot — but then **doctor is no longer your daemon
-check**, and you should verify the daemon separately:
+One blind spot remains, and the line states it: **the pinned tag is not verified to be installed.**
+`/api/tags` returns fully-qualified `name:tag` while Ollama resolves an unqualified name to
+`:latest`, so exact membership is not a sound existence test and would paint a working host
+unhealthy. A typo'd tag therefore passes doctor and fails at curate time. Ollama itself answers that
+question exactly:
 
 ```bash
-curl -fsS "${AGORA_OLLAMA_HOST:-http://localhost:11434}/api/tags" >/dev/null && echo "ollama: up"
+ollama show 'qwen3.6:35b-a3b' >/dev/null && echo "model: installed"   # exit 1 if it is not
 ```
+
+The two pin forms differ in one way that matters:
+
+| | Travels with the repo | Doctor lists installed models |
+|---|---|---|
+| `--model <tag>` in the `adapters.yaml` argv | **yes** — `agora watch` under launchd/systemd sees it | no (reachability yes) |
+| `$AGORA_OLLAMA_MODEL` | no — it is process environment | **yes** (`_resolve_model` calls `list_ollama_models` first) |
+
+The argv form is the right default for an unattended deployment: a pin the scheduler cannot see is
+worse than a narrower probe.
 
 (`$AGORA_OLLAMA_MODEL` reaches the shim at all because the default `qwen` backend declares
 `network: loopback`, which means it is *not* run inside the sandbox and inherits the process
@@ -491,6 +497,7 @@ agora doctor (agora 0.1.0b1, python 3.12.13)
   sandbox: seatbelt (ok)
     write-inside=True write-outside-denied=True apple-shim=True
     network-denied=True
+    confines this repo's brains: NO — outside: qwen (network: loopback) (only network: none is confined)
   routing: plan=qwen (network: loopback)  author=qwen (network: loopback)
   brain qwen: ollama http://localhost:11434 reachable, 2 models, would use 'qwen3.6-hermes:latest'
   harvest: disabled (scope_lock=personal)
@@ -509,13 +516,18 @@ Read the `brain qwen:` line before moving on. Here it says `would use 'qwen3.6-h
 §3 pin**, then re-run doctor until that line reads:
 
 ```
-  brain qwen: ollama http://localhost:11434, model pinned to 'qwen3.6:35b-a3b' by adapters.yaml argv (no /api/tags probe — the run lists no models either; reachability NOT checked)
+  brain qwen: ollama http://localhost:11434 reachable, model pinned to 'qwen3.6:35b-a3b' by adapters.yaml argv (no /api/tags probe — the run lists no models either; the pin is NOT verified installed)
 ```
 
-Doctor probes the configured brain and that probe **counts toward the verdict** (`cli.py:2281-2373`,
-#96) — **for an unpinned backend**. Once you apply the argv pin, that line is the pin's own report
-and no longer a reachability check; see [§3](#3-pin-the-model-path-a-only). Run the pin *and* the
-`curl` check there if you want both.
+Doctor probes the configured brain and that probe **counts toward the verdict** (#96), pinned or
+not — a dead daemon is `status: unhealthy` either way (#129). What the pin narrows is only the
+*model* question; see [§3](#what-the-argv-pin-does-and-does-not-check).
+
+Two more lines above are worth reading once. `sandbox: seatbelt (ok)` proves the mechanism works on
+**this host**; the `confines this repo's brains:` line under it answers the different question of
+whether *your* backend goes through it — `NO` here, because the default `network: loopback` brain
+needs the loopback socket to reach Ollama and only `network: none` is confined. That is the designed
+default, not a fault ([`LIMITATIONS.md` §5](LIMITATIONS.md)).
 
 On an unpinned backend a red verdict is correct behaviour, not a false alarm — it means
 `agora curate` cannot run. With Ollama down (the six lines between the remediation block and the
