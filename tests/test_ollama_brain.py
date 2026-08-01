@@ -1717,6 +1717,86 @@ def test_list_ollama_models_honors_an_explicit_timeout(monkeypatch) -> None:
     assert seen["timeout"] == 3.0
 
 
+# --- ping_ollama: liveness WITHOUT the model question (#129) -------------------------------------
+
+
+class _FakePingResponse:
+    """Minimal urlopen() context manager recording the read cap `ping_ollama` asks for."""
+
+    def __init__(self, seen: dict) -> None:
+        self._seen = seen
+
+    def __enter__(self) -> _FakePingResponse:
+        return self
+
+    def __exit__(self, *exc: object) -> bool:
+        return False
+
+    def read(self, size: int | None = None) -> bytes:
+        self._seen["read_size"] = size
+        return b"Ollama is running"
+
+
+def test_ping_ollama_hits_the_root_not_api_tags(monkeypatch) -> None:
+    """The whole point of #129: liveness is asked at ``/``, never by listing models.
+
+    If this ever became ``/api/tags`` the pinned path would silently start answering the model
+    question the run does not ask, which is what the #96 crit-3 short-circuit exists to prevent.
+    """
+    seen: dict = {}
+
+    def urlopen(url, timeout=None):  # type: ignore[no-untyped-def]
+        seen["url"] = url
+        seen["timeout"] = timeout
+        return _FakePingResponse(seen)
+
+    monkeypatch.setattr(ob.urllib.request, "urlopen", urlopen)
+
+    assert ob.ping_ollama("http://h:1", timeout=2.0) is None
+    assert seen["url"] == "http://h:1/"
+    assert seen["timeout"] == 2.0
+    assert seen["read_size"] == ob._PING_READ_BYTES
+
+
+def test_ping_ollama_treats_an_http_error_as_ALIVE(monkeypatch) -> None:
+    """A 404/500 proves a socket accepted the connection and spoke HTTP — that IS liveness.
+
+    ``HTTPError`` subclasses ``URLError``, so catching the parent first would turn a live daemon
+    that merely answers ``/`` differently (a future Ollama, a reverse proxy in front of it) into a
+    doctor verdict of ``unhealthy`` on a perfectly working host.
+    """
+
+    def urlopen(url, timeout=None):  # type: ignore[no-untyped-def]
+        raise ob.urllib.error.HTTPError(url, 404, "Not Found", {}, None)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(ob.urllib.request, "urlopen", urlopen)
+
+    assert ob.ping_ollama("http://h:1") is None
+
+
+def test_ping_ollama_raises_brainerror_when_the_daemon_is_down(monkeypatch) -> None:
+    def urlopen(url, timeout=None):  # type: ignore[no-untyped-def]
+        raise ob.urllib.error.URLError("Connection refused")
+
+    monkeypatch.setattr(ob.urllib.request, "urlopen", urlopen)
+
+    with pytest.raises(ob.BrainError) as excinfo:
+        ob.ping_ollama("http://h:1")
+    assert "is the Ollama daemon running?" in str(excinfo.value)
+
+
+def test_ping_ollama_default_timeout_is_ten(monkeypatch) -> None:
+    seen: dict = {}
+
+    def urlopen(url, timeout=None):  # type: ignore[no-untyped-def]
+        seen["timeout"] = timeout
+        return _FakePingResponse(seen)
+
+    monkeypatch.setattr(ob.urllib.request, "urlopen", urlopen)
+    ob.ping_ollama("http://h:1")
+    assert seen["timeout"] == 10.0
+
+
 def test_debug_dump_noop_when_env_unset(monkeypatch, tmp_path) -> None:
     monkeypatch.delenv(ob._DEBUG_ENV, raising=False)
     # Must not raise and must not create any file.

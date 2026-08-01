@@ -1750,11 +1750,20 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
     # network: none backend at curate time) without flagging the whole host unhealthy.
     cfg = _doctor_repo_config(layout)
 
-    ok = _doctor_sandbox(cfg.allow_reduced_isolation) and ok
+    # Loaded BEFORE the sandbox probe (#129): the `sandbox:` block reports not just "the mechanism
+    # works on this host" but "does it confine THIS repo's brains", and that second answer is the
+    # resolved backends' `network` posture. Still ONE parse shared with routing/brains below.
+    registry, registry_error = _doctor_backend_registry(layout)
+
+    ok = (
+        _doctor_sandbox(
+            cfg.allow_reduced_isolation, registry=registry, default_backend=cfg.default_backend
+        )
+        and ok
+    )
 
     # ADR-0015: observability — which brain runs each cognitive act (default or routed). Reporting
     # only; never affects the health verdict.
-    registry, registry_error = _doctor_backend_registry(layout)
     _doctor_routing(registry, registry_error, cfg.default_backend)
 
     # Issue #96: is that brain actually ANSWERABLE? The first verdict contributor that asks the
@@ -2121,12 +2130,15 @@ def _ollama_argv_tail(argv: tuple[str, ...]) -> tuple[str, ...] | None:
 def _probe_ollama(tail: tuple[str, ...], *, timeout: float) -> tuple[str, bool]:
     """Probe an Ollama-shim backend; return ``(rendering, healthy)``.
 
-    Mirrors :func:`ollama_brain._resolve_model` EXACTLY so doctor's answer and the run's answer
-    cannot diverge:
+    Mirrors :func:`ollama_brain._resolve_model` EXACTLY **on model selection** so doctor's answer
+    and the run's answer cannot diverge:
 
-    * an explicit ``--model`` short-circuits ``/api/tags`` ENTIRELY (#96 criterion 3) — doctor must
-      not contact the daemon either, because "the daemon is up" is a fact the run never establishes
-      on this path;
+    * an explicit ``--model`` short-circuits ``/api/tags`` ENTIRELY (#96 criterion 3) — doctor does
+      not list models either, because "which models are installed" is a fact the run never
+      establishes on this path. It DOES check liveness (``ping_ollama``, #129): the mirror is about
+      model SELECTION, while every run — pinned or not — still does ``POST /api/generate``, so a
+      dead daemon fails it. Checking a precondition the run really has cannot diverge from the run;
+      skipping it made doctor report ``healthy`` on a repo where ``agora curate`` could not run;
     * otherwise ``list_ollama_models(host)`` runs FIRST and its result is fed VERBATIM to
       ``select_model(None, $AGORA_OLLAMA_MODEL, available)``. Note the consequence, which is why
       #96 mandates calling the real functions: an ENV-pinned model does NOT short-circuit the
@@ -2148,12 +2160,28 @@ def _probe_ollama(tail: tuple[str, ...], *, timeout: float) -> tuple[str, bool]:
         )
     host = args.host
     if args.model and args.model.strip():
-        # The parenthetical is deliberately about /api/TAGS, not about the daemon: a real run does
-        # POST /api/generate, so the daemon is still required — this path simply establishes
-        # nothing about it, and saying otherwise would tell an operator the opposite of the truth.
+        # #129: the /api/TAGS short-circuit stays (a pinned run lists no models, and doctor must
+        # not answer a question the run never asks), but LIVENESS is checked — a real run does
+        # POST /api/generate, so a dead daemon fails it. Before this, a pinned repo ran ZERO
+        # reachability checks and doctor said `healthy` while `agora curate` could not run at all.
+        pin = args.model.strip()
+        try:
+            ollama_brain.ping_ollama(host, timeout=timeout)
+        except ollama_brain.BrainError as exc:
+            return (f"ollama {host} UNREACHABLE ({exc}) [model pinned to {pin!r}]", False)
+        except ValueError as exc:
+            # A scheme-less host (`AGORA_OLLAMA_HOST=localhost:11434`) makes urlopen raise a bare
+            # ValueError that ping_ollama does NOT wrap — same first-run typo, same rendering as
+            # the auto-select branch below.
+            return (
+                f"ollama {host} UNREACHABLE ({type(exc).__name__}: {exc}) "
+                f"[model pinned to {pin!r}]",
+                False,
+            )
         return (
-            f"ollama {host}, model pinned to {args.model.strip()!r} by adapters.yaml argv "
-            "(no /api/tags probe — the run lists no models either; reachability NOT checked)",
+            f"ollama {host} reachable, model pinned to {pin!r} by adapters.yaml argv "
+            "(no /api/tags probe — the run lists no models either; the pin is NOT verified "
+            "installed)",
             True,
         )
     try:
@@ -2373,7 +2401,51 @@ def _doctor_brains(
     return ok
 
 
-def _doctor_sandbox(allow_reduced_isolation: bool) -> bool:
+def _sandbox_confinement(
+    registry: BackendRegistry | None, default_backend: str | None
+) -> str | None:
+    """Render whether the sandbox actually confines THIS repo's brains, or ``None`` if unknowable.
+
+    The `sandbox:` self-test proves the MECHANISM works on this host. It says nothing about whether
+    any brain goes through it, because :meth:`SubprocessBackend._spawn` confines ONLY a
+    ``network: 'none'`` spec — and ``repo init`` writes ``network: loopback`` (the local Ollama
+    daemon needs the loopback socket), so the DEFAULT repo runs its brain UNCONFINED. Reading
+    ``sandbox: seatbelt (ok)`` as "my brain is sandboxed" is therefore the natural and WRONG
+    reading; #129 exists because that misreading nearly reached SECURITY.md.
+
+    Reporting only — never a verdict. An unconfined loopback brain is the designed default, not a
+    fault; what was faulty was leaving an operator to infer the opposite. Resolution reuses
+    :func:`_routed_brain_names` so this line and the `routing:` line below cannot disagree.
+    """
+    if registry is None:
+        return None
+    confined: list[str] = []
+    unconfined: list[str] = []
+    for name in _routed_brain_names(registry, default_backend):
+        try:
+            network = registry.get(name).network
+        except KeyError:
+            # repo.yaml curator.backend names no defined brain — `routing:` and the brain probe
+            # both surface that; saying anything about its confinement would be invention.
+            continue
+        (confined if network == "none" else unconfined).append(f"{name} (network: {network})")
+    if not confined and not unconfined:
+        return None
+    if not unconfined:
+        return f"confines this repo's brains: yes — {', '.join(confined)}"
+    lead = "NO" if not confined else "PARTIAL"
+    detail = f"outside: {', '.join(unconfined)}"
+    if confined:
+        detail = f"{detail}; confined: {', '.join(confined)}"
+    return f"confines this repo's brains: {lead} — {detail} (only network: none is confined)"
+
+
+def _doctor_sandbox(
+    allow_reduced_isolation: bool,
+    *,
+    registry: BackendRegistry | None = None,
+    default_backend: str | None = None,
+) -> bool:
     """Run the ADR-0013 sandbox self-test and print its report; return whether the host is healthy.
 
     Selects the OS-appropriate :class:`~agora_kb.curator.isolation.BackendIsolation` and runs the
@@ -2384,6 +2456,11 @@ def _doctor_sandbox(allow_reduced_isolation: bool) -> bool:
     (``SandboxUnavailable``) prints a fail-closed note and returns ``True`` — the default loopback
     Ollama brain does inference outside the sandbox and never needs one; the fail-closed guard bites
     only a ``network: none`` backend at curate time. Never raises: any unexpected error is reported.
+
+    ``registry`` / ``default_backend`` are threaded in for the #129 sub-line only
+    (:func:`_sandbox_confinement`): the self-test answers "does the mechanism work HERE", which an
+    operator reads — wrongly — as "is my brain sandboxed". Both are optional so the self-test
+    remains callable on its own; omitting them just drops the sub-line.
     """
     from .curator.isolation.selftest import ollama_reachable, self_test
 
@@ -2391,6 +2468,7 @@ def _doctor_sandbox(allow_reduced_isolation: bool) -> bool:
         isolation = select_backend_isolation(allow_reduced_isolation=allow_reduced_isolation)
     except SandboxUnavailable as exc:
         print(f"  sandbox: unavailable — fail-closed for network:none backends ({exc})")
+        _print_sandbox_confinement(registry, default_backend)
         return True
 
     wt = Path(tempfile.mkdtemp(prefix="agora-doctor-wt-"))
@@ -2423,7 +2501,25 @@ def _doctor_sandbox(allow_reduced_isolation: bool) -> bool:
     )
     net_note = "" if reachable else " (no reachable target — unproven, not a failure)"
     print(f"    network-denied={report.network_denied}{net_note}")
+    _print_sandbox_confinement(registry, default_backend)
     return healthy
+
+
+def _print_sandbox_confinement(
+    registry: BackendRegistry | None, default_backend: str | None
+) -> None:
+    """Print the #129 confinement sub-line when it is knowable. Never raises, never a verdict.
+
+    Contained like every other doctor helper: a defect here must not cost the operator the
+    `sandbox:` block that was already printed, let alone the `status:` line.
+    """
+    try:
+        line = _sandbox_confinement(registry, default_backend)
+    except Exception as exc:  # noqa: BLE001 — an observability line never crashes doctor.
+        print(f"    confines this repo's brains: unknown ({type(exc).__name__}: {exc})")
+        return
+    if line is not None:
+        print(f"    {line}")
 
 
 # --- helpers ------------------------------------------------------------------------------------

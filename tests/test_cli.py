@@ -1781,6 +1781,25 @@ def _installed_models(*names: str):  # type: ignore[no-untyped-def]
     return fake
 
 
+def _live_ping(calls: list[str] | None = None):  # type: ignore[no-untyped-def]
+    """A ``ping_ollama`` stand-in for a daemon that answers (#129). Same keyword-only shape."""
+
+    def fake(host: str, *, timeout: float) -> None:
+        if calls is not None:
+            calls.append(host)
+
+    return fake
+
+
+def _dead_ping(message: str = "refused"):  # type: ignore[no-untyped-def]
+    """A ``ping_ollama`` stand-in for a daemon that is DOWN (#129)."""
+
+    def fake(host: str, *, timeout: float) -> None:
+        raise ollama_brain.BrainError(message)
+
+    return fake
+
+
 def _which_only(installed: set[str]):  # type: ignore[no-untyped-def]
     """A ``shutil.which`` that pins WHICH known CLI agents resolve; everything else stays real.
 
@@ -1814,11 +1833,16 @@ def probe_env(monkeypatch: pytest.MonkeyPatch) -> None:
     * ``agora-ollama-brain`` resolves to a real executable, because the probe now asks the argv[0]
       question for the shim too (#96 crit 4) and whether the console script is on THIS host's PATH
       is not what these tests are about. Everything else still resolves for real.
+
+    ``ping_ollama`` is stubbed LIVE for the same reason ``list_ollama_models`` always was: since
+    #129 the pinned-model path contacts the daemon, so an unstubbed test would reach the real
+    network and pass or fail on whether the developer happens to be running Ollama.
     """
     monkeypatch.setattr(cli_mod, "_doctor_sandbox", lambda *a, **k: True)
     monkeypatch.delenv(ollama_brain.MODEL_ENV, raising=False)
     monkeypatch.delenv("AGORA_OLLAMA_HOST", raising=False)
     monkeypatch.setattr(shutil, "which", _shim_which())
+    monkeypatch.setattr(ollama_brain, "ping_ollama", _live_ping())
 
 
 def _shim_which():  # type: ignore[no-untyped-def]
@@ -1921,8 +1945,10 @@ def test_doctor_pinned_model_skips_the_tags_probe(
 ) -> None:
     """#96 crit 3: an explicit ``--model`` short-circuits /api/tags — because the RUN does too.
 
-    Probing the daemon here would establish a fact the run never establishes, so doctor would be
-    reporting on something the curator does not depend on.
+    Listing models here would establish a fact the run never establishes. #129 draws the line one
+    notch finer: the MODEL question is skipped, the LIVENESS question is not, because the run does
+    ``POST /api/generate`` on this path like any other. Both halves are asserted together — a fix
+    that started listing models to get reachability back would pass one and fail the other.
     """
     target = _probe_repo(
         tmp_path / "kb",
@@ -1931,23 +1957,213 @@ def test_doctor_pinned_model_skips_the_tags_probe(
         "default_backend: qwen\n",
     )
     calls: list[str] = []
+    pings: list[str] = []
 
     def recorder(host: str, *, timeout: float) -> list[str]:
         calls.append(host)
         return ["whatever:1b"]
 
     monkeypatch.setattr(ollama_brain, "list_ollama_models", recorder)
+    monkeypatch.setattr(ollama_brain, "ping_ollama", _live_ping(pings))
     capsys.readouterr()
 
     rc = main(["doctor", "--repo", str(target)])
 
     out = capsys.readouterr().out
     assert calls == []
+    assert pings == ["http://localhost:11434"]
     assert "model pinned to 'pinned:1b' by adapters.yaml argv" in out
-    # The parenthetical must not claim the daemon is irrelevant: the RUN still POSTs /api/generate,
-    # so this path establishes nothing about reachability and has to say so.
-    assert "no /api/tags probe — the run lists no models either; reachability NOT checked" in out
+    # The parenthetical must not overclaim in EITHER direction: the daemon answered, but nothing
+    # here says the pinned model is actually installed.
+    assert "reachable, model pinned to 'pinned:1b'" in out
+    assert "no /api/tags probe — the run lists no models either; the pin is NOT verified" in out
     assert rc == 0
+
+
+@requires_git
+def test_doctor_pinned_model_with_dead_daemon_is_unhealthy(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    probe_env: None,
+) -> None:
+    """#129 case 1: a pinned repo whose daemon is DOWN must be RED, not green.
+
+    The regression this locks is specific and was live on main: pinning the model in adapters.yaml
+    argv made the probe skip /api/tags — and, before #129, skip reachability ENTIRELY — so doctor
+    printed ``status: healthy`` for a repo where ``agora curate`` could not run at all. That is
+    verbatim #96's opening complaint, reintroduced through the crit-3 short-circuit.
+
+    The paired control (same repo, live daemon → healthy) is what proves the verdict tracks the
+    daemon rather than the pin.
+    """
+    target = _probe_repo(
+        tmp_path / "kb",
+        "backends:\n"
+        '  qwen: { argv: [agora-ollama-brain, --model, "pinned:1b"], network: loopback }\n'
+        "default_backend: qwen\n",
+    )
+    monkeypatch.setattr(ollama_brain, "ping_ollama", _dead_ping("connection refused"))
+    capsys.readouterr()
+
+    rc = main(["doctor", "--repo", str(target)])
+
+    out = capsys.readouterr().out
+    assert "brain qwen: ollama http://localhost:11434 UNREACHABLE (connection refused)" in out
+    assert "[model pinned to 'pinned:1b']" in out
+    assert "status: unhealthy" in out
+    assert rc == 1
+
+    monkeypatch.setattr(ollama_brain, "ping_ollama", _live_ping())
+    capsys.readouterr()
+
+    rc = main(["doctor", "--repo", str(target)])
+
+    assert "status: healthy" in capsys.readouterr().out
+    assert rc == 0
+
+
+@requires_git
+def test_doctor_pinned_model_scheme_less_host_is_unhealthy(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A portless ``$AGORA_OLLAMA_HOST`` makes urlopen raise a BARE ValueError, not a URLError.
+
+    ``ping_ollama`` deliberately does not wrap it (neither does ``list_ollama_models``), so the
+    pinned branch has to catch it exactly like the auto-select branch does. Without that catch the
+    probe raises, doctor prints ``probe ERROR`` and offers no remediation — for what is the most
+    ordinary first-run config typo there is.
+
+    Deliberately does NOT use ``probe_env``: that fixture stubs ``ping_ollama``, and the REAL one
+    is what this test is about. ``localhost`` (no scheme, no port) never leaves the machine —
+    urlopen rejects it before opening a socket.
+    """
+    target = _probe_repo(
+        tmp_path / "kb",
+        "backends:\n"
+        '  qwen: { argv: [agora-ollama-brain, --model, "pinned:1b"], network: loopback }\n'
+        "default_backend: qwen\n",
+    )
+    monkeypatch.setattr(cli_mod, "_doctor_sandbox", lambda *a, **k: True)
+    monkeypatch.setattr(shutil, "which", _shim_which())
+    monkeypatch.delenv(ollama_brain.MODEL_ENV, raising=False)
+    monkeypatch.setenv("AGORA_OLLAMA_HOST", "localhost")
+    capsys.readouterr()
+
+    rc = main(["doctor", "--repo", str(target)])
+
+    out = capsys.readouterr().out
+    assert "brain qwen: ollama localhost UNREACHABLE (ValueError:" in out
+    assert "probe ERROR" not in out
+    assert "status: unhealthy" in out
+    assert rc == 1
+
+
+# --- #129 case 2: does the sandbox confine THIS repo's brains? ----------------------------------
+
+
+def _registry(adapters: str):  # type: ignore[no-untyped-def]
+    from agora_kb.curator.backends import BackendRegistry
+
+    return BackendRegistry.from_yaml(adapters)
+
+
+def test_sandbox_confinement_says_NO_for_the_default_loopback_repo() -> None:
+    """`repo init` writes ``network: loopback``, and only ``network: none`` is confined.
+
+    So the DEFAULT repo runs its brain outside the sandbox while ``sandbox: seatbelt (ok)`` sits
+    right above — the misreading #129 exists to close, and the one that nearly put a false
+    confinement claim into SECURITY.md.
+    """
+    line = cli_mod._sandbox_confinement(_registry(_OLLAMA_ADAPTERS), "qwen")
+
+    assert line == (
+        "confines this repo's brains: NO — outside: qwen (network: loopback) "
+        "(only network: none is confined)"
+    )
+
+
+def test_sandbox_confinement_says_yes_when_every_act_is_network_none() -> None:
+    adapters = "backends:\n  q: { argv: [agora-ollama-brain], network: none }\ndefault_backend: q\n"
+
+    assert cli_mod._sandbox_confinement(_registry(adapters), "q") == (
+        "confines this repo's brains: yes — q (network: none)"
+    )
+
+
+def test_sandbox_confinement_reports_PARTIAL_on_split_routing() -> None:
+    """ADR-0015 routing can send ``plan`` and ``author`` to brains with different postures.
+
+    A single yes/no would then be a lie in one direction or the other, so both sides are named.
+    """
+    adapters = (
+        "backends:\n"
+        "  loud: { argv: [agora-ollama-brain], network: loopback }\n"
+        "  quiet: { argv: [agora-cli-brain], network: none }\n"
+        "default_backend: loud\n"
+        "routing: { plan: loud, author: quiet }\n"
+    )
+
+    line = cli_mod._sandbox_confinement(_registry(adapters), "loud")
+
+    assert line == (
+        "confines this repo's brains: PARTIAL — outside: loud (network: loopback); "
+        "confined: quiet (network: none) (only network: none is confined)"
+    )
+
+
+def test_sandbox_confinement_is_silent_without_adapters_yaml() -> None:
+    """No registry = nothing to say. Inventing a posture for a repo with no backend is worse than
+    the missing line, and ``routing:`` already reports the absent file."""
+    assert cli_mod._sandbox_confinement(None, "qwen") is None
+
+
+def test_sandbox_confinement_skips_a_backend_that_is_not_defined() -> None:
+    """``repo.yaml`` naming an undefined brain is surfaced by ``routing:`` and the brain probe.
+
+    Claiming anything about its confinement would be invention, and raising here would cost the
+    operator the sandbox block that was already printed.
+    """
+    assert cli_mod._sandbox_confinement(_registry(_OLLAMA_ADAPTERS), "ghost") is None
+
+
+def test_print_sandbox_confinement_never_crashes_doctor(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An observability line is never a reason to lose the `sandbox:` block or `status:`."""
+
+    def boom(registry, default_backend):  # type: ignore[no-untyped-def]
+        raise RuntimeError("kaboom")
+
+    monkeypatch.setattr(cli_mod, "_sandbox_confinement", boom)
+    capsys.readouterr()
+
+    cli_mod._print_sandbox_confinement(None, "qwen")
+
+    assert "confines this repo's brains: unknown (RuntimeError: kaboom)" in capsys.readouterr().out
+
+
+@requires_git
+def test_doctor_prints_the_confinement_line_under_the_sandbox_block(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """End of the wire: the line reaches real `agora doctor` output, and is REPORTING only.
+
+    ``_doctor_sandbox`` is NOT stubbed here (that is what carries the line), so the assertion is on
+    the confinement text alone — whether this host's kernel sandbox self-test passes is a property
+    of the developer's machine and a different test's business.
+    """
+    target = _probe_repo(tmp_path / "kb", _OLLAMA_ADAPTERS)
+    monkeypatch.setattr(shutil, "which", _shim_which())
+    monkeypatch.setattr(ollama_brain, "list_ollama_models", _installed_models("qwen3.6:35b-a3b"))
+    capsys.readouterr()
+
+    main(["doctor", "--repo", str(target)])
+
+    out = capsys.readouterr().out
+    assert "    confines this repo's brains: NO — outside: qwen (network: loopback)" in out
 
 
 @requires_git

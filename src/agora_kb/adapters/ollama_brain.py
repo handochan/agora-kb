@@ -78,6 +78,11 @@ CONSOLE_SCRIPT = "agora-ollama-brain"
 # Default Ollama daemon endpoint (overridable by --host / $AGORA_OLLAMA_HOST).
 _DEFAULT_HOST = "http://localhost:11434"
 
+# How much of the liveness response `ping_ollama` reads. The body is irrelevant (Ollama answers a
+# short "Ollama is running") — the read exists only so the response is consumed before the socket
+# closes, and the cap keeps a misconfigured host that streams megabytes from stalling doctor.
+_PING_READ_BYTES = 1024
+
 # Env var the model name may be pinned in (after the explicit --model flag, before auto-select).
 # PUBLIC for the same reason as CONSOLE_SCRIPT: doctor reports WHICH pin decided the model, and a
 # second spelling of the var name in the CLI would be a silent lie the moment either side moves.
@@ -817,6 +822,34 @@ def list_ollama_models(host: str, *, timeout: float = 10.0) -> list[str]:
             if isinstance(entry, dict) and isinstance(entry.get("name"), str):
                 names.append(entry["name"])
     return names
+
+
+def ping_ollama(host: str, *, timeout: float = 10.0) -> None:
+    """GET ``{host}/`` to prove the daemon ANSWERS. Raise :class:`BrainError` when it does not.
+
+    Deliberately NOT ``/api/tags``: this asks whether the daemon is *alive*, never what it has
+    installed. The distinction is the whole point (#129). ``_resolve_model``'s ``/api/tags``
+    short-circuit on an explicit ``--model`` is about MODEL SELECTION — a pinned run genuinely
+    never lists models — but every run still does ``POST /api/generate``, so daemon liveness is a
+    precondition the run really has. `agora doctor` may therefore check it on the pinned path
+    without its answer diverging from the run's.
+
+    Any well-formed HTTP response counts as ALIVE, including a 4xx/5xx: the socket accepted the
+    connection and spoke HTTP, which is exactly the fact being established. Only a transport
+    failure (connection refused, DNS, timeout) is a dead daemon. That ordering matters —
+    :class:`urllib.error.HTTPError` is a SUBCLASS of :class:`~urllib.error.URLError`, so catching
+    the parent first would paint a live-but-unexpected daemon as unreachable.
+    """
+    url = f"{host.rstrip('/')}/"
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as resp:  # noqa: S310 (local host)
+            resp.read(_PING_READ_BYTES)
+    except urllib.error.HTTPError:
+        return
+    except (urllib.error.URLError, OSError) as exc:
+        raise BrainError(
+            f"could not reach the Ollama daemon at {url}: {exc}; is the Ollama daemon running?"
+        ) from exc
 
 
 def call_ollama(
