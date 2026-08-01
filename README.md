@@ -4,6 +4,11 @@
 > Plain-markdown knowledge that many agents and people write to, that **organizes itself**,
 > and that any MCP-speaking tool can read and contribute to.
 
+> **Beta — read the limits before you rely on it.** Start at
+> [`docs/GETTING-STARTED.md`](docs/GETTING-STARTED.md) (prerequisites → your first curated note);
+> read [`docs/LIMITATIONS.md`](docs/LIMITATIONS.md) (the data-safety contract) before you put
+> anything you cannot afford to re-create into a repo.
+
 **Status:** **Phases 1–3.6 shipped** · version **`0.1.0b1`** (pre-release; the `v0.1.0b1` tag is
 **not cut yet** — install from `main` and expect it to move; see
 [`CHANGELOG.md`](CHANGELOG.md) for what is in it, what is still gating the tag, and the
@@ -46,7 +51,10 @@ pluggable — any headless CLI agent + any model (default: a local open-weight m
   it once and keeps it current. Cross-references and contradictions are already resolved.
 - **Shared across agents.** One knowledge base any agent contributes to and reads from → agents
   (and teams) get smarter with use.
-- **Yours.** Plain markdown on disk, versioned in git, self-hosted. No lock-in, no upload.
+- **Yours.** Plain markdown on disk, versioned in git, self-hosted. No lock-in, and nothing is
+  uploaded by default — the default brain is a local model and `agora sync` only pushes to a backup
+  remote *you* configure. (Routing the brain to a hosted CLI agent is supported and does send KB
+  content to that vendor; it is an explicit opt-in — [`docs/LIMITATIONS.md`](docs/LIMITATIONS.md) §9.)
 - **Open source, top to bottom.** Every component has a permissive-OSS default (see the BOM in
   [`docs/DESIGN.md`](docs/DESIGN.md)); proprietary agents are *optional plugins*.
 
@@ -67,17 +75,59 @@ pluggable — any headless CLI agent + any model (default: a local open-weight m
 
 ## Quickstart (local, no cloud, no auth)
 
+> **New here? Read [`docs/GETTING-STARTED.md`](docs/GETTING-STARTED.md) instead.** It is this block
+> with the prerequisites spelled out, the model's real disk/RAM cost measured, and every step's
+> output pasted from a real run. The block below assumes you already have a curator brain.
+
 Runs entirely on your machine: a local markdown repo, a local model (Qwen via Ollama by
-default), zero cloud, zero auth. Requires **Python 3.12+** and [`uv`](https://docs.astral.sh/uv/).
+default), zero cloud, zero auth. Requires **Python 3.12+**, [`uv`](https://docs.astral.sh/uv/),
+**`git`**, and **a curator brain** — `agora curate` does not think for itself, so an LLM is a
+required runtime dependency, not an optional enhancement. That is either a local Ollama model
+(~23 GB on disk, ~29 GB resident — the default, fully offline) or any headless CLI agent already on
+your PATH (`claude`/`codex`/`gemini`, no download, but **hosted** — your KB content leaves the
+machine on every run). Both paths, with the numbers, are
+[`docs/GETTING-STARTED.md`](docs/GETTING-STARTED.md) §1.2.
+
+**There is no PyPI release — a source checkout is the only install path.** `pip install agora-kb`
+resolves to nothing (the distribution name is unclaimed; the unrelated `agora` on PyPI is someone
+else's package), so every command below runs out of the clone through `uv run`. Reserving the name
+is [#102](https://github.com/handochan/agora-kb/issues/102).
+
+**Supported platforms.** macOS and Linux are the developed and tested targets — the two matrix legs
+CI runs *without* `continue-on-error` (`.github/workflows/ci.yml:33,40`; note that nothing gates a
+merge today — branch protection is not enabled, [`SECURITY.md`](SECURITY.md) §4.7) — and the
+curator's OS sandbox exists only for them (Apple `sandbox-exec` on macOS, `bubblewrap` on Linux —
+ADR-0013, `src/agora_kb/curator/isolation/`; on Linux `bwrap` is a separate
+`apt-get install bubblewrap`, see [`docs/GETTING-STARTED.md`](docs/GETTING-STARTED.md) §1.1).
+**Native Windows does not run at all**, not even
+`agora --help`: `src/agora_kb/curator/claim.py:30` imports `fcntl` at module scope and the CLI
+imports that module at `src/agora_kb/cli.py:84`, so the process dies with
+`ModuleNotFoundError: No module named 'fcntl'` before it parses an argument. `windows-latest` runs
+in CI as `continue-on-error` for exactly that reason — a progress signal, not a gate — and deleting
+that line is what marks the port done (`.github/workflows/ci.yml:33`). The port is epic
+[#85](https://github.com/handochan/agora-kb/issues/85); the import blocker itself is
+[#86](https://github.com/handochan/agora-kb/issues/86). Windows deployment units and an interim
+WSL2 path are not documented — [#92](https://github.com/handochan/agora-kb/issues/92).
 
 ```bash
-# 1. Install the project
+# 0. Get the source (no PyPI release — the clone is the install)
+git clone https://github.com/handochan/agora-kb.git
+cd agora-kb
+
+# 1. Install the project  (bare `uv sync` installs NO extras and PRUNES any already there —
+#    add --extra web --extra ingest --extra metrics --extra dev if you want them)
 uv sync
+
+# 1.5 You need a curator brain before step 3 will pass. Either:
+#       ollama pull qwen3.6:35b-a3b        # local, offline, ~23 GB — the default wiring
+#     or wire a CLI agent you already have (hosted; see docs/GETTING-STARTED.md §1.2 Path B).
+#     On Linux also: sudo apt-get install -y bubblewrap  (only needed for `network: none` backends)
 
 # 2. Create a knowledge repo  (note: it is `agora repo init`, NOT `agora init`)
 uv run agora repo init ~/my-kb --name my-kb --domain general
 
-# 3. Health check — git, deps, and the curator OS-sandbox self-test (ADR-0013)
+# 3. Health check — git, deps, the curator OS-sandbox self-test (ADR-0013), and a brain
+#    reachability probe. Exits 1 if no brain is configured or reachable (#96).
 uv run agora doctor --repo ~/my-kb
 
 # 4. (optional) Import an existing Obsidian/markdown vault — non-destructive: the
@@ -131,7 +181,9 @@ knowledge graph (plus a per-note local/backlink graph; canvas drag/zoom/click �
 MIT force-graph, no Node — ADR-0021), a read-only **`/dashboard`**
 (KB health · curator · harvester · gold-pack status, HTMX-polled), and a Prometheus **`/metrics`**
 endpoint for external scraping. It binds to `127.0.0.1` by default and ships no authentication — keep
-it local. A loopback bind is a *network* boundary, and a browser walks through it, so the face also
+it local; what that posture does and does not defend against, and how to report a hole privately,
+is [`SECURITY.md`](SECURITY.md). A loopback bind is a *network* boundary, and a browser walks
+through it, so the face also
 defends the browser-mediated paths (issue #94, ADR-0025 appendix): a **Host allowlist**
 (`web.security.allowed_hosts`, loopback-only by default) rejects DNS-rebinding reads with 400, an
 **Origin/Referer guard** rejects any upload whose origin is not the deployment's own host:port with
@@ -199,10 +251,13 @@ alone; multi-machine topology / bidirectional sync is deferred to issue #46. An 
 best-effort **and non-interactive**: credential/host-key prompts are disabled and the push is
 time-bounded, so an unattended scheduler can never hang on one — use an ssh agent or a credential
 helper (not a prompting flow) with `auto: true`. Its failure never fails the curation that
-triggered it (the result surfaces on the `agora doctor` backup line). **Coverage limits:** `_kb/` is git-ignored, so *uncurated inbox
-events, harvest cursors, and gold packs are NOT protected by the push* — knowledge captured but not
-yet curated can still be lost with the disk (a residual capture→curate window; a separate spool
-backup is a later decision). Run `agora curate` before you rely on a fresh `agora sync`.
+triggered it (the result surfaces on the `agora doctor` backup line). **Coverage limits:** `_kb/` is git-ignored, so *nothing under it is
+protected by the push* — uncurated inbox events, harvest cursors, gold packs, **`_kb/failed/`
+(terminal events awaiting `agora requeue`), the curator's `_kb/state.json`, and your `_kb/repo.yaml`
+policy**. Knowledge captured but not yet curated can still be lost with the disk (a residual
+capture→curate window; a separate spool backup is a later decision). Run `agora curate` before you
+rely on a fresh `agora sync`, and read the full twelve-entry table in
+[`docs/LIMITATIONS.md`](docs/LIMITATIONS.md) §1.
 
 **Always-on (launchd / systemd).** `agora watch`, `agora web`, and `agora harvest` are plain
 foreground processes; [`deploy/`](deploy/) ships example launchd LaunchAgents and systemd user
@@ -213,18 +268,25 @@ own scheduled unit** — the `agora watch` loop evaluates only the curation trig
 harvest. If an unattended loop ever curates against a brain that has stopped answering, three
 consecutive failures move those captures to `_kb/failed/` — `agora requeue` moves them back, by
 rename, once you have fixed the cause ([`deploy/README.md`](deploy/README.md) → "Recovering terminal
-failures"). Sharing one KB with a small team (single hub, reverse proxy, SSH MCP writes, read-only
-clones) is covered by [`docs/DEPLOY-TEAM.md`](docs/DEPLOY-TEAM.md) (issue #68).
+failures", the procedure's SSOT; the retry-budget trap and the `--reset-attempts` cost are worked
+through in [`docs/LIMITATIONS.md`](docs/LIMITATIONS.md) §7). Sharing one KB with a small team
+(single hub, reverse proxy, SSH MCP writes, read-only clones) is covered by
+[`docs/DEPLOY-TEAM.md`](docs/DEPLOY-TEAM.md) (issue #68; written in Korean).
 
 ## Documentation
 
 | Doc | What |
 |---|---|
+| [`docs/GETTING-STARTED.md`](docs/GETTING-STARTED.md) | The first 30 minutes: prerequisites → first curated note |
+| [`docs/LIMITATIONS.md`](docs/LIMITATIONS.md) | The data-safety contract — what this beta does *not* protect |
 | [`docs/DESIGN.md`](docs/DESIGN.md) | Full design — core, tenancy, harvester, web/dashboard, OSS BOM |
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Components, data flow, deployment topology |
 | [`docs/DATA-MODEL.md`](docs/DATA-MODEL.md) | Concrete schemas: inbox item, repo meta, state, provenance |
 | [`docs/ROADMAP.md`](docs/ROADMAP.md) | Phased path: personal MVP → harvester → team server |
 | [`docs/adr/`](docs/adr/) | Architecture Decision Records (the *why* behind each choice) |
+| [`docs/DEPLOY-TEAM.md`](docs/DEPLOY-TEAM.md) | Sharing one KB with 2–10 people: hub topology, proxy auth, footguns (**Korean**) |
+| [`deploy/README.md`](deploy/README.md) | Always-on packaging — launchd / systemd units + install steps |
+| [`SECURITY.md`](SECURITY.md) | Threat model, supported scope, private vulnerability reporting |
 
 ## License
 
