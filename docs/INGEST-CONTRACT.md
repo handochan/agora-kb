@@ -398,6 +398,13 @@ edits:
 On failure for a note: reset that body to placeholder `> _summary pending_` (derived from the plan
 `summary`), set `body_status: pending`, continue. The structural diff is already valid, so the run publishes.
 
+On SUCCESS for a note — no `agora:body` region in it left unauthored — the worker REMOVES `body_status` in
+the same post-gate step, after the §4.2 verdict (including any degrade) and BEFORE §4.4. PASS 2 cannot do
+it: §4.2 requires frontmatter byte-identity and the model is outside the integrity boundary. The predicate
+is note-local, so a region an EARLIER run left at the placeholder keeps the flag alive even when every
+region THIS run asked for landed (a run may therefore report `prose_pending: 0` beside a retained flag —
+`prose_pending` grades this run's PASS 2, `body_status` describes the note). Lint L2-6 warns on a stale flag.
+
 ### 4.3 LOG + PUBLISH (deterministic, worker-only — preserves append-only + single-writer)
 **Hard ordering invariant:** the worker writes `log.md` ONLY AFTER §4.2 and §4.4 have passed-or-degraded for
 ALL notes. Throughout PASS 1 and PASS 2, `log.md` MUST be byte-identical to `base_commit` (asserted in §4.1
@@ -452,7 +459,8 @@ checks:
    (enum `active | stub | contested | deprecated`), `summary` (str), `tags` (list[str]), `aliases`
    (list[str], default `[]`), `sources` (list[str]; theme notes require non-empty UNLESS `status: stub`),
    `related` (list of `[[basename]]`), `created` (`YYYY-MM-DD == run_date`), `updated`
-   (`YYYY-MM-DD == run_date`). `body_status` ∈ {`pending`, absent}. `origin` (str, ADR-0010 enum) iff any
+   (`YYYY-MM-DD == run_date`). `body_status` ∈ {`pending`, absent}, and is checked against the note body by
+   the warning-only L2-6 rule. `origin` (str, ADR-0010 enum) iff any
    provenance source is `harvest:<agent>`; `confidence` (`high | medium | low`) present on harvested
    regions. `orphan`/`stale` are DERIVED at read/dashboard time (link graph + `run_date`) and are NEVER
    persisted in frontmatter.

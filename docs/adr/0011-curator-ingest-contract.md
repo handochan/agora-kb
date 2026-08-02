@@ -342,6 +342,12 @@ pass writes ONLY between the worker-placed sentinels. Validate the `git diff` of
 On failure for a note: reset that body to placeholder `> _summary pending_` (derived from the plan
 `summary`), set `body_status: pending`, continue. The structural diff is already valid, so the run
 publishes.
+On SUCCESS for a note — no `agora:body` region in it left unauthored — the worker REMOVES `body_status`
+in the same post-gate step, after the §4.2 verdict (including any degrade) and BEFORE §4.4. PASS 2 cannot
+do it: §4.2 requires frontmatter byte-identity and the model is outside the integrity boundary. The
+predicate is note-local, so a region an EARLIER run left at the placeholder keeps the flag alive. Lint
+L2-6 warns on a stale flag (warning-only — an error would fail every run on a pre-existing repo, and a
+lint failure discards the whole diff, so the run could never repair what made it fail).
 
 **§4.3 LOG + PUBLISH (deterministic, worker-only — preserves append-only + single-writer).**
 *Hard ordering invariant:* the worker writes `log.md` ONLY AFTER §4.2 and §4.4 have passed-or-degraded for

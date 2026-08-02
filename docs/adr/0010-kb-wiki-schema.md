@@ -341,7 +341,10 @@ schema doc + symlinks. Two tiers.
 **L2 — HEALTH (soft; DERIVED at read/dashboard time; never written; feeds Dashboard, DESIGN §5.3):**
 L2-1 orphan (theme with 0 inbound `[[ ]]` AND not in any MOC `children:`; dailies exempt) · L2-2
 stale (`updated` older than `stale_days` before `run_date`) · L2-3 stub unfilled for `stub_max_runs`
-runs · L2-4 contested lingering · L2-5 body exceeds `max_note_bytes`. Thresholds from
+runs · L2-4 contested lingering · L2-5 body exceeds `max_note_bytes` · L2-6 stale `body_status`
+(the key is present but every `agora:body` region in the note is authored — warning only, so it
+never flips `LintResult.ok`; promote to a hard L1 rule only once `agora repo upgrade` can repair an
+existing repo). Thresholds from
 `_kb/repo.yaml` (`health: {stale_days: 90, stub_max_runs: 5, max_note_bytes: 262144}`), computed
 relative to `run_date`.
 
@@ -416,6 +419,9 @@ a `status: stub` theme in the same run. Plan MOC maintenance (lazy create at fir
 all frontmatter (dates from injected values; `summary`; contested fields; `body_status: pending`) and
 the body sentinels. **PASS 2 (author):** the brain writes prose ONLY between the worker-placed
 `<!-- agora:body:start/end id=<candidate_id> -->` sentinels; once authored, `body_status` is dropped.
+*As built:* the brain cannot drop it (the §4.2 AUTHOR diff requires frontmatter byte-identity), so the
+WORKER retracts the key immediately after that gate and before the L1 lint, for every `needs_prose`
+note left holding no unauthored region; a region an earlier run left at the placeholder keeps the flag.
 The worker appends one line to `log.md`. The brain never adds a tag/domain, never writes
 `_meta/`/`_templates/`/`raw/`/`_kb/`, git config, hooks, or any off-allowlist path (L1-9).
 
