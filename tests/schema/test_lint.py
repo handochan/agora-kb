@@ -929,3 +929,121 @@ def test_lint_max_orphans_exact_boundary_no_finding(tmp_path: Path) -> None:
     _add_orphan_theme(layout)  # exactly 1 orphan
     result = lint(layout, taxonomy=_TAXONOMY, run_date=RUN_DATE, max_orphans=1)
     assert all(f.code != "L2-1" for f in result.findings)
+
+
+# --- L2-6 stale `body_status: pending` (#119, warning-only) --------------------------------------
+#
+# The at-rest half of the #119 invariant: `body_status: pending` is present ONLY while a note owes
+# prose (ADR-0010 §2.6), and the curator's worker retracts it after the §4.2 AUTHOR gate. These lock
+# BOTH the predicate ("no region is still a placeholder", not "prose exists") and the severity — an
+# error here would fail every run on a pre-#119 repo over notes the plan never named, and a lint
+# failure discards the whole diff, so the run could never repair what made it fail.
+
+_SID = f"{RUN_ID}--c1"
+_SID2 = f"{RUN_ID}--c2"
+
+
+def _region(sentinel_id: str, body: str) -> str:
+    """Render one APPLY-shaped body region (start marker / body / end marker, each on its line)."""
+    return (
+        f"<!-- agora:body:start id={sentinel_id} -->\n"
+        f"{body}\n"
+        f"<!-- agora:body:end id={sentinel_id} -->"
+    )
+
+
+def _add_sentinel_theme(layout: RepoLayout, body: str, **fm_overrides: object) -> str:
+    """Write an otherwise-L1-clean theme carrying ``body`` verbatim; return its rel_path."""
+    rel = "wiki/ai-tech/themes/body-status-probe.md"
+    _raw_source(layout, "raw/ai-tech/2026-06-09-probe.md")
+    _write(
+        layout,
+        rel,
+        _theme_fm(
+            title="Body status probe",
+            summary="probe",
+            sources=["raw/ai-tech/2026-06-09-probe.md"],
+            related=[],
+            **fm_overrides,
+        ),
+        body,
+    )
+    return rel
+
+
+def test_l2_6_authored_region_with_pending_flag_warns_but_stays_ok(tmp_path: Path) -> None:
+    """Criterion (c): lint catches "prose present but body_status: pending" — as a WARNING."""
+    layout = _valid_repo(tmp_path)
+    rel = _add_sentinel_theme(
+        layout,
+        _region(_SID, "The single curator holds a per-repo flock."),
+        body_status="pending",
+    )
+    result = lint(layout, taxonomy=_TAXONOMY, run_date=RUN_DATE)
+    stale = [f for f in result.findings if f.code == "L2-6"]
+    assert len(stale) == 1
+    assert stale[0].severity == "warning"
+    assert stale[0].path == rel
+    # A warning NEVER flips ok — the §4.4 curator gate and the dashboard verdict are byte-unchanged,
+    # so shipping this cannot self-lock a run on a repo full of pre-#119 notes.
+    assert result.ok is True
+
+
+def test_l2_6_silent_when_a_region_is_still_a_placeholder(tmp_path: Path) -> None:
+    """The flag is LEGITIMATE while any region is unauthored — including a partly-authored note."""
+    layout = _valid_repo(tmp_path)
+    _add_sentinel_theme(
+        layout,
+        _region(_SID, "Real prose landed here.") + "\n\n" + _region(_SID2, "_summary pending_"),
+        body_status="pending",
+    )
+    result = lint(layout, taxonomy=_TAXONOMY, run_date=RUN_DATE)
+    assert all(f.code != "L2-6" for f in result.findings)
+
+
+def test_l2_6_silent_on_the_degrade_reset_placeholder(tmp_path: Path) -> None:
+    """The §4.2 RESET form (`> _summary pending_`) also reads as unauthored — the degrade path must
+    keep its flag (criterion (b)) without lint contradicting it."""
+    layout = _valid_repo(tmp_path)
+    _add_sentinel_theme(layout, _region(_SID, "> _summary pending_"), body_status="pending")
+    result = lint(layout, taxonomy=_TAXONOMY, run_date=RUN_DATE)
+    assert all(f.code != "L2-6" for f in result.findings)
+
+
+def test_l2_6_silent_when_the_key_is_absent(tmp_path: Path) -> None:
+    layout = _valid_repo(tmp_path)
+    _add_sentinel_theme(layout, _region(_SID, "The single curator holds a per-repo flock."))
+    result = lint(layout, taxonomy=_TAXONOMY, run_date=RUN_DATE)
+    assert all(f.code != "L2-6" for f in result.findings)
+
+
+def test_l2_6_converse_is_not_a_violation_unauthored_region_without_flag(tmp_path: Path) -> None:
+    """REGRESSION LOCK on the one-directional rule: an APPEND_DAILY with ``needs_prose=False``
+    places an EMPTY region (apply._apply_append_daily) but NO ``body_status`` (apply.py sets it
+    only when ``disp.needs_prose``), and ``_needs_prose_map`` never authors it. That is a real,
+    reachable, lint-clean state — the biconditional would false-positive on every such daily."""
+    layout = _valid_repo(tmp_path)
+    _write_daily(layout, "wiki/ai-tech/daily/ai-tech-2026-06-14.md")
+    daily = layout.root / "wiki/ai-tech/daily/ai-tech-2026-06-14.md"
+    text = daily.read_text(encoding="utf-8")
+    daily.write_text(
+        text.rstrip("\n") + "\n\n" + _region(_SID, "_summary pending_") + "\n", encoding="utf-8"
+    )
+    result = lint(layout, taxonomy=_TAXONOMY, run_date=RUN_DATE)
+    assert all(f.code != "L2-6" for f in result.findings)
+    assert result.ok is True
+
+
+def test_l2_6_stays_silent_on_a_malformed_marker_note_l1_20_already_rejects(
+    tmp_path: Path,
+) -> None:
+    """FAIL-SAFE: a tampered marker structure grades as unauthored, so the note KEEPS its flag and
+    L2-6 does not double-report what L1-20 already hard-rejects."""
+    layout = _valid_repo(tmp_path)
+    body = f"<!-- agora:body:start id={_SID} -->\nprose with no closing marker\n"
+    _add_sentinel_theme(layout, body, body_status="pending")
+    result = lint(layout, taxonomy=_TAXONOMY, run_date=RUN_DATE)
+    codes = _codes(result.findings)
+    assert "L1-20" in codes  # the hard gate fires
+    assert "L2-6" not in codes  # …and the soft one stays quiet
+    assert result.ok is False

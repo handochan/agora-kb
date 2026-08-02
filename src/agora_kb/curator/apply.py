@@ -48,6 +48,17 @@ from pathlib import Path
 
 from agora_kb.core import frontmatter
 from agora_kb.core.frontmatter import FrontmatterError
+
+# The strict PRODUCER body-region grammar + the initial-fill placeholder. These live in
+# :mod:`agora_kb.core.sentinel` (#119) rather than here because ``schema/lint.py`` must grade "is
+# this region unauthored?" with the SAME vocabulary and may not import the curator (core <- curator,
+# ADR-0001/0003) — so the one shared home has to sit BELOW both packages. The two matchers are the
+# AUTHOR-diff parser's (§4.2): they capture the candidate id so the validator can pair start/end and
+# confirm only declared needs_prose regions were touched. The §4.4 L1-20 gate and the L2-6
+# stale-flag check import the very same two patterns, so the three graders provably cannot drift.
+from agora_kb.core.sentinel import BODY_END_LINE_RE as _SENTINEL_END_RE
+from agora_kb.core.sentinel import BODY_PLACEHOLDER
+from agora_kb.core.sentinel import BODY_START_LINE_RE as _SENTINEL_START_RE
 from agora_kb.curator.plan import Disposition, Plan
 from agora_kb.schema.notes import wikilinks
 
@@ -80,8 +91,10 @@ _SENTINEL_END = "<!-- agora:body:end id={cid} -->"
 # it). Kept on its own line so a clean sentinel region is never byte-empty. This is DISTINCT from
 # the §4.2 AUTHOR-failure RESET placeholder, which ADR-0011 §4.2 pins as the blockquote ``>
 # _summary pending_`` derived from the plan summary; the reset path lives in the worker, not here,
-# so the two must not be conflated.
-BODY_PLACEHOLDER = "_summary pending_"
+# so the two must not be conflated. Both spellings now live in :mod:`agora_kb.core.sentinel` (#119)
+# so ``schema/lint.py`` can grade "is this region unauthored?" with the SAME vocabulary without
+# importing the curator; re-exported here because APPLY is the historical home every caller imports
+# (worker.py, subprocess_backend.py, adapters/ollama_brain.py, curator/__init__.py, the tests).
 # Historical private alias, kept so in-module references and any external reader stay valid.
 _BODY_PLACEHOLDER = BODY_PLACEHOLDER
 
@@ -99,11 +112,6 @@ _CONTESTED_CALLOUT_PREFIX = "> [!contested]"
 
 # §4.6 stray-wikilink regex: a [[...]] token with no nested brackets / newlines, inner captured.
 _WIKILINK_TOKEN_RE = re.compile(r"\[\[([^\[\]\r\n]*)\]\]")
-
-# A sentinel start/end line matcher for the AUTHOR-diff parser (§4.2): captures the candidate id so
-# the validator can pair start/end and confirm only declared needs_prose regions were touched.
-_SENTINEL_START_RE = re.compile(r"\A<!-- agora:body:start id=(?P<cid>.+) -->\Z")
-_SENTINEL_END_RE = re.compile(r"\A<!-- agora:body:end id=(?P<cid>.+) -->\Z")
 
 
 class ApplyError(ValueError):

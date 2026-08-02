@@ -27,8 +27,14 @@
   </div>
   <div class="stat">
     <span class="label">Lint</span>
+    {# `lint_findings` counts warnings too, and a warning never flips `lint_ok` — so rendering the
+       count ONLY in the not-ok branch hid every L2 signal behind the word "ok". Since #119 that
+       matters: L2-6 is one warning per note still carrying a stale `body_status`, and it is the
+       only surface that tells an operator a `agora repo upgrade` (#63) repair is owed. #}
     <span class="value {{ 'ok' if health.lint_ok else 'warn' }}">
-      {{ 'ok' if health.lint_ok else health.lint_findings ~ ' findings' }}
+      {% if not health.lint_ok %}{{ health.lint_findings }} findings
+      {%- elif health.lint_findings %}ok · {{ health.lint_findings }} warnings
+      {%- else %}ok{% endif %}
     </span>
   </div>
   <div class="stat">

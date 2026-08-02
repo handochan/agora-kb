@@ -171,6 +171,17 @@ These promote three previously-hardcoded/inert tunables (ADR-0011 §1.3) to oper
   `lint` emits **one `warning`-severity** `L2-1` finding if the whole-tree orphan-theme count exceeds
   it; a warning never flips `LintResult.ok`, so it does not break the §4.4 gate or the dashboard.
 
+`L2-6` (stale `body_status`) is the other `warning`-severity finding `lint` emits — unconditional, with
+no threshold to configure: one per note whose `body_status: pending` survives over a body with no
+unauthored `agora:body` region. Like `L2-1` it never flips `LintResult.ok`, so it is debt rather than a
+gate: a repo published by a pre-#119 build keeps curating normally and heals a note's flag whenever a
+later run gives that note a `needs_prose` region. Bulk repair of notes the curator never re-touches
+belongs to `agora repo upgrade` (#63) — invariant 2 forbids any other component writing `wiki/`.
+The debt is surfaced as `lint_findings` in `GET /api/dashboard/health` and on the dashboard's Lint stat,
+which reads `ok · N warnings` while `lint_ok` stays true. It is deliberately NOT in the curator's
+`failed_checks`: that channel carries only the error-severity findings that actually failed the §4.4
+gate, so an unbounded warning cannot bury the one line saying why a run failed.
+
 The nesting follows the established ADR-0011 namespaces — `curator.limits.*` for the two size/breadth
 knobs, `curator.lint.*` for the orphan (lint) knob. **These are the repo-global bases that the
 per-domain block (b) below overrides** — the per-domain block uses *flat* keys **inside** its
