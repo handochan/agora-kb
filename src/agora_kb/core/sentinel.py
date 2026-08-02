@@ -22,6 +22,12 @@ Two distinct operations — kept separate on purpose (the difference is load-bea
 
 The PRODUCER duty (assembly-time neutralization of an embedded opener) lives with the emitter in
 :mod:`agora_kb.core.gold` (``_neutralize_sentinels``) and is intentionally *not* moved here.
+
+This module ALSO owns the curator's **producer body-region grammar** (the strict, line-anchored
+``agora:body:start/end`` matchers) and the vocabulary of an **unauthored region body** — the
+placeholder set plus the :func:`has_unauthored_region` grader that both the curator's post-§4.2
+``body_status`` clear and the schema linter's L2-6 check read (#119). Two grammars now live here on
+purpose; see the section comment below for why they must never be conflated.
 """
 
 from __future__ import annotations
@@ -31,6 +37,13 @@ import re
 __all__ = [
     "AGORA_SENTINEL_RE",
     "AGORA_SPAN_RE",
+    "BODY_END_LINE_RE",
+    "BODY_PLACEHOLDER",
+    "BODY_RESET_PLACEHOLDER",
+    "BODY_START_LINE_RE",
+    "UNAUTHORED_REGION_BODIES",
+    "has_unauthored_region",
+    "region_is_unauthored",
     "strip_sentinel_spans",
     "strip_agora_sentinels",
 ]
@@ -78,3 +91,81 @@ def strip_agora_sentinels(text: str) -> str:
     curator's deterministic diff gate is the real integrity boundary; this is a cheap extra layer.
     """
     return AGORA_SENTINEL_RE.sub("", strip_sentinel_spans(text))
+
+
+# --- the curator's body-region grammar (producer side; ADR-0011 §3/§3.1) ----------------------
+# DISTINCT FROM the tolerant consumer regexes above, and deliberately so: AGORA_SPAN_RE is
+# DOTALL + id-agnostic + first-closer-wins because it defends against POISONED harvested text.
+# The producer grammar below is STRICT and LINE-ANCHORED because it grades the curator's OWN
+# output at the §4.2 integrity boundary. Never implement a region predicate on AGORA_SPAN_RE —
+# it pairs marker shapes the strict gate rejects, and the two would silently disagree.
+# These two patterns are the SINGLE spelling: apply.py, worker.py and schema/lint.py all import
+# them, so the L1-20 gate, the §4.2 validator and the L2-6 check provably read the same markers.
+BODY_START_LINE_RE = re.compile(r"\A<!-- agora:body:start id=(?P<cid>.+) -->\Z")
+BODY_END_LINE_RE = re.compile(r"\A<!-- agora:body:end id=(?P<cid>.+) -->\Z")
+
+# APPLY's initial fill (apply.py) and the §4.2 AUTHOR-failure RESET form (worker.py). They live
+# HERE, below both `schema/` and `curator/`, because BOTH the curator (which sets and clears
+# `body_status`) and schema/lint.py (which asserts it, L2-6) must grade "unauthored" with the
+# SAME vocabulary — and schema/ may not import the curator (core <- curator, ADR-0001/0003).
+BODY_PLACEHOLDER = "_summary pending_"
+BODY_RESET_PLACEHOLDER = f"> {BODY_PLACEHOLDER}"
+# A region body reading as one of these carries no prose, whatever the diff says. DERIVED from
+# the REAL constants rather than re-spelled, so a change to either placeholder cannot silently
+# stop being detected. Compared after strip() so trailing-newline churn is not mistaken for
+# authored content.
+UNAUTHORED_REGION_BODIES = frozenset({"", BODY_PLACEHOLDER, BODY_RESET_PLACEHOLDER})
+
+
+def region_is_unauthored(region_body: str) -> bool:
+    """True iff ``region_body`` still carries no prose (empty / either placeholder)."""
+    return region_body.strip() in UNAUTHORED_REGION_BODIES
+
+
+def has_unauthored_region(body: str) -> bool:
+    """True iff ``body`` holds at least one agora:body region that is still unauthored (#119).
+
+    The ONE grader behind both halves of the invariant: the curator's post-§4.2 clear
+    (:func:`agora_kb.curator.worker._clear_body_status`) and the L2-6 lint check
+    (:func:`agora_kb.schema.lint._check_body_status`) call this, so a state the worker just
+    produced can never trip its own new lint rule.
+
+    NOTE-LOCAL, never run-scoped: it walks EVERY region in the note, including one an EARLIER
+    run left at the placeholder (a same-day APPEND_DAILY or a MERGE_INTO_THEME onto a
+    prose-pending theme both produce that shape). A rule derived from only THIS run's region ids
+    would clear a flag that is still owed.
+
+    FAIL-SAFE on malformed markers (nested / unmatched / mismatched / DUPLICATED id): returns True,
+    so a tampered note KEEPS its flag and L2-6 stays silent about a note L1-20 already hard-rejects.
+    The line walk mirrors :func:`agora_kb.curator.apply._extract_sentinel_regions` exactly —
+    including its duplicate-id arm, which is not decorative: a duplicated id is the very corruption
+    L1-20 was added for after a real dogfood run produced two identical markers in one note. Without
+    the ``seen`` set this function would grade such a note as fully authored and L2-6 would report
+    "every region is authored" over a note lint simultaneously declares structurally tampered.
+    """
+    open_cid: str | None = None
+    seen: set[str] = set()
+    lines: list[str] = []
+    for line in body.split("\n"):
+        start = BODY_START_LINE_RE.match(line)
+        if start is not None:
+            if open_cid is not None:
+                return True  # nested/overlapping start — malformed, fail safe
+            open_cid = start.group("cid")
+            lines = []
+            continue
+        end = BODY_END_LINE_RE.match(line)
+        if end is not None:
+            if open_cid is None or end.group("cid") != open_cid:
+                return True  # unmatched/mismatched end — malformed, fail safe
+            if open_cid in seen:
+                return True  # duplicated id — malformed, fail safe (apply returns None here)
+            if region_is_unauthored("\n".join(lines)):
+                return True
+            seen.add(open_cid)
+            open_cid = None
+            lines = []
+            continue
+        if open_cid is not None:
+            lines.append(line)
+    return open_cid is not None  # unclosed start — malformed, fail safe
