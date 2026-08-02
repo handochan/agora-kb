@@ -190,13 +190,12 @@ guarantee:
    > an operator configures a `network: none` backend — which is also the only configuration whose
    > absence of a sandbox makes `agora curate` refuse to run.
 
-   The *mechanism* is **proven at runtime, not assumed** — though read the doctor line as "this
-   host's sandbox works", not "your brain is confined" (see the scope note above). `agora doctor`
-   runs the ADR-0013 self-test against a throwaway worktree — write-inside must succeed,
-   write-outside must be refused with a mechanism-specific errno, and the network deny is only
-   accepted against a *reachable* target so "blocked" cannot silently mean "nothing was listening"
-   (`src/agora_kb/curator/isolation/selftest.py:1-30`, printed by `_doctor_sandbox`,
-   `src/agora_kb/cli.py:2376-2425`):
+   The *mechanism* is **proven at runtime, not assumed**. `agora doctor` runs the ADR-0013
+   self-test against a throwaway worktree — write-inside must succeed, write-outside must be
+   refused with a mechanism-specific errno, and the network deny is only accepted against a
+   *reachable* target so "blocked" cannot silently mean "nothing was listening"
+   (`src/agora_kb/curator/isolation/selftest.py`, printed by `_doctor_sandbox` in
+   `src/agora_kb/cli.py`):
 
    ```bash
    uv run agora doctor --repo /ABSOLUTE/PATH/TO/knowledge-repo
@@ -206,11 +205,20 @@ guarantee:
      sandbox: seatbelt (ok)
        write-inside=True write-outside-denied=True apple-shim=True
        network-denied=True
+       confines this repo's brains: NO — outside: plan=qwen (network: loopback), author=qwen (network: loopback) (only a network: none author is confined; PASS-1 never is)
    ```
 
+   The first three lines answer *"does the mechanism work on this host"*. The fourth answers the
+   different and more useful question — *"does it confine **this repo's** brains"* — per act, so
+   you never have to derive it from the scope note above (#129). It can never read `yes`: PASS-1 is
+   unconfined on every path, so `PARTIAL` is the strongest true answer, and it degrades to `NO`
+   when the host has no kernel sandbox, when the self-test failed, or when
+   `allow_reduced_isolation` selected the `restricted` fallback.
+
    A sandbox whose self-test **fails** makes `agora doctor` exit non-zero — a confinement that lies
-   is treated as worse than none (`src/agora_kb/cli.py:2382-2383`; the verdict is folded in at
-   `src/agora_kb/cli.py:1753` and returned at `:1791`).
+   is treated as worse than none. So does a host with **no** kernel sandbox when a routed act
+   declares `network: none`: `build_routed_backend` then refuses to build that act, so `agora
+   curate` cannot run at all and a green verdict would be a lie (#129).
 
 2. **The deterministic FINAL-DIFF gate (ADR-0008 step 4)** — `_assert_final_diff_allowlisted`,
    called at `src/agora_kb/curator/worker.py:773`, implemented at `:1528`. Everything the
@@ -360,9 +368,11 @@ unsupported one.
   invariant 3). A secret pasted through `kb_remember` or the web upload is unfiltered (§3(d)) and
   becomes permanent git history — replicated to every clone and every backup push.
 - **Run `agora doctor` before you trust a deployment.** It exercises the sandbox mechanism rather
-  than assuming it, and it exits non-zero when the host is unhealthy (§3(c)). Read its brain line
-  carefully: with a `--model` pin in the `adapters.yaml` argv the verdict never contacts the daemon
-  (`src/agora_kb/cli.py:2150-2156`), so green proves presence, not function.
+  than assuming it, reports per act whether that mechanism confines *your* brains, and exits
+  non-zero when the host is unhealthy (§3(c)). Read its brain line carefully all the same: the
+  daemon is contacted on every path, but a model pinned in the `adapters.yaml` argv is reported
+  **without being verified installed** — `ollama show '<tag>'` is the check that closes that gap.
+  Green proves presence, not function.
 - **Keep the web face on loopback unless an authenticating proxy is in front of it.** That is the
   entire boundary (§3(a)).
 

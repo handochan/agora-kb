@@ -79,7 +79,7 @@ does not gate, because the two are easy to confuse:
   declares `network: none` (`curator/subprocess_backend.py:371`), and both brains this document
   configures declare `network: loopback`. Without bubblewrap, `agora doctor` prints
   `sandbox: unavailable — fail-closed for network:none backends (…)` and **still returns
-  `status: healthy`** (`cli.py:2391-2393`) — curation runs.
+  `status: healthy`** (`cli.py` `_doctor_sandbox`) — curation runs.
 - **It is required the moment you configure a `network: none` backend.** Selection is fail-closed:
   with no usable kernel sandbox `select_backend_isolation` raises `SandboxUnavailable` and
   `agora curate` refuses rather than running unconfined (`curator/isolation/__init__.py:239-244`).
@@ -336,7 +336,7 @@ model produced the wiki text.
 ```
 
 Note what doctor does *not* do here: it prints a `WARNING … this is the alphabetical fallback` only
-when **no** qwen-family model is installed at all (`cli.py:2193-2201`). With two qwen models it
+when **no** qwen-family model is installed at all (`cli.py` `_probe_ollama`). With two qwen models it
 simply names its pick and stays quiet, so read that line rather than the verdict word.
 
 Pin it. On a freshly initialized repo (see §4 step 1), overwrite `adapters.yaml`:
@@ -366,14 +366,15 @@ uv run agora doctor --repo /tmp/my-kb | grep "brain qwen"
 ```
 
 ```
-  brain qwen: ollama http://localhost:11434, model pinned to 'qwen3.6:35b-a3b' by adapters.yaml argv (no /api/tags probe — the run lists no models either; reachability NOT checked)
+  brain qwen: ollama http://localhost:11434 reachable, model pinned to 'qwen3.6:35b-a3b' by adapters.yaml argv (no /api/tags probe — the run lists no models either; the pin is NOT verified installed)
 ```
 
-### The trade-off the argv pin makes — read this before you choose
+### What the argv pin does and does not check
 
-**Pinning in the argv turns off doctor's reachability probe.** Read the parenthetical in that line
-literally: an explicit `--model` short-circuits `/api/tags` *entirely*, so doctor returns a passing
-verdict without contacting the daemon at all (`cli.py:2150-2156`). Verified on this host with the
+**The daemon is still checked; the model list is not.** Read the parenthetical literally. An
+explicit `--model` short-circuits `/api/tags` because a pinned *run* never lists models either — so
+doctor does not answer a question the curator does not ask. But every run, pinned or not, still does
+`POST /api/generate`, so daemon liveness is a real precondition and doctor checks it. With the
 heredoc above applied and nothing listening:
 
 ```bash
@@ -381,28 +382,35 @@ AGORA_OLLAMA_HOST=http://localhost:1 uv run agora doctor --repo /tmp/my-kb
 ```
 
 ```
-  brain qwen: ollama http://localhost:1, model pinned to 'qwen3.6:35b-a3b' by adapters.yaml argv (no /api/tags probe — the run lists no models either; reachability NOT checked)
-status: healthy          # exit 0 — with the daemon completely down
+  brain qwen: ollama http://localhost:1 UNREACHABLE (could not reach the Ollama daemon at http://localhost:1/: <urlopen error [Errno 61] Connection refused>; is the Ollama daemon running?) [model pinned to 'qwen3.6:35b-a3b']
+    fix (no download — 'claude', 'codex', 'gemini' are already installed): add to adapters.yaml
+…                        # the remediation block and the remaining report lines are cut here
+status: unhealthy        # exit 1
 ```
 
-That is deliberate, not a bug (#96): on this path "the daemon is up" is a fact the *run* never
-establishes either, so claiming it would be a lie. But the consequence is yours to manage, and it is
-the opposite of what [§4 step 2](#step-2--health-check) can otherwise do for you.
+> **Changed in 0.1.0b1 (#129).** Earlier builds skipped reachability *entirely* on this path and
+> printed `status: healthy` with the daemon completely down. If you scripted around that, note that
+> a pinned repo with a dead daemon now exits `1`.
 
-The two pin forms are **not** equivalent:
-
-| | Travels with the repo | Doctor still probes reachability |
-|---|---|---|
-| `--model <tag>` in the `adapters.yaml` argv | **yes** — `agora watch` under launchd/systemd sees it | **no** |
-| `$AGORA_OLLAMA_MODEL` | no — it is process environment | **yes** (`_resolve_model` calls `list_ollama_models` first, `cli.py:2131-2134`) |
-
-Pick on that basis. The argv form is still the right default for an unattended deployment — a pin
-the scheduler cannot see is worse than a blind spot — but then **doctor is no longer your daemon
-check**, and you should verify the daemon separately:
+One blind spot remains, and the line states it: **the pinned tag is not verified to be installed.**
+`/api/tags` returns fully-qualified `name:tag` while Ollama resolves an unqualified name to
+`:latest`, so exact membership is not a sound existence test and would paint a working host
+unhealthy. A typo'd tag therefore passes doctor and fails at curate time. Ollama itself answers that
+question exactly:
 
 ```bash
-curl -fsS "${AGORA_OLLAMA_HOST:-http://localhost:11434}/api/tags" >/dev/null && echo "ollama: up"
+ollama show 'qwen3.6:35b-a3b' >/dev/null && echo "model: installed"   # exit 1 if it is not
 ```
+
+The two pin forms differ in one way that matters:
+
+| | Travels with the repo | Doctor lists installed models |
+|---|---|---|
+| `--model <tag>` in the `adapters.yaml` argv | **yes** — `agora watch` under launchd/systemd sees it | no (reachability yes) |
+| `$AGORA_OLLAMA_MODEL` | no — it is process environment | **yes** (`_resolve_model` calls `list_ollama_models` first) |
+
+The argv form is the right default for an unattended deployment: a pin the scheduler cannot see is
+worse than a narrower probe.
 
 (`$AGORA_OLLAMA_MODEL` reaches the shim at all because the default `qwen` backend declares
 `network: loopback`, which means it is *not* run inside the sandbox and inherits the process
@@ -491,6 +499,7 @@ agora doctor (agora 0.1.0b1, python 3.12.13)
   sandbox: seatbelt (ok)
     write-inside=True write-outside-denied=True apple-shim=True
     network-denied=True
+    confines this repo's brains: NO — outside: plan=qwen (network: loopback), author=qwen (network: loopback) (only a network: none author is confined; PASS-1 never is)
   routing: plan=qwen (network: loopback)  author=qwen (network: loopback)
   brain qwen: ollama http://localhost:11434 reachable, 2 models, would use 'qwen3.6-hermes:latest'
   harvest: disabled (scope_lock=personal)
@@ -509,13 +518,19 @@ Read the `brain qwen:` line before moving on. Here it says `would use 'qwen3.6-h
 §3 pin**, then re-run doctor until that line reads:
 
 ```
-  brain qwen: ollama http://localhost:11434, model pinned to 'qwen3.6:35b-a3b' by adapters.yaml argv (no /api/tags probe — the run lists no models either; reachability NOT checked)
+  brain qwen: ollama http://localhost:11434 reachable, model pinned to 'qwen3.6:35b-a3b' by adapters.yaml argv (no /api/tags probe — the run lists no models either; the pin is NOT verified installed)
 ```
 
-Doctor probes the configured brain and that probe **counts toward the verdict** (`cli.py:2281-2373`,
-#96) — **for an unpinned backend**. Once you apply the argv pin, that line is the pin's own report
-and no longer a reachability check; see [§3](#3-pin-the-model-path-a-only). Run the pin *and* the
-`curl` check there if you want both.
+Doctor probes the configured brain and that probe **counts toward the verdict** (#96), pinned or
+not — a dead daemon is `status: unhealthy` either way (#129). What the pin narrows is only the
+*model* question; see [§3](#what-the-argv-pin-does-and-does-not-check).
+
+Two more lines above are worth reading once. `sandbox: seatbelt (ok)` proves the mechanism works on
+**this host**; the `confines this repo's brains:` line under it answers the different question of
+whether *your* acts go through it — `NO` here, because the default `network: loopback` brain needs
+the loopback socket to reach Ollama. That is the designed default, not a fault
+([`LIMITATIONS.md` §5](LIMITATIONS.md)). The line reports per act and **never reads `yes`**: PASS-1
+is unconfined on every path, so `PARTIAL` is the best any repo can get.
 
 On an unpinned backend a red verdict is correct behaviour, not a false alarm — it means
 `agora curate` cannot run. With Ollama down (the six lines between the remediation block and the
@@ -535,7 +550,7 @@ status: unhealthy
 ```
 
 Exit code `1`. The remediation block leads with a CLI agent already on your PATH because that costs
-no download (`cli.py:2242-2278`) — but re-read the Path B warning in
+no download (`cli.py` `_probe_program`) — but re-read the Path B warning in
 [§1.2](#path-b--a-headless-cli-agent-no-model-download-adr-0016) before taking it: those agents are
 hosted, and doctor's convenience ranking is not a privacy recommendation. Ollama is the fully-local
 fallback.
@@ -779,13 +794,13 @@ tools appear, confirmed live via `tools/list`:
 | Symptom | Cause | Fix |
 |---|---|---|
 | `agora curate` fails and the brain's stderr reads *"no Ollama models available; pull one (e.g. `ollama pull qwen3.6:35b-a3b`) and ensure the daemon is running"* | The daemon answered but has zero models installed — `select_model` raises rather than guess (`adapters/ollama_brain.py:173-176`) | `ollama pull qwen3.6:35b-a3b`, then re-check with `uv run agora doctor --repo /tmp/my-kb \| grep "brain "` |
-| Curation output reads oddly and you cannot tell which model produced it | Two independent causes. (1) `select_model` falls back to the alphabetically first qwen-family model with **no run-time log line**, and doctor only prints `WARNING … alphabetical fallback` when *no* qwen model exists at all (`adapters/ollama_brain.py:160-181`, `cli.py:2193-2201`). (2) The batch is too large for the model: over-filling PASS-1 **degrades plan quality silently — no error** ([`INGEST-CONTRACT.md`](INGEST-CONTRACT.md) §1.3), and the default cap 32 is frontier-sized (`curator/constants.py:54`) | `ollama list` to see what is actually installed, then pin explicitly per [§3](#3-pin-the-model-path-a-only); and lower `curator.limits.max_candidates_per_run` to 16–24 for a ~30B MoE, 8–12 for ≤8B |
+| Curation output reads oddly and you cannot tell which model produced it | Two independent causes. (1) `select_model` falls back to the alphabetically first qwen-family model with **no run-time log line**, and doctor only prints `WARNING … alphabetical fallback` when *no* qwen model exists at all (`adapters/ollama_brain.py:160-181`, `cli.py` `_probe_ollama`). (2) The batch is too large for the model: over-filling PASS-1 **degrades plan quality silently — no error** ([`INGEST-CONTRACT.md`](INGEST-CONTRACT.md) §1.3), and the default cap 32 is frontier-sized (`curator/constants.py:54`) | `ollama list` to see what is actually installed, then pin explicitly per [§3](#3-pin-the-model-path-a-only); and lower `curator.limits.max_candidates_per_run` to 16–24 for a ~30B MoE, 8–12 for ≤8B |
 | `agora doctor` prints `brain qwen: ollama … UNREACHABLE (… Connection refused …)` and exits `1` | No Ollama daemon on the configured host (`$AGORA_OLLAMA_HOST`, default `http://localhost:11434` — `adapters/ollama_brain.py:79,1315`) | Start it (`ollama serve`), **or** wire a CLI agent per [§1.2 Path B](#path-b--a-headless-cli-agent-no-model-download-adr-0016) — reading its hosted-service warning first. On a deliberately brain-less host, `--skip-probe` |
-| `agora curate` fails on a host where `agora doctor` said `status: healthy` | Doctor proved **presence**, not function. With an argv `--model` pin it never contacts the daemon at all ([§3](#3-pin-the-model-path-a-only), `cli.py:2150-2156`); for a non-Ollama backend the probe is a `shutil.which` PATH lookup and nothing more (`cli.py:2242-2278`) | `curl -fsS "$AGORA_OLLAMA_HOST/api/tags"` for the daemon; otherwise treat a `agora curate --force` that reaches `status: published` as the only real proof the brain answers |
-| `agora web` dies with a traceback ending `ModuleNotFoundError: No module named 'fastapi'` | The `web` extra is not installed. The clean message `_cmd_web` intends (`cli.py:1517-1527`) does **not** fire: `uvicorn` arrives transitively with `fastmcp`, so both guarded imports succeed and the real failure lands later at `build_app` (verified in a core-only venv). No issue tracks this yet; it is a cosmetic guard, not a functional defect — and the message it would print names a `pip install 'agora-kb[web]'` that cannot work anyway, since there is no PyPI distribution ([§0](#0-before-you-start)) | `uv sync --extra web --extra ingest --extra metrics` — see [§2](#2-install) |
+| `agora curate` fails on a host where `agora doctor` said `status: healthy` | Doctor proved **presence**, not function. The daemon is contacted on every path since #129, but an argv-pinned model is reported *without being verified installed* ([§3](#what-the-argv-pin-does-and-does-not-check)); and for a non-Ollama backend the probe only asks whether `argv[0]` resolves and is executable | `ollama show '<tag>'` for the pinned model; otherwise treat an `agora curate --force` that reaches `status: published` as the only real proof the brain answers |
+| `agora web` dies with a traceback ending `ModuleNotFoundError: No module named 'fastapi'` | The `web` extra is not installed. The clean message `_cmd_web` intends (`cli.py` `_cmd_web`) does **not** fire: `uvicorn` arrives transitively with `fastmcp`, so both guarded imports succeed and the real failure lands later at `build_app` (verified in a core-only venv). No issue tracks this yet; it is a cosmetic guard, not a functional defect — and the message it would print names a `pip install 'agora-kb[web]'` that cannot work anyway, since there is no PyPI distribution ([§0](#0-before-you-start)) | `uv sync --extra web --extra ingest --extra metrics` — see [§2](#2-install) |
 | `agora curate` prints `status: failed` with a `failed_record:` path, and the exit code is still `0` | A failing run is normal self-healing, not a crash: within-budget events go back to `inbox/` and `agora curate` returns `0` deliberately so cron/systemd do not manufacture a restart loop (`cli.py:618-625`). The cause is on stdout and in `_kb/failed/<date>/<run-id>/error.json` | Read the `failed_checks:` line, then `uv run agora status --repo /tmp/my-kb` for `last_failure: UNRESOLVED …`. Once the budget is exhausted the events are terminal; return them with `agora requeue` — **never hand-move files inside `_kb/`**. The full lifecycle, including `--reset-attempts` and `_kb/requeued/`, is [`LIMITATIONS.md`](LIMITATIONS.md) |
 | `agora curate` prints `should_run: False` / `reason: none` / `note: no consolidation run was due` | **The inbox is empty.** No trigger fires over depth 0 — threshold needs `depth >= threshold` (min 1), idle needs `depth > 0`, and cron explicitly refuses an empty inbox (`curator/triggers.py:116-130`). On a repo that *has* captures this is not the message you get: a never-run repo fires `reason: cron` immediately | Capture something (step 3) and re-run. `--force` still prints `should_run: True` but a run over an empty inbox changes nothing |
-| `agora doctor` says `status: healthy` in a directory that is not a knowledge repo | Deliberate: an **absent** `adapters.yaml` is "setup not done", not a misconfiguration, so it passes with `brains: not probed (no adapters.yaml — no backend configured)` (`cli.py:2315-2322`) | Check the `repo …: not initialized (run 'agora repo init')` line — that is the one telling you where you are |
+| `agora doctor` says `status: healthy` in a directory that is not a knowledge repo | Deliberate: an **absent** `adapters.yaml` is "setup not done", not a misconfiguration, so it passes with `brains: not probed (no adapters.yaml — no backend configured)` (`cli.py` `_doctor_brains`) | Check the `repo …: not initialized (run 'agora repo init')` line — that is the one telling you where you are |
 | `pytest` or `ruff` is suddenly "command not found" after an install step | A bare `uv sync` pruned them; `dev` is an *extra*, not a dependency group (`pyproject.toml:42-48`) | Re-run the full command in [§2](#2-install). Confirm before you sync next time with `uv sync --dry-run` |
 
 ## 7. Next steps

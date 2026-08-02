@@ -236,9 +236,23 @@ ADR. Until it is written, multi-machine curation is unsupported, not merely undo
 > kernel sandbox at all**, and the deterministic FINAL-DIFF gate is the entire boundary. This is by
 > design, not an oversight — the Ollama shim couples inference and file-writing and needs loopback
 > to reach the daemon (ADR-0013 Context) — but it means `agora doctor`'s `sandbox: seatbelt (ok)`
-> line tells you *the mechanism works on this host*, **not** *your brain is confined*. Everything
-> below is therefore about the configuration you opt into with `network: none`, plus the flag that
-> weakens it further.
+> line tells you *the mechanism works on this host*, **not** *your brain is confined*. Since #129
+> doctor answers the second question on its own line, per act, so you never have to infer it:
+>
+> ```
+>   sandbox: seatbelt (ok)
+>     …
+>     confines this repo's brains: NO — outside: plan=qwen (network: loopback), author=qwen (network: loopback) (only a network: none author is confined; PASS-1 never is)
+> ```
+>
+> **That line can never read `yes`**, in any configuration. `SubprocessBackend.plan` passes
+> `confine=False` unconditionally, so PASS-1 is outside the sandbox even for a `network: none`
+> backend; `PARTIAL` is the strongest true answer. It also reads `NO` — not `PARTIAL` — when the
+> host has no kernel sandbox, when the self-test failed, or when the flag below selected the
+> `restricted` fallback.
+>
+> Everything below is therefore about the configuration you opt into with `network: none`, plus the
+> flag that weakens it further.
 
 **What is true.** The flag defaults to `false` and the default posture is fail-closed: with no
 usable kernel sandbox, backend selection raises `SandboxUnavailable` and the run fails rather than
@@ -414,11 +428,13 @@ agora status --repo /ABSOLUTE/PATH/TO/knowledge-repo
 **What a green `agora doctor` does and does not prove.** Step 3 is the step everything else depends
 on, so be precise about the evidence. Doctor's brain check establishes **presence**, not function:
 
-- For a non-Ollama argv it is a `shutil.which` PATH lookup and nothing more (`cli.py:2242-2278`) —
-  a brain that is installed but broken reads `status: healthy`.
-- For an Ollama backend pinned with `--model` in the argv it does not contact the daemon **at all**
-  (`cli.py:2150-2156`); the line says so itself with `reachability NOT checked`. Verified: with the
-  daemon down and a pinned argv, doctor exits `0` and prints `status: healthy`.
+- For a non-Ollama argv it asks only whether `argv[0]` resolves and is executable — a brain that is
+  installed but broken reads `status: healthy`.
+- For an Ollama backend it establishes that the daemon **answers**, on every path including a
+  `--model` pin in the argv (#129). What it does not establish is that the *pinned tag is
+  installed*: `/api/tags` returns fully-qualified `name:tag` while Ollama resolves an unqualified
+  name to `:latest`, so exact membership is not a sound existence test. The line says so itself
+  with `the pin is NOT verified installed`; `ollama show '<tag>'` is the check that answers it.
 
 That matters here because step 5 spends a resource. The only thing that proves the cause is fixed is
 **a run that reaches `status: published`**. So: fix, then `agora requeue --dry-run` to see the
@@ -511,12 +527,13 @@ status: unhealthy
 # ---  argv: [agora-ollama-brain, --model, qwen3.6:35b-a3b]                  ---
 $ agora doctor --repo …/demo-kb
 …
-  brain qwen: ollama http://localhost:11434, model pinned to 'qwen3.6:35b-a3b' by adapters.yaml argv (no /api/tags probe — the run lists no models either; reachability NOT checked)
+  brain qwen: ollama http://localhost:11434 reachable, model pinned to 'qwen3.6:35b-a3b' by adapters.yaml argv (no /api/tags probe — the run lists no models either; the pin is NOT verified installed)
 …
   requeue: 1 terminal event in _kb/failed/ — fix the cause above, then 'agora requeue --all' returns the backlog to the inbox
 status: healthy
-# exit code: 0 — and note the parenthetical: this verdict did NOT contact the daemon.
-#                Green here proves presence, not function. See "what a green doctor proves".
+# exit code: 0 — the daemon answered, but note the parenthetical: nothing here proves that
+#                PINNED TAG is installed. Green proves presence, not function. See "what a
+#                green doctor proves".
 
 $ agora requeue --repo …/demo-kb --all --dry-run
 warning: the last curator failure is still UNRESOLVED (run=2026-07-31T16-22-44.409Z--e19beb record=…) — run 'agora doctor' first; a requeued event goes terminal again on the next failing run
