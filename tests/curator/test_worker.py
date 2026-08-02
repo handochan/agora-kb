@@ -1,7 +1,10 @@
 """Tests for the capstone transactional curator run-loop + recovery (ADR-0008/0011, DESIGN §4).
 
 ZERO real model: every run is driven by a :class:`FakeBackend` built with a canned ``plan.json``
-string + a ``{candidate_id: prose}`` map. Success is graded as a pure function of
+string + a prose map keyed by the PERSISTED, run-scoped region id
+``region_sentinel_id(plan.run_id, candidate_id)`` — NOT the bare per-run ``candidate_id`` (#121;
+the module-level :func:`_no_unintended_prose_pending` guard below enforces that). Success is graded
+as a pure function of
 ``(plan, git_diff, manifest, lint)`` (ADR-0011 §4), so a fake brain is sufficient to exercise the
 entire integrity boundary. We cover the four contractually-distinct outcomes:
 
@@ -18,6 +21,7 @@ from __future__ import annotations
 
 import json
 import os
+from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -135,6 +139,77 @@ def _run(repo: Repo, backend: Backend, *, now: datetime = NOW) -> RunReport:
         state_store=StateStore(repo.layout),
         now=now,
         taxonomy=TAXONOMY,
+    )
+
+
+# --- the prose-fake contract + the pending guard (#121) -----------------------------------------
+#
+# ``FakeBackend.author`` looks prose up by the id it is HANDED in ``needs_prose`` — the persisted,
+# run-scoped ``region_sentinel_id(plan.run_id, candidate_id)`` APPLY stamped into the note — never
+# the bare per-run ``candidate_id``. ~30 call sites here passed ``prose={"c1": …}``, which matches
+# NOTHING: PASS 2 wrote no prose and the note published carrying APPLY's ``_summary pending_``
+# placeholder, while the test asserted ``published`` and never looked at a body. That is the exact
+# #115 failure shape — a published assertion with no body oracle — reproduced inside the tests
+# meant to guard against it. The guard below is that oracle, applied to EVERY run in this file.
+
+# The prose map for a run whose PLAN never survives the §4.1 gate (or that claims nothing at all):
+# PASS 2 is never invoked, so the map is never read and its keys cannot matter. A NAMED constant
+# rather than an inline ``{"c1": "unreachable"}`` so the bare id reads as the deliberate statement
+# it is — "no prose can land on this path" — instead of looking like the #121 bug it resembles.
+PLAN_REJECTED_PROSE = {"c1": "unreachable: the plan is rejected before PASS 2 is ever invoked"}
+
+
+@pytest.fixture
+def prose_pending_is_the_point() -> None:
+    """Opt out of :func:`_no_unintended_prose_pending` — a pending region IS this test's subject.
+
+    Requested BY NAME in the signature, so "this run publishes a placeholder body" is a claim the
+    test makes out loud rather than a silence. Used by the #115 degrade shapes (a PASS 2 that wrote
+    nothing / was rejected) and by the #119 cross-run shapes (a note carrying a legitimate
+    ``body_status: pending`` owed by an EARLIER run).
+    """
+
+
+@pytest.fixture(autouse=True)
+def _no_unintended_prose_pending(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+) -> Iterator[None]:
+    """Fail any test in this file that publishes a placeholder body without saying so (#121).
+
+    The oracle is ``_unauthored_regions`` — the worker's OWN §4.2 per-region verdict — rather than
+    ``report.counts["prose_pending"]``, because a FAILED run's counts carry no such key at all
+    (``{"retried": 1}``), and the failed paths are precisely where the silent gaps hid: the
+    final-diff, lint and CAS tests all reach PASS 2 before their gate rejects them, so a mismatched
+    prose key there quietly made "the brain authored legit prose" false in fixtures whose docstrings
+    assert it. Spying on the worker's module attribute leaves the two direct unit tests of
+    ``_unauthored_regions`` (which import the function itself) untouched, as it should.
+
+    Whole-suite inventory taken while writing this: the only OTHER runs that leave a region
+    unauthored are ``tests/test_cli.py::test_curate_warns_loudly_when_pass2_authors_no_prose`` and
+    ``tests/core/test_sentinel.py::test_grader_agrees_with_the_run_scoped_unauthored_regions_verdict``
+    — both deliberate, and both named for it.
+    """
+    original = worker_mod._unauthored_regions
+    pending: list[tuple[str, str]] = []
+
+    def spy(
+        needs_prose: dict[str, list[str]],
+        per_file_old: dict[str, str],
+        per_file_new: dict[str, str],
+    ) -> list[tuple[str, str]]:
+        unauthored = original(needs_prose, per_file_old, per_file_new)
+        pending.extend(unauthored)
+        return unauthored
+
+    monkeypatch.setattr(worker_mod, "_unauthored_regions", spy)
+    yield
+    if "prose_pending_is_the_point" in request.fixturenames:
+        return
+    assert not pending, (
+        f"PASS 2 left {len(pending)} body region(s) unauthored, so this test published placeholder "
+        f"bodies while asserting nothing about them: {pending}. Key the FakeBackend prose map with "
+        "region_sentinel_id(<the plan's run_id>, 'c1') — or, if a pending region IS the point, "
+        "request the `prose_pending_is_the_point` fixture."
     )
 
 
@@ -267,6 +342,11 @@ def test_happy_path_publishes_theme_advances_ref_and_finalizes(tmp_path: Path) -
         fm, _ = frontmatter.parse(theme_text)
         assert fm["created"] == RUN_DATE
         assert fm["updated"] == RUN_DATE
+        # #119 criterion (a): PASS 2 really filled the region, so the worker RETRACTED APPLY's
+        # `body_status: pending` before the §4.4 lint. The key is the schema's "this note still
+        # owes prose" signal (ADR-0010 §2.6) — leaving it set on a published, authored note made
+        # that signal worthless to every reader.
+        assert "body_status" not in fm
 
     # Events moved to processed/<date>/; the inbox is drained.
     processed = layout.processed_dir / RUN_DATE
@@ -488,7 +568,13 @@ def test_sync_failure_after_publish_does_not_unpublish_or_unfinalize(tmp_path: P
     repo.sync_to_branch = boom  # type: ignore[method-assign]
 
     report = _run(
-        repo, FakeBackend(plan, prose={"c1": "The single curator holds a per-repo flock."})
+        repo,
+        FakeBackend(
+            plan,
+            prose={
+                region_sentinel_id("ignored", "c1"): "The single curator holds a per-repo flock."
+            },
+        ),
     )
 
     # The run is STILL published and the commit is durable in git despite the sync failure.
@@ -497,6 +583,11 @@ def test_sync_failure_after_publish_does_not_unpublish_or_unfinalize(tmp_path: P
     assert new_tip is not None
     assert new_tip != base
     assert repo.branch_commit() == new_tip  # durable: the curated ref advanced
+    # ...and what it published is a REAL note, not a placeholder (#121). The owner working copy is
+    # deliberately stuck at the old tip here, so the published COMMIT is the only honest source.
+    with repo.worktree(at=new_tip) as published:
+        theme = published / "wiki" / "ai-tech" / "themes" / "curator-concurrency.md"
+        assert "The single curator holds a per-repo flock." in theme.read_text(encoding="utf-8")
     # The stuck working copy is surfaced as an observable signal, not silently swallowed.
     assert report.counts.get("owner_working_copy_unsynced") == 1
     # ADR-0012 §2 / #26: because the working copy is UNSYNCED, the index rebuild is skipped (the
@@ -552,7 +643,7 @@ def test_failed_run_leaves_owner_working_copy_unchanged(tmp_path: Path) -> None:
             ],
         }
     )
-    report = _run(repo, FakeBackend(bad_plan, prose={"c1": "unreachable"}))
+    report = _run(repo, FakeBackend(bad_plan, prose=PLAN_REJECTED_PROSE))
 
     assert report.status == "failed"
     assert repo.head_commit() == base  # the owner working copy never advanced
@@ -597,7 +688,7 @@ def test_invalid_plan_fails_leaves_branch_unchanged_and_events_in_failed(tmp_pat
             ],
         }
     )
-    report = _run(repo, FakeBackend(bad_plan, prose={"c1": "unreachable"}))
+    report = _run(repo, FakeBackend(bad_plan, prose=PLAN_REJECTED_PROSE))
 
     assert report.status == "failed"
     # The curated branch never moved (nothing published).
@@ -641,7 +732,9 @@ def test_merge_targeting_a_moc_is_rejected_by_validate_plan_not_crash_apply(tmp_
         repo,
         FakeBackend(
             _create_theme_plan("ignored", "c1", e0),
-            prose={"c1": "The single curator holds a per-repo flock."},
+            prose={
+                region_sentinel_id("ignored", "c1"): "The single curator holds a per-repo flock."
+            },
         ),
     )
     assert report0.status == "published"
@@ -649,6 +742,10 @@ def test_merge_targeting_a_moc_is_rejected_by_validate_plan_not_crash_apply(tmp_
     with repo.worktree(at=repo.branch_commit()) as wt:
         assert (wt / "wiki" / "ai-tech" / "ai-tech-moc.md").is_file()
         assert not (wt / "wiki" / "ai-tech" / "themes" / "ai-tech-moc.md").exists()
+        # The setup publish is a real authored theme, not a placeholder one (#121) — run 2's
+        # rejection has to be attributable to the MOC target, not to a half-built run 1.
+        theme = wt / "wiki" / "ai-tech" / "themes" / "curator-concurrency.md"
+        assert "The single curator holds a per-repo flock." in theme.read_text(encoding="utf-8")
 
     # Run 2: a MERGE_INTO_THEME whose target is the MOC basename — in live_basenames, NOT a theme.
     e1 = _write_capture(inbox, text="A claim that overlaps an existing topic.", second=10)
@@ -680,7 +777,7 @@ def test_merge_targeting_a_moc_is_rejected_by_validate_plan_not_crash_apply(tmp_
             ],
         }
     )
-    report = _run(repo, FakeBackend(bad_plan, prose={"c1": "unreachable"}))
+    report = _run(repo, FakeBackend(bad_plan, prose=PLAN_REJECTED_PROSE))
 
     # The run FAILS at the PLAN gate (BASENAME), publishing NOTHING — never an uncaught ApplyError.
     assert report.status == "failed"
@@ -737,7 +834,7 @@ def test_plan_failure_goes_terminal_to_failed_at_retry_budget(tmp_path: Path) ->
     # Run the curator three times; the same event keeps coming back to inbox/ and is re-claimed.
     last = None
     for _ in range(3):
-        last = _run(repo, FakeBackend(bad_plan_for(e1), prose={"c1": "x"}))
+        last = _run(repo, FakeBackend(bad_plan_for(e1), prose=PLAN_REJECTED_PROSE))
         assert last.status == "failed"
         assert repo.branch_commit() == base  # nothing ever published
 
@@ -778,10 +875,18 @@ def test_recover_finalizes_a_published_crashed_run_without_backend(tmp_path: Pat
     e1 = _write_capture(inbox, text="One curator advances the branch under a lock.", second=10)
     _seed_raw(repo, e1)
     plan = _create_theme_plan("ignored", "c1", e1)
-    report = _run(repo, FakeBackend(plan, prose={"c1": "Single-writer detail."}))
+    report = _run(
+        repo,
+        FakeBackend(plan, prose={region_sentinel_id("ignored", "c1"): "Single-writer detail."}),
+    )
     assert report.status == "published"
     published_commit = report.published_commit
     assert published_commit is not None
+    # The commit the crashed run is then rewound onto is a REAL publish, prose and all (#121):
+    # recovery must be shown finalizing a genuine tip, not one holding a placeholder body. The
+    # owner working copy is at that tip (read-after-publish), so it is the same bytes.
+    theme = layout.wiki_dir / "ai-tech" / "themes" / "curator-concurrency.md"
+    assert "Single-writer detail." in theme.read_text(encoding="utf-8")
 
     # Simulate a crash AFTER the CAS landed but BEFORE finalize: rewind the manifest to
     # phase=published (events still claimed in processing/, state lacks the run, processed/ empty).
@@ -905,10 +1010,17 @@ def _seed_theme_and_harvested(tmp_path: Path) -> tuple[Repo, str, str]:
         repo,
         FakeBackend(
             _create_theme_plan("ignored", "c1", e0),
-            prose={"c1": "The single curator holds a per-repo flock."},
+            prose={
+                region_sentinel_id("ignored", "c1"): "The single curator holds a per-repo flock."
+            },
         ),
     )
     assert report0.status == "published"
+    # The MERGE target is a fully-authored theme (#121). Every caller below merges a harvested
+    # candidate INTO this note, so a target published with a placeholder body would leave each of
+    # them asserting cursor arithmetic over a note that never held any knowledge.
+    target = repo.layout.wiki_dir / "ai-tech" / "themes" / "curator-concurrency.md"
+    assert "The single curator holds a per-repo flock." in target.read_text(encoding="utf-8")
 
     # Configure the connector + queue two harvested gated candidates (distinct content → c1, c2).
     _write_adapters_yaml(layout, "demo-agent")
@@ -932,7 +1044,10 @@ def test_harvest_cursor_accepted_rejected_bumped_after_finalize(tmp_path: Path) 
 
     plan = _merge_and_drop_plan("merge-run", e_merge, e_drop, "curator-concurrency")
     report = _run(
-        repo, FakeBackend(plan, prose={"merge-run--c1": "Harvested corroboration prose."})
+        repo,
+        FakeBackend(
+            plan, prose={region_sentinel_id("merge-run", "c1"): "Harvested corroboration prose."}
+        ),
     )
     assert report.status == "published"
 
@@ -985,7 +1100,11 @@ def test_phase3_exit_web_upload_becomes_a_queryable_curated_note(tmp_path: Path)
         repo,
         FakeBackend(
             _create_theme_plan("exit-run", "c1", event_id),
-            prose={"c1": "The single curator serializes every wiki write behind one flock."},
+            prose={
+                region_sentinel_id("exit-run", "c1"): (
+                    "The single curator serializes every wiki write behind one flock."
+                )
+            },
         ),
     )
     assert report.status == "published"
@@ -995,6 +1114,11 @@ def test_phase3_exit_web_upload_becomes_a_queryable_curated_note(tmp_path: Path)
     assert result["status"] == "ok"
     assert result["hits"]
     assert any(hit["path"].endswith("curator-concurrency.md") for hit in result["hits"])
+    # The exit criterion says "becomes a linked wiki NOTE", so the note has to hold the prose PASS 2
+    # authored. Keyed bare, this whole chain ended on APPLY's `_summary pending_` placeholder and
+    # the query hit above was the only thing anyone checked (#121).
+    theme = repo.layout.wiki_dir / "ai-tech" / "themes" / "curator-concurrency.md"
+    assert "serializes every wiki write behind one flock" in theme.read_text(encoding="utf-8")
 
 
 def test_harvest_cursor_not_bumped_for_unconfigured_connector(tmp_path: Path) -> None:
@@ -1008,7 +1132,10 @@ def test_harvest_cursor_not_bumped_for_unconfigured_connector(tmp_path: Path) ->
 
     plan = _merge_and_drop_plan("merge-run", e_merge, e_drop, "curator-concurrency")
     report = _run(
-        repo, FakeBackend(plan, prose={"merge-run--c1": "Harvested corroboration prose."})
+        repo,
+        FakeBackend(
+            plan, prose={region_sentinel_id("merge-run", "c1"): "Harvested corroboration prose."}
+        ),
     )
     assert report.status == "published"
 
@@ -1034,7 +1161,10 @@ def test_harvest_cursor_increment_is_not_double_counted_on_recovery(tmp_path: Pa
 
     plan = _merge_and_drop_plan("merge-run", e_merge, e_drop, "curator-concurrency")
     report = _run(
-        repo, FakeBackend(plan, prose={"merge-run--c1": "Harvested corroboration prose."})
+        repo,
+        FakeBackend(
+            plan, prose={region_sentinel_id("merge-run", "c1"): "Harvested corroboration prose."}
+        ),
     )
     assert report.status == "published"
     assert report.run_id is not None
@@ -1098,7 +1228,10 @@ def test_harvest_cursor_io_error_does_not_abort_an_already_published_run(
 
     plan = _merge_and_drop_plan("merge-run", e_merge, e_drop, "curator-concurrency")
     report = _run(
-        repo, FakeBackend(plan, prose={"merge-run--c1": "Harvested corroboration prose."})
+        repo,
+        FakeBackend(
+            plan, prose={region_sentinel_id("merge-run", "c1"): "Harvested corroboration prose."}
+        ),
     )
 
     # The publish is unperturbed: status published, the diff is durable in git.
@@ -1225,7 +1358,10 @@ class _RawForgingBackend(FakeBackend):
 # --- (5) §4.2 AUTHOR degrade-or-publish ---------------------------------------------------------
 
 
-def test_author_failure_degrades_prose_but_run_still_publishes(tmp_path: Path) -> None:
+def test_author_failure_degrades_prose_but_run_still_publishes(
+    tmp_path: Path, prose_pending_is_the_point: None
+) -> None:
+    """The §4.2 degrade path DELIBERATELY publishes a placeholder body — asserted below."""
     repo = _init_repo(tmp_path)
     layout = repo.layout
     inbox = Inbox(layout)
@@ -1271,7 +1407,9 @@ class _SilentBackend(FakeBackend):
         return ["AUTHOR wiki/x.md [c1]: backend 'stub' exited 1: bwrap: execvp …: No such file"]
 
 
-def test_author_that_writes_nothing_publishes_but_reports_prose_pending(tmp_path: Path) -> None:
+def test_author_that_writes_nothing_publishes_but_reports_prose_pending(
+    tmp_path: Path, prose_pending_is_the_point: None
+) -> None:
     """A PASS 2 that authors NOTHING must not be reported as an unqualified success (#115).
 
     The §4.2 validator only ever saw CHANGED files, so a backend that wrote nothing produced an
@@ -1381,7 +1519,14 @@ def test_off_allowlist_file_is_rejected_by_final_diff_gate(tmp_path: Path) -> No
     # The backend plants a file OUTSIDE the allowlist (_templates/) AND a scratch file. The §4.0
     # final-diff gate must FAIL the run and publish nothing; the scratch file is git-ignored so it
     # never even reaches the diff (it would otherwise be a second violation).
-    report = _run(repo, _OffAllowlistBackend(plan, prose={"c1": "detail"}))
+    # The prose is keyed run-scoped so PASS 2 genuinely authors the region (#121): the rejection
+    # under test must be attributable to the planted path ALONE, not to a pass that wrote nothing.
+    report = _run(
+        repo,
+        _OffAllowlistBackend(
+            plan, prose={region_sentinel_id("ignored", "c1"): "A legitimately authored region."}
+        ),
+    )
 
     assert report.status == "failed"
     assert repo.branch_commit() == base  # nothing published
@@ -1418,8 +1563,13 @@ def test_brain_cannot_forge_or_plant_raw_during_pass2(tmp_path: Path) -> None:
 
     forge_ref = f"raw/ai-tech/{e1}.md"  # the engine-materialized source the brain overwrites
     plant_ref = "raw/ai-tech/planted-by-brain.md"  # a brand-new raw/ file the brain plants
+    # Run-scoped key so "beyond authoring legit prose" in the fixture's docstring is TRUE (#121):
+    # the forge/plant must be rejected even on a pass whose in-region work was otherwise valid.
     backend = _RawForgingBackend(
-        plan, forge_ref=forge_ref, plant_ref=plant_ref, prose={"c1": "legit prose"}
+        plan,
+        forge_ref=forge_ref,
+        plant_ref=plant_ref,
+        prose={region_sentinel_id("ignored", "c1"): "legit prose"},
     )
 
     report = _run(repo, backend)
@@ -1445,12 +1595,21 @@ def test_scratch_only_writes_do_not_break_publish(tmp_path: Path) -> None:
 
     # A backend that writes legit prose PLUS scratch under _agora_scratch/ still publishes cleanly —
     # the worktree .gitignore exclude keeps the scratch out of the curated diff (§4.3).
-    report = _run(repo, _ScratchOnlyBackend(plan, prose={"c1": "detail"}))
+    report = _run(
+        repo,
+        _ScratchOnlyBackend(
+            plan, prose={region_sentinel_id("ignored", "c1"): "A legitimately authored region."}
+        ),
+    )
 
     assert report.status == "published"
     with repo.worktree(at=report.published_commit) as published:  # type: ignore[arg-type]
         # The scratch dir is NOT part of the published tree.
         assert not (published / "_agora_scratch").exists()
+        # ...and the "legit prose PLUS scratch" this test names really is legit: the region the
+        # backend authored is in the published body. Keyed bare, it never was (#121).
+        theme = published / "wiki" / "ai-tech" / "themes" / "curator-concurrency.md"
+        assert "A legitimately authored region." in theme.read_text(encoding="utf-8")
 
 
 # --- (7) LINT failure after a real APPLY+commit -------------------------------------------------
@@ -1477,7 +1636,11 @@ def test_lint_failure_after_apply_discards_diff_leaves_branch_unchanged(tmp_path
     base = repo.head_commit()
     plan = _create_theme_plan("ignored", "c1", e1)
 
-    report = _run(repo, FakeBackend(plan, prose={"c1": "detail"}))
+    # PASS 2 runs and succeeds here (run-scoped key, #121) — the discard under test is the LINT
+    # gate's alone, so the prose pass must not be silently failing underneath it.
+    report = _run(
+        repo, FakeBackend(plan, prose={region_sentinel_id("ignored", "c1"): "Authored detail."})
+    )
 
     assert report.status == "failed"
     assert repo.branch_commit() == base  # the load-bearing guarantee: discard-after-commit
@@ -1485,6 +1648,79 @@ def test_lint_failure_after_apply_discards_diff_leaves_branch_unchanged(tmp_path
     assert error_files
     checks = json.loads(error_files[0].read_text(encoding="utf-8"))["failed_checks"]
     assert any(c.startswith("LINT") for c in checks)
+
+
+def test_lint_failure_reasons_carry_errors_only_not_l2_warnings(tmp_path: Path) -> None:
+    """A WARNING is not a failed check — and since #119 there can be unboundedly many of them.
+
+    L2-6 fires once per note still carrying a stale ``body_status``, which is EVERY note on a repo
+    published by a pre-#119 build. ``lint`` sorts findings by ``(path, code)``, so passing warnings
+    into ``_fail(reasons=...)`` would push the real error behind them on both truncating operator
+    surfaces: ``RunFailure.summary(limit=3)`` (the ``failed_checks:`` line ``agora curate`` and the
+    ``agora watch`` tick print) and ``LastFailure``, which keeps only ``MAX_FAILURE_REASONS``.
+
+    The legacy notes here are planted directly on the branch — exactly the shape an upgrade leaves
+    behind — and are alphabetically BEFORE the note that actually fails, so a regression that lets
+    warnings through is caught by the ordering rather than by luck.
+    """
+    repo = _init_repo(tmp_path)
+    layout = repo.layout
+    inbox = Inbox(layout)
+
+    themes = layout.root / "wiki" / "ai-tech" / "themes"
+    themes.mkdir(parents=True, exist_ok=True)
+    for i in range(4):
+        sid = f"2026-06-13T03-00-00.000Z--legacy--c{i}"
+        (themes / f"aa-legacy-{i}.md").write_text(
+            "---\n"
+            f"title: Legacy {i}\ntype: theme\ndomain: ai-tech\ntags: []\naliases: []\n"
+            "created: 2026-06-12\nupdated: 2026-06-12\nstatus: stub\n"
+            f"summary: A legacy note {i}.\ndescription: A legacy note {i}.\n"
+            "sources: []\nrelated: []\nconfidence: high\n"
+            # `status: stub` keeps the note L1-7-exempt (a non-stub theme needs non-empty
+            # `sources:`), so L2-6 is the ONLY finding these notes contribute — which is what makes
+            # the ordering assertion below meaningful rather than accidental.
+            "body_status: pending\n"  # the stale flag a pre-#119 build left behind
+            "---\n\n"
+            f"# Legacy {i}\n\n"
+            f"<!-- agora:body:start id={sid} -->\n"
+            "Authored prose, so L2-6 fires: the flag survives over a body with no pending region.\n"
+            f"<!-- agora:body:end id={sid} -->\n",
+            encoding="utf-8",
+        )
+    repo.commit_all("plant legacy prose-pending notes", when=datetime(2026, 6, 12, tzinfo=UTC))
+
+    lint_before = lint(layout, taxonomy=TAXONOMY, run_date=RUN_DATE)
+    stale = [f for f in lint_before.findings if f.code == "L2-6"]
+    assert len(stale) == 4, "precondition: every planted note must emit its own L2-6 warning"
+    assert lint_before.ok, "L2-6 is a warning — it must never flip the gate"
+
+    # Now make the run fail for a REAL reason: a cited source that does not exist (L1-8, error).
+    e1 = inbox.write(
+        text="One curator advances the branch under a lock.",
+        writer="dochan",
+        source="claude-code",
+        domain="ai-tech",
+        raw_ref="raw/ai-tech/missing-upload.md",
+        now=datetime(2026, 6, 13, 2, 40, 10, tzinfo=UTC),
+    ).id
+    report = _run(
+        repo,
+        FakeBackend(
+            _create_theme_plan("ignored", "c1", e1),
+            prose={region_sentinel_id("ignored", "c1"): "Authored detail."},
+        ),
+    )
+
+    assert report.status == "failed"
+    checks = json.loads(next(layout.failed_dir.rglob("error.json")).read_text(encoding="utf-8"))[
+        "failed_checks"
+    ]
+    assert checks, "the failure must still say why it failed"
+    assert not any("L2-6" in c for c in checks), f"warnings leaked into failed_checks: {checks}"
+    assert all(c.startswith("LINT L1") for c in checks)
+    # The operator-facing one-liner is the surface that actually truncates.
+    assert "L2-6" not in report.failure.summary()
 
 
 # --- (8) CAS conflict ---------------------------------------------------------------------------
@@ -1503,7 +1739,9 @@ def test_cas_conflict_publishes_nothing_and_retries_without_burning_budget(tmp_p
     # Force a CAS conflict by monkeypatching compare_and_swap_branch to report the ref moved.
     repo.compare_and_swap_branch = lambda *, expected, new, branch=None: False  # type: ignore[method-assign]
 
-    report = _run(repo, FakeBackend(plan, prose={"c1": "detail"}))
+    report = _run(
+        repo, FakeBackend(plan, prose={region_sentinel_id("ignored", "c1"): "Authored detail."})
+    )
 
     assert report.status == "failed"
     assert repo.branch_commit() == base  # nothing partial published
@@ -1602,8 +1840,15 @@ def test_keyed_capture_records_event_key_and_dedups_a_later_retry(tmp_path: Path
     _seed_raw(repo, e1)
     plan = _create_theme_plan("ignored", "c1", e1)
 
-    report = _run(repo, FakeBackend(plan, prose={"c1": "detail"}))
+    report = _run(
+        repo,
+        FakeBackend(plan, prose={region_sentinel_id("ignored", "c1"): "One flock, one writer."}),
+    )
     assert report.status == "published"
+    # A real publish with a real body — the dedup below is only meaningful if the FIRST delivery
+    # actually became knowledge rather than a placeholder note (#121).
+    theme = layout.wiki_dir / "ai-tech" / "themes" / "curator-concurrency.md"
+    assert "One flock, one writer." in theme.read_text(encoding="utf-8")
 
     # The composite writer:event_key is persisted into state.event_keys (the blocker: this was
     # silently empty when keys were recorded BEFORE the move to processed/).
@@ -1839,9 +2084,18 @@ def test_recover_finalizes_via_git_ref_when_state_missing(tmp_path: Path) -> Non
     # A real publish so the curated ref genuinely points at a run commit.
     e1 = _write_capture(inbox, text="One curator advances the branch under a lock.", second=10)
     _seed_raw(repo, e1)
-    report = _run(repo, FakeBackend(_create_theme_plan("ignored", "c1", e1), prose={"c1": "x"}))
+    report = _run(
+        repo,
+        FakeBackend(
+            _create_theme_plan("ignored", "c1", e1),
+            prose={region_sentinel_id("ignored", "c1"): "One curator holds a per-repo flock."},
+        ),
+    )
     tip = report.published_commit
     assert tip is not None
+    # A genuine authored publish (#121) — the git-ref recovery below is finalizing a real tip.
+    theme = layout.wiki_dir / "ai-tech" / "themes" / "curator-concurrency.md"
+    assert "One curator holds a per-repo flock." in theme.read_text(encoding="utf-8")
 
     # Simulate the §9 line "CAS succeeded but state.json wasn't recorded" row: a manifest left at
     # phase='applied' prose_complete=True with published_commit==the advanced ref tip, but
@@ -1917,7 +2171,13 @@ def test_recover_does_not_double_publish_after_crash_in_cas_success_window(
     W._advance = faulting_advance  # type: ignore[assignment]
     try:
         try:
-            _run(repo, FakeBackend(plan, prose={"c1": "detail"}))
+            _run(
+                repo,
+                FakeBackend(
+                    plan,
+                    prose={region_sentinel_id("ignored", "c1"): "One curator holds a flock."},
+                ),
+            )
         except RuntimeError:
             pass  # the simulated crash
     finally:
@@ -1950,6 +2210,12 @@ def test_recover_does_not_double_publish_after_crash_in_cas_success_window(
     assert not (layout.inbox_item_path("dochan", e1)).is_file()
     assert repo.branch_commit() == tip  # the ref did not advance a second time
     assert StateStore(layout).load().published_runs[crashed.run_id] == tip
+    # The commit that landed before the crash holds the authored note, and recovery re-published
+    # nothing on top of it: the prose appears EXACTLY once. Keyed bare, the body was a placeholder
+    # and "no double publish" was asserted only over the ref (#121).
+    with repo.worktree(at=tip) as published:
+        theme = published / "wiki" / "ai-tech" / "themes" / "curator-concurrency.md"
+        assert theme.read_text(encoding="utf-8").count("One curator holds a flock.") == 1
 
 
 # --- (16) capture -> consolidate -> publish, end-to-end with NO pre-seeded raw/ -----------------
@@ -2315,7 +2581,7 @@ def test_failed_run_report_carries_the_error_record_path(tmp_path: Path) -> None
     e1 = _write_capture(inbox, text="A fact in a non-existent domain.", second=10)
     _seed_raw(repo, e1)
 
-    report = _run(repo, FakeBackend(_bad_domain_plan(e1), prose={"c1": "unreachable"}))
+    report = _run(repo, FakeBackend(_bad_domain_plan(e1), prose=PLAN_REJECTED_PROSE))
 
     assert report.status == "failed"
     failure = report.failure
@@ -2344,7 +2610,13 @@ def test_cas_conflict_report_has_no_error_record(tmp_path: Path) -> None:
     _seed_raw(repo, e1)
     repo.compare_and_swap_branch = lambda *, expected, new, branch=None: False  # type: ignore[method-assign]
 
-    report = _run(repo, FakeBackend(_create_theme_plan("ignored", "c1", e1), prose={"c1": "x"}))
+    report = _run(
+        repo,
+        FakeBackend(
+            _create_theme_plan("ignored", "c1", e1),
+            prose={region_sentinel_id("ignored", "c1"): "One curator holds a flock."},
+        ),
+    )
 
     assert report.status == "failed"
     failure = report.failure
@@ -2471,14 +2743,21 @@ def test_failure_phase_distinguishes_pre_and_post_apply(tmp_path: Path) -> None:
     # PLAN failure — rejected at the §4.1 gate, long before APPLY.
     e1 = _write_capture(inbox, text="A fact in a non-existent domain.", second=10)
     _seed_raw(repo, e1)
-    plan_report = _run(repo, FakeBackend(_bad_domain_plan(e1), prose={"c1": "unreachable"}))
+    plan_report = _run(repo, FakeBackend(_bad_domain_plan(e1), prose=PLAN_REJECTED_PROSE))
     assert plan_report.failure is not None
     assert plan_report.failure.phase == "claimed"
 
     # LINT failure — a real APPLY + commit happened on the detached worktree first.
     repo2 = _init_repo(tmp_path / "kb2")
     e2 = _lint_failure_event(Inbox(repo2.layout))
-    lint_report = _run(repo2, FakeBackend(_create_theme_plan("ignored", "c1", e2), prose={}))
+    # PASS 2 authors its region successfully; the failure under test is the LINT gate's alone.
+    lint_report = _run(
+        repo2,
+        FakeBackend(
+            _create_theme_plan("ignored", "c1", e2),
+            prose={region_sentinel_id("ignored", "c1"): "One curator holds a flock."},
+        ),
+    )
     assert lint_report.status == "failed"
     assert lint_report.failure is not None
     assert lint_report.failure.phase == "applied"
@@ -2499,7 +2778,7 @@ def test_non_terminal_failure_is_visible_in_state(tmp_path: Path) -> None:
     e1 = _write_capture(inbox, text="A fact in a non-existent domain.", second=10)
     _seed_raw(repo, e1)
 
-    report = _run(repo, FakeBackend(_bad_domain_plan(e1), prose={"c1": "unreachable"}))
+    report = _run(repo, FakeBackend(_bad_domain_plan(e1), prose=PLAN_REJECTED_PROSE))
     assert report.status == "failed"
 
     st = StateStore(layout).load()
@@ -2564,7 +2843,7 @@ def test_publish_leaves_state_semantics_unchanged(tmp_path: Path) -> None:
     e1 = _write_capture(inbox, text="One curator advances the branch under a lock.", second=10)
     _seed_raw(repo, e1)
 
-    failed = _run(repo, FakeBackend(_bad_domain_plan(e1), prose={"c1": "unreachable"}), now=NOW)
+    failed = _run(repo, FakeBackend(_bad_domain_plan(e1), prose=PLAN_REJECTED_PROSE), now=NOW)
     assert failed.status == "failed"
 
     # The event came back to inbox/; run 2 re-claims it with a VALID plan.
@@ -2603,7 +2882,13 @@ def test_cas_conflict_stamps_attempt_but_records_no_failure(tmp_path: Path) -> N
     _seed_raw(repo, e1)
     repo.compare_and_swap_branch = lambda *, expected, new, branch=None: False  # type: ignore[method-assign]
 
-    report = _run(repo, FakeBackend(_create_theme_plan("ignored", "c1", e1), prose={"c1": "x"}))
+    report = _run(
+        repo,
+        FakeBackend(
+            _create_theme_plan("ignored", "c1", e1),
+            prose={region_sentinel_id("ignored", "c1"): "One curator holds a flock."},
+        ),
+    )
     assert report.status == "failed"
 
     st = StateStore(layout).load()
@@ -2628,7 +2913,7 @@ def test_terminal_failure_records_counter_and_last_failure_together(tmp_path: Pa
 
     last = None
     for _ in range(3):  # curator.max_attempts defaults to 3
-        last = _run(repo, FakeBackend(_bad_domain_plan(e1), prose={"c1": "x"}))
+        last = _run(repo, FakeBackend(_bad_domain_plan(e1), prose=PLAN_REJECTED_PROSE))
         assert last.status == "failed"
     assert last is not None
 
@@ -2745,7 +3030,7 @@ def test_failure_state_write_error_becomes_a_warning_not_a_crash(
 
     monkeypatch.setattr(StateStore, "save", flaky_save)
 
-    report = _run(repo, FakeBackend(_bad_domain_plan(e1), prose={"c1": "unreachable"}))
+    report = _run(repo, FakeBackend(_bad_domain_plan(e1), prose=PLAN_REJECTED_PROSE))
 
     assert report.status == "failed"  # the terminal verdict is unchanged...
     assert report.failure is not None  # ...and the cause still reaches the operator
@@ -2782,7 +3067,7 @@ def test_fail_preserves_an_event_whose_inbox_return_is_refused(tmp_path: Path) -
 
     worker_mod.return_event_to_inbox = occupy_then_return  # type: ignore[assignment]
     try:
-        report = _run(repo, FakeBackend(_bad_domain_plan(e1), prose={"c1": "unreachable"}))
+        report = _run(repo, FakeBackend(_bad_domain_plan(e1), prose=PLAN_REJECTED_PROSE))
     finally:
         worker_mod.return_event_to_inbox = real_return  # type: ignore[assignment]
 
@@ -2828,7 +3113,7 @@ def test_a_traversing_frontmatter_id_is_refused_at_claim(tmp_path: Path, hostile
     src.write_text(frontmatter.render(fm, body), encoding="utf-8")
     before = src.read_bytes()
 
-    report = _run(repo, FakeBackend(_bad_domain_plan(e1), prose={"c1": "unreachable"}))
+    report = _run(repo, FakeBackend(_bad_domain_plan(e1), prose=PLAN_REJECTED_PROSE))
 
     # Nothing was claimable, so the run is a clean noop — no crash, no traceback out of run().
     assert report.status == "noop"
@@ -2862,7 +3147,13 @@ def test_cas_conflict_preserves_an_event_whose_return_is_refused(tmp_path: Path)
         status="unreadable", source=event_path, dest=None, detail="refused, for the test"
     )
     try:
-        report = _run(repo, FakeBackend(_create_theme_plan("ignored", "c1", e1), prose={"c1": "x"}))
+        report = _run(
+            repo,
+            FakeBackend(
+                _create_theme_plan("ignored", "c1", e1),
+                prose={region_sentinel_id("ignored", "c1"): "One curator holds a flock."},
+            ),
+        )
     finally:
         worker_mod.return_event_to_inbox = real_return  # type: ignore[assignment]
 
@@ -2936,7 +3227,10 @@ def test_iter_attempt_records_is_the_single_budget_derivation(
     e1 = _write_capture(inbox, text="A fact in a non-existent domain.", second=10)
     _seed_raw(repo, e1)
     for _ in range(2):
-        assert _run(repo, FakeBackend(_bad_domain_plan(e1), prose={"c1": "x"})).status == "failed"
+        assert (
+            _run(repo, FakeBackend(_bad_domain_plan(e1), prose=PLAN_REJECTED_PROSE)).status
+            == "failed"
+        )
 
     records = list(worker_mod.iter_attempt_records(layout))
 
@@ -2971,3 +3265,472 @@ def test_iter_attempt_records_is_the_single_budget_derivation(
         worker_mod, "iter_attempt_records", lambda _layout: iter([(Path("x"), ["spliced"])])
     )
     assert worker_mod._event_attempt_counts(layout) == {"spliced": 1}
+
+
+# --- (17) #119: the worker retracts `body_status: pending` once the prose really lands -----------
+#
+# APPLY stamps `body_status: pending` on every needs_prose note and — until #119 — NOTHING ever
+# removed it, so the schema's "this note still owes prose" signal (ADR-0010 §2.6) was set on every
+# published note and useless to every reader. PASS 2 cannot retract it (validate_author_diff
+# requires frontmatter byte-identity and the model is outside the integrity boundary, ADR-0011 §4),
+# so the worker does it behind the §4.2 gate. The predicate is NOTE-LOCAL, never this run's region
+# ids — the cross-run tests below are what distinguish the two rules.
+
+
+def _merge_plan_two_regions(run_id: str, e1: str, e2: str, target: str) -> str:
+    """Two MERGE_INTO_THEME dispositions into the SAME theme → one note, TWO needs_prose regions.
+
+    APPEND_DAILY would be the other natural two-region shape, but a daily's `run_id:` frontmatter is
+    taken from ``plan.run_id`` while lint L1-14 compares it to the run's INJECTED manifest run_id —
+    which ``run()`` generates internally — so an end-to-end daily plan cannot be canned here. The
+    MERGE shape carries no such coupling.
+    """
+    return json.dumps(
+        {
+            "schema_version": 1,
+            "run_id": run_id,
+            "finished": True,
+            "dispositions": [
+                {
+                    "candidate_id": cid,
+                    "event_ids": [event],
+                    "op": "MERGE_INTO_THEME",
+                    "domain": "ai-tech",
+                    "target_basename": target,
+                    "summary": f"Augmentation {cid}.",
+                    "needs_prose": True,
+                    "reason": "Corroborates an existing theme.",
+                }
+                for cid, event in (("c1", e1), ("c2", e2))
+            ],
+        }
+    )
+
+
+def _merge_plan(run_id: str, event_id: str, target: str) -> str:
+    """A single non-gated MERGE_INTO_THEME that appends a NEW prose region to an existing theme."""
+    return json.dumps(
+        {
+            "schema_version": 1,
+            "run_id": run_id,
+            "finished": True,
+            "dispositions": [
+                {
+                    "candidate_id": "c1",
+                    "event_ids": [event_id],
+                    "op": "MERGE_INTO_THEME",
+                    "domain": "ai-tech",
+                    "target_basename": target,
+                    "summary": "Augments the existing theme.",
+                    "needs_prose": True,
+                    "reason": "Corroborates an existing theme.",
+                }
+            ],
+        }
+    )
+
+
+def _published_theme_fm(repo: Repo, report: RunReport) -> dict[str, object]:
+    """Parse the published `curator-concurrency` theme's frontmatter out of the published commit."""
+    with repo.worktree(at=report.published_commit) as published:  # type: ignore[arg-type]
+        theme = published / "wiki" / "ai-tech" / "themes" / "curator-concurrency.md"
+        fm, _ = frontmatter.parse(theme.read_text(encoding="utf-8"))
+    return fm
+
+
+def test_body_status_cleared_when_pass2_fills_every_region(tmp_path: Path) -> None:
+    """(a) The flag is REMOVED when PASS 2 really authored the prose — and the prose is there.
+
+    Both halves matter together: asserting only "the key is gone" would also pass if the clear ran
+    over an empty region, and asserting only "the prose landed" is the pre-#119 status quo.
+    """
+    repo = _init_repo(tmp_path)
+    inbox = Inbox(repo.layout)
+    e1 = _write_capture(inbox, text="One curator advances the branch under a lock.", second=10)
+    _seed_raw(repo, e1)
+
+    report = _run(
+        repo,
+        FakeBackend(
+            _create_theme_plan("ignored", "c1", e1),
+            prose={region_sentinel_id("ignored", "c1"): "The single curator holds a flock."},
+        ),
+    )
+
+    assert report.status == "published"
+    with repo.worktree(at=report.published_commit) as published:  # type: ignore[arg-type]
+        theme = published / "wiki" / "ai-tech" / "themes" / "curator-concurrency.md"
+        fm, body = frontmatter.parse(theme.read_text(encoding="utf-8"))
+        assert "body_status" not in fm
+        start, end = body_sentinels(region_sentinel_id("ignored", "c1"))
+        region = body[body.find(start) + len(start) : body.find(end)]
+        assert region.strip() == "The single curator holds a flock."
+        # The §4.4 gate the worker ran saw the POST-clear tree — including the new L2-6 rule, which
+        # is the exact inverse of the clear, so a note the worker just wrote can never trip it.
+        result = lint(RepoLayout(published), taxonomy=TAXONOMY, run_date=RUN_DATE)
+        assert result.ok
+        assert all(f.code != "L2-6" for f in result.findings)
+
+
+def _publish_authored_theme(tmp_path: Path) -> Repo:
+    """Run 1: publish `curator-concurrency` with its single region fully authored (flag cleared)."""
+    repo = _init_repo(tmp_path)
+    inbox = Inbox(repo.layout)
+    e0 = _write_capture(inbox, text="One curator advances the branch under a lock.", second=5)
+    _seed_raw(repo, e0)
+    report = _run(
+        repo,
+        FakeBackend(
+            _create_theme_plan("run-one", "c1", e0),
+            prose={region_sentinel_id("run-one", "c1"): "The single curator holds a flock."},
+        ),
+    )
+    assert report.status == "published", report.failure
+    assert "body_status" not in _published_theme_fm(repo, report)
+    return repo
+
+
+def test_body_status_stays_when_only_some_regions_are_authored(
+    tmp_path: Path, prose_pending_is_the_point: None
+) -> None:
+    """A note whose PASS 2 filled 1 of 2 regions legitimately has prose AND a legitimate pending.
+
+    This is the predicate most likely to be got wrong: the rule is "NO region is still a
+    placeholder", not "prose exists anywhere in the note".
+    """
+    repo = _publish_authored_theme(tmp_path)
+    inbox = Inbox(repo.layout)
+    e1 = _write_capture(inbox, text="Curators serialize every wiki write.", second=20)
+    e2 = _write_capture(inbox, text="The inbox is append-only and per-writer.", second=21)
+    _seed_raw(repo, e1, e2)
+
+    report = _run(
+        repo,
+        FakeBackend(
+            _merge_plan_two_regions("run-two", e1, e2, "curator-concurrency"),
+            # prose for c1's region ONLY — c2's stays at APPLY's `_summary pending_`.
+            prose={region_sentinel_id("run-two", "c1"): "The curator serializes every write."},
+        ),
+    )
+
+    assert report.status == "published", report.failure
+    assert report.counts["prose_pending"] == 1  # exactly one region left unauthored (#115)
+    with repo.worktree(at=report.published_commit) as published:  # type: ignore[arg-type]
+        theme = published / "wiki" / "ai-tech" / "themes" / "curator-concurrency.md"
+        fm, body = frontmatter.parse(theme.read_text(encoding="utf-8"))
+        assert fm["body_status"] == "pending"  # the note still OWES prose — flag retained
+        assert "The curator serializes every write." in body  # …while real prose is present
+        assert lint(RepoLayout(published), taxonomy=TAXONOMY, run_date=RUN_DATE).ok
+
+
+def _publish_theme_with_pending_region(tmp_path: Path) -> tuple[Repo, str]:
+    """Run 1: publish `curator-concurrency` whose ONLY region PASS 2 left at the placeholder.
+
+    Returns ``(repo, run1_region_sentinel_id)``. This is the pre-existing-debt shape every later run
+    has to reason about: a live note carrying a legitimate `body_status: pending` from an EARLIER
+    run, whose region NO future run's needs_prose map will ever list again.
+    """
+    repo = _init_repo(tmp_path)
+    inbox = Inbox(repo.layout)
+    e0 = _write_capture(inbox, text="One curator advances the branch under a lock.", second=5)
+    _seed_raw(repo, e0)
+
+    # A backend that authors NOTHING (the #115 shape) leaves the region at APPLY's placeholder.
+    report = _run(repo, FakeBackend(_create_theme_plan("run-one", "c1", e0), prose={}))
+    assert report.status == "published"
+    assert _published_theme_fm(repo, report)["body_status"] == "pending"
+    return repo, region_sentinel_id("run-one", "c1")
+
+
+class _AlsoHealsOlderRegionBackend(FakeBackend):
+    """A PASS 2 that also fills a region left over from an EARLIER run.
+
+    Contract-legal, not a cheat: ``_needs_prose_map`` unions every sentinel id PRESENT in the note
+    into the §4.2 ``sentinels`` set, so ``validate_author_diff`` accepts an edit to a prior run's
+    region. Nothing ASKS the brain to do it (``needs_prose`` lists only this run's ids), which is
+    exactly why the healing in :func:`test_body_status_clears_once_the_older_region_is_filled` is
+    opportunistic rather than something a run can be relied upon to perform.
+    """
+
+    def __init__(self, plan_text: str, *, extra: dict[str, str], **kw: object) -> None:
+        super().__init__(plan_text, **kw)  # type: ignore[arg-type]
+        self._extra = extra
+
+    def author(
+        self,
+        worktree: Path,
+        needs_prose: dict[str, list[str]],
+        context: dict[str, AuthorRegion],
+    ) -> None:
+        super().author(worktree, needs_prose, context)
+        for rel in needs_prose:
+            path = worktree / rel
+            text = path.read_text(encoding="utf-8")
+            for sid, prose in self._extra.items():
+                text = worker_mod._replace_sentinel_region(text, sid, prose)
+            path.write_text(text, encoding="utf-8")
+
+
+def test_body_status_survives_a_later_run_that_authors_only_its_own_region(
+    tmp_path: Path, prose_pending_is_the_point: None
+) -> None:
+    """CROSS-RUN: run 2 authors 100% of ITS regions, yet the flag must SURVIVE (#119).
+
+    This is the test that distinguishes the note-local rule from a run-scoped one. Run 1 left a
+    region at the placeholder; run 2 MERGEs a new authored region into the same theme. A rule keyed
+    on THIS run's `_unauthored_regions` would see zero pending regions and clear a flag that is
+    still owed. The divergence it produces — `prose_pending: 0` next to a retained
+    `body_status: pending` — is DELIBERATE: `prose_pending` grades this run's PASS 2 (#115),
+    `body_status` describes THE NOTE (ADR-0010 §2.6). Do not "fix" it.
+    """
+    repo, _run1_sid = _publish_theme_with_pending_region(tmp_path)
+    inbox = Inbox(repo.layout)
+    e1 = _write_capture(inbox, text="Curators serialize every wiki write.", second=20)
+    _seed_raw(repo, e1)
+
+    report = _run(
+        repo,
+        FakeBackend(
+            _merge_plan("run-two", e1, "curator-concurrency"),
+            prose={region_sentinel_id("run-two", "c1"): "Corroborated by a second capture."},
+        ),
+    )
+
+    assert report.status == "published"
+    assert report.counts["prose_pending"] == 0  # run 2's OWN pass was a complete success…
+    with repo.worktree(at=report.published_commit) as published:  # type: ignore[arg-type]
+        theme = published / "wiki" / "ai-tech" / "themes" / "curator-concurrency.md"
+        fm, body = frontmatter.parse(theme.read_text(encoding="utf-8"))
+        assert fm["body_status"] == "pending"  # …yet the note still owes run 1's region
+        assert "Corroborated by a second capture." in body
+        assert "_summary pending_" in body  # run 1's region is the one still owed
+        result = lint(RepoLayout(published), taxonomy=TAXONOMY, run_date=RUN_DATE)
+        assert result.ok
+        # L2-6 agrees with the worker: the flag is legitimate here, so no stale-flag warning.
+        assert all(f.code != "L2-6" for f in result.findings)
+
+
+def test_body_status_clears_once_the_older_region_is_filled(
+    tmp_path: Path, prose_pending_is_the_point: None
+) -> None:
+    """Free incremental healing: when the LAST unauthored region is filled, the flag drops.
+
+    The corpus is not swept (a whole-worktree rewrite inside the curate hot path would touch notes
+    the plan never named — that is `agora repo upgrade`'s job, #63), but any run whose PASS 2 leaves
+    a note with zero placeholder regions repairs that note for free.
+    """
+    repo, run1_sid = _publish_theme_with_pending_region(tmp_path)
+    inbox = Inbox(repo.layout)
+    e1 = _write_capture(inbox, text="Curators serialize every wiki write.", second=20)
+    _seed_raw(repo, e1)
+
+    report = _run(
+        repo,
+        _AlsoHealsOlderRegionBackend(
+            _merge_plan("run-two", e1, "curator-concurrency"),
+            prose={region_sentinel_id("run-two", "c1"): "Corroborated by a second capture."},
+            extra={run1_sid: "The single curator holds a per-repo flock."},
+        ),
+    )
+
+    assert report.status == "published"
+    with repo.worktree(at=report.published_commit) as published:  # type: ignore[arg-type]
+        theme = published / "wiki" / "ai-tech" / "themes" / "curator-concurrency.md"
+        fm, body = frontmatter.parse(theme.read_text(encoding="utf-8"))
+        assert "body_status" not in fm  # every region is authored now → the flag is retracted
+        assert "_summary pending_" not in body
+        assert lint(RepoLayout(published), taxonomy=TAXONOMY, run_date=RUN_DATE).ok
+
+
+def test_clear_removes_exactly_the_body_status_line_and_nothing_else(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BYTE LOCK on the YAML round-trip: the clear is `parse -> pop -> render`, so a PyYAML quoting
+    or key-order difference would silently churn every published note. Capture the note immediately
+    before the clear and assert the published bytes differ by EXACTLY the one dropped line."""
+    repo = _init_repo(tmp_path)
+    inbox = Inbox(repo.layout)
+    e1 = _write_capture(inbox, text="One curator advances the branch under a lock.", second=10)
+    _seed_raw(repo, e1)
+
+    before: dict[str, str] = {}
+    original = worker_mod._clear_body_status
+
+    def spy(worktree: Path, needs_prose: dict[str, list[str]]) -> list[str]:
+        for rel in needs_prose:
+            before[rel] = (worktree / rel).read_text(encoding="utf-8")
+        return original(worktree, needs_prose)
+
+    monkeypatch.setattr(worker_mod, "_clear_body_status", spy)
+
+    report = _run(
+        repo,
+        FakeBackend(
+            _create_theme_plan("ignored", "c1", e1),
+            prose={region_sentinel_id("ignored", "c1"): "The single curator holds a flock."},
+        ),
+    )
+
+    assert report.status == "published"
+    rel = "wiki/ai-tech/themes/curator-concurrency.md"
+    assert "body_status: pending\n" in before[rel]
+    with repo.worktree(at=report.published_commit) as published:  # type: ignore[arg-type]
+        after = (published / rel).read_text(encoding="utf-8")
+    assert after == before[rel].replace("body_status: pending\n", "", 1)
+
+
+def test_clear_never_writes_a_note_that_has_no_body_status(tmp_path: Path) -> None:
+    """(vii) A needs_prose note without the key is NOT rewritten — no churn, no diff line.
+
+    The no-write oracle is deliberately structural rather than an mtime comparison: the note is
+    written with NON-canonical YAML spacing that ``frontmatter.render`` would normalize away, so any
+    write at all — even one that produced the same frontmatter mapping — is detectable.
+    """
+    from agora_kb.curator.worker import _clear_body_status
+
+    rel = "wiki/ai-tech/themes/no-flag.md"
+    path = tmp_path / rel
+    path.parent.mkdir(parents=True, exist_ok=True)
+    text = (
+        "---\n"
+        "title:   No flag\n"  # non-canonical spacing: yaml.safe_dump would collapse it
+        "type: theme\n"
+        "---\n"
+        "\n"
+        "<!-- agora:body:start id=r--c1 -->\n"
+        "Authored prose, and no body_status key was ever set.\n"
+        "<!-- agora:body:end id=r--c1 -->\n"
+    )
+    path.write_text(text, encoding="utf-8")
+
+    assert _clear_body_status(tmp_path, {rel: ["r--c1"]}) == []
+    assert path.read_text(encoding="utf-8") == text
+
+
+def test_clear_is_a_noop_for_a_note_pass2_deleted(tmp_path: Path) -> None:
+    """Defensive: a note PASS 2 deleted (the §4.2 validator rejects it separately) must not raise —
+    the clear runs unconditionally inside `if needs_prose:` and cannot be the thing that turns a
+    clean FAILED verdict into an uncaught traceback out of run()."""
+    from agora_kb.curator.worker import _clear_body_status
+
+    assert _clear_body_status(tmp_path, {"wiki/ai-tech/themes/gone.md": ["r--c1"]}) == []
+
+
+def test_clear_skips_a_malformed_note_instead_of_fabricating_a_fence(tmp_path: Path) -> None:
+    """A note whose frontmatter will not parse is L1-4's finding at §4.4, not the clear's problem.
+
+    Rendering one here would REPLACE the malformed document with a fabricated fence — the worker
+    inventing structure the §4.2 gate never validated.
+    """
+    from agora_kb.curator.worker import _clear_body_status
+
+    rel = "wiki/ai-tech/themes/broken.md"
+    path = tmp_path / rel
+    path.parent.mkdir(parents=True, exist_ok=True)
+    text = "no frontmatter fence at all\n<!-- agora:body:start id=r--c1 -->\np\n"
+    path.write_text(text, encoding="utf-8")
+
+    assert _clear_body_status(tmp_path, {rel: ["r--c1"]}) == []
+    assert path.read_text(encoding="utf-8") == text
+
+
+class _GoodProseButTampersFrontmatter(FakeBackend):
+    """PASS 2 authors REAL prose into the region *and* tampers frontmatter — §4.2 rejects the note.
+
+    ``_OutOfRegionBackend`` writes no prose at all, so at the moment of the verdict its region is
+    already the placeholder. This backend makes the region genuinely AUTHORED when §4.2 rejects,
+    which is the only shape that can tell "the flag survives because the degrade rewound the prose"
+    from "the flag survives because nothing was ever written".
+    """
+
+    def author(
+        self,
+        worktree: Path,
+        needs_prose: dict[str, list[str]],
+        context: dict[str, AuthorRegion],
+    ) -> None:
+        super().author(worktree, needs_prose, context)
+        for rel in needs_prose:
+            path = worktree / rel
+            text = path.read_text(encoding="utf-8")
+            path.write_text(text.replace("status: active", "status: active\nrogue: 1"), "utf-8")
+
+
+def test_a_rejected_pass_keeps_its_flag_even_though_prose_was_written(
+    tmp_path: Path, prose_pending_is_the_point: None
+) -> None:
+    """(b) A §4.2-REJECTED pass keeps its flag even though PASS 2 had written genuine prose.
+
+    ``has_unauthored_region`` would have said "authored" at the moment PASS 2 finished. The §4.2
+    gate rejected the pass, `_degrade_prose` discarded ALL of it (including the good prose) and
+    re-set `body_status: pending`; the clear then correctly leaves the note alone, because the
+    predicate is evaluated on the POST-degrade bytes.
+
+    NOTE on ordering: this does NOT lock "clear after degrade". Verified by mutation — moving the
+    clear above `_degrade_prose` still passes, because `_degrade_prose` unconditionally re-stamps
+    `body_status: pending`, so the reversed order is self-correcting (it would only churn a write).
+    The ordering that IS load-bearing is "clear BEFORE the §4.4 lint", locked by
+    :func:`test_the_clear_runs_before_the_lint_that_grades_it`.
+    """
+    repo = _init_repo(tmp_path)
+    inbox = Inbox(repo.layout)
+    e1 = _write_capture(inbox, text="One curator advances the branch under a lock.", second=10)
+    _seed_raw(repo, e1)
+
+    report = _run(
+        repo,
+        _GoodProseButTampersFrontmatter(
+            _create_theme_plan("ignored", "c1", e1),
+            prose={region_sentinel_id("ignored", "c1"): "The single curator holds a flock."},
+        ),
+    )
+
+    assert report.status == "published", report.failure
+    with repo.worktree(at=report.published_commit) as published:  # type: ignore[arg-type]
+        theme = published / "wiki" / "ai-tech" / "themes" / "curator-concurrency.md"
+        fm, body = frontmatter.parse(theme.read_text(encoding="utf-8"))
+        assert fm["body_status"] == "pending"  # the flag SURVIVED the rejected pass
+        assert "rogue" not in fm  # the frontmatter tamper was discarded
+        start, end = body_sentinels(region_sentinel_id("ignored", "c1"))
+        assert body[body.find(start) + len(start) : body.find(end)].strip() == "> _summary pending_"
+
+
+def test_the_clear_runs_before_the_lint_that_grades_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """(c) ORDERING LOCK — §4.4 lint must grade the POST-clear tree, read from DISK.
+
+    `lint` reads the worktree, not `new_state`, so the clear has to have hit disk by the time it
+    runs. If the clear moved below the lint call, the gate would grade pre-clear bytes and every
+    freshly-published note would trip the very L2-6 rule this change adds — criterion (c) defeated
+    while every other assertion in the suite still passed.
+    """
+    repo = _init_repo(tmp_path)
+    inbox = Inbox(repo.layout)
+    e1 = _write_capture(inbox, text="One curator advances the branch under a lock.", second=10)
+    _seed_raw(repo, e1)
+
+    seen_at_lint_time: list[str] = []
+    original = worker_mod.lint
+
+    def lint_spy(layout, **kwargs):  # type: ignore[no-untyped-def]
+        note = layout.root / "wiki" / "ai-tech" / "themes" / "curator-concurrency.md"
+        if note.is_file():
+            seen_at_lint_time.append(note.read_text(encoding="utf-8"))
+        return original(layout, **kwargs)
+
+    monkeypatch.setattr(worker_mod, "lint", lint_spy)
+
+    report = _run(
+        repo,
+        FakeBackend(
+            _create_theme_plan("ignored", "c1", e1),
+            prose={region_sentinel_id("ignored", "c1"): "The single curator holds a flock."},
+        ),
+    )
+
+    assert report.status == "published", report.failure
+    assert len(seen_at_lint_time) == 1
+    # The bytes the §4.4 gate actually saw already had the flag retracted.
+    assert "body_status" not in seen_at_lint_time[0]
+    assert "The single curator holds a flock." in seen_at_lint_time[0]

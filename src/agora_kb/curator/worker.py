@@ -51,7 +51,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import re
 import shutil
 import subprocess
 from collections.abc import Iterator
@@ -61,16 +60,18 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal, Protocol
 
 from ..core import frontmatter
+from ..core.frontmatter import FrontmatterError
 from ..core.ids import new_event_id
 from ..core.inbox import Inbox, return_event_to_inbox
 from ..core.layout import RepoLayout
 from ..core.repo import GitError, Repo
+from ..core.sentinel import BODY_RESET_PLACEHOLDER, UNAUTHORED_REGION_BODIES, has_unauthored_region
+from ..core.sentinel import BODY_START_LINE_RE as _START_SENTINEL_RE
 from ..core.state import CuratorState, LastBatch, LastFailure, StateStore
 from ..schema.emit import Taxonomy
 from ..schema.lint import lint
 from ..schema.notes import Note, parse_all_notes
 from .apply import (
-    BODY_PLACEHOLDER,
     apply_plan,
     body_sentinels,
     region_sentinel_id,
@@ -110,8 +111,10 @@ __all__ = [
 # §4.2 AUTHOR-failure RESET placeholder (ADR-0011 §4.2): the blockquote derived from the plan
 # summary. DISTINCT from APPLY's initial ``_summary pending_`` fill — this is the degrade-on-
 # failure body the worker substitutes when a note's PASS-2 diff is rejected, so the run still
-# publishes a structurally-valid (but prose-pending) note.
-_RESET_PLACEHOLDER = "> _summary pending_"
+# publishes a structurally-valid (but prose-pending) note. The spelling itself now lives in
+# :mod:`agora_kb.core.sentinel` (#119) so ``schema/lint.py`` grades "unauthored" with the SAME
+# vocabulary without importing the curator; this is a local alias, not a second spelling.
+_RESET_PLACEHOLDER = BODY_RESET_PLACEHOLDER
 
 _logger = logging.getLogger(__name__)
 
@@ -259,8 +262,10 @@ def _region_body(text: str, sentinel_id: str) -> str | None:
 # re-spelled, so a change to either placeholder cannot silently stop being detected — in the
 # AUTHOR-diff-rejected path this set is the only thing standing between a reset note and a report
 # claiming its prose landed. Compared after ``strip()`` so trailing-newline churn is not mistaken
-# for authored content.
-_EMPTY_REGION_BODIES = frozenset({"", BODY_PLACEHOLDER, _RESET_PLACEHOLDER})
+# for authored content. Now a local alias of the :mod:`agora_kb.core.sentinel` set (#119) — the
+# SAME frozenset the L2-6 lint rule grades with, so the run-scoped ``_unauthored_regions`` verdict
+# and the note-local ``has_unauthored_region`` verdict can never disagree on the placeholder set.
+_EMPTY_REGION_BODIES = UNAUTHORED_REGION_BODIES
 
 
 def _unauthored_regions(
@@ -733,6 +738,25 @@ def _run_locked(
                 )
                 prose_warnings.extend(author_failures)
 
+            # #119: body_status: pending is APPLY's promise that a region is still empty — nothing
+            # ever retracted it, so every published note carried a stale flag and the signal was
+            # worthless to every reader (schema doc, dashboard, gold, agents). Retract it HERE:
+            # AFTER _degrade_prose (a §4.2-rejected pass must KEEP its flag — that ordering is
+            # belt-and-braces rather than load-bearing, since _degrade_prose re-stamps the flag
+            # unconditionally, but it also avoids a pointless write) and BEFORE the §4.4 lint,
+            # which reads the worktree from DISK — THAT ordering IS load-bearing and is locked by
+            # test_the_clear_runs_before_the_lint_that_grades_it. PASS 2 cannot do this itself —
+            # validate_author_diff requires frontmatter byte-identity and the model is outside the
+            # integrity boundary (ADR-0011 §4). The predicate is WHOLE-NOTE, never this run's region
+            # ids: a region an EARLIER run left at the placeholder keeps the flag alive even when
+            # every region THIS run asked for landed. Consequence, deliberate and not a bug: a run
+            # can report prose_pending: 0 while a note it touched still says body_status: pending.
+            # prose_pending grades THIS run's PASS-2 (#115); body_status describes THE NOTE
+            # (ADR-0010 §2.6). Do not "fix" the divergence.
+            _clear_body_status(wt, needs_prose)
+            # new_state is now STALE for any cleared note (its last reader was the grading above).
+            # Re-read from disk rather than trusting it if you add a reader below.
+
         # §4.4 deterministic LINT of the full worktree — the SAME gate the dashboard runs. A lint
         # failure is a structural failure: discard the whole diff, publish nothing (§4.4).
         lint_result = lint(
@@ -743,12 +767,24 @@ def _run_locked(
             max_orphans=max_orphans,
         )
         if not lint_result.ok:
+            # ERRORS ONLY, matching the gate's own predicate (``LintResult.ok`` is False iff an
+            # error-severity finding exists): a warning is by definition not a failed check. This
+            # is load-bearing since #119 added L2-6, the first UNBOUNDED per-note warning — on a
+            # repo published by a pre-#119 build every legacy note emits one, and `findings` is
+            # sorted by (path, code), so passing warnings through here would bury the one line
+            # that says why the run failed. Both operator surfaces truncate: ``summary(limit=3)``
+            # is what `agora curate` / the `agora watch` tick print, and ``LastFailure`` keeps
+            # only ``MAX_FAILURE_REASONS``. The lossless record stays in _kb/failed/**/error.json.
             return _fail(
                 layout,
                 manifest,
                 state_store,
                 now=now,
-                reasons=[f"LINT {f.code} {f.path}: {f.message}" for f in lint_result.findings],
+                reasons=[
+                    f"LINT {f.code} {f.path}: {f.message}"
+                    for f in lint_result.findings
+                    if f.severity == "error"
+                ],
                 max_attempts=max_attempts,
             )
 
@@ -1728,9 +1764,6 @@ def _disposition_note_rel_path(disp: Disposition, worktree: Path, run_date: str)
     return None
 
 
-_START_SENTINEL_RE = re.compile(r"\A<!-- agora:body:start id=(?P<cid>.+) -->\Z")
-
-
 def _present_sentinel_ids(path: Path) -> set[str]:
     """Return every ``agora:body:start id=<cid>`` candidate id present in ``path`` (or ``set()``).
 
@@ -1775,6 +1808,46 @@ def _degrade_prose(
             body = _replace_sentinel_region(body, cid, _RESET_PLACEHOLDER)
         fm["body_status"] = "pending"
         path.write_text(frontmatter.render(fm, body), encoding="utf-8")
+
+
+def _clear_body_status(worktree: Path, needs_prose: dict[str, list[str]]) -> list[str]:
+    """Drop the stale ``body_status: pending`` from every needs_prose note that owes no prose.
+
+    The exact inverse of :func:`_degrade_prose`, and the EXACT INVERSE of the L2-6 lint predicate
+    (both call :func:`agora_kb.core.sentinel.has_unauthored_region`), so a tree this step just
+    wrote can never trip the §4.4 gate's own new rule. Returns the rel_paths actually rewritten
+    (unused by :func:`run` today — it exists so a test can call this directly and so a future
+    counter is a one-line change).
+
+    CLEAR-ONLY: this never ADDS the key. APPLY owns placement, and there is a legitimate state
+    where a region exists with no flag — an APPEND_DAILY with ``needs_prose=False`` places an
+    empty region but no ``body_status`` (:func:`agora_kb.curator.apply._apply_append_daily`), and
+    :func:`_needs_prose_map` never authors it. Stamping a flag there would pin a permanently-
+    unclearable ``pending`` on a note APPLY deliberately left clean.
+
+    Scope is deliberately the run's OWN needs_prose notes: those are the notes APPLY already
+    rewrote this run, so ``parse -> pop -> render`` round-trips the bytes APPLY just produced and
+    the run's diff gains no file its ``log.md`` does not explain. A note whose flag is stale from
+    an EARLIER build is left to L2-6 (warning) and to the ``agora repo upgrade`` migration (#63) —
+    healing the whole worktree inside a curate run would rewrite notes the plan never named.
+    """
+    cleared: list[str] = []
+    for rel in sorted(needs_prose):  # sorted so the write order is deterministic
+        path = worktree / rel
+        if not path.is_file():
+            continue  # defensive: PASS-2 deleted it, §4.2 rejected, _degrade_prose restored it
+        try:
+            fm, body = frontmatter.parse(path.read_text(encoding="utf-8"))
+        except FrontmatterError:
+            continue  # a malformed note is L1-4's finding at §4.4; never fabricate a fence here
+        if fm.get("body_status") is None:
+            continue  # nothing to clear -> NO WRITE, so an already-correct note never churns
+        if has_unauthored_region(body):
+            continue  # still owes prose (this run's, OR an earlier run's still-empty region)
+        fm.pop("body_status")
+        path.write_text(frontmatter.render(fm, body), encoding="utf-8")
+        cleared.append(rel)
+    return cleared
 
 
 def _disposition_counts(plan: Plan) -> dict[str, int]:

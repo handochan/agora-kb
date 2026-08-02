@@ -50,6 +50,19 @@ import yaml
 
 from agora_kb.core.frontmatter import FrontmatterError
 from agora_kb.core.layout import RepoLayout
+
+# The L1-20 body-sentinel grammar (ADR-0011 §4.4 check 6 / ADR-0010 §2.6) + the L2-6 unauthored-
+# region grader. These MUST match the curator's apply.py sentinel grammar BYTE-FOR-BYTE so the gate
+# the curator runs at §4.4 and the dashboard's reuse agree. They used to be re-spelled LOCALLY here
+# to keep ``schema/`` free of a curator import; #119 SATISFIES that constraint properly instead —
+# the strict producer grammar now lives in ``core.sentinel``, BELOW both packages, so importing it
+# introduces no cycle and deletes the fork (apply.py + worker.py + here were three copies of the
+# same two patterns). The persisted region id is run-scoped (``{run_id}--{candidate_id}``,
+# apply.region_sentinel_id) but L1-20 is id-opaque — it only pairs starts/ends and forbids
+# unmatched/nested/duplicated markers, so it works for ANY id string.
+from agora_kb.core.sentinel import BODY_END_LINE_RE as _BODY_SENTINEL_END_RE
+from agora_kb.core.sentinel import BODY_START_LINE_RE as _BODY_SENTINEL_START_RE
+from agora_kb.core.sentinel import has_unauthored_region
 from agora_kb.schema.emit import Taxonomy
 from agora_kb.schema.notes import (
     PARSE_EXEMPT_BASENAMES,
@@ -89,15 +102,6 @@ _CONTESTED_CALLOUT_RE = re.compile(r"^> \[!contested\]", re.MULTILINE)
 # A daily basename is `<domain>-YYYY-MM-DD`; the trailing 10 chars are the date (ADR-0010, L1-14).
 _DAILY_DATE_RE = re.compile(r"-(?P<date>\d{4}-\d{2}-\d{2})\Z")
 
-# L1-20 body-sentinel grammar (ADR-0011 §4.4 check 6 / ADR-0010 §2.6 L1 sentinel integrity). These
-# MUST match the curator's apply.py sentinel grammar BYTE-FOR-BYTE so the gate the curator runs at
-# §4.4 and the dashboard's reuse agree; kept LOCAL (not imported from curator) so schema/ never
-# depends on the curator package (no import cycle). The persisted id is run-scoped
-# (`{run_id}--{candidate_id}`, apply.region_sentinel_id) but this check is id-opaque — it only pairs
-# starts/ends and forbids unmatched/nested/duplicated markers, so it works for ANY id string.
-_BODY_SENTINEL_START_RE = re.compile(r"\A<!-- agora:body:start id=(?P<cid>.+) -->\Z")
-_BODY_SENTINEL_END_RE = re.compile(r"\A<!-- agora:body:end id=(?P<cid>.+) -->\Z")
-
 
 def _date_str(value: object) -> str | None:
     """Canonicalize a frontmatter date scalar to a ``YYYY-MM-DD`` string, else ``None``.
@@ -133,10 +137,13 @@ class LintFinding:
     """One L1 lint finding (ADR-0010 §6).
 
     ``code`` is the rule id (e.g. ``"L1-7"``). ``severity`` is ``"error"`` for a hard-reject L1 rule
-    or ``"warning"`` for a soft signal (every rule here is ``"error"``; the field exists so the type
-    can also carry derived L2 health signals without a schema change). ``path`` is the POSIX repo-
-    relative path of the offending note (or the relevant metadata file for whole-repo rules like
-    schema_version drift). ``message`` is a human-readable one-liner.
+    or ``"warning"`` for a soft L2 signal. Every L1 rule is ``"error"`` — ``kb_schema.md`` freezes
+    L1 as "STRUCTURAL (hard; reject the commit)" — while the L2 rules emitted from inside
+    :func:`lint` are warnings: L2-1 (orphan count, ADR-0022) and L2-6 (the #119 ``body_status``
+    invariant). The distinction is load-bearing, not cosmetic: ``LintResult.ok`` is False iff an
+    ERROR exists, and that is what the curator's §4.4 gate discards a whole run on. ``path`` is the
+    POSIX repo-relative path of the offending note (or the relevant metadata file for whole-repo
+    rules like schema_version drift). ``message`` is a human-readable one-liner.
     """
 
     code: str
@@ -424,9 +431,11 @@ def _check_body_sentinels(note: Note) -> list[LintFinding]:
     candidate_id collided); the persisted id is now run-scoped (apply.region_sentinel_id), and this
     gate hard-rejects any note that still carries colliding/unbalanced markers.
 
-    Uses the SAME line grammar as :func:`agora_kb.curator.apply._extract_sentinel_regions` (kept
-    local to avoid importing the curator package into ``schema/``). A malformed marker line that
-    does not match the exact grammar is treated as ordinary content (not a sentinel) — like apply.
+    Uses the SAME line grammar as :func:`agora_kb.curator.apply._extract_sentinel_regions` —
+    literally the same two compiled patterns, imported from :mod:`agora_kb.core.sentinel`, which
+    sits BELOW both packages so ``schema/`` still never imports the curator (#119 replaced three
+    private copies with that one home). A malformed marker line that does not match the exact
+    grammar is treated as ordinary content (not a sentinel) — like apply.
     """
     path = note.rel_path
 
@@ -461,6 +470,51 @@ def _check_body_sentinels(note: Note) -> list[LintFinding]:
     if open_cid is not None:
         return fail(f"unmatched agora:body:start id={open_cid!r} (no closing end)")
     return []
+
+
+def _check_body_status(note: Note) -> list[LintFinding]:
+    """L2-6: a stale ``body_status: pending`` over a fully-authored note (#119, ADR-0010 §2.6).
+
+    ADR-0010 §2.6 / §7.3: the key is present ONLY while a note's prose is not yet authored, and
+    the curator's worker DROPS it after the §4.2 AUTHOR gate. Until #119 nothing ever removed it,
+    so every published note carried it and the signal was worthless. This is the at-rest assertion
+    of that contract, and the EXACT INVERSE of
+    :func:`agora_kb.curator.worker._clear_body_status` — both call
+    :func:`agora_kb.core.sentinel.has_unauthored_region`, so a curator-produced note can never
+    trip it.
+
+    The predicate is "NO region is still a placeholder", NOT "prose exists": a note whose PASS-2
+    filled 2 of 3 regions legitimately has prose AND a legitimate pending. This is the single
+    thing most likely to be got wrong.
+
+    Severity is WARNING, deliberately and load-bearingly. :func:`lint` grades the WHOLE worktree,
+    not the run's diff, and every note published by a pre-#119 build carries a stale flag. At error
+    severity ``LintResult.ok`` would be False on any pre-existing repo, the worker's §4.4 gate would
+    ``_fail`` the run over notes it never touched, and — because a lint failure discards the whole
+    diff — the run could never repair what made it fail, burning the §5.1 retry budget until the
+    events go terminal to ``failed/``. Promote to a hard ``L1-21`` error ONLY AFTER
+    ``agora repo upgrade`` (#63) can perform the one-shot repair on an existing repo; at that point
+    mark L2-6 superseded in ADR-0010's table using the append-only banner pattern (ADR-0011 §7.1).
+
+    ONLY the present-direction is checked. The converse ("an unauthored region but no flag") is
+    NOT a violation: an APPEND_DAILY with ``needs_prose=False`` places an empty region
+    (``apply._apply_append_daily``) and no ``body_status``, and the worker's ``_needs_prose_map``
+    never authors it — a real, reachable, lint-clean state. Asserting the biconditional would
+    false-positive on every such daily.
+    """
+    if note.frontmatter.get("body_status") is None:
+        return []
+    if has_unauthored_region(note.body):
+        return []
+    return [
+        LintFinding(
+            "L2-6",
+            "warning",
+            note.rel_path,
+            "body_status: pending but every agora:body region is authored (stale flag; the "
+            "curator drops it after PASS-2 — ADR-0010 §2.6)",
+        )
+    ]
 
 
 def lint(
@@ -607,6 +661,11 @@ def lint(
         # ADR-0011 §4.4 check 6). Runs on every note; only theme/daily carry markers, so a
         # moc/index with no markers always passes.
         findings.extend(_check_body_sentinels(n))
+
+        # L2-6 stale `body_status: pending` over a fully-authored note (#119). WARNING severity —
+        # it never flips LintResult.ok, so the §4.4 curator gate and the dashboard verdict are
+        # byte-unchanged; see _check_body_status for why an error here would self-lock a run.
+        findings.extend(_check_body_status(n))
 
         # L1-12 dates (format always; no-future only when run_date given).
         findings.extend(_check_dates(n, run_date))
