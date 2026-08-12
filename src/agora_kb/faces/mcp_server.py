@@ -54,7 +54,7 @@ import argparse
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from agora_kb.config import load_backend_registry, load_repo_config
+from agora_kb.config import guard_repo_schema_version, load_backend_registry, load_repo_config
 from agora_kb.core import Inbox, Repo, StateStore, Wiki, failed_event_count
 from agora_kb.curator.constants import DEFAULT_BODY_BYTE_BOUND
 from agora_kb.curator.subprocess_backend import (
@@ -1015,6 +1015,12 @@ def build_server(*, repo_path: Path, writer: str = DEFAULT_WRITER) -> FastMCP:
     from fastmcp.exceptions import ResourceError
 
     repo = Repo.resolve(repo_path)
+    # #98 / DESIGN §10 V9: refuse to stand up a face over a repo whose KB schema this build does not
+    # understand. `agora serve` already stops at the CLI dispatch guard, so this fires for the OTHER
+    # callers — a programmatic embedder, a supervisor importing build_server directly — where a
+    # silent misread would put an old binary's writes into a newer repo. Raises
+    # UnsupportedSchemaVersionError; a repo that cannot be read at all passes through untouched.
+    guard_repo_schema_version(repo.layout)
     handlers = AgoraHandlers(repo, writer=writer)
     mcp: FastMCP = FastMCP(name="agora-kb")
 

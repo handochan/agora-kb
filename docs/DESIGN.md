@@ -487,6 +487,15 @@ registry.
 curator-visible vocabulary. Posture: new binary on an old repo = read-works / write-warns; old binary
 on a new repo = fail-loud.
 
+*As built (issue #98):* the fail-loud half is `config.SUPPORTED_KB_SCHEMA_VERSIONS` +
+`guard_repo_schema_version`, asserted at the CLI dispatch (`main`) and both face constructors
+(`build_server` / `build_app`). It judges the canonical `_meta/taxonomy.yaml` value (ADR-0010 §5.1);
+cross-location drift stays lint `L1-17`'s finding. The loader deliberately never raises, so
+`agora doctor` — the one exempt command, alongside `--version` and `repo init` — can still READ a
+skewed repo to diagnose it, reporting `schema: repo=<n> supported=[…] (UNSUPPORTED …)` and
+`status: unhealthy`. The *write-warns* half is unobservable while the supported set is `{1}` and
+lands with the first bump; `agora repo upgrade` is #63.
+
 **Consumption reaches restricted environments (Q3).** Because corporate hosts often block MCP, the
 file-`@include` channel is first-class: a per-agent memory-path map (e.g. `CLAUDE.md`,
 `.github/copilot-instructions.md`, `.cursor/rules`) receives a sentinel-fenced, refresh-only gold-pack

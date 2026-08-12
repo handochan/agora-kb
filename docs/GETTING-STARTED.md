@@ -496,6 +496,7 @@ agora doctor (agora 0.1.0b1, python 3.12.13)
   dep fastmcp: ok
   dep yaml: ok
   repo /tmp/my-kb: initialized
+  schema: repo=1 supported=[1]
   sandbox: seatbelt (ok)
     write-inside=True write-outside-denied=True apple-shim=True
     network-denied=True

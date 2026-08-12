@@ -156,9 +156,16 @@ recorded before anyone touches the code, and Track B gets its `windows-latest` s
       exits 0, so the #65 units' `Restart=on-failure`/`KeepAlive` no longer convert a deterministic
       per-tick raise into a 10-second crash loop; `--once` keeps its single-shot contract (same
       line, `return 1`). Ctrl-C still stops cleanly, and every happy-path tick byte is unchanged.
-- [ ] **`schema_version` compatibility check (#98).** Read in three places (`config.py:174/909/915`) and
-      compared against a supported range in **none**; no doctor line. A repo written by a future
-      build must fail loudly. (`agora repo upgrade` itself stays #63.)
+- [x] **`schema_version` compatibility check (#98)** — DONE. `SUPPORTED_KB_SCHEMA_VERSIONS` (a SET,
+      not a ceiling) + `read_kb_schema_version`, a narrow read of the CANONICAL
+      `_meta/taxonomy.yaml` that deliberately does not route through `load_repo_config` — an
+      unrelated `repo.yaml` typo must not be able to switch the gate off. Applied structurally at
+      CLI dispatch (any command taking `--repo`, plus `import`/`repo init` on their positional
+      destination, which are direct writers of `wiki/`), and in `build_server` / `build_app` for
+      programmatic embedders; re-asserted per `watch` tick, since that daemon outlives a repo that
+      may change under it. `agora doctor` is the single exemption — it must READ a skewed repo to
+      diagnose it — and reports `schema: repo=<n> supported=[1]`, failing the verdict on a skew or
+      on a version it cannot verify. (`agora repo upgrade` itself stays #63.)
 - [x] **`agora requeue` — failed-event reinjection (#99)** — DONE. A `watch --interval` of 60s, a
       threshold trigger that ignores `last_run` and fires every tick (`curator/triggers.py`), and
       `max_attempts=3` still move captures **terminally** into `_kb/failed/` in roughly three minutes

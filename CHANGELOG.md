@@ -32,14 +32,14 @@ no git tag exists yet, so `git checkout v0.1.0b1` will not resolve and there is 
 artifact. Installing today means installing from `main`, which moves.
 
 The `0.1.0b1` notes below are the prepared release notes, not a shipped release. Remaining gates
-(epic [#93](https://github.com/handochan/agora-kb/issues/93), Track A): the frontmatter
-`body_status` invariant (#119) with its test-oracle repair (#121), the `schema_version` skew guard
-(#98), PyPI name reservation (#102), a friendly Windows failure (#103), repo metadata
-(description/topics, part of #106), and a clean-machine release smoke run by someone who is not the
-author (#107) — plus the `windows-latest` gate ruling that decides whether Windows ships in b1 or
-b2. Landed: [`SECURITY.md`](SECURITY.md) (#95), [`docs/GETTING-STARTED.md`](docs/GETTING-STARTED.md)
-(#104), [`docs/LIMITATIONS.md`](docs/LIMITATIONS.md) (#105), the README reconciliation (#106), and
-the two `agora doctor` truthfulness fixes (#129).
+(epic [#93](https://github.com/handochan/agora-kb/issues/93), Track A): PyPI name reservation
+(#102), a friendly Windows failure (#103), repo metadata (description/topics, part of #106), and a
+clean-machine release smoke run by someone who is not the author (#107) — plus the
+`windows-latest` gate ruling that decides whether Windows ships in b1 or b2. Landed:
+[`SECURITY.md`](SECURITY.md) (#95), [`docs/GETTING-STARTED.md`](docs/GETTING-STARTED.md) (#104),
+[`docs/LIMITATIONS.md`](docs/LIMITATIONS.md) (#105), the README reconciliation (#106), the two
+`agora doctor` truthfulness fixes (#129), the frontmatter `body_status` invariant (#119) with its
+test-oracle repair (#121), and the `schema_version` skew guard (#98).
 
 **Security reports go through [`SECURITY.md`](SECURITY.md)** — private vulnerability reporting, not
 a public issue.
@@ -245,10 +245,13 @@ against the code. The normative version lives in
    not shipped. The compensating control ADR-0013 promises for `allow_reduced_isolation` (forced
    review mode) is not implemented (#91).
    The real last line of defense is the deterministic FINAL-DIFF gate, not the kernel.
-9. **No schema migration command.** `agora repo upgrade` is #63, still open, and `schema_version` is
-   read but never compared against a supported range (#98). A repo initialized by this beta is
-   expected to keep working — the format is what is stable, not `main` — but if the schema moves
-   there is no command to move a repo with it.
+9. **No schema migration command.** `agora repo upgrade` is #63, still open. The *read* side is
+   guarded as of #98 — a build that meets a repo whose `schema_version` it does not support
+   refuses every acting command with one line and exit 1, and `agora doctor` says so on its
+   `schema:` line — so an old binary can no longer silently misread a newer repo and write on top
+   of that misreading. What is still missing is the other half: if the schema moves, there is no
+   command to move a repo with it. A repo initialized by this beta is expected to keep working —
+   the format is what is stable, not `main`.
 10. **No embeddings and no semantic search.** Deterministic BM25F ranking is the contract
     (ADR-0009/0012), not a gap waiting to be filled; ADR-0032 is reserved and evidence-triggered.
     If you want vector recall, Agora is the wrong tool today.
