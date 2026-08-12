@@ -3873,3 +3873,39 @@ def test_the_clear_runs_before_the_lint_that_grades_it(
     # The bytes the §4.4 gate actually saw already had the flag retracted.
     assert "body_status" not in seen_at_lint_time[0]
     assert "The single curator holds a flock." in seen_at_lint_time[0]
+
+
+def test_a_hand_edited_note_fails_the_run_cleanly_instead_of_crashing(tmp_path: Path) -> None:
+    """A fenceless note in the live tree FAILS the run; it does not escape as a traceback.
+
+    `run()` catches only LockHeld, so the strict `parse_all_notes` raise escaped uncaught: the
+    claimed batch was stranded in `_kb/processing/` while `agora status` still reported
+    `failed_events: 0` and `agora doctor` still reported `status: healthy`, and every `agora watch`
+    tick recovered, re-claimed and re-crashed. Opening the repo in Obsidian and saving one note
+    without a frontmatter fence is enough to reach it — exactly the coexistence DESIGN §7 calls
+    unsupported, which must still degrade honestly rather than silently.
+    """
+    repo = _init_repo(tmp_path)
+    hand_edited = repo.root / "wiki" / "ai-tech" / "themes" / "human-note.md"
+    hand_edited.parent.mkdir(parents=True, exist_ok=True)
+    hand_edited.write_text(
+        "# Just a note\n\nNo frontmatter fence, straight from Obsidian.\n", "utf-8"
+    )
+    _commit_all(repo, "chore: a human saved a note in Obsidian")
+
+    e1 = _write_capture(Inbox(repo.layout), text="One curator advances the branch.", second=10)
+    _seed_raw(repo, e1)
+    base = repo.head_commit()
+    plan = _create_theme_plan("hand-edit-run", "c1", e1)
+
+    report = _run(repo, FakeBackend(plan, prose=PLAN_REJECTED_PROSE))
+
+    assert report.status == "failed"
+    assert report.failure is not None
+    assert any("LIVE-TREE" in r for r in report.failure.reasons)
+    assert any("human-note.md" in r for r in report.failure.reasons)
+    assert repo.branch_commit() == base  # nothing published
+    # The batch is disposed of, not stranded: no processing/ dir survives the run.
+    assert not list(repo.layout.processing_dir.glob("*/")) or not any(
+        (d / "events").exists() for d in repo.layout.processing_dir.glob("*/")
+    )

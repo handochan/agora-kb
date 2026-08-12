@@ -570,7 +570,25 @@ def _run_locked(
         # strict=True: a malformed note in the live tree is integrity-critical here (the basename /
         # theme registries grade the model's plan), so surface it loudly rather than silently
         # building an incomplete registry. The browse read path uses the tolerant default instead.
-        notes = parse_all_notes(wt_layout, strict=True)
+        # A malformed note in the LIVE tree is an operator problem, not a crash: `run()` catches
+        # only LockHeld, so this raise escaped as a traceback that left the claimed batch stranded
+        # in `_kb/processing/` while `agora status` still printed `failed_events: 0` and
+        # `agora doctor` still printed `status: healthy` — and each `agora watch` tick recovered,
+        # re-claimed and re-crashed. One hand-edited `wiki/` note (an Obsidian note with no
+        # frontmatter fence) is enough to trigger it. Keep strict=True — an incomplete registry
+        # would misgrade the model's plan — and turn the raise into the FAILED run the contract
+        # already promises, so #96's `last_failure` names the offending path.
+        try:
+            notes = parse_all_notes(wt_layout, strict=True)
+        except FrontmatterError as exc:
+            return _fail(
+                layout,
+                manifest,
+                state_store,
+                now=now,
+                reasons=[f"LIVE-TREE: unparseable note in the curated tree — {exc}"],
+                max_attempts=max_attempts,
+            )
         live_basenames = {n.basename for n in notes}
         theme_basenames = {n.basename for n in notes if _is_theme_note(n)}
 
