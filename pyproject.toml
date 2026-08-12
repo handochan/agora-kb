@@ -48,7 +48,11 @@ dev = [
 ]
 
 [project.scripts]
-agora = "agora_kb.cli:main"
+# `_entry:main`, not `cli:main` — TEMPORARY, removed by #86 (see `src/agora_kb/_entry.py`). The
+# shim is a stdlib-only platform check that runs before the `fcntl` import chain, so native Windows
+# gets three lines of guidance instead of a ModuleNotFoundError traceback (#103). On macOS/Linux it
+# calls straight through to `cli.main`.
+agora = "agora_kb._entry:main"
 agora-ollama-brain = "agora_kb.adapters.ollama_brain:main"
 agora-cli-brain = "agora_kb.adapters.cli_agent_brain:main"
 

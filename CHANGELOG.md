@@ -33,13 +33,14 @@ artifact. Installing today means installing from `main`, which moves.
 
 The `0.1.0b1` notes below are the prepared release notes, not a shipped release. Remaining gates
 (epic [#93](https://github.com/handochan/agora-kb/issues/93), Track A): PyPI name reservation
-(#102), a friendly Windows failure (#103), repo metadata (description/topics, part of #106), and a
-clean-machine release smoke run by someone who is not the author (#107) — plus the
-`windows-latest` gate ruling that decides whether Windows ships in b1 or b2. Landed:
-[`SECURITY.md`](SECURITY.md) (#95), [`docs/GETTING-STARTED.md`](docs/GETTING-STARTED.md) (#104),
+(#102), repo metadata (description/topics, part of #106), and a clean-machine release smoke run by
+someone who is not the author (#107) — plus the `windows-latest` gate ruling that decides whether
+Windows ships in b1 or b2. Landed: [`SECURITY.md`](SECURITY.md) (#95),
+[`docs/GETTING-STARTED.md`](docs/GETTING-STARTED.md) (#104),
 [`docs/LIMITATIONS.md`](docs/LIMITATIONS.md) (#105), the README reconciliation (#106), the two
 `agora doctor` truthfulness fixes (#129), the frontmatter `body_status` invariant (#119) with its
-test-oracle repair (#121), and the `schema_version` skew guard (#98).
+test-oracle repair (#121), the `schema_version` skew guard (#98), and the friendly Windows failure
+(#103).
 
 **Security reports go through [`SECURITY.md`](SECURITY.md)** — private vulnerability reporting, not
 a public issue.
@@ -197,11 +198,14 @@ against the code. The normative version lives in
    (#67) threads a provenance *label* for the log — it isolates nothing and enforces nothing. Auth
    is Phase 4; ADR-0036 is still Proposed (`docs/adr/0036-authn-authz.md`). Remote MCP transport (Streamable HTTP) is coupled
    to that decision and is deliberately not shipped: stdio only.
-2. **macOS and Linux only.** On native Windows not even `agora --help` runs — `curator/claim.py`
-   imports `fcntl` unconditionally and that import sits on the path of every command. Windows is
-   epic #85 (the import blocker is #86); `windows-latest` runs in CI purely as a progress signal.
-   The WSL2 workaround has *zero* verification evidence in this repo — no test, no CI job, no doc —
-   so it is a guess, not a supported path.
+2. **macOS and Linux only.** On native Windows no command runs, `agora --help` included —
+   `curator/claim.py` imports `fcntl` unconditionally and that import sits on the path of every
+   command. As of #103 the `agora` entry point says so in three lines on stderr and exits 2
+   instead of raising `ModuleNotFoundError`, via a stdlib-only shim (`src/agora_kb/_entry.py`)
+   that runs before the import; that is a courtesy, not a port, and it is deleted when #86 lands.
+   Windows is epic #85 (the import blocker is #86); `windows-latest` runs in CI purely as a
+   progress signal. The WSL2 workaround has *zero* verification evidence in this repo — no test,
+   no CI job, no doc — so it is a guess, not a supported path.
 3. **Nothing can be deleted through a supported path.** The curator's op vocabulary is closed and
    contains no DELETE (`CREATE_THEME`, `APPEND_DAILY`, `MERGE_INTO_THEME`, `MARK_CONTESTED`, `DROP`,
    `NOOP` — and `DROP` discards an inbox event during planning, it does not remove curated content),

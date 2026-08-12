@@ -99,15 +99,18 @@ merge today — branch protection is not enabled, [`SECURITY.md`](SECURITY.md) �
 curator's OS sandbox exists only for them (Apple `sandbox-exec` on macOS, `bubblewrap` on Linux —
 ADR-0013, `src/agora_kb/curator/isolation/`; on Linux `bwrap` is a separate
 `apt-get install bubblewrap`, see [`docs/GETTING-STARTED.md`](docs/GETTING-STARTED.md) §1.1).
-**Native Windows does not run at all**, not even
-`agora --help`: `src/agora_kb/curator/claim.py:30` imports `fcntl` at module scope and the CLI
-imports that module at `src/agora_kb/cli.py:84`, so the process dies with
-`ModuleNotFoundError: No module named 'fcntl'` before it parses an argument. `windows-latest` runs
-in CI as `continue-on-error` for exactly that reason — a progress signal, not a gate — and deleting
-that line is what marks the port done (`.github/workflows/ci.yml:33`). The port is epic
-[#85](https://github.com/handochan/agora-kb/issues/85); the import blocker itself is
-[#86](https://github.com/handochan/agora-kb/issues/86). Windows deployment units and an interim
-WSL2 path are not documented — [#92](https://github.com/handochan/agora-kb/issues/92).
+**Native Windows does not run at all** — no command works, `agora --help` included.
+`src/agora_kb/curator/claim.py:30` imports `fcntl` at module scope and the CLI imports that module
+at `src/agora_kb/cli.py:86`, so the CLI cannot be imported there in the first place. What a Windows
+user gets is a refusal rather than a crash: the `agora` console script points at a stdlib-only shim
+(`src/agora_kb/_entry.py`) that checks `sys.platform` *before* that import and writes three lines to
+stderr — what is supported, that WSL2 may work but is unverified, and where the port is tracked —
+then exits 2 ([#103](https://github.com/handochan/agora-kb/issues/103)). The shim is a stopgap and
+is deleted the day the import blocker [#86](https://github.com/handochan/agora-kb/issues/86) lands.
+`windows-latest` runs in CI as `continue-on-error` for exactly that reason — a progress signal, not
+a gate — and deleting that line is what marks the port done (`.github/workflows/ci.yml:33`). The
+port is epic [#85](https://github.com/handochan/agora-kb/issues/85). Windows deployment units and an
+interim WSL2 path are not documented — [#92](https://github.com/handochan/agora-kb/issues/92).
 
 ```bash
 # 0. Get the source (no PyPI release — the clone is the install)

@@ -37,10 +37,13 @@ resolve; the PyPI name is not reserved either — that is still an open release 
 (`CHANGELOG.md`, "Release status"). Placeholders in this document use the `deploy/README.md` token
 convention: `/ABSOLUTE/PATH/TO/agora-kb` is your source checkout.
 
-**macOS and Linux only.** On native Windows not even `agora --help` runs: `curator/claim.py`
-imports `fcntl` unconditionally and that import is on the path of every command
-(`CHANGELOG.md:176-180`). Native Windows is epic
-[#85](https://github.com/handochan/agora-kb/issues/85); packaging and platform docs for it are
+**macOS and Linux only.** On native Windows no command runs, `agora --help` included:
+`curator/claim.py` imports `fcntl` unconditionally and that import is on the path of every command.
+Since [#103](https://github.com/handochan/agora-kb/issues/103) you get a three-line refusal on
+stderr and exit 2 instead of a `ModuleNotFoundError` traceback — a stopgap shim
+(`src/agora_kb/_entry.py`) that is deleted when the import blocker
+[#86](https://github.com/handochan/agora-kb/issues/86) lands, not a partial port. Native Windows is
+epic [#85](https://github.com/handochan/agora-kb/issues/85); packaging and platform docs for it are
 [#92](https://github.com/handochan/agora-kb/issues/92). The WSL2 workaround has no verification
 evidence in this repo, so it is not documented here as a path.
 
