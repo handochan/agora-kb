@@ -232,6 +232,9 @@ def build_connectors(
         session_policy = redact.policy if redact is not None else DEFAULT_POLICY
     connectors: list[Connector] = []
     for spec in specs:
+        # An absent spec.max_files keeps the connector class's own default, so the kwarg is only
+        # passed when the operator actually set one (never a None that would override the default).
+        caps = {} if spec.max_files is None else {"max_files": spec.max_files}
         if spec.name.startswith("file:"):
             connectors.append(
                 FileConnector(
@@ -239,6 +242,7 @@ def build_connectors(
                     path=spec.path or "",
                     scope=Scope(spec.scope),
                     follow_links=spec.follow_links,
+                    **caps,
                 )
             )
         elif spec.name.startswith("session:"):
@@ -248,6 +252,7 @@ def build_connectors(
                     path=spec.path or "",
                     scope=Scope(spec.scope),
                     redact_policy=session_policy,
+                    **caps,
                 )
             )
         else:

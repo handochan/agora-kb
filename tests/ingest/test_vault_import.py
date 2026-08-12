@@ -918,3 +918,46 @@ def test_end_to_end_small_vault_imports_lint_clean(tmp_path: Path) -> None:
     assert moc_fm["children"] == ["[[alpha]]", "[[beta]]"]
     index_fm = _parses(dest, "index.md")
     assert index_fm["children"] == ["[[general-moc]]"]
+
+
+def test_no_source_note_is_overwritten_by_a_colliding_destination(tmp_path: Path) -> None:
+    """Every source note lands on its OWN destination — no silent overwrite (no-loss, ADR-0014 D5).
+
+    Two ways two notes used to collapse into one file while the run still reported ``lint: clean``:
+
+    * a purely non-ASCII stem slugified to ``""`` and took the literal name ``note``, so EVERY
+      Korean-titled note in a vault overwrote the previous one. The curator path had already fixed
+      exactly this with the deterministic ``note-<sha8>`` name (#57); the importer had not;
+    * two distinct stems that slugify alike (``projects/Setup.md`` / ``archive/setup.md``) both
+      inferred ``wiki/<domain>/themes/setup.md``.
+
+    In both cases the losers no longer existed, so no duplicate basename remained for L1-1 to
+    report — the import announced a clean lint over notes it had just destroyed. Measured on the
+    pre-fix code: five sources produced two files.
+    """
+    src, dest = tmp_path / "vault", tmp_path / "kb"
+    _write(src, "큐레이터 설계.md", "# 큐레이터 설계\n\n한국어 노트 하나.\n")
+    _write(src, "하베스터 안전.md", "# 하베스터 안전\n\n두 번째 한국어 노트.\n")
+    _write(src, "골드 팩.md", "# 골드 팩\n\n세 번째 한국어 노트.\n")
+    _write(src, "projects/Setup.md", "# Setup A\n\nfirst setup note.\n")
+    _write(src, "archive/setup.md", "# Setup B\n\nsecond setup note.\n")
+
+    report = import_vault(src, dest, domains=["general"], import_date=_IMPORT_DATE)
+
+    themes = sorted(p.name for p in (dest / "wiki" / "general" / "themes").glob("*.md"))
+    assert len(themes) == 5, themes
+    assert len({n.rel_path for n in report.notes if "/themes/" in n.rel_path}) == 5
+    # The un-slugifiable stems take the #57 content-keyed name, never the literal "note".
+    assert "note.md" not in themes
+    assert sum(name.startswith("note-") for name in themes) == 3
+    # The slug collision is disambiguated rather than overwritten, and says so out loud.
+    assert "setup.md" in themes
+    assert sum(name.startswith("setup-") for name in themes) == 1
+    renamed = [n for n in report.notes if any("already claimed" in w for w in n.warnings)]
+    assert len(renamed) == 1
+    # Distinct content keeps distinct bodies — nothing was clobbered on the way in.
+    bodies = {
+        (dest / "wiki" / "general" / "themes" / name).read_text(encoding="utf-8") for name in themes
+    }
+    assert len(bodies) == 5
+    assert report.lint.ok is True, [(f.code, f.path, f.message) for f in report.lint.findings]

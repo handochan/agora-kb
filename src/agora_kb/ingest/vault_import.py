@@ -40,6 +40,7 @@ import yaml
 
 from agora_kb.core import frontmatter
 from agora_kb.core.frontmatter import FrontmatterError
+from agora_kb.core.hashing import content_sha256
 from agora_kb.core.layout import RepoLayout
 from agora_kb.core.repo import GitError, Repo
 from agora_kb.schema import Taxonomy, emit_schema, lint
@@ -306,7 +307,21 @@ def _slugify(text: str) -> str:
     return re.sub(r"-+", "-", slug).strip("-")
 
 
-def _infer_layout(dest_rel: str, first_domain: str) -> tuple[str, str, str | None]:
+def _hash_basename(text: str) -> str:
+    """Deterministic ``note-<sha8>`` basename for an un-slugifiable stem (#57, mirrored here).
+
+    A purely non-ASCII filename (e.g. a Korean note title) slugifies to ``""``. The curator path
+    already solves this — :func:`agora_kb.adapters.ollama_brain._hash_fallback_basename` names such
+    a note ``note-`` + the first 8 hex chars of the canonical ``content_sha256`` — but the importer
+    never got that fix and used a literal ``"note"``, so EVERY un-slugifiable note in a vault landed
+    on the same destination and silently overwrote the previous one while the run still reported
+    ``lint: clean`` (the losers no longer exist, so no duplicate basename remains for L1-1 to find).
+    Keying on content keeps distinct notes distinct and identical notes genuinely deduplicated.
+    """
+    return f"note-{content_sha256(text)[:8]}"
+
+
+def _infer_layout(dest_rel: str, first_domain: str, *, text: str) -> tuple[str, str, str | None]:
     """Infer ``(type, normalized-dest-rel, moved_from_or_None)`` from a DEST-relative path.
 
     The ADR-0010 §1 folder rules drive the inference:
@@ -340,7 +355,7 @@ def _infer_layout(dest_rel: str, first_domain: str) -> tuple[str, str, str | Non
 
     # Anything else: move to a theme under the first domain (catch-all), record the original path.
     stem = parts[-1][: -len(".md")] if parts[-1].endswith(".md") else parts[-1]
-    slug = _slugify(stem) or "note"
+    slug = _slugify(stem) or _hash_basename(text)
     moved_dest = f"wiki/{first_domain}/themes/{slug}.md"
     return "theme", moved_dest, dest_rel
 
@@ -991,7 +1006,7 @@ def import_vault(
                 )
 
         # Infer the type + (possibly moved) destination path from the SOURCE-relative path.
-        type_inferred, dest_rel, moved_from = _infer_layout(src_rel, first_domain)
+        type_inferred, dest_rel, moved_from = _infer_layout(src_rel, first_domain, text=body)
         build.type_inferred = type_inferred
         build.rel_path = dest_rel
         if moved_from is not None:
@@ -1000,6 +1015,29 @@ def import_vault(
                 f"no {type_inferred} path matched)"
             )
         builds.append(build)
+
+    # NO-LOSS: two sources may still infer the SAME destination — distinct stems that slugify alike
+    # (``projects/Setup.md`` + ``archive/setup.md`` → ``setup``), or two notes whose paths were both
+    # rewritten by the catch-all above. The writer would overwrite, and because the loser then does
+    # not exist there is no duplicate basename left for lint L1-1 to report, so the import announced
+    # ``lint: clean`` over notes it had just destroyed. Disambiguate deterministically with the same
+    # content-keyed suffix, in a stable order, and say so in the per-note warnings.
+    claimed: dict[str, _NoteBuild] = {}
+    for build in sorted(builds, key=lambda b: b.rel_path):
+        first = claimed.get(build.rel_path)
+        if first is None:
+            claimed[build.rel_path] = build
+            continue
+        collided = build.rel_path
+        parent = PurePosixPath(collided).parent
+        build.rel_path = (
+            f"{parent}/{PurePosixPath(collided).stem}-{content_sha256(build.body)[:8]}.md"
+        )
+        build.warnings.append(
+            f"destination {collided!r} was already claimed by {first.src_path.name!r}; "
+            f"renamed to {PurePosixPath(build.rel_path).name!r} so neither note is lost"
+        )
+        claimed[build.rel_path] = build
 
     # Build the basename→dest-relpath map over ALL notes (last writer wins on a basename clash; a
     # genuine duplicate basename is an L1-1 the attached lint will surface).

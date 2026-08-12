@@ -288,6 +288,7 @@ through in [`docs/LIMITATIONS.md`](docs/LIMITATIONS.md) §7). Sharing one KB wit
 | [`docs/ROADMAP.md`](docs/ROADMAP.md) | Phased path: personal MVP → harvester → team server |
 | [`docs/adr/`](docs/adr/) | Architecture Decision Records (the *why* behind each choice) |
 | [`docs/DEPLOY-TEAM.md`](docs/DEPLOY-TEAM.md) | Sharing one KB with 2–10 people: hub topology, proxy auth, footguns (**Korean**) |
+| [`docs/STRATEGY-2026-08.md`](docs/STRATEGY-2026-08.md) | Scope review: what is defensible vs commoditized, the verified defects, roadmap verdicts (**Korean**) |
 | [`deploy/README.md`](deploy/README.md) | Always-on packaging — launchd / systemd units + install steps |
 | [`SECURITY.md`](SECURITY.md) | Threat model, supported scope, private vulnerability reporting |
 

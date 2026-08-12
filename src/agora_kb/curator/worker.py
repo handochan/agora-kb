@@ -570,7 +570,25 @@ def _run_locked(
         # strict=True: a malformed note in the live tree is integrity-critical here (the basename /
         # theme registries grade the model's plan), so surface it loudly rather than silently
         # building an incomplete registry. The browse read path uses the tolerant default instead.
-        notes = parse_all_notes(wt_layout, strict=True)
+        # A malformed note in the LIVE tree is an operator problem, not a crash: `run()` catches
+        # only LockHeld, so this raise escaped as a traceback that left the claimed batch stranded
+        # in `_kb/processing/` while `agora status` still printed `failed_events: 0` and
+        # `agora doctor` still printed `status: healthy` — and each `agora watch` tick recovered,
+        # re-claimed and re-crashed. One hand-edited `wiki/` note (an Obsidian note with no
+        # frontmatter fence) is enough to trigger it. Keep strict=True — an incomplete registry
+        # would misgrade the model's plan — and turn the raise into the FAILED run the contract
+        # already promises, so #96's `last_failure` names the offending path.
+        try:
+            notes = parse_all_notes(wt_layout, strict=True)
+        except FrontmatterError as exc:
+            return _fail(
+                layout,
+                manifest,
+                state_store,
+                now=now,
+                reasons=[f"LIVE-TREE: unparseable note in the curated tree — {exc}"],
+                max_attempts=max_attempts,
+            )
         live_basenames = {n.basename for n in notes}
         theme_basenames = {n.basename for n in notes if _is_theme_note(n)}
 
@@ -662,6 +680,20 @@ def _run_locked(
         # preserved by model_copy), and the on-disk manifest is byte-identical either way.
         manifest = _advance(layout, manifest, phase="applied", prose_complete=False)
 
+        # §4.2 SCOPE BASELINE: snapshot the post-APPLY tree so the AUTHOR diff below is graded on
+        # what PASS 2 ACTUALLY touched, not merely on the notes it was ASKED to author. Deriving
+        # the changed set from `needs_prose` alone made that set a SUBSET of `sentinels`, which
+        # rendered validate_author_diff's "path not in sentinels" rejection unreachable in
+        # production: a PASS-2 write to any OTHER `wiki/` note passed the §4.2 gate untested and
+        # then passed §4.0 too, because the final-diff allowlist admits the whole `wiki/` prefix
+        # (constants.ALLOWLIST_DIR_PREFIXES). Reproduced end-to-end: an adversarial backend rewrote
+        # an unrelated theme's body AND flipped its frontmatter `status`, and the run PUBLISHED
+        # with `failure=None`; deleting that note while scrubbing its MOC references published too,
+        # losing the note. `_agora_scratch/` is already excluded per-worktree (above), so backend
+        # scratch can never enter this baseline.
+        _git(wt, "add", "-A")
+        applied_tree = _git(wt, "write-tree").stdout.strip()
+
         # PASS 2 — DELEGATED: author prose between the candidate-id sentinels, then validate the
         # diff. The §8.2 context grounds each region in its candidate's verbatim source + op; it is
         # advisory backend input only — base_state/changed/sentinels (the §4.2 gate) are unchanged.
@@ -697,11 +729,27 @@ def _run_locked(
             # owned); the strip is iterated to a fixed point in strip_stray_wikilinks.
             _strip_stray_links(wt, needs_prose, plan, live_basenames, run_date)
             new_state = _read_notes(wt, needs_prose)
-            changed = [rel for rel in needs_prose if base_state[rel] != new_state[rel]]
+            # The REAL PASS-2 diff: every tracked add/modify/delete against the post-APPLY
+            # baseline, so a write outside `needs_prose` reaches check 1 instead of being invisible.
+            _git(wt, "add", "-A")
+            pass2_diff = _parse_name_status_z(
+                _git(wt, "diff", "--cached", "--name-status", "-z", applied_tree).stdout
+            )
+            changed = sorted({rel for _status, rel in pass2_diff})
+            # The validator reads BOTH sides for `log.md` (and for any needs_prose note); supply
+            # every changed path so an out-of-scope edit is graded on real bytes, never on a
+            # defaulted empty string that would silently compare equal.
+            per_file_old = dict(base_state)
+            per_file_new = dict(new_state)
+            for rel in changed:
+                if rel not in per_file_old:
+                    per_file_old[rel] = _blob_at(wt, applied_tree, rel)
+                if rel not in per_file_new:
+                    per_file_new[rel] = _worktree_text(wt / rel)
             author_errors = validate_author_diff(
                 changed_paths=changed,
-                per_file_old=base_state,
-                per_file_new=new_state,
+                per_file_old=per_file_old,
+                per_file_new=per_file_new,
                 sentinels=sentinels,
             )
             if author_errors:
@@ -711,6 +759,12 @@ def _run_locked(
                 # Structure is APPLY-owned and intact, so the run still PUBLISHES a prose-pending
                 # note rather than failing (only the prose pass is lost).
                 _degrade_prose(wt, needs_prose, base_state)
+                # _degrade_prose walks `needs_prose` ONLY, so a path outside it stays tampered and
+                # would publish inside an otherwise-"rejected" run. Restore those from the same
+                # post-APPLY baseline the diff was graded against — same all-or-nothing semantics.
+                _restore_out_of_scope(
+                    wt, applied_tree, [r for r in changed if r not in needs_prose]
+                )
                 prose_complete = False
                 new_state = _read_notes(wt, needs_prose)
                 prose_warnings.append(
@@ -1623,6 +1677,47 @@ def _assert_final_diff_allowlisted(
                 reasons.append(f"FINAL-DIFF: {path!r} ({status}) contains a '..' path escape")
 
     return sorted(reasons)
+
+
+def _worktree_text(path: Path) -> str:
+    """The note's current text, or ``""`` when PASS 2 deleted it (mirrors :func:`_read_notes`)."""
+    if not path.is_file():
+        return ""
+    return path.read_text(encoding="utf-8", errors="replace")
+
+
+def _blob_at(worktree: Path, tree: str, rel: str) -> str:
+    """``rel``'s text in ``tree``, or ``""`` when the path did not exist there (a PASS-2 ADD).
+
+    Used to give :func:`agora_kb.curator.apply.validate_author_diff` the real base bytes for a path
+    outside ``needs_prose`` (whose text ``base_state`` never captured), so the ``log.md`` equality
+    check grades actual content instead of two defaulted empty strings.
+    """
+    try:
+        return _git(worktree, "show", f"{tree}:{rel}").stdout
+    except RuntimeError:
+        return ""
+
+
+def _restore_out_of_scope(worktree: Path, tree: str, paths: list[str]) -> None:
+    """Undo PASS-2 writes to paths outside ``needs_prose`` by restoring them from ``tree``.
+
+    A path present in ``tree`` is checked back out (undoing a modify or a delete); a path ABSENT
+    from it was created by PASS 2 and is removed. Both leave the worktree byte-identical to the
+    post-APPLY baseline, so the §4.0 final-diff gate then sees only APPLY's own changes.
+
+    ONLY §4.0-allowlisted paths are restored. An OFF-allowlist write (``_templates/``, ``_kb/``, a
+    planted or forged ``raw/`` source, a touched schema symlink) is deliberately left on disk so
+    :func:`_assert_final_diff_allowlisted` still FAILS the whole run on it — §4.2 degrades, §4.0
+    fails, and sanitizing here must not quietly convert the second into the first.
+    """
+    for rel in paths:
+        if not is_allowlisted_path(rel):
+            continue
+        try:
+            _git(worktree, "checkout", tree, "--", rel)
+        except RuntimeError:
+            (worktree / rel).unlink(missing_ok=True)
 
 
 def _parse_name_status_z(out: str) -> list[tuple[str, str]]:

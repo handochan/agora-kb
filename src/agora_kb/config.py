@@ -734,6 +734,13 @@ class ConnectorSpec:
     scope: str
     path: str | None
     follow_links: bool = False
+    #: Per-scan cap on how many glob matches this connector reads. ``None`` keeps the connector
+    #: class's own default (``file:`` 64, ``session:`` 512). It was previously a constructor-only
+    #: default with NO config key, so a source whose glob matched more files than the cap was
+    #: truncated with no supported way to raise it — and because a truncated file never reaches the
+    #: whole-source digest, editing it did not even re-trigger a scan, so its facts were unreachable
+    #: rather than merely delayed.
+    max_files: int | None = None
 
 
 def load_connector_specs(path: str | Path) -> list[ConnectorSpec] | None:
@@ -772,12 +779,24 @@ def load_connector_specs(path: str | Path) -> list[ConnectorSpec] | None:
         follow_links = _opt_bool(
             spec.get("follow_links"), False, key=f"connector {name!r}: follow_links"
         )
+        # max_files is OPTIONAL: absent keeps the connector class's own default. A supplied value
+        # must be a positive int — fail LOUD on a typo rather than silently reinstating the default,
+        # which is exactly how an operator ends up believing a raised cap took effect.
+        raw_max_files = spec.get("max_files")
+        max_files = (
+            None
+            if raw_max_files is None
+            else _opt_int(raw_max_files, 0, key=f"connector {name!r}: max_files")
+        )
+        if max_files is not None and max_files < 1:
+            raise ConfigError(f"connector {name!r}: max_files must be >= 1, got {max_files!r}")
         specs.append(
             ConnectorSpec(
                 name=str(name),
                 scope=scope,
                 path=_opt_str(spec.get("path")),
                 follow_links=follow_links,
+                max_files=max_files,
             )
         )
     return specs
