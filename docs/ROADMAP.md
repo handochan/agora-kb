@@ -225,11 +225,19 @@ recorded before anyone touches the code, and Track B gets its `windows-latest` s
 - [ ] **PyPI name claim (#102).** `agora-kb` currently 404s (unclaimed); bare `agora` belongs to someone
       else. A `0.1.0b1` placeholder upload claims the name, kept deliberately separate from an actual
       distribution track.
-- [ ] **Windows friendly failure (#103).** Until #86 lands, `curator/claim.py:30` imports `fcntl`
-      unconditionally via `curator/__init__.py:12` → `cli.py:57`, so even `agora --help` raises
-      `ModuleNotFoundError` on native Windows. A platform check at the entry point turns that into a
-      sentence that names the platform, the tracking issue, and the WSL2 interim caveat — a temporary
-      line of defense, removed when #86 lands.
+- [x] **Windows friendly failure (#103)** — DONE. `curator/claim.py:30` imports `fcntl`
+      unconditionally via `curator/__init__.py:12` → `cli.py:86`, so on native Windows even
+      `agora --help` used to raise `ModuleNotFoundError` — which reads as "this package is broken",
+      not "this platform is not supported yet". `[project.scripts] agora` now points at
+      `src/agora_kb/_entry.py`, a **stdlib-only** shim whose `sys.platform == "win32"` check runs
+      *before* the first `agora_kb` import; it writes three lines to stderr (supported = macOS and
+      Linux · WSL2 may work but is UNVERIFIED · the port is #85) and returns 2, with no traceback.
+      The check is exactly `win32` and nothing broader: an allowlist would refuse the BSDs and
+      anything else that ships `fcntl`. Locked by `tests/test_entry_shim.py`, including an
+      end-to-end child interpreter where `fcntl` is genuinely unimportable — plus a control that
+      fails if that block ever stops working. **Deleted when #86 lands** (stated in `_entry.py` and
+      in #86's acceptance criteria): at that point native Windows imports and the refusal becomes a
+      lie.
 
 **Docs (3)**
 - [ ] **`docs/GETTING-STARTED.md` — installable-from-zero + the Ollama premise (#104).** Quickstart step 1
@@ -272,7 +280,10 @@ recorded before anyone touches the code, and Track B gets its `windows-latest` s
 - [ ] **#87 → #86 → #88 → #89**, in that order: the ADR decision, then the `fcntl` import blocker +
       the single-writer lock port + the `windows-latest` matrix, then LF/git hygiene, then encoding.
       Today `curator/claim.py:30` imports `fcntl` unconditionally via `curator/__init__.py:12` →
-      `cli.py:57`, so even `agora --help` raises `ModuleNotFoundError` on native Windows. Track B does
+      `cli.py:86`, so `agora_kb.cli` cannot be imported on native Windows at all; since #103 the
+      `agora` entry point refuses with three lines and exit 2 rather than a traceback
+      (`src/agora_kb/_entry.py` — **which #86 deletes**, along with `tests/test_entry_shim.py` and
+      the `[project.scripts]` redirect). Track B does
       **not** block the tag — the gate below only decides *which* release it lands in. Three
       corrections surfaced by this cutline: #89's "4 `text=True` sites" is actually **6**
       (`core/repo.py:164`, `curator/worker.py:1260`, `curator/backends.py:295`,
