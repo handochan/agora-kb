@@ -22,6 +22,14 @@ silently reversible by a well-meaning edit:
 The wiring itself (``[project.scripts] agora``) is asserted too: a perfect shim that no console
 script points at ships nothing.
 
+On the ``windows-latest`` CI leg (``continue-on-error`` until #86, ``.github/workflows/ci.yml:33``)
+this module is one of the ones that *collects*: its module scope reaches only ``agora_kb._entry``,
+which is exactly the property under test. Nothing here runs there regardless — pytest aborts the
+session on the 36 collection errors raised by the modules that do import the ``fcntl`` chain — and
+running this file on its own under Windows fails the pass-through tests for that same reason. They
+are deliberately not skip-marked: the shared ``posix_only`` marker is part of #86's own scope, and
+this file does not outlive #86.
+
 When #86 lands, this file is deleted along with the module it guards — that is stated in
 ``_entry.py`` and in #86's acceptance criteria, and
 :func:`test_removal_condition_is_recorded_in_code` keeps the in-code half of that promise from
