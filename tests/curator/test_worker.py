@@ -1503,10 +1503,145 @@ def test_stray_wikilink_is_stripped_and_run_publishes(tmp_path: Path) -> None:
     assert read_manifest(manifest_path(repo.layout, report.run_id)).prose_complete is True
 
 
+class _VandalBackend(FakeBackend):
+    """Authors its region, then ALSO rewrites an unrelated ``wiki/`` note (body + frontmatter)."""
+
+    def __init__(self, *args: object, victim: str, **kwargs: object) -> None:
+        super().__init__(*args, **kwargs)  # type: ignore[arg-type]
+        self._victim = victim
+
+    def author(
+        self,
+        worktree: Path,
+        needs_prose: dict[str, list[str]],
+        context: dict[str, AuthorRegion],
+    ) -> None:
+        super().author(worktree, needs_prose, context)
+        note = worktree / self._victim
+        text = note.read_text(encoding="utf-8")
+        text = text.replace(_VICTIM_SENTENCE, "TAMPERED BY PASS 2 — never named by the plan.")
+        note.write_text(text.replace("status: active", "status: deprecated"), encoding="utf-8")
+
+
+class _CoveringDeleteBackend(FakeBackend):
+    """Authors its region, then DELETES an unrelated note AND scrubs every MOC reference to it."""
+
+    def __init__(self, *args: object, victim: str, **kwargs: object) -> None:
+        super().__init__(*args, **kwargs)  # type: ignore[arg-type]
+        self._victim = victim
+
+    def author(
+        self,
+        worktree: Path,
+        needs_prose: dict[str, list[str]],
+        context: dict[str, AuthorRegion],
+    ) -> None:
+        super().author(worktree, needs_prose, context)
+        (worktree / self._victim).unlink()
+        stem = Path(self._victim).stem
+        for moc in (worktree / "wiki").rglob("*-moc.md"):
+            kept = [
+                ln
+                for ln in moc.read_text(encoding="utf-8").splitlines(keepends=True)
+                if stem not in ln
+            ]
+            moc.write_text("".join(kept), encoding="utf-8")
+
+
+_VICTIM_SENTENCE = "The original, human-trusted sentence that must not change."
+_VICTIM_REL = "wiki/ai-tech/themes/victim-note.md"
+_VICTIM_TEXT = f"""---
+title: Victim note
+type: theme
+created: 2026-06-12
+updated: 2026-06-12
+status: active
+summary: A pre-existing curated note the plan never mentions.
+description: A pre-existing curated note the plan never mentions.
+timestamp: 2026-06-12T00:00:00Z
+tags: [curator]
+aliases: []
+related: []
+sources: [raw/ai-tech/victim-src.md]
+---
+
+# Victim note
+
+{_VICTIM_SENTENCE}
+"""
+
+
+def _repo_with_a_bystander_note(tmp_path: Path) -> tuple[Repo, str, str, dict[str, str]]:
+    """A repo carrying one lint-clean curated note that this run's plan never mentions."""
+    repo = _init_repo(tmp_path)
+    src = repo.root / "raw" / "ai-tech" / "victim-src.md"
+    src.parent.mkdir(parents=True, exist_ok=True)
+    src.write_text("raw source for the victim note\n", encoding="utf-8")
+    victim = repo.root / _VICTIM_REL
+    victim.parent.mkdir(parents=True, exist_ok=True)
+    victim.write_text(_VICTIM_TEXT, encoding="utf-8")
+    _commit_all(repo, "chore: plant a pre-existing curated note")
+
+    e1 = _write_capture(Inbox(repo.layout), text="One curator advances the branch.", second=10)
+    _seed_raw(repo, e1)
+    base = repo.head_commit()
+    plan = _create_theme_plan("bystander-run", "c1", e1)
+    prose = {region_sentinel_id("bystander-run", "c1"): "A legitimately authored region."}
+    return repo, base, plan, prose
+
+
+def test_pass2_cannot_tamper_with_a_note_the_plan_never_named(
+    tmp_path: Path, prose_pending_is_the_point: None
+) -> None:
+    """PASS 2 may not edit a ``wiki/`` note outside ``needs_prose`` — body OR frontmatter.
+
+    Regression lock for the §4.2 scope hole: the changed set was derived from ``needs_prose``, so it
+    was a SUBSET of ``sentinels`` and ``validate_author_diff``'s "path not in sentinels" rejection
+    could never fire in production, while §4.0 admits the whole ``wiki/`` prefix. A backend could
+    therefore rewrite any bystander note's prose and flip its frontmatter ``status``, and the run
+    PUBLISHED with ``failure=None``. The capture is not at fault, so the run still publishes (§4.2
+    degrades) — but the bystander must come back byte-identical.
+    """
+    repo, _base, plan, prose = _repo_with_a_bystander_note(tmp_path)
+
+    report = _run(repo, _VandalBackend(plan, prose=prose, victim=_VICTIM_REL))
+
+    assert report.status == "published"
+    published = (repo.root / _VICTIM_REL).read_text(encoding="utf-8")
+    assert published == _VICTIM_TEXT  # byte-identical: body AND frontmatter restored
+    assert "TAMPERED BY PASS 2" not in published
+    assert "status: deprecated" not in published
+
+
+def test_pass2_cannot_delete_a_note_while_scrubbing_its_moc_references(
+    tmp_path: Path, prose_pending_is_the_point: None
+) -> None:
+    """A PASS-2 delete that covers its tracks must not lose the note.
+
+    The naive delete was caught only by ACCIDENT — ``LINT L1-2 broken link`` on the MOC — so a
+    backend that also scrubbed the MOC bullet published a tree with the note permanently gone. The
+    §4.2 scope check is the real net; lint never had to be the one holding it.
+    """
+    repo, _base, plan, prose = _repo_with_a_bystander_note(tmp_path)
+
+    report = _run(repo, _CoveringDeleteBackend(plan, prose=prose, victim=_VICTIM_REL))
+
+    assert report.status == "published"
+    assert (repo.root / _VICTIM_REL).is_file()
+    assert (repo.root / _VICTIM_REL).read_text(encoding="utf-8") == _VICTIM_TEXT
+
+
 # --- (6) final-diff allowlist gate + _agora_scratch/ gitignore ----------------------------------
 
 
-def test_off_allowlist_file_is_rejected_by_final_diff_gate(tmp_path: Path) -> None:
+def test_off_allowlist_file_is_rejected_by_final_diff_gate(
+    tmp_path: Path, prose_pending_is_the_point: None
+) -> None:
+    # The planted `_templates/evil.md` is now VISIBLE to the §4.2 AUTHOR-diff too (the changed set
+    # is the real git diff against the post-APPLY baseline, not just `needs_prose`), so PASS 2 is
+    # rejected as a whole and every region degrades to the placeholder before §4.0 fails the run.
+    # The prose pending here is that rejection, declared out loud — the assertion under test is
+    # still that FINAL-DIFF, not §4.2, is what fails the run and keeps the branch unmoved.
     repo = _init_repo(tmp_path)
     layout = repo.layout
     inbox = Inbox(layout)
@@ -1539,17 +1674,21 @@ def test_off_allowlist_file_is_rejected_by_final_diff_gate(tmp_path: Path) -> No
     assert not any("_agora_scratch" in c for c in checks)
 
 
-def test_brain_cannot_forge_or_plant_raw_during_pass2(tmp_path: Path) -> None:
+def test_brain_cannot_forge_or_plant_raw_during_pass2(
+    tmp_path: Path, prose_pending_is_the_point: None
+) -> None:
     """A PASS-2 backend that overwrites/plants ``raw/`` is rejected by the final-diff gate (D3).
 
     The blocker the loosened ``raw/``-prefix allowlist re-introduced: the brain can never write
-    ``raw/`` (ADR-0010 D3 / the Karpathy immutable-verification-baseline guarantee), yet the
-    §4.2 AUTHOR-diff check never sees ``raw/`` (it grades only needs_prose notes' sentinel regions),
-    so the final-diff gate is the ONLY protection. It must admit ONLY the EXACT engine-written
-    paths-with-content (``apply_plan``'s ``raw_writes``): a PASS-2 OVERWRITE of the materialized
-    source (same path, forged bytes) AND a PLANTED new ``raw/`` file both fall through to the
-    off-allowlist rejection. The run must FAIL, the branch must NOT move, and the error must name
-    the FINAL-DIFF check on a ``raw/`` path.
+    ``raw/`` (ADR-0010 D3 / the Karpathy immutable-verification-baseline guarantee). The §4.2
+    AUTHOR-diff now DOES see such a write — its changed set is the real git diff against the
+    post-APPLY baseline, so a ``raw/`` path reaches check 1 and degrades the prose pass — but §4.2
+    only ever degrades, and ``_restore_out_of_scope`` deliberately declines to sanitize a path
+    outside the §4.0 allowlist. So the final-diff gate remains the enforcer that FAILS the run: it
+    admits ONLY the EXACT engine-written paths-with-content (``apply_plan``'s ``raw_writes``), and a
+    PASS-2 OVERWRITE of the materialized source (same path, forged bytes) AND a PLANTED new ``raw/``
+    file both fall through to the off-allowlist rejection. The run must FAIL, the branch must NOT
+    move, and the error must name the FINAL-DIFF check on a ``raw/`` path.
     """
     repo = _init_repo(tmp_path)
     layout = repo.layout
