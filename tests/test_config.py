@@ -792,3 +792,46 @@ def test_backup_policy_not_added_to_repo_config(tmp_path: Path) -> None:
     _write_repo_yaml(layout, "name: kb\nbackup:\n  remote: origin\n  auto: true\n")
     cfg = load_repo_config(layout)  # must not trip extra='forbid'
     assert cfg.name == "kb"
+
+
+def test_connector_max_files_is_operator_configurable(tmp_path: Path) -> None:
+    """``connectors.<name>.max_files`` overrides the scan cap (absent = the class's own default).
+
+    The cap was a constructor-only default (``file:`` 64) with no config key, so a source glob that
+    matched more files than that was truncated with no supported way to raise it — and a truncated
+    file never reaches the whole-source digest, so editing it did not re-trigger a scan either. A
+    5-person ``notes/<person>/**`` layout hits this immediately.
+    """
+    from agora_kb.config import load_connector_specs
+
+    p = tmp_path / "adapters.yaml"
+    p.write_text(
+        "connectors:\n"
+        "  file:notes:\n"
+        "    path: ~/notes/**/*.md\n"
+        "    scope: team\n"
+        "    max_files: 500\n"
+        "  file:defaulted:\n"
+        "    path: ~/other/**/*.md\n",
+        encoding="utf-8",
+    )
+
+    specs = {s.name: s for s in load_connector_specs(p) or []}
+
+    assert specs["file:notes"].max_files == 500
+    assert specs["file:defaulted"].max_files is None  # absent → the connector class's own default
+
+
+@pytest.mark.parametrize("bad", ["0", "-1", '"many"', "true"])
+def test_connector_max_files_fails_loud_on_a_bad_value(tmp_path: Path, bad: str) -> None:
+    """A typo'd cap raises rather than reinstating the default the operator meant to raise."""
+    from agora_kb.config import ConfigError, load_connector_specs
+
+    p = tmp_path / "adapters.yaml"
+    p.write_text(
+        f"connectors:\n  file:notes:\n    path: ~/notes/**/*.md\n    max_files: {bad}\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigError, match="max_files"):
+        load_connector_specs(p)
