@@ -56,8 +56,11 @@ from pydantic import ValidationError
 
 from . import __version__
 from .config import (
+    SUPPORTED_KB_SCHEMA_VERSIONS,
     ConfigError,
     RepoConfig,
+    UnsupportedSchemaVersionError,
+    guard_repo_schema_version,
     load_backend_registry,
     load_backup_policy,
     load_connector_specs,
@@ -65,6 +68,7 @@ from .config import (
     load_index_policy,
     load_redact_policy,
     load_repo_config,
+    read_kb_schema_version,
     write_default_adapters_yaml,
     write_default_repo_config,
 )
@@ -152,7 +156,8 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="TAG",
         help="an allowed taxonomy tag (repeatable; default: none)",
     )
-    p_repo_init.set_defaults(func=_cmd_repo_init)
+    # Positional repo path — declared so the #98 guard covers a RE-init onto an existing repo.
+    p_repo_init.set_defaults(func=_cmd_repo_init, schema_guard_attr="path")
     p_repo.set_defaults(func=_cmd_repo_missing)
 
     # import — the opt-in Obsidian/markdown vault normalizer (ADR-0014 D5).
@@ -177,7 +182,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="an allowed destination taxonomy tag (repeatable; source tags outside this set are "
         "stripped + reported; default: none)",
     )
-    p_import.set_defaults(func=_cmd_import)
+    # `dest` may already BE an Agora repo (import does not refuse one), and import writes
+    # wiki/ + _meta/ and commits — so it must be guarded (#98).
+    p_import.set_defaults(func=_cmd_import, schema_guard_attr="dest")
 
     # status
     p_status = sub.add_parser("status", help="show inbox depth + curator state")
@@ -360,7 +367,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="skip the brain-availability probe (no daemon or PATH lookups; the health "
         "verdict then ignores brain reachability)",
     )
-    p_doctor.set_defaults(func=_cmd_doctor)
+    # `skip_schema_guard` EXEMPTS doctor from the #98 KB-schema support gate — the ONLY command that
+    # names a repo with `--repo` and is allowed to run against one this build does not support.
+    # Diagnosing the skew is doctor's entire job; a guard that killed it would take out the tool the
+    # failure message sends the operator to. Doctor reports the skew on its `schema:` line and goes
+    # `status: unhealthy` instead (see `_doctor_schema`).
+    p_doctor.set_defaults(func=_cmd_doctor, skip_schema_guard=True)
 
     return parser
 
@@ -369,7 +381,10 @@ def main(argv: list[str] | None = None) -> int:
     """CLI entry point (wired as ``[project.scripts] agora``).
 
     Returns a process exit code. With no subcommand (or an unknown one) the parser help is written
-    to stderr and ``2`` is returned.
+    to stderr and ``2`` is returned. Between parsing and dispatch sits the #98 KB-schema support
+    gate (:func:`_schema_version_guard`) — ONE central check rather than a call every command has to
+    remember, because a guard a future ``agora foo`` forgets to make is the same silent-misread bug
+    the guard exists to fix.
     """
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -377,7 +392,62 @@ def main(argv: list[str] | None = None) -> int:
     if func is None:
         parser.print_help(sys.stderr)
         return 2
+    guard_rc = _schema_version_guard(args)
+    if guard_rc is not None:
+        return guard_rc
     return func(args)
+
+
+def _schema_version_guard(args: argparse.Namespace) -> int | None:
+    """The DESIGN §10 V9 fail-loud gate, applied ONCE for every command (#98).
+
+    Returns ``None`` to let dispatch proceed, or an exit code the caller returns immediately.
+
+    The rule is deliberately structural rather than a per-command list: a command is guarded IFF it
+    names a repo with ``--repo`` and has not opted out with ``skip_schema_guard``. So a future
+    ``agora foo --repo PATH`` is guarded the day it is added, with no edit here — the failure mode
+    that made this issue P0 is a check somebody forgets to wire.
+
+    A command whose repo argument is POSITIONAL declares which attribute holds it, with
+    ``set_defaults(schema_guard_attr="...")``. That covers ``agora import <src> <dest>`` and
+    ``agora repo init <path>``, which an earlier draft exempted on the premise that they "CREATE
+    the repo they name". That premise is FALSE and the exemption was a hole: neither command
+    refuses an ALREADY-INITIALIZED destination, and both are DIRECT writers of ``wiki/`` and
+    ``_meta/`` plus their own git commit — i.e. exactly the old-binary-writes-into-a-newer-repo
+    damage this issue exists to prevent, on the flow the README quickstart documents. Creating a
+    FRESH destination still passes silently, because :func:`read_kb_schema_version` yields the
+    default ``1`` for a directory that is not an Agora repo — so the exemption's real intent
+    survives without the hole.
+
+    Two deliberate non-firings, each an "act on a repo?" answer of no:
+
+    * ``agora --version`` — argparse exits from inside ``parse_args``, never reaching dispatch;
+    * ``agora repo`` / ``index`` / ``gold`` with no subcommand — usage stubs that touch no repo.
+
+    ``agora doctor`` is the one command that DOES name a repo and is still exempt (see
+    ``build_parser``). ``tests/test_schema_version_guard.py`` walks the whole parser tree and fails
+    if any other command slips into the unguarded category without a decision being made.
+    """
+    if getattr(args, "skip_schema_guard", False):
+        return None
+    repo = getattr(args, "repo", None)
+    if repo is None:
+        attr = getattr(args, "schema_guard_attr", None)
+        repo = getattr(args, attr, None) if attr is not None else None
+    if repo is None:
+        return None
+    try:
+        guard_repo_schema_version(RepoLayout(Path(repo)))
+    except UnsupportedSchemaVersionError as exc:
+        # A clean one-liner + non-zero exit — never a traceback. Ordered BEFORE the ValueError arm
+        # below on purpose: UnsupportedSchemaVersionError is a ConfigError, hence a ValueError.
+        print(f"{_PROG}: {exc}", file=sys.stderr)
+        return 1
+    except (OSError, ValueError):
+        # An unusable `--repo` string (NUL byte, vanished cwd, unreadable path). Not the guard's
+        # verdict to render: the command itself reports it with the context only it has.
+        return None
+    return None
 
 
 # --- commands -----------------------------------------------------------------------------------
@@ -1418,6 +1488,14 @@ def _watch_tick(repo: Repo) -> bool:
     """
     layout = repo.layout
     cfg = load_repo_config(layout)
+    # #98 re-asserted PER TICK, not just at dispatch. `watch` is the one always-on command (the
+    # launchd/systemd units) and it hosts the single writer of `wiki/`, so a process that started
+    # on a v1 repo would keep curating onto a repo that became v2 under it — a `git pull` of a
+    # newer schema, or a future `agora repo upgrade`, is exactly how that happens. The tick already
+    # re-reads the config every pass so operator edits take effect without a restart; the schema is
+    # part of what may have changed. The raise lands in the loop's own guard (#97), so it surfaces
+    # as one bounded tick error rather than a crash loop.
+    guard_repo_schema_version(layout)
     now = datetime.now(UTC)
     stamp = _fmt_dt(now)
 
@@ -1750,6 +1828,12 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
     # network: none backend at curate time) without flagging the whole host unhealthy.
     cfg = _doctor_repo_config(layout)
 
+    # #98 / DESIGN §10 V9: the schema-skew line. Doctor is EXEMPT from the guard that stops every
+    # other command, precisely so this line can exist — and it is the one `_doctor_*` line about a
+    # FILE that still moves the verdict, because a repo this build cannot read makes every line
+    # below it a guess.
+    ok = _doctor_schema(layout) and ok
+
     # Loaded BEFORE the sandbox probe (#129): the `sandbox:` block reports not just "the mechanism
     # works on this host" but "does it confine THIS repo's brains", and that second answer is the
     # resolved backends' `network` posture. Still ONE parse shared with routing/brains below.
@@ -1798,6 +1882,38 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
 
     print(f"status: {'healthy' if ok else 'unhealthy'}")
     return 0 if ok else 1
+
+
+def _doctor_schema(layout: RepoLayout) -> bool:
+    """Print ``schema: repo=<n> supported=[...]``; False when this build does not support it.
+
+    Issue #98 / DESIGN §10 V9. Unlike the purely observational ``_doctor_*`` lines, this one FEEDS
+    THE VERDICT: `agora status` / `curate` / `harvest` / `serve` / `web` all refuse on an
+    unsupported repo, so reporting `status: healthy` for a tree where nothing but doctor can run
+    would be a lie. Doctor stays the exempt command — it must reach this line to explain WHY the
+    others exited 1.
+
+    Takes the LAYOUT, not the loaded :class:`RepoConfig`, and reads the canonical value through
+    :func:`~agora_kb.config.read_kb_schema_version` — the SAME narrow read the guard makes, so the
+    two provably cannot disagree. Reading it off ``cfg`` was a real defect: ``_doctor_repo_config``
+    substitutes DEFAULTS whenever ``repo.yaml`` fails to load for ANY reason, so a schema-2 repo
+    with an unrelated ``repo.yaml`` typo made doctor print ``repo=1 supported=[1]`` and vote
+    ``healthy`` — asserting a version it never read, about the one repo this line exists for.
+
+    An indeterminate version is reported as such and FAILS the verdict: doctor's whole job here is
+    to answer the question the other commands refuse on, and "I could not tell" is not a pass.
+    Never crashes — the reader swallows every I/O and parse error into ``None``.
+    """
+    supported = sorted(SUPPORTED_KB_SCHEMA_VERSIONS)
+    version = read_kb_schema_version(layout)
+    if version is None:
+        print(f"  schema: repo=? supported={supported} (UNREADABLE — cannot verify)")
+        return False
+    if version in SUPPORTED_KB_SCHEMA_VERSIONS:
+        print(f"  schema: repo={version} supported={supported}")
+        return True
+    print(f"  schema: repo={version} supported={supported} (UNSUPPORTED — upgrade agora)")
+    return False
 
 
 def _doctor_connectors(layout: RepoLayout) -> None:

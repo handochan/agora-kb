@@ -17,6 +17,13 @@ curator run-loop already consumes. Two config surfaces are read here, both plain
   crash — a :class:`BackendRegistry` requires ≥1 backend by construction, so a 0-backend registry
   cannot exist). The registry's own typing/validation owns the backend specs.
 
+One thing here is not a loader: the DESIGN §10 V9 **KB schema-version support gate** (issue #98) —
+:data:`SUPPORTED_KB_SCHEMA_VERSIONS` plus :func:`assert_supported_kb_schema_version` /
+:func:`guard_repo_schema_version`. It lives beside the loader because it judges the loader's output,
+but it is deliberately NOT part of loading: an old binary must still be able to READ a
+newer-than-it-understands repo (that is how ``agora doctor`` diagnoses the skew) while every command
+that would ACT on it refuses first.
+
 Nothing here invokes a model, touches git, or writes the wiki — it is pure config I/O that produces
 the typed inputs the deterministic run-loop already takes (so the integrity boundary is unchanged).
 
@@ -51,6 +58,12 @@ __all__ = [
     "ConfigError",
     "RepoConfig",
     "load_repo_config",
+    "SUPPORTED_KB_SCHEMA_VERSIONS",
+    "MAX_SUPPORTED_KB_SCHEMA_VERSION",
+    "UnsupportedSchemaVersionError",
+    "assert_supported_kb_schema_version",
+    "read_kb_schema_version",
+    "guard_repo_schema_version",
     "write_default_repo_config",
     "write_default_adapters_yaml",
     "load_backend_registry",
@@ -236,6 +249,147 @@ def load_repo_config(layout: RepoLayout) -> RepoConfig:
         max_orphans=max_orphans,
         language=language,
     )
+
+
+# --- KB schema-version support gate (DESIGN §10 V9 / issue #98) ---------------------------------
+# The KB WIKI schema versions THIS BUILD of agora can read and write — the ADR-0010 §5.1
+# ``schema_version`` whose canonical home is ``_meta/taxonomy.yaml`` (mirrored into
+# ``_kb/repo.yaml`` and the schema doc header, which is what lint L1-17 cross-checks).
+#
+# NOT :data:`agora_kb.curator.plan.SUPPORTED_SCHEMA_VERSIONS` — DIFFERENT VOCABULARY. That one is
+# the version of the ``plan.json`` ENVELOPE a brain emits during PASS-1 (ADR-0011 §2): a property of
+# the CURATOR PROTOCOL, bumped when the plan wire format changes. This one is a property of the REPO
+# ON DISK, bumped when the wiki schema evolves. The two must never reference each other — a v2 wiki
+# schema does not imply a v2 plan envelope, or the reverse — and they are proven to move
+# independently by ``tests/test_schema_version_guard.py``.
+#
+# Widening this set is how a future build declares "I understand v2 repos too"; it is deliberately a
+# SET rather than a ceiling so a build can support {1, 2} while a hypothetical v3 stays refused.
+SUPPORTED_KB_SCHEMA_VERSIONS: frozenset[int] = frozenset({1})
+
+# Derived, never a second source of truth: message/upgrade-hint convenience so widening the set
+# above is a genuinely one-line change.
+MAX_SUPPORTED_KB_SCHEMA_VERSION: int = max(SUPPORTED_KB_SCHEMA_VERSIONS)
+
+
+class UnsupportedSchemaVersionError(ConfigError):
+    """The repo's KB ``schema_version`` is not one this build understands (DESIGN §10 V9).
+
+    The FAIL-LOUD half of the V9 posture: *new binary on an old repo = read-works / write-warns;
+    OLD BINARY ON A NEW REPO = fail-loud*. An old build that silently reads a v2 repo AS IF it were
+    v1 and then lets the curator write on top of that misreading is unrecoverable damage, so every
+    command that acts on a repo refuses instead — the one exception being ``agora doctor``, whose
+    job is to DIAGNOSE the skew (see :func:`guard_repo_schema_version`).
+
+    A :class:`ConfigError` (hence ``ValueError``) subclass so callers that already funnel config
+    problems into one clean message keep working unchanged. ``version`` / ``repo`` are kept as
+    attributes for callers that want to re-render rather than re-parse the string.
+    """
+
+    def __init__(self, version: int, *, repo: Path | None = None) -> None:
+        self.version = version
+        self.repo = repo
+        where = f"{repo}: " if repo is not None else ""
+        # ONE line, three facts, in the order an operator needs them: what the repo says, what this
+        # build accepts, what to do about it. No traceback — the CLI prints this verbatim.
+        # The remedy names the install path that EXISTS. `pip install -U agora-kb` does not work:
+        # there is no PyPI distribution yet (README §0, issue #102), so a fix an operator cannot
+        # follow would be worse than no fix. `agora repo upgrade` is named as ARRIVING, not as
+        # runnable, because it does not exist either (#63).
+        super().__init__(
+            f"{where}KB schema_version {version} is not supported by this agora build "
+            f"(supported: {sorted(SUPPORTED_KB_SCHEMA_VERSIONS)}) — upgrade agora: this build "
+            f"installs from source, so 'git pull && uv sync --extra dev' in your agora-kb "
+            f"checkout (there is no PyPI release yet, #102). The repo-side migration path "
+            f"arrives later with 'agora repo upgrade' (#63)"
+        )
+
+
+def assert_supported_kb_schema_version(cfg: RepoConfig, *, repo: Path | None = None) -> None:
+    """Raise :class:`UnsupportedSchemaVersionError` unless this build supports ``cfg``'s schema.
+
+    The single place the comparison lives. Judges on ``cfg.taxonomy.schema_version`` — the value
+    :func:`load_repo_config` already resolved from the CANONICAL ``_meta/taxonomy.yaml`` (ADR-0010
+    §5.1), falling back to ``repo.yaml`` only when that file is absent. A repo whose two locations
+    DISAGREE is not this guard's business: that drift is lint ``L1-17``'s finding, and having two
+    rules answer the same question with different verdicts is worse than either alone.
+
+    Deliberately NOT called from :func:`load_repo_config`: the loader must keep loading a skewed
+    repo, because ``agora doctor`` has to READ one in order to diagnose it. This is an assertion
+    callers make at an entry point, not a property of loading.
+
+    ``repo`` is cosmetic — the repo root named in the message so an operator running against
+    several repos (or a cron line with a stale ``--repo``) knows WHICH one refused.
+
+    Vocabulary note: this is the KB WIKI schema (:data:`SUPPORTED_KB_SCHEMA_VERSIONS`), NOT the
+    ``plan.json`` envelope version checked by :meth:`agora_kb.curator.plan.Plan.from_json` against
+    its own same-shaped ``SUPPORTED_SCHEMA_VERSIONS``. Same pattern, unrelated numbers.
+    """
+    version = cfg.taxonomy.schema_version
+    if version not in SUPPORTED_KB_SCHEMA_VERSIONS:
+        raise UnsupportedSchemaVersionError(version, repo=repo)
+
+
+def read_kb_schema_version(layout: RepoLayout) -> int | None:
+    """Read ONLY the canonical KB ``schema_version``. ``None`` when it cannot be determined.
+
+    NARROW ON PURPOSE, and that is the whole point of the function. Routing the #98 gate through
+    :func:`load_repo_config` made it conditional on the ENTIRE ``repo.yaml`` parsing — so one
+    unrelated typo (``curator.max_attempts: not-an-int``) silently disabled the gate and let
+    ``agora status`` run on a schema-2 repo. That coupling is backwards twice over: an unrelated
+    key has nothing to do with schema support, and "the old binary cannot parse the new repo's
+    config" is precisely the state a schema bump is most likely to produce — i.e. the gate would
+    switch itself off in exactly the situation it exists for.
+
+    Precedence MIRRORS :func:`_load_taxonomy` so the guard and the loaded config cannot disagree:
+    ``_meta/taxonomy.yaml`` is canonical (ADR-0010 §5.1) and ``_kb/repo.yaml`` is consulted only
+    when that file is ABSENT. A repo whose two locations merely DISAGREE is lint ``L1-17``'s
+    finding, not this one's.
+
+    Returns ``None`` only when a file is present but its ``schema_version`` cannot be established
+    (unparseable YAML, a non-mapping document, a non-integer value, an unreadable path). Callers
+    must treat that as "unknown", never as "supported": the guard stays silent so a YAML typo is
+    reported by the command that owns it, while ``agora doctor`` says out loud that it could not
+    verify. A directory that is no Agora repo at all yields ``1`` — the documented default — so the
+    guard never turns "wrong cwd" into a confusing schema complaint.
+    """
+    meta_path = layout.root / "_meta" / "taxonomy.yaml"
+    repo_path = layout.kb_dir / _REPO_CONFIG_NAME
+    for path, key in ((meta_path, "schema_version"), (repo_path, "schema_version")):
+        if not path.is_file():
+            continue
+        try:
+            raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001 — unreadable/unparseable is "unknown", never "supported".
+            return None
+        if not isinstance(raw, dict):
+            return None
+        value = raw.get(key)
+        if value is None:
+            # The key is absent from a file that IS readable: a pre-#98 repo. Fall through to the
+            # next location, and default to 1 if neither names it (criterion 5, no regression).
+            continue
+        # bool is an int subclass in Python; a YAML 1.1 `yes` must not read as version 1.
+        if isinstance(value, bool) or not isinstance(value, int):
+            return None
+        return value
+    return 1
+
+
+def guard_repo_schema_version(layout: RepoLayout) -> None:
+    """Entry-point guard: fail loud when ``layout``'s KB schema is one this build cannot support.
+
+    What the faces + the CLI dispatch call. Tolerant on the way IN, loud on the way OUT: reads the
+    canonical version through :func:`read_kb_schema_version` — NOT through the whole config loader
+    — so an unrelated ``repo.yaml`` problem can no longer switch the gate off. An indeterminate
+    version passes silently (the command that owns that file reports it), and a directory that is
+    not an Agora repo passes silently too.
+
+    The ONLY exception it raises is :class:`UnsupportedSchemaVersionError`.
+    """
+    version = read_kb_schema_version(layout)
+    if version is not None and version not in SUPPORTED_KB_SCHEMA_VERSIONS:
+        raise UnsupportedSchemaVersionError(version, repo=layout.root)
 
 
 def write_default_repo_config(

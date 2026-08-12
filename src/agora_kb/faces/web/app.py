@@ -65,7 +65,12 @@ from pydantic import BaseModel
 from starlette.datastructures import Headers, MutableHeaders
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
-from agora_kb.config import WebConfig, WebIdentityConfig, load_web_config
+from agora_kb.config import (
+    WebConfig,
+    WebIdentityConfig,
+    guard_repo_schema_version,
+    load_web_config,
+)
 from agora_kb.core import Repo
 from agora_kb.core.hashing import content_sha256
 from agora_kb.faces.mcp_server import AgoraHandlers
@@ -417,6 +422,11 @@ def build_app(*, repo_path: Path, writer: str = "web", user: str = "local") -> F
     :class:`WebConfig` knob.
     """
     repo = Repo.resolve(repo_path)
+    # #98 / DESIGN §10 V9: same fail-loud gate `build_server` applies, for the same reason — `agora
+    # web` stops at the CLI dispatch guard, but uvicorn factories, tests, and embedders call
+    # build_app directly, and the web face has a WRITE path (upload → Inbox.write) that must not run
+    # against a repo this build only THINKS it understands.
+    guard_repo_schema_version(repo.layout)
     handlers = AgoraHandlers(repo, writer=writer)
     # ADR-0025: resolve the operator's web policy PER-REPO (invariant 5 / ADR-0006) — never a
     # module-global the browser could flip across repos. Threaded into the graph caps, the upload
