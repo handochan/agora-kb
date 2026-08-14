@@ -1921,9 +1921,11 @@ def _clear_body_status(worktree: Path, needs_prose: dict[str, list[str]]) -> lis
     flag remains a legitimate state AT REST even though the curator no longer mints one: #131 made
     region placement and the flag one decision in :func:`agora_kb.curator.apply._apply_append_daily`
     (before it, a ``needs_prose=False`` APPEND_DAILY placed an empty region that nothing would ever
-    author), but every daily published by a pre-#131 build still carries that shape on disk, as does
-    any hand- or tool-edited note. Stamping a flag there would pin a ``pending`` this clear-only
-    step could never retract — the flag would outlive every run, on a note nobody owes prose for.
+    author). The shape survives on disk in any daily whose APPEND_DAILY dispositions never flagged
+    ``needs_prose`` — which the reference brain cannot emit, since ``ollama_brain.normalize_plan``
+    forces the flag for this op — and in any hand-edited or imported note. Stamping a flag there
+    would pin a ``pending`` this clear-only step could never retract: the flag would outlive every
+    run, on a note nobody owes prose for.
 
     Scope is deliberately the run's OWN needs_prose notes: those are the notes APPLY already
     rewrote this run, so ``parse -> pop -> render`` round-trips the bytes APPLY just produced and
