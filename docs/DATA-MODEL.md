@@ -178,9 +178,10 @@ gate: a repo published by a pre-#119 build keeps curating normally and heals a n
 later run gives that note a `needs_prose` region. Bulk repair of notes the curator never re-touches
 belongs to `agora repo upgrade` (#63) — invariant 2 forbids any other component writing `wiki/`.
 Since #131 the curator can no longer MINT the shape that made a flag unclearable (an `APPEND_DAILY`
-region nothing would ever author), so this debt is bounded to pre-#131 history plus hand-edited or
-imported notes; the converse check stays deliberately unasserted because that shape still exists at
-rest and `lint` grades the whole worktree.
+region nothing would ever author). The converse check stays deliberately unasserted because that
+shape still exists at rest and `lint` grades the whole worktree: it survives in any pre-#131 daily
+whose `APPEND_DAILY` dispositions never flagged `needs_prose` — a plan the reference brain cannot
+emit — and in any hand-edited or imported note.
 The debt is surfaced as `lint_findings` in `GET /api/dashboard/health` and on the dashboard's Lint stat,
 which reads `ok · N warnings` while `lint_ok` stays true. It is deliberately NOT in the curator's
 `failed_checks`: that channel carries only the error-severity findings that actually failed the §4.4

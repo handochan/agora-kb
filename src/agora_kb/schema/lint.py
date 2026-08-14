@@ -500,10 +500,11 @@ def _check_body_status(note: Note) -> list[LintFinding]:
     a violation. The curator no longer PRODUCES that shape — #131 made region placement and the flag
     one decision in ``apply._apply_append_daily``, which until then placed an empty region for a
     ``needs_prose=False`` APPEND_DAILY that ``_needs_prose_map`` would never author — but the shape
-    still exists AT REST, which is what matters to a check that grades the whole worktree: every
-    daily published by a pre-#131 build carries it, as does any hand-authored or imported note.
-    Asserting the biconditional would false-positive on all of them, on a repo that has no way to
-    repair itself until ``agora repo upgrade`` (#63).
+    still exists AT REST, which is what matters to a check that grades the whole worktree: any daily
+    published by a pre-#131 build whose APPEND_DAILY dispositions never flagged ``needs_prose``
+    carries it, as does any hand-authored or imported note. Asserting the biconditional would
+    false-positive on all of them, on a repo that has no way to repair itself until
+    ``agora repo upgrade`` (#63).
     """
     if note.frontmatter.get("body_status") is None:
         return []
