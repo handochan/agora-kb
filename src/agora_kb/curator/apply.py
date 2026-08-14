@@ -568,8 +568,11 @@ def apply_plan(
       sentinel pair keyed by ``candidate_id`` when ``needs_prose``; add ``[[basename]]`` to the
       domain MOC and root index.
     * ``APPEND_DAILY`` — create-or-append ``wiki/<domain>/daily/<domain>-<run_date>.md``, adding one
-      dated ``## <run_date>`` section per disposition (in stable manifest-event order) wrapped in
-      its own ``candidate_id``-keyed sentinel pair (§3.1).
+      dated ``## <run_date>`` section per ``needs_prose`` disposition (in stable manifest-event
+      order) wrapped in its own ``candidate_id``-keyed sentinel pair (§3.1). A disposition that does
+      NOT flag ``needs_prose`` contributes its provenance only — the ``raw/`` capture and the day's
+      ``sources:`` union — and no body section (#131); the worker reports that under-delivery on
+      :attr:`~agora_kb.curator.worker.RunReport.warnings` rather than inventing prose.
     * ``MERGE_INTO_THEME`` — union this run's provenance into the target theme's ``sources:`` (never
       drop prior), bump ``updated``, insert ``links``, and append a NEW sentinel augmentation
       sub-region below existing prose (never rewrite prior prose).
@@ -695,13 +698,32 @@ def _apply_append_daily(
     provenance: list[dict[str, object]],
     raw_writes: dict[str, str],
 ) -> None:
-    """Create-or-append the per-domain daily, adding one dated section per disposition (§3.1)."""
+    """Create-or-append the per-domain daily, one dated section per ``needs_prose`` disposition."""
     if not disp.domain:
         raise ApplyError(f"candidate {disp.candidate_id!r}: APPEND_DAILY requires a domain")
     basename = disp.basename or f"{disp.domain}-{run_date}"
     path = worktree / "wiki" / disp.domain / "daily" / f"{basename}.md"
-    region = _empty_body_region(region_sentinel_id(run_id, disp.candidate_id))
-    section = f"## {run_date}\n\n{region}"
+    # A body region is placed ONLY for a disposition flagged `needs_prose` — the placement rule
+    # ADR-0011 §3 and INGEST-CONTRACT §3 already state ("place body sentinels ... for notes flagged
+    # needs_prose"), and the SAME gate `_apply_create_theme` and `_apply_merge` apply. This function
+    # placed one UNCONDITIONALLY while the worker's `_needs_prose_map` skips non-`needs_prose`
+    # dispositions, so the region was built and then never handed to PASS 2 (#131). Two reachable
+    # damages, both reproduced live: alone it left a permanent `_summary pending_` placeholder, and
+    # a run mixing a `needs_prose` True and False APPEND_DAILY into ONE daily pinned
+    # `body_status: pending` FOREVER — `has_unauthored_region` stayed True over the False region, so
+    # the #119 retraction could never fire on a note whose prose HAD all landed.
+    #
+    # The dated heading goes with it: `## <run_date>` is the section's first line, not a separate
+    # artifact (§7.1 calls this op's body deliverable "that section"), so with no prose there is no
+    # section and no heading — otherwise every no-prose disposition accrues one empty heading.
+    # `_sources_union` stays OUTSIDE the gate: the PROVENANCE half of the op is unconditional, so
+    # the capture is still written to `raw/` and unioned into the day's `sources:`. This is a note
+    # with no readable section, NOT a silently-dropped capture.
+    if disp.needs_prose:
+        region = _empty_body_region(region_sentinel_id(run_id, disp.candidate_id))
+        section = f"## {run_date}\n\n{region}"
+    else:
+        section = ""
     new_sources = _sources_union(disp.domain, provenance, worktree=worktree, raw_writes=raw_writes)
 
     if path.is_file():
@@ -717,7 +739,13 @@ def _apply_append_daily(
         _set_updated(fm, run_date)
         if disp.needs_prose:
             fm["body_status"] = "pending"
-        body = f"{prior_body}\n\n{section}" if prior_body else section
+        # A provenance-only append (no section, #131) byte-preserves the body. `frontmatter.render`
+        # rstrips trailing newlines, so the unguarded expression renders identically today — this is
+        # explicit intent plus insurance against a renderer that stops rstripping.
+        if not section:
+            body = prior_body
+        else:
+            body = f"{prior_body}\n\n{section}" if prior_body else section
         path.write_text(frontmatter.render(fm, body), encoding="utf-8")
     else:
         fm = _daily_frontmatter(disp, run_id=run_id, run_date=run_date, sources=new_sources)

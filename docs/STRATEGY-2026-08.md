@@ -204,7 +204,22 @@ document by default"*, 그리고 여러 문서 중 무엇을 볼지 고르는 �
 **건질 것 하나.** PageIndex Flash(`summary=False`)는 LLM이 전혀 없고 결정론적이고 오프라인이다
 (222p→264노드 5.5초, 두 번 돌려 SHA-256 동일) [조사]. 현재 `ingest/extractors/pdf.py`는 pdfminer 평면
 텍스트라 200페이지 PDF의 헤딩을 전부 파괴한다. Flash를 얹으면 `headings` 필드(가중치 2.0)가 살아난다 —
-기존 Extractor Protocol에 그대로 맞고 **seam 변경 0, MIT, invariant-4 clean, 결정론 계약 무손상**.
+기존 Extractor Protocol에 그대로 맞고 seam 변경 0, 결정론 계약 무손상.
+
+> **라이선스 정정 (2026-08-15) [재현].** 이 문서의 초판은 이를 무조건 "invariant-4 clean"이라고
+> 적었다. **조건부로만 맞다.** Flash를 담은 릴리스 `pageindex==0.3.0.dev3`는 `pymupdf>=1.26.0`을
+> **하드 의존으로** 끌어오고, PyPI가 보고하는 pymupdf 라이선스는 *"Dual Licensed - GNU AFFERO GPL
+> 3.0 or [commercial]"* 이다 — README와 DESIGN §8이 *"pymupdf are AGPL … avoid in redistributable
+> core (we use pdfminer.six instead of pymupdf)"* 로 명시적으로 배제한 바로 그 패키지다. 따라서
+> **`pip install pageindex`는 ADR-0005 위반이다.**
+>
+> 다만 `pymupdf`/`fitz`를 실제로 쓰는 것은 *classic* LLM 경로(`pageindex/utils.py`,
+> `pageindex/tree_optimize.py`)뿐이고, **`pageindex/flash/`는 쓰지 않는다** — 그 서브패키지의
+> 서드파티 임포트는 `pypdfium2`(BSD-3-Clause/Apache-2.0) · `PyPDF2`(BSD) · `regex`(Apache-2.0) ·
+> `sortedcontainers`(Apache-2.0) + 표준 라이브러리가 전부다.
+>
+> 즉 채택 경로는 **의존이 아니라 벤더링**이다 — ADR-0021이 이미 세운 선례(Node/CDN을 들이지 않고
+> MIT force-graph를 벤더링) 그대로. 의존으로 넣으면 AGPL이 코어에 들어온다.
 
 **리트리버로는 안 된다.** ADR-0012 §0a는 가속기가 후보집합을 over-approximate할 때만 허용하는데 트리
 탐색은 가지치기가 존재 이유라 부분집합을 낸다. 더 깊은 파탄은 `not_found`가 사라지는 것 — 트리 탐색기는
@@ -273,8 +288,8 @@ core는 오늘 이미 Windows-clean이다 [조사]. **단 이 권고는 오너�
 
 1. ADR-0012 §1/§3 형태소 정규화 addendum (#56과 동일 형식) → [#140](https://github.com/handochan/agora-kb/issues/140)
 2. `summary` 가중치 하향 또는 lint 게이트 → [#140](https://github.com/handochan/agora-kb/issues/140)
-3. PageIndex Flash를 결정론적 구조보존 PDF 추출기로 채택 + 기본 off의 비계약 `kb_explore` →
-   [#139](https://github.com/handochan/agora-kb/issues/139)
+3. `raw/` 검색 티어 → [#139](https://github.com/handochan/agora-kb/issues/139). 세 갈래 중 결정 필요
+   (§5의 라이선스 정정 참조 — PageIndex Flash는 **의존이 아니라 벤더링**으로만 채택 가능하다)
 
 ### 재정렬
 

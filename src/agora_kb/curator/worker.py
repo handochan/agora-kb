@@ -700,7 +700,10 @@ def _run_locked(
         candidate_texts = {c.candidate_id: c.text for c in bundle.candidates}
         needs_prose, sentinels, context = _needs_prose_map(plan, wt, run_date, candidate_texts)
         prose_complete = True
-        prose_warnings: list[str] = []
+        # Seeded, not appended later: an APPEND_DAILY that never flagged needs_prose contributes NO
+        # region, so a plan made only of those has an empty `needs_prose` map and skips the whole
+        # block below — the one shape that most needs the diagnostic (#131).
+        prose_warnings: list[str] = _plan_shape_warnings(plan)
         prose_counts: dict[str, int] = {}
         if needs_prose:
             base_state = {rel: (wt / rel).read_text(encoding="utf-8") for rel in needs_prose}
@@ -1914,11 +1917,13 @@ def _clear_body_status(worktree: Path, needs_prose: dict[str, list[str]]) -> lis
     (unused by :func:`run` today — it exists so a test can call this directly and so a future
     counter is a one-line change).
 
-    CLEAR-ONLY: this never ADDS the key. APPLY owns placement, and there is a legitimate state
-    where a region exists with no flag — an APPEND_DAILY with ``needs_prose=False`` places an
-    empty region but no ``body_status`` (:func:`agora_kb.curator.apply._apply_append_daily`), and
-    :func:`_needs_prose_map` never authors it. Stamping a flag there would pin a permanently-
-    unclearable ``pending`` on a note APPLY deliberately left clean.
+    CLEAR-ONLY: this never ADDS the key. APPLY owns placement, and an unauthored region with no
+    flag remains a legitimate state AT REST even though the curator no longer mints one: #131 made
+    region placement and the flag one decision in :func:`agora_kb.curator.apply._apply_append_daily`
+    (before it, a ``needs_prose=False`` APPEND_DAILY placed an empty region that nothing would ever
+    author), but every daily published by a pre-#131 build still carries that shape on disk, as does
+    any hand- or tool-edited note. Stamping a flag there would pin a ``pending`` this clear-only
+    step could never retract — the flag would outlive every run, on a note nobody owes prose for.
 
     Scope is deliberately the run's OWN needs_prose notes: those are the notes APPLY already
     rewrote this run, so ``parse -> pop -> render`` round-trips the bytes APPLY just produced and
@@ -1943,6 +1948,42 @@ def _clear_body_status(worktree: Path, needs_prose: dict[str, list[str]]) -> lis
         path.write_text(frontmatter.render(fm, body), encoding="utf-8")
         cleared.append(rel)
     return cleared
+
+
+def _plan_shape_warnings(plan: Plan) -> list[str]:
+    """Non-fatal §7.1 shape diagnostics for an otherwise-VALID plan (#131, on the #115 channel).
+
+    APPEND_DAILY's body deliverable IS its dated section (schema §7.1: "yes (that section)"), and
+    since #131 APPLY places that section only when the disposition flags ``needs_prose``. So a plan
+    that leaves the flag off publishes a daily recording the day's ``sources:`` and nothing
+    readable. That is UNDER-DELIVERY by the planner, not corruption by the engine — hence a warning
+    and neither of the two louder options:
+
+    * NOT a §4.1 rejection. ``needs_prose`` is ``bool = False`` by default, so "false" is
+      indistinguishable from "omitted"; failing the run would burn the §5.1 retry budget and push
+      real captures to ``_kb/failed/`` over a field whose default value the contract itself made
+      legal.
+    * NOT a normalization to ``True``. ``needs_prose`` is also the §4.2 PASS-2 write allowlist
+      (:func:`agora_kb.curator.apply.validate_author_diff`) and the §4.6 stray-link-strip scope
+      (:func:`_strip_stray_links`), so coercing it would have the ENGINE GRANT the model a writable
+      region the plan never asked for — the wrong direction for every other engine/model asymmetry
+      here, all of which NARROW model authority. It would also make the persisted ``plan.json``
+      disagree with what the run actually did, which is the audit record's whole job.
+
+    One line per run listing every under-specified candidate, in plan order, so a chatty
+    third-party brain cannot flood the channel. The shipped brains never trip it:
+    ``ollama_brain.normalize_plan`` forces ``needs_prose = op in _PROSE_OPS``.
+    """
+    ids = [
+        d.candidate_id for d in plan.dispositions if d.op == "APPEND_DAILY" and not d.needs_prose
+    ]
+    if not ids:
+        return []
+    return [
+        f"PLAN SHAPE: {len(ids)} APPEND_DAILY disposition(s) did not flag needs_prose, so no dated "
+        f"section was written for them — the day's sources: and raw/ captures are recorded, the "
+        f"prose is not ({', '.join(ids)}); schema §7.1 lists this op as needing prose (#131)"
+    ]
 
 
 def _disposition_counts(plan: Plan) -> dict[str, int]:

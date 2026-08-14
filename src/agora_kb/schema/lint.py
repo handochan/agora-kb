@@ -496,11 +496,14 @@ def _check_body_status(note: Note) -> list[LintFinding]:
     ``agora repo upgrade`` (#63) can perform the one-shot repair on an existing repo; at that point
     mark L2-6 superseded in ADR-0010's table using the append-only banner pattern (ADR-0011 §7.1).
 
-    ONLY the present-direction is checked. The converse ("an unauthored region but no flag") is
-    NOT a violation: an APPEND_DAILY with ``needs_prose=False`` places an empty region
-    (``apply._apply_append_daily``) and no ``body_status``, and the worker's ``_needs_prose_map``
-    never authors it — a real, reachable, lint-clean state. Asserting the biconditional would
-    false-positive on every such daily.
+    ONLY the present-direction is checked. The converse ("an unauthored region but no flag") is NOT
+    a violation. The curator no longer PRODUCES that shape — #131 made region placement and the flag
+    one decision in ``apply._apply_append_daily``, which until then placed an empty region for a
+    ``needs_prose=False`` APPEND_DAILY that ``_needs_prose_map`` would never author — but the shape
+    still exists AT REST, which is what matters to a check that grades the whole worktree: every
+    daily published by a pre-#131 build carries it, as does any hand-authored or imported note.
+    Asserting the biconditional would false-positive on all of them, on a repo that has no way to
+    repair itself until ``agora repo upgrade`` (#63).
     """
     if note.frontmatter.get("body_status") is None:
         return []
