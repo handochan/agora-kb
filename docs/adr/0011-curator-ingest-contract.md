@@ -1,6 +1,6 @@
 # ADR-0011 — Curator INGEST contract (plan-apply-author)
 
-**Status:** Accepted · 2026-06-13 · **§7.1 routing superseded by [ADR-0015](0015-per-task-brain-routing.md)** · **§5.1 corrected + §5.1a added 2026-07-29 (issue #99)**
+**Status:** Accepted · 2026-06-13 · **§7.1 routing superseded by [ADR-0015](0015-per-task-brain-routing.md)** · **§5.1 corrected + §5.1a added 2026-07-29 (issue #99)** · **§3.1 addendum 2026-08-15 (issue #131)**
 
 ## Context
 The transactional curator loop (ADR-0008) delegates exactly one cognitive step — INGEST — to a
@@ -159,7 +159,7 @@ CREATE/MERGE/CONTEST (so every disposition maps to ≥1 event and coverage stays
 | op | meaning | structural effect (applied by deterministic code, §3) | needs prose? | gated candidate? |
 |---|---|---|---|---|
 | `CREATE_THEME` | new atomic concept page | create `wiki/<domain>/themes/<basename>.md` w/ frontmatter (title, summary, tags, status, created, updated, aliases, sources, related, confidence, origin?) per ADR-0010; add `[[basename]]` to `<domain>-moc.md` + root index (per ADR-0014 D3, these MOC/index entries are emitted as standard markdown links `[Title](relative.md)`, not `[[basename]]`); insert plan `links[]` | yes (body) | **NO** (may never originate) |
-| `APPEND_DAILY` | dated capture/briefing | create-or-append `wiki/<domain>/daily/<domain>-<YYYY-MM-DD>.md`; add a dated `## ` section (one per disposition, §3.1) + `sources:` line | yes (the appended section only) | **NO** (originates content) |
+| `APPEND_DAILY` | dated capture/briefing | create-or-append `wiki/<domain>/daily/<domain>-<YYYY-MM-DD>.md`; add a dated `## ` section (one per **`needs_prose`** disposition, §3.1 — see the 2026-08-15 addendum) + `sources:` line | yes (the appended section only) | **NO** (originates content) |
 | `MERGE_INTO_THEME` | fold claim into existing theme | edit target theme: UNION this run's `event_ids` into `sources:` (never drop prior); insert plan `links[]`; place an augmentation sentinel sub-region | yes (only the augmented sub-region) | **YES** — corroborate only |
 | `MARK_CONTESTED` | contradiction | annotate target with the templated `> [!contested]` callout + `[[competing-note]]`; set frontmatter `status: contested` + `contested_by` + `contested_at`; record the new claim's provenance; keep BOTH | no (callout is templated, §2.1) | **YES** — on contradiction |
 | `DROP` | discard (noise/redundant/uncertain) | NO wiki edit; record disposition + reason only | no | **YES** — default on doubt |
@@ -284,6 +284,28 @@ manifest-event order** (sort by the first event_id of each disposition), each wr
 pair keyed by `candidate_id`. PASS 2 authors each section independently per its candidate_id. This is why
 the sentinel id is `id=<candidate_id>` everywhere (§3, §8.2), never `basename` (which would collide for
 daily).
+
+> **Addendum — 2026-08-15 (issue #131): one section per `needs_prose` disposition.** §3's placement
+> rule ("place body sentinels … for notes flagged `needs_prose`") is normative for `APPEND_DAILY`
+> too, and §3.1's "ONE dated section per disposition" is read subject to it. APPLY had placed the
+> daily's region UNCONDITIONALLY while the worker's PASS-2 map skips non-`needs_prose` dispositions,
+> so the region was built and then handed to nobody: alone it published a permanent placeholder, and
+> mixed with a flagged disposition into the same daily it pinned `body_status: pending` forever —
+> the §2.6 flag could never be retracted because an unauthored region remained over a note whose
+> prose had all landed. A disposition that does not flag `needs_prose` now contributes its
+> provenance only (the `raw/` capture and the day's `sources:` union) and no section, matching what
+> `CREATE_THEME` and `MERGE_INTO_THEME` already did.
+>
+> The flag is deliberately NOT coerced to true for this op, even though the §2 table says the op
+> needs prose. `needs_prose` is also the §4.2 PASS-2 write allowlist and the §4.6 stray-link-strip
+> scope, so coercion would have the ENGINE grant the model a writable region the plan never
+> requested — the opposite direction from every other engine/model asymmetry here (`confidence`
+> mirrored not planned, `raw/` admitted as an exact engine-written set, links stripped to the plan's
+> allowlist) — and would make the persisted `plan.json` disagree with what the run did. Nor is it a
+> §4.1 rejection: `needs_prose` defaults to `false`, so "false" cannot be distinguished from
+> "omitted", and failing the run would burn the §5.1 retry budget and dead-letter real captures over
+> a legal field value. The under-delivery is reported on the non-fatal `RunReport.warnings` channel
+> (#115) instead. No decision above is reversed.
 
 ### 4. Output / success-detection contract (decide success WITHOUT trusting the model)
 

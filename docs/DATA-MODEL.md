@@ -177,6 +177,10 @@ unauthored `agora:body` region. Like `L2-1` it never flips `LintResult.ok`, so i
 gate: a repo published by a pre-#119 build keeps curating normally and heals a note's flag whenever a
 later run gives that note a `needs_prose` region. Bulk repair of notes the curator never re-touches
 belongs to `agora repo upgrade` (#63) — invariant 2 forbids any other component writing `wiki/`.
+Since #131 the curator can no longer MINT the shape that made a flag unclearable (an `APPEND_DAILY`
+region nothing would ever author), so this debt is bounded to pre-#131 history plus hand-edited or
+imported notes; the converse check stays deliberately unasserted because that shape still exists at
+rest and `lint` grades the whole worktree.
 The debt is surfaced as `lint_findings` in `GET /api/dashboard/health` and on the dashboard's Lint stat,
 which reads `ok · N warnings` while `lint_ok` stays true. It is deliberately NOT in the curator's
 `failed_checks`: that channel carries only the error-severity findings that actually failed the §4.4
@@ -598,7 +602,8 @@ Disposition fields the model DECIDES: `candidate_id`, `event_ids[]`, `op` ∈ {C
 exist in `_meta/taxonomy.yaml`, C5), `links[]` (wikilink basenames; APPLY resolves each to a standard
 markdown body link `[Title](relative.md)` — the git+Obsidian+OKF-native form; only frontmatter `related:`/`children:`
 remain `[[basename]]` — see ADR-0014 D3), `needs_prose` (whether PASS 2 authors a
-body), and `reason`. EXACTLY one disposition per candidate; the union of all `event_ids` equals the manifest
+body — and therefore whether APPLY places a region at all, for every prose op including
+`APPEND_DAILY`: #131 / ADR-0011 §3.1 addendum), and `reason`. EXACTLY one disposition per candidate; the union of all `event_ids` equals the manifest
 set, each exactly once (the manifest is the sole coverage universe). Contested judgments are NOT expressed by
 setting `status: contested` on a normal disposition. They use the dedicated `MARK_CONTESTED` op against an
 existing `target_basename`; deterministic APPLY then materializes the `status: contested` frontmatter plus

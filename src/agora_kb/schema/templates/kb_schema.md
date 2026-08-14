@@ -687,6 +687,15 @@ Frozen decision rules for PASS 1:
 6. Do the tier-3 semantic judgment via the pre-fetched `related/<cand-id>.json` (retrieve-then-decide,
    ZERO network, NO search tool): overlap → `MERGE_INTO_THEME`; genuinely new → `CREATE_THEME`;
    contradiction → `MARK_CONTESTED`; noise / redundant → `DROP`.
+7. **The "needs prose?" column is what you must SET, and `needs_prose` is what places the region.**
+   The worker writes a body region ONLY where you flagged `needs_prose` — for all three prose ops.
+   Leaving it off an `APPEND_DAILY` does not produce a section you can fill later: it produces a
+   daily that records the day's `sources:` and nothing readable, and the run reports that
+   under-delivery to the operator. The engine never sets the flag for you (it is also the PASS-2
+   write allowlist, §7.3 — the worker will not hand you a region you did not ask for). For
+   `CREATE_THEME` and `MERGE_INTO_THEME` a false value is a real choice: the rule-5 `status: stub`
+   forward declaration, and a provenance-only corroboration that unions `sources:` without new
+   prose. For `APPEND_DAILY` it is not — the dated section IS the op.
 
 ### 7.2 APPLY (deterministic — the worker, not you)
 
