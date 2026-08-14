@@ -37,6 +37,7 @@ from agora_kb.core.state import LastFailure, StateStore
 from agora_kb.curator.apply import body_sentinels, region_sentinel_id
 from agora_kb.curator.claim import curator_lock
 from agora_kb.curator.manifest import RunManifest, manifest_path, read_manifest, write_manifest
+from agora_kb.curator.plan import Disposition, Plan
 from agora_kb.curator.subprocess_backend import RoutedBackend
 from agora_kb.curator.worker import (
     AuthorRegion,
@@ -3908,4 +3909,243 @@ def test_a_hand_edited_note_fails_the_run_cleanly_instead_of_crashing(tmp_path: 
     # The batch is disposed of, not stranded: no processing/ dir survives the run.
     assert not list(repo.layout.processing_dir.glob("*/")) or not any(
         (d / "events").exists() for d in repo.layout.processing_dir.glob("*/")
+    )
+
+
+# --- (20) #131: an APPEND_DAILY nobody will author must not leave a region nobody will fill ------
+#
+# APPLY built the daily's body region UNCONDITIONALLY while `_needs_prose_map` skips
+# `needs_prose=False` dispositions, so the region was placed and then orphaned. Alone that is a
+# permanent `_summary pending_` in a published note; MIXED with a `needs_prose=True` disposition
+# into the SAME daily it is worse — the note takes `body_status: pending`, PASS 2 authors every
+# region it was HANDED, and the #119 retraction still cannot fire because `has_unauthored_region`
+# is True over the region PASS 2 was never told about. The flag is then pinned forever on a healthy
+# note. These run end-to-end through `run()`, which is what makes them regressions rather than
+# assertions about a helper.
+
+
+class _RunIdAwareBackend(FakeBackend):
+    """A :class:`FakeBackend` whose canned plan learns the run's REAL id from the bundle.
+
+    A daily is the one note type that cannot use a verbatim canned plan: `_daily_frontmatter` takes
+    `run_id:` from `plan.run_id`, while lint L1-14 compares it to the run's INTERNALLY generated
+    manifest id — so any hard-coded value fails the §4.4 gate for a reason that has nothing to do
+    with the behaviour under test (`_merge_plan_two_regions` documents the same limitation and
+    sidesteps it by using MERGE). The id is right there in `bundle/candidates.json`, which the
+    backend already reads in production, so read it and format the template. No production change,
+    and the prose map is keyed the same way as everywhere else in this file — by
+    `region_sentinel_id(<real run id>, cid)`, resolved after the fact.
+    """
+
+    def __init__(self, plan_template: str, prose_by_candidate: dict[str, str]) -> None:
+        super().__init__("")
+        self._template = plan_template
+        self._prose_by_candidate = dict(prose_by_candidate)
+        self.run_id: str | None = None
+
+    def plan(self, bundle_dir: Path) -> str:
+        doc = json.loads((bundle_dir / "candidates.json").read_text(encoding="utf-8"))
+        self.run_id = doc["run_id"]
+        # Re-key the prose map onto the persisted run-scoped sentinel ids now that the id is known.
+        self._prose = {
+            region_sentinel_id(doc["run_id"], cid): text
+            for cid, text in self._prose_by_candidate.items()
+        }
+        return self._template.replace("__RUN_ID__", doc["run_id"])
+
+
+def _daily_plan(*dispositions: dict[str, object]) -> str:
+    """A canned APPEND_DAILY ``plan.json`` template (run id filled in by _RunIdAwareBackend)."""
+    return json.dumps(
+        {
+            "schema_version": 1,
+            "run_id": "__RUN_ID__",
+            "finished": True,
+            "dispositions": [
+                {
+                    "op": "APPEND_DAILY",
+                    "domain": "ai-tech",
+                    # §4.1 BASENAME requires it explicitly, even though APPLY would derive the same
+                    # `<domain>-<run_date>` default worker-side.
+                    "basename": f"ai-tech-{RUN_DATE}",
+                    "title": f"Daily {RUN_DATE}",
+                    "summary": "Daily consolidation.",
+                    "reason": "Capture of the day.",
+                    **d,
+                }
+                for d in dispositions
+            ],
+        }
+    )
+
+
+def _published_daily(repo: Repo, report: RunReport) -> tuple[dict[str, object], str]:
+    with repo.worktree(at=report.published_commit) as published:  # type: ignore[arg-type]
+        daily = published / "wiki" / "ai-tech" / "daily" / f"ai-tech-{RUN_DATE}.md"
+        return frontmatter.parse(daily.read_text(encoding="utf-8"))
+
+
+def test_mixed_prose_flags_in_one_daily_no_longer_pin_body_status(tmp_path: Path) -> None:
+    """THE #131 regression: one run, one daily, both flag values — the flag must still clear.
+
+    Before the fix this published `body_status: pending` on a note whose every authored region had
+    landed, and no later run could retract it: the retraction is note-local and clear-only, and the
+    orphaned region kept `has_unauthored_region` True forever.
+    """
+    repo = _init_repo(tmp_path)
+    inbox = Inbox(repo.layout)
+    e1 = _write_capture(inbox, text="One curator advances the branch under a lock.", second=10)
+    e2 = _write_capture(inbox, text="A second capture, filed the same day.", second=20)
+    _seed_raw(repo, e1, e2)
+
+    backend = _RunIdAwareBackend(
+        _daily_plan(
+            {"candidate_id": "c1", "event_ids": [e1], "needs_prose": True},
+            {"candidate_id": "c2", "event_ids": [e2], "needs_prose": False},
+        ),
+        prose_by_candidate={"c1": "The single curator holds a per-repo flock."},
+    )
+    report = _run(repo, backend)
+
+    assert report.status == "published", report.failure
+    assert report.counts["prose_regions"] == 1, "only the flagged disposition owns a region"
+    assert report.counts["prose_pending"] == 0
+
+    fm, body = _published_daily(repo, report)
+    assert "body_status" not in fm, "#131: the flag is retracted, not pinned by an orphan region"
+    assert "_summary pending_" not in body, "no region nobody will author"
+    assert "The single curator holds a per-repo flock." in body
+    # The unflagged disposition still contributed its provenance — this is not a silent DROP.
+    assert fm["sources"] == [f"raw/ai-tech/{e1}.md", f"raw/ai-tech/{e2}.md"]
+
+    with repo.worktree(at=report.published_commit) as published:  # type: ignore[arg-type]
+        assert lint(RepoLayout(published), taxonomy=TAXONOMY, run_date=RUN_DATE).ok
+
+
+def test_a_daily_with_no_prose_at_all_publishes_clean_and_warns(tmp_path: Path) -> None:
+    """The lone-disposition shape (#131 case (a)): no region, no flag, and a warning that says so.
+
+    The plan under-delivered — schema §7.1 lists this op as needing prose — so the run reports it
+    on the `warnings` channel (#115) rather than failing (which would burn the §5.1 retry budget
+    over a field whose default value the contract made legal) or coercing the flag (which would
+    have the ENGINE grant PASS 2 a writable region the plan never requested).
+    """
+    repo = _init_repo(tmp_path)
+    e1 = _write_capture(Inbox(repo.layout), text="A capture nobody will narrate.", second=10)
+    _seed_raw(repo, e1)
+
+    report = _run(
+        repo,
+        _RunIdAwareBackend(
+            _daily_plan({"candidate_id": "c1", "event_ids": [e1], "needs_prose": False}),
+            prose_by_candidate={},
+        ),
+    )
+
+    assert report.status == "published", report.failure
+    fm, body = _published_daily(repo, report)
+    assert "body_status" not in fm
+    assert "agora:body" not in body
+    assert f"## {RUN_DATE}" not in body
+    assert fm["sources"] == [f"raw/ai-tech/{e1}.md"]  # the capture survives
+
+    shape = [w for w in report.warnings if w.startswith("PLAN SHAPE:")]
+    assert len(shape) == 1, report.warnings
+    assert "c1" in shape[0] and "needs_prose" in shape[0]
+
+    with repo.worktree(at=report.published_commit) as published:  # type: ignore[arg-type]
+        assert lint(RepoLayout(published), taxonomy=TAXONOMY, run_date=RUN_DATE).ok
+
+
+def test_a_well_formed_daily_plan_emits_no_plan_shape_warning(tmp_path: Path) -> None:
+    """The negative control: the diagnostic must be silent on the plan the shipped brains emit.
+
+    `ollama_brain.normalize_plan` forces `needs_prose = op in _PROSE_OPS`, so a warning here would
+    fire on every real run and train operators to ignore the channel.
+    """
+    repo = _init_repo(tmp_path)
+    e1 = _write_capture(Inbox(repo.layout), text="One curator advances the branch.", second=10)
+    _seed_raw(repo, e1)
+
+    report = _run(
+        repo,
+        _RunIdAwareBackend(
+            _daily_plan({"candidate_id": "c1", "event_ids": [e1], "needs_prose": True}),
+            prose_by_candidate={"c1": "The single curator serializes every wiki write."},
+        ),
+    )
+
+    assert report.status == "published", report.failure
+    assert not any(w.startswith("PLAN SHAPE:") for w in report.warnings), report.warnings
+    fm, _ = _published_daily(repo, report)
+    assert "body_status" not in fm
+
+
+def test_plan_shape_warning_names_every_under_specified_candidate_on_one_line() -> None:
+    """One line per run, not one per candidate — a chatty brain must not flood the channel."""
+    plan = Plan(
+        schema_version=1,
+        run_id="r",
+        finished=True,
+        dispositions=(
+            Disposition(
+                candidate_id="c1",
+                event_ids=("e1",),
+                op="APPEND_DAILY",
+                domain="ai-tech",
+                needs_prose=False,
+                reason="r",
+            ),
+            Disposition(
+                candidate_id="c2",
+                event_ids=("e2",),
+                op="APPEND_DAILY",
+                domain="ai-tech",
+                needs_prose=True,
+                reason="r",
+            ),
+            Disposition(
+                candidate_id="c3",
+                event_ids=("e3",),
+                op="APPEND_DAILY",
+                domain="ai-tech",
+                needs_prose=False,
+                reason="r",
+            ),
+            # The other ops have legitimate no-prose forms and must never be named here: a
+            # CREATE_THEME without prose is the §7.1 forward-declared stub, and a MERGE without
+            # prose is provenance-only corroboration.
+            Disposition(
+                candidate_id="c4",
+                event_ids=("e4",),
+                op="CREATE_THEME",
+                domain="ai-tech",
+                basename="stub",
+                needs_prose=False,
+                reason="r",
+            ),
+            Disposition(
+                candidate_id="c5",
+                event_ids=("e5",),
+                op="MERGE_INTO_THEME",
+                domain="ai-tech",
+                target_basename="stub",
+                needs_prose=False,
+                reason="r",
+            ),
+            Disposition(candidate_id="c6", event_ids=("e6",), op="DROP", reason="r"),
+        ),
+    )
+
+    warnings = worker_mod._plan_shape_warnings(plan)
+
+    assert len(warnings) == 1
+    assert "c1" in warnings[0] and "c3" in warnings[0]
+    for other in ("c2", "c4", "c5", "c6"):
+        assert other not in warnings[0], f"{other} has a legitimate no-prose form"
+    assert (
+        worker_mod._plan_shape_warnings(
+            Plan(schema_version=1, run_id="r", finished=True, dispositions=())
+        )
+        == []
     )

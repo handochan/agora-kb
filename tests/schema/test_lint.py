@@ -1018,10 +1018,16 @@ def test_l2_6_silent_when_the_key_is_absent(tmp_path: Path) -> None:
 
 
 def test_l2_6_converse_is_not_a_violation_unauthored_region_without_flag(tmp_path: Path) -> None:
-    """REGRESSION LOCK on the one-directional rule: an APPEND_DAILY with ``needs_prose=False``
-    places an EMPTY region (apply._apply_append_daily) but NO ``body_status`` (apply.py sets it
-    only when ``disp.needs_prose``), and ``_needs_prose_map`` never authors it. That is a real,
-    reachable, lint-clean state — the biconditional would false-positive on every such daily."""
+    """REGRESSION LOCK on the one-directional rule: an unauthored region with no ``body_status`` is
+    lint-clean, so the biconditional must never be asserted.
+
+    The curator no longer PRODUCES this shape — before #131, an ``APPEND_DAILY`` with
+    ``needs_prose=False`` placed an empty region that ``_needs_prose_map`` would never author; now
+    the region and the flag are one decision. What keeps this lock necessary is that the shape
+    exists AT REST, which is what a check grading the WHOLE worktree meets: every daily published by
+    a pre-#131 build carries it, as does any hand-authored or imported note. The note here is
+    written by hand for exactly that reason — it is the artifact on disk, not the producer, that
+    L2-6 has to tolerate."""
     layout = _valid_repo(tmp_path)
     _write_daily(layout, "wiki/ai-tech/daily/ai-tech-2026-06-14.md")
     daily = layout.root / "wiki/ai-tech/daily/ai-tech-2026-06-14.md"

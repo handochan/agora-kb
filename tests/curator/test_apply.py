@@ -507,6 +507,109 @@ def test_append_daily_cross_run_preserves_prior_run_id(tmp_path: Path) -> None:
     assert new_start in body  # new region appended
 
 
+def test_append_daily_no_prose_places_no_region_and_no_flag(tmp_path: Path) -> None:
+    """#131: a disposition nobody will author must not leave a region nobody will fill.
+
+    APPLY placed the region unconditionally while ``worker._needs_prose_map`` skips
+    ``needs_prose=False`` dispositions, so the region was built and then orphaned — a permanent
+    ``_summary pending_`` in a published note. The region, the dated heading and the
+    ``body_status`` stamp are now ONE decision.
+    """
+    wt = _worktree(tmp_path)
+    plan = _plan(_append_daily(needs_prose=False))
+    apply_plan(plan, worktree=wt, run_date=RUN_DATE, provenance=_provenance("d1", E1))
+
+    daily = wt / "wiki" / "ai-tech" / "daily" / f"ai-tech-{RUN_DATE}.md"
+    assert daily.is_file(), "the daily is still created — only its body section is withheld"
+    fm, body = frontmatter.parse(daily.read_text(encoding="utf-8"))
+
+    assert "body_status" not in fm
+    assert "agora:body" not in body, "no sentinel region"
+    assert f"## {RUN_DATE}" not in body, "the dated heading is the section's first line, not a peer"
+    assert body.strip() == ""
+    # The bytes are the shape _apply_create_theme already writes for a no-prose theme.
+    assert daily.read_text(encoding="utf-8").endswith("---\n\n\n")
+
+    result = lint(RepoLayout(wt), taxonomy=TAXONOMY, run_date=RUN_DATE, run_id=RUN_ID)
+    assert result.ok, [f for f in result.findings]
+
+
+def test_append_daily_no_prose_still_records_provenance(tmp_path: Path) -> None:
+    """The PROVENANCE half of the op is unconditional — this is not a silent DROP.
+
+    ``_sources_union`` sits OUTSIDE the ``needs_prose`` gate on purpose: withholding the section
+    must never discard the capture. If a future edit "simplifies" a no-prose APPEND_DAILY into a
+    DROP, this is the test that fails.
+    """
+    wt = _worktree(tmp_path)
+    plan = _plan(_append_daily(needs_prose=False))
+    apply_plan(plan, worktree=wt, run_date=RUN_DATE, provenance=_provenance("d1", E1))
+
+    daily = wt / "wiki" / "ai-tech" / "daily" / f"ai-tech-{RUN_DATE}.md"
+    fm, _ = frontmatter.parse(daily.read_text(encoding="utf-8"))
+    assert fm["sources"] == [f"raw/ai-tech/{E1}.md"]
+    assert (wt / "raw" / "ai-tech" / f"{E1}.md").is_file()
+
+
+def test_append_daily_no_prose_append_branch_preserves_the_body_byte_for_byte(
+    tmp_path: Path,
+) -> None:
+    """The append-to-existing branch: a provenance-only append must not touch prior prose.
+
+    Also the trailing-whitespace answer the issue asked for — with no section there is nothing to
+    join, so ``prior_body`` is carried through unchanged rather than gaining a blank separator.
+    """
+    wt = _worktree(tmp_path)
+    daily = wt / "wiki" / "ai-tech" / "daily" / f"ai-tech-{RUN_DATE}.md"
+    daily.parent.mkdir(parents=True, exist_ok=True)
+    prior_start, prior_end = body_sentinels("d0")
+    prior_fm = {
+        "title": f"Daily {RUN_DATE}",
+        "type": "daily",
+        "aliases": [],
+        "tags": [],
+        "created": RUN_DATE,
+        "updated": RUN_DATE,
+        "status": "active",
+        "summary": "prior consolidation",
+        "date": RUN_DATE,
+        "run_id": "prior-run",
+        "sources": [f"raw/ai-tech/{E1}.md"],
+    }
+    prior_body = f"## {RUN_DATE}\n\n{prior_start}\nprior prose\n{prior_end}"
+    daily.write_text(frontmatter.render(prior_fm, prior_body), encoding="utf-8")
+
+    apply_plan(
+        _plan(_append_daily(candidate_id="d1", event_ids=(E2,), needs_prose=False)),
+        worktree=wt,
+        run_date=RUN_DATE,
+        provenance=_provenance("d1", E2),
+    )
+    fm, body = frontmatter.parse(daily.read_text(encoding="utf-8"))
+
+    assert body == prior_body, "the existing body is carried through untouched"
+    assert "body_status" not in fm, "no flag for a section that was never placed"
+    assert fm["sources"] == [f"raw/ai-tech/{E1}.md", f"raw/ai-tech/{E2}.md"]  # still unioned
+    assert str(fm["updated"]) == RUN_DATE  # still bumped
+    assert fm["run_id"] == "prior-run"  # still preserved
+
+
+def test_append_daily_with_prose_bytes_are_unchanged(tmp_path: Path) -> None:
+    """The half that must NOT move: pin the ``needs_prose=True`` bytes exactly (#131 lands
+    before the ``v0.1.0b1`` tag precisely because it touches APPLY's output shape)."""
+    wt = _worktree(tmp_path)
+    apply_plan(
+        _plan(_append_daily()),
+        worktree=wt,
+        run_date=RUN_DATE,
+        provenance=_provenance("d1", E1),
+    )
+    daily = wt / "wiki" / "ai-tech" / "daily" / f"ai-tech-{RUN_DATE}.md"
+    start, end = body_sentinels(region_sentinel_id(RUN_ID, "d1"))
+    _, body = frontmatter.parse(daily.read_text(encoding="utf-8"))
+    assert body == f"## {RUN_DATE}\n\n{start}\n_summary pending_\n{end}"
+
+
 # --- MERGE_INTO_THEME ---------------------------------------------------------------------------
 
 
