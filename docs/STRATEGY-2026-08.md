@@ -344,8 +344,111 @@ $ git log --all --diff-filter=A --name-only --pretty=format: | grep -i strateg
 **이 문서를 커밋하는 이유가 그것이다.** 결론만 휘발성 위치에 남기는 실패를 반복하지 않기 위해, 근거
 등급과 재현 명령을 본문에 함께 남긴다. #55는 이 문서를 참조하도록 갱신하거나 닫아야 한다.
 
+## 10. OpenKB 정렬 판정 — 수정 채택 (2026-08-15)
+
+**질문:** "위키 구조·정리 패턴·검색 로직을 OpenKB와 완전 호환으로 맞추고, 아고라는 상시 serving·자율
+분석·크론·멀티테넌트로 차별화한다."
+
+**판정: 목표는 옳고 메커니즘만 뒤집는다.** "직접 만들지 말고 얻어라"(직접 구현 8~14 person-month,
+그중 PageIndex·멀티모달은 `pymupdf`(AGPL) 때문에 ADR-0005 하에서 **법적으로 불가**)와 "차별화는
+위층"은 맞다. 틀린 건 **얻는 방법**이다 — OpenKB의 역량은 디렉터리 모양이 아니라 컴파일러 코드에
+있어서, 모양을 맞춰도 역량은 한 줄도 안 따라온다.
+
+**결정적 발견 [코드]:** `openkb add`는 평범한 `.md`를 받는다 (`openkb/cli.py:231`
+`SUPPORTED_EXTENSIONS`, `converter.py:225`). 그러므로 필요한 건 위키 모양 흉내가 아니라 **문서를
+내보내는 것**이다.
+
+| | (A) 포맷 호환 | (B) 기능 패리티 | **(C) 문서 피드** |
+|---|---|---|---|
+| src LOC | ~3,100 | ~26,000 | **~300** |
+| ADR | 3 폐기 + 7 개정 | 불변식 9회 재개방 | **0** |
+| 기간 | 다주 | 8~14 pm | **~2주** |
+
+**한 저장소 공존은 파괴적이다 [재현].** OpenKB 산출물 5종을 `wiki/`에 놓고 `agora curate`를 돌리면
+**5/5 전부** 실패시킨다(3종은 `LINT L1-11 unknown type`, 2종은 `LIVE-TREE unparseable note`).
+반대로 `openkb add`의 롤백(`openkb/mutation.py:282-290`)은 `wiki/concepts`·`wiki/entities`를
+디렉터리째 스냅샷한 뒤 백업에 없는 라이브 파일을 `unlink()` 한다. **오늘 아고라가 살아남는 유일한
+이유가 `wiki/<domain>/` 파티션이 그 폭발 반경 밖이라는 것**이고, 포맷 정렬은 정확히 그걸 안으로
+옮긴다.
+
+**무복귀선: 도메인 파티션 평탄화.** 나머지는 기계적으로 복구되지만(`_NOTE_TYPES` 참조는 3곳)
+도메인은 경로 세그먼트 외 어디에도 기록되지 않는다.
+
+## 11. aelix 1급 판정 — 채택(1급) · 기각(특권) (2026-08-15)
+
+구분 기준: **1급** = 에이전트가 *선언한 능력*에 따라 엔진이 더 요구 · **특권** = 에이전트 *이름*에
+따라 엔진이 채점을 바꿈. 불변식 6(`CLAUDE.md:30`)과 ADR-0027:152는 후자만 금지한다.
+
+**오늘 특권을 받고 있는 건 aelix가 아니라 Claude Code다 [코드]** — `core/models.py:28-30`
+`FIXED_SOURCES`에 aelix가 없어 `source="aelix"`가 거부되고, `harvester/session_connector.py:130`이
+`reader or ClaudeCodeJsonlReader()`인데 `ConnectorSpec`에 `format:` 키가 없어 **모든**
+`session:<agent>` 커넥터가 Claude Code JSONL로 파싱된다. 이슈 [#147].
+
+→ **"aelix를 1급으로 만드는 작업"과 "Claude Code의 특권을 해제하는 작업"은 같은 커밋이다.**
+
+공동 설계로만 되는 것 1순위는 **재서술 루프 차단**이다 — ADR-0017:64/0023:176이 스스로 "NOT
+eliminated"로 적어둔 미해결 위험이고, 지금 그 텔레메트리는 관측 대상에서 0을 센다([#148]).
+
+## 12. 스키마 강화 판정 — 한다, 단 새 `type:` 값 없이 (2026-08-15)
+
+**질문:** "OpenKB의 좋은 구조 아이디어를 아고라 스키마에 흡수하되 호환도 유지하고 거버넌스는 지킨다."
+
+**결정적 사실 [코드]: BM25F 랭커는 `type`을 보지 못한다.** `_FIELDS = (title, aliases, tags,
+headings, summary, body)` (`core/wiki.py:72`)이고 `_Note`에 `type` 필드가 없다. 그러므로 #139의 검색
+격차를 메우는 것은 *타입 토큰*이 아니라 **풍부한 필드를 가진 노트가 코퍼스에 존재하는 것**이다.
+그리고 `core/wiki.py:802`의 `wiki_dir.rglob("*.md")`는 제한이 없어 **새 하위 폴더가 자동 색인된다.**
+
+→ 문서 층은 **`type: theme` + 가산 프론트매터 키**로 착지시킨다. 새 op 불필요, `schema_version` 범프
+불필요, **#63이 선행조건이 아니게 된다**, lint L1-7/L1-8의 출처 강제를 공짜로 상속, 완전히 되돌릴 수
+있음.
+
+**6개 아이디어 판정:** 문서 요약 층 **TAKE**(1순위, #139와 같은 작업) · `sources` 티어
+**TAKE-MODIFIED**(`full_text:` 포인터만; `raw/`를 `wiki/` 밑으로 옮기는 건 거부) · 엔티티
+**TAKE-MODIFIED**(태그 패싯으로, 스키마 변경 0) · explorations **SKIP**(모델 합성물을 소싱된 지식과
+같은 층에 넣으면 자기-섭취 루프) · 얇은 프론트매터 **SKIP**(채점 필드 6개 중 4개가 프론트매터
+저작이라 능동적으로 파괴적) · 타입 파티셔닝 **SKIP**(`wiki/<domain>/{themes,daily}/`가 이미 중첩 구조).
+
+**도메인: 유지하되 soft화.** 실측([#146])에서 4개 질의 중 3개에서 빈 MOC 스텁이 정답을 이겼고,
+한 번은 정직한 `not_found`가 스텁 3개로 바뀌었다. 가장 싼 고가치 구매는 **워커가 `domain:`을
+프론트매터에 물질화하는 것** — 무복귀선을 닫아 이후 모든 도메인 결정을 되돌릴 수 있게 만든다.
+
+## 13. 검색 아키텍처 판정 — LLM이 주(主), 결정론 티어가 헌법 (2026-08-15)
+
+전문은 이슈 [#150]. 요지:
+
+**전제 교정 [조사]:** 카파시 LLM-wiki 원안은 렉시컬 검색을 요구하지 않는다 — 그가 권하는 검색
+레이어 QMD는 BM25 + 벡터 + LLM 리랭킹을 RRF로 융합하며 **전부 로컬 GGUF**다. `DESIGN.md:22-23`이
+카파시 계보 인용 옆에 "not vector search"를 병치해 **"no vectors"가 계보에서 온 것처럼 읽히는데,
+아고라가 스스로 추가한 별개 제약이다.** 그리고 `summary` 가중치 2.0이므로 **오늘도 이미 모델이 검색에
+들어와 있다** — "모델 프리"가 아니라 모델이 쓴 텍스트 위에서 산술이 재현 가능할 뿐이다.
+
+**실측 [조사]** (로컬 `qwen3.6:35b-a3b`, 1콜, 0.7초, $0 / 수작성 비순환 패러프레이즈 24 + 부정 10):
+bm25 단독 r@1 **0.208** · RRF 융합 0.500이지만 **부정 정답률 1.000 → 0.100 붕괴** ·
+**llm_then_bm25 r@1 0.583 / r@5 0.750 / 부정 1.000** (McNemar p = 0.0117).
+
+**결정:** LLM이 `ok`/`not_found`와 순서를 소유하고 BM25F가 모델 픽 아래를 backfill 한다. RRF 융합
+기각(기권 붕괴), BM25-as-gate 기각(0.458 < 0.583, 그리고 거짓 not_found 33%가 모델 호출을 막는다).
+**BM25F는 보조가 아니라 헌법이다** — 오프라인 폴백 · 쓰기 경로 오라클([#144]) · 양성 단락 · 회귀
+게이트를 소유한다.
+
+**정정:** `FLOOR = 0.18`은 사실상 죽은 코드다 — 0.0으로 몽키패치해도 `not_found` 10건 중 0건이
+뒤집히지 않는다. 실제로는 `_passes_gate`(`core/wiki.py:1380`)가 전부 만든다. #140의 서술을 이에 맞게
+정정했다.
+
+**최우선 선행 작업 [코드]:** `curator/bundle.py:145`가 후보마다 `wiki.query()`를 부른다 — 랭커는
+읽기 전용 관심사가 **아니고**, 플래닝 브레인의 `MERGE_INTO_THEME` 타깃을 정한다. 오병합은 provenance
+도장을 달고 영구화된다(닫힌 어휘에 DELETE 없음). **모델 코드가 존재하기 전에** `Wiki.query_lexical()`
+심을 뽑아 고정해야 한다([#144]).
+
 ## 참조
 
+- 2026-08-15 신규 이슈: [#144](https://github.com/handochan/agora-kb/issues/144) (쓰기 경로 랭커 결합) ·
+  [#145](https://github.com/handochan/agora-kb/issues/145) (gold spec_hash) ·
+  [#146](https://github.com/handochan/agora-kb/issues/146) (domain_focus) ·
+  [#147](https://github.com/handochan/agora-kb/issues/147) (불변식 6 위반 2건) ·
+  [#148](https://github.com/handochan/agora-kb/issues/148) (§8 루프 텔레메트리) ·
+  [#149](https://github.com/handochan/agora-kb/issues/149) (읽기 면 미구현 계약 3건) ·
+  [#150](https://github.com/handochan/agora-kb/issues/150) (검색 아키텍처 결정)
 - 결함 이슈: [#135](https://github.com/handochan/agora-kb/issues/135) ·
   [#136](https://github.com/handochan/agora-kb/issues/136) ·
   [#137](https://github.com/handochan/agora-kb/issues/137) ·
