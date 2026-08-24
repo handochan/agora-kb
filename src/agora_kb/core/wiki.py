@@ -1379,12 +1379,18 @@ def _combined(lex: float, struct: float, fm: float) -> float:
 
         0.65*0 + 0.35*1.0 + 0.0 = 0.35  >  FLOOR = 0.18
 
-    so an empty husk surfaced as a hit and, when it was the only candidate, replaced an honest
-    ``not_found``. That is issue #146, measured on the live corpus as empty MOC stubs beating the
-    correct answer in 3 of 4 queries. Regression: ``tests/core/test_wiki_lexical_evidence_146.py``.
+    so an empty husk surfaced as a hit. That is issue #146, measured on the live corpus as empty MOC
+    stubs beating the correct answer in 3 of 4 queries. Regression:
+    ``tests/core/test_wiki_lexical_evidence_146.py``.
 
     Blast radius is exactly the ``lex == 0`` set: any candidate with lexical evidence scores
     byte-identically to before.
+
+    What this does NOT reach: a husk's mere EXISTENCE can still flip an honest ``not_found`` to
+    ``ok``, because ``moc_label_tokens`` comes from the MOC's *body* link labels — so the bullet
+    pointing at the husk puts its topic words into the MOC's own scoring fields. Whatever admits the
+    husk therefore admits the MOC too. That is the thin-page half of #146 and needs a content/length
+    prior; it is pinned as a ``strict=True`` xfail in the regression module.
     """
     struct_term = W_STRUCT * struct if lex > 0 else 0.0
     return max(0.0, min(1.0, W_LEX * lex + struct_term + fm))
