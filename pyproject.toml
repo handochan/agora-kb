@@ -13,6 +13,24 @@ license = { text = "Apache-2.0" }
 authors = [{ name = "dochan" }]
 keywords = ["mcp", "agent-memory", "knowledge-base", "llm-wiki", "markdown", "self-hosted"]
 
+# `Operating System :: POSIX` is a DECLARATION, not an oversight. The curator's single-writer lock
+# is `fcntl.flock` (`curator/claim.py`), imported at module scope, so native Windows cannot run the
+# `agora` command at all — `_entry.py` catches that and prints three lines of guidance instead of a
+# ModuleNotFoundError traceback (#103). Windows support is a portable-filelock change tracked by
+# #86; until it lands, saying so in the metadata costs one line and unblocks every macOS and Linux
+# user today, whereas withholding the release until Windows is green blocks all three.
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Operating System :: POSIX",
+    "Operating System :: MacOS :: MacOS X",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: Text Processing :: Indexing",
+]
+
 # Core deps kept minimal & permissively licensed. Optional features live in extras so the
 # core library stays small and dependency-light (see ADR-0005: fully-OSS BOM).
 dependencies = [

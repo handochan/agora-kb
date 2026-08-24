@@ -696,16 +696,18 @@ class Wiki:
             cand.fm = round(_fm(cand.note.status), 6)
             if not _passes_gate(cand, q_tokens):
                 continue
-            combined = W_LEX * cand.lex + W_STRUCT * cand.struct + cand.fm
-            cand.score = round(max(0.0, min(1.0, combined)), 6)
+            cand.score = round(_combined(cand.lex, cand.struct, cand.fm), 6)
             self._assign_reason_and_extract(cand, q_tokens, stats)
             eligible.append(cand)
 
-        # not_found gates (b) zero eligible, (c) best < floor.
+        # The floor is a property of a HIT, not only of the best hit (issue #146). Applying it to
+        # `best` alone let every other eligible candidate ride in behind a single strong one — so a
+        # husk scoring 0.0 was returned as a search result whenever anything else cleared the floor.
+        # Filtering first also subsumes not_found gate (c): an empty survivor set IS not_found.
+        eligible = [c for c in eligible if c.score >= FLOOR]
+
+        # not_found gates (b) zero eligible, (c) nothing clears the floor.
         if not eligible:
-            return QueryResult(query=question, status="not_found", hits=())
-        best = max(c.score for c in eligible)
-        if best < FLOOR:
             return QueryResult(query=question, status="not_found", hits=())
 
         eligible.sort(key=_order_key)
@@ -1360,6 +1362,38 @@ def _structural(d_moc: int, indeg: int, max_indeg: int) -> float:
     """Degree-surrogate structural score (ADR-0012 §5)."""
     indeg_norm = indeg / max(1, max_indeg)
     return STRUCT_ALPHA * (1.0 / (1 + d_moc)) + STRUCT_BETA * indeg_norm
+
+
+def _combined(lex: float, struct: float, fm: float) -> float:
+    """Combined [0,1] score (ADR-0012 §5, amended for issue #146).
+
+    **Structure amplifies lexical evidence; it never substitutes for it.** A candidate with no
+    lexical match contributes no structural term, so it can score at most its frontmatter boost
+    (+0.10 for ``active``) — below ``FLOOR``.
+
+    Why this is a correction and not a new policy: ADR-0012 §6 names the admission check a
+    *mandatory lexical-evidence* gate, but ``_passes_gate``'s second branch admits a ``d_moc == 0``
+    note whose only overlap is with ``moc_label_tokens`` — the MOC's LINK TEXT, which is not one of
+    the note's own scoring ``_FIELDS``. Such a candidate reaches here with ``lex == 0``, and used to
+    take the full structural term:
+
+        0.65*0 + 0.35*1.0 + 0.0 = 0.35  >  FLOOR = 0.18
+
+    so an empty husk surfaced as a hit. That is issue #146, measured on the live corpus as empty MOC
+    stubs beating the correct answer in 3 of 4 queries. Regression:
+    ``tests/core/test_wiki_lexical_evidence_146.py``.
+
+    Blast radius is exactly the ``lex == 0`` set: any candidate with lexical evidence scores
+    byte-identically to before.
+
+    What this does NOT reach: a husk's mere EXISTENCE can still flip an honest ``not_found`` to
+    ``ok``, because ``moc_label_tokens`` comes from the MOC's *body* link labels — so the bullet
+    pointing at the husk puts its topic words into the MOC's own scoring fields. Whatever admits the
+    husk therefore admits the MOC too. That is the thin-page half of #146 and needs a content/length
+    prior; it is pinned as a ``strict=True`` xfail in the regression module.
+    """
+    struct_term = W_STRUCT * struct if lex > 0 else 0.0
+    return max(0.0, min(1.0, W_LEX * lex + struct_term + fm))
 
 
 def _fm(status: str) -> float:
