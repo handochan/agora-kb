@@ -726,3 +726,74 @@ normative reference column is now the §10 "fm=on" column.
 > query → read → neighbors → re-query navigation loop this ranking serves. Wiring only:
 > `Wiki.query`, the tokenizer/cache contract above, and the frozen `QueryResult`/`SearchHit`
 > shapes are untouched.
+
+---
+
+## Addendum — structure amplifies lexical evidence, never substitutes for it (#146, landed 2026-08-24)
+
+**Status:** Accepted · amends §5 (combined score) and §6 (lexical-evidence gate). Append-only, per the
+#56 precedent. No `CACHE_SCHEMA_VERSION` bump: nothing serialized into the reader cache changes.
+
+### What was wrong
+
+§6 names the admission check a **mandatory lexical-evidence gate**, but `_passes_gate`'s second branch
+admits a `d_moc == 0` candidate whose only overlap is with `moc_label_tokens` — the MOC's **link text**,
+which is not one of the note's own scoring `_FIELDS` (title/aliases/tags/headings/summary/body). Such a
+candidate reached the scorer with `lex == 0` and took the full structural term:
+
+```
+combined = W_LEX*0 + W_STRUCT*struct + fm
+         = 0.65*0  + 0.35*1.0        + 0.0   = 0.35   >   FLOOR = 0.18
+```
+
+So a structurally-perfect empty husk surfaced as a search hit with **zero lexical evidence** — the
+`#57` `note-<sha8>` shape is the realistic carrier: a CJK-titled note slugs to a husk-looking basename
+while the MOC bullet carries the human-readable title.
+
+A **second half of the same defect**: `FLOOR` was applied only to `best`, so once any single candidate
+cleared it, every other eligible candidate rode in behind it. A husk scoring `0.0` was returned as a
+result whenever anything else in the corpus scored above the floor.
+
+This is issue [#146], measured on the live corpus as empty MOC stubs beating the correct answer in 3 of
+4 queries. It also contradicted a comment already standing in the shipped test suite
+(`test_not_found_unrelated_query`: *"structural-only notes never clear the floor"*) — intent the code
+did not deliver.
+
+### Decision
+
+1. **The structural term is conditional on lexical evidence.** `_combined(lex, struct, fm)` contributes
+   `W_STRUCT * struct` only when `lex > 0`. A candidate with no lexical match scores at most its
+   frontmatter boost (`+0.10` for `active`), which is below `FLOOR`.
+2. **The floor is a property of a hit, not only of the best hit.** Candidates scoring below `FLOOR` are
+   filtered before ordering; an empty survivor set *is* `not_found`, which subsumes the old gate (c).
+
+`_passes_gate` itself is **unchanged** — the fix is in scoring and hit membership, not admission, so the
+`#56` alias-mediated widening keeps working exactly as ratified.
+
+### Blast radius, and why the weights did not move
+
+Exactly the `lex == 0` set. Any candidate with lexical evidence scores **byte-identically** to before,
+which is why no weight, floor, or field constant is touched by this addendum and why the full suite
+(1,968 tests) passes unchanged. Deliberately **not** done here: re-tuning `W_LEX`/`W_STRUCT`/`FLOOR`,
+which would move every existing score and destroy the ranker's value as a regression gate.
+
+### What this does NOT fix — recorded, not folklore
+
+A husk's mere **existence** can still flip an honest `not_found` to `ok`. `moc_label_tokens` is derived
+from the MOC's *body* link labels, so the bullet pointing at the husk puts the husk's topic words into
+the MOC's own body — a real lexical match for the MOC. Delete the bullet and the query is `not_found`;
+keep it and the MOC is returned. The reader is pointed at a map whose only relevant entry is empty.
+
+That is the **thin-page half** of #146 — pages winning on genuine lexical matches while carrying no
+substance — and it needs a content/length prior, not a gate change. It is pinned as a `strict=True`
+xfail in `tests/core/test_wiki_lexical_evidence_146.py`, so when a content prior lands the test flips to
+passing and says so out loud.
+
+### Conformance
+
+`tests/core/test_wiki_lexical_evidence_146.py` is a **conformance block**: any future change to
+`_passes_gate`, `_structural`, or the combined-score assembly must keep it passing **unmodified**. If a
+proposed change requires editing a test in that file, the lexical-evidence guarantee got weaker, not
+simpler, and the diff should say so.
+
+[#146]: https://github.com/handochan/agora-kb/issues/146
