@@ -5,6 +5,9 @@
 >
 > **범위:** "옵시디언·MCP·git으로 충분한가"라는 질문에서 출발해 2026년 에이전트 메모리 시장을 다시
 > 재고, 아고라의 코드를 재현 실험으로 검증했다. 기준 `main @ 0390d5d`, 2026-08-13.
+>
+> **§10–§13 추가 2026-08-15 · §14(4자 합성 판정) 추가 2026-09-02.** 이 문서는 append-only로
+> 자란다 — 앞 절의 서술이 뒤에 반증되면 지우지 않고 §14.1처럼 정정 표로 기록한다.
 
 이 문서는 이슈 [#34](https://github.com/handochan/agora-kb/issues/34)에 대한 답이다 — 2026-06-26에
 *"obsidian이나 일반적 지식그래프와 agora에서 구현된 것은 동일 개념인 것인가"* 라는 제목으로,
@@ -34,6 +37,10 @@
 하베스터 · 커넥터 경계 레닥션 · 아웃바운드 센티널 루프브레이크 · 모델 없는 BM25F**. 이 다섯은 가장
 가까운 경쟁 트리에 문자 그대로 존재하지 않는다 (`grep -rniE 'harvest|redact|MEMORY\.md|\.jsonl'` → 0
 hit) [조사].
+
+> **정정 (2026-09-02).** 이 grep은 **OpenKB 트리에 대해서만** 참이었다. OpenViking은 같은 기능을
+> `harvest`가 아니라 `ingest`로 부르며 이미 갖고 있다. 다섯 중 4자 조사에서도 유일하게 남은 것은
+> **경계 레닥션 · 아웃바운드 센티널 · 후보 게이트**이고, 하베스터 자체는 더 이상 유일하지 않다 — §14.
 
 카테고리가 검증되었다는 것은 해자가 생겼다는 뜻이 아니다. **범용 레이어가 이제 소비할 상품이
 되었다**는 뜻이다.
@@ -147,17 +154,24 @@ WEIGHTS: title 3.0 / aliases 3.0 / tags 2.5 / headings 2.0 / summary 2.0 / body 
 MCP × local-LLM × multi-tenant teams + memory harvesting"* 는 유지할 수 없다. 별점을 의심해 `gh api`로
 전수 확인했고 **수치는 전부 실측과 일치했다** [재현, 2026-08-13].
 
-| 저장소 | 별 | 라이선스 | 반증하는 절 |
-|---|---:|---|---|
-| thedotmack/claude-mem | 90,520 | Apache-2.0 | 메모리 수확 (7개 에이전트 지원) |
-| kepano/obsidian-skills | 45,079 | MIT | 스키마를 AGENTS.md로 배포 |
-| khoj-ai/khoj | 36,463 | AGPL-3.0 | 마크다운 우선 + 로컬 |
-| VectifyAI/PageIndex | 35,155 | MIT | 벡터 없는 검색 |
-| TencentCloud/TencentDB-Agent-Memory | 20,395 | — | 팀 공유 메모리 + LLM-Wiki |
-| AgriciDaniel/claude-obsidian | 10,788 | MIT | 단일 라이터 트랜잭션 엔진 |
-| **VectifyAI/OpenKB** | **3,664** | **Apache-2.0** | **거의 전부** |
-| basicmachines-co/basic-memory | 3,641 | AGPL-3.0 | 마크다운 + MCP |
-| nex-crm/wuphf | 1,240 | — | 아키텍처 쌍둥이 + 인간 검증 게이트 |
+| 저장소 | 별 | 라이선스 | 계층 | 반증하는 절 |
+|---|---:|---|---|---|
+| **Graphify** (Graphify Labs) | **109,033** | Apache-2.0 + MIT | T0 | `export wiki`/`obsidian` — 마크다운 위키 + `index.md` + 에이전트 크롤 |
+| thedotmack/claude-mem | 90,520 | Apache-2.0 | — | 메모리 수확 (7개 에이전트 지원) |
+| kepano/obsidian-skills | 45,079 | MIT | — | 스키마를 AGENTS.md로 배포 |
+| khoj-ai/khoj | 36,463 | AGPL-3.0 | T4 | 마크다운 우선 + 로컬 |
+| VectifyAI/PageIndex | 35,155 | MIT | T2 | 벡터 없는 검색 |
+| **volcengine/OpenViking** | **31,496** | **AGPL-3.0** | **T4** | **하베스터 — claude_code·codex·hermes·openclaw·opencode 세션 인제스트** |
+| TencentCloud/TencentDB-Agent-Memory | 20,395 | — | — | 팀 공유 메모리 + LLM-Wiki |
+| AgriciDaniel/claude-obsidian | 10,788 | MIT | — | 단일 라이터 트랜잭션 엔진 |
+| **VectifyAI/OpenKB** | **3,664** | **Apache-2.0** | **T0** | **거의 전부** |
+| basicmachines-co/basic-memory | 3,641 | AGPL-3.0 | T4 | 마크다운 + MCP |
+| nex-crm/wuphf | 1,240 | — | — | 아키텍처 쌍둥이 + 인간 검증 게이트 |
+
+> **재발행 (2026-09-02).** 초판 표에는 **1·2위가 빠져 있었다.** Graphify와 OpenViking 두 행은
+> 2026-08-21 조사에서 추가됐고 별점은 그날의 스냅샷이다 [조사] — 나머지 행은 2026-08-13 실측이다.
+> **계층** 열은 ADR-0005의 T0–T4 애드덤이고, 별점이 아니라 **무엇으로 붙일 수 있는가**를 말한다.
+> 판정 전문은 §14.
 
 유일하게 안 반증되는 절이 **"multi-tenant teams"** 인데, 그건 정확히 출하하지 않은 절이다 —
 `src/agora_kb/auth/__init__.py`는 2줄 docstring이다 [코드].
@@ -440,6 +454,144 @@ bm25 단독 r@1 **0.208** · RRF 융합 0.500이지만 **부정 정답률 1.000 
 도장을 달고 영구화된다(닫힌 어휘에 DELETE 없음). **모델 코드가 존재하기 전에** `Wiki.query_lexical()`
 심을 뽑아 고정해야 한다([#144]).
 
+## 14. 4자 합성 판정 — B′: 아티팩트 위에서 합성한다 (2026-08-21/22 조사, 기록 2026-09-02)
+
+이 문서의 §1–§13은 **OpenKB 하나**를 가장 가까운 경쟁 트리로 놓고 쓰였다. 2026-08-21에 두 건이
+추가로 조사됐고 — ByteDance Volcengine의 **OpenViking**(31.5k★, AGPL-3.0)과 **Graphify**(109k★,
+Apache-2.0+MIT) — 그 결과 §1·§3·§6의 전제 일부가 반증됐다. **이 절의 외부 사실은 전부 [조사]이며
+2026-08-21 스냅샷이다.** 아고라 코드에 대한 주장만 [코드]로 재확인했다.
+
+### 14.1 정정 다섯
+
+| 앞서 이 문서가/내가 한 말 | 실제 |
+|---|---|
+| §1 *"다섯은 가장 가까운 경쟁 트리에 문자 그대로 존재하지 않는다"* | **하베스터는 아니다.** OpenViking은 같은 것을 `harvest`가 아니라 `ingest`로 부른다 — `openviking/ingest/sources/`에 claude_code·codex·hermes·openclaw·opencode 5종 리더, JSONL 바이트오프셋 커서 + inode 회전 감지. 그 PR은 **18.5시간·3,258줄**이었다 |
+| "OpenViking은 git을 안 쓴다" | **틀렸다.** git을 Rust로 직접 구현했다(`crates/ragfs/src/git/service.rs`, gitoxide, 기본 enabled, `ov snapshot {commit,restore,diff,log}`). 앞선 grep이 파이썬 라이브러리만 봤다 |
+| "파일이 SSOT가 아니다" | **틀렸다.** 평문 파일이 SSOT이고 벡터 스토어는 파생이다(`reindex`로 재구축) |
+| "provenance는 아고라만" | **부분적으로 틀렸다.** `source_extraction_id(s)` · `last_update_trace_id`가 파일 트레일러에 지속되고 커밋마다 `memory_diff.json`을 쓴다 |
+| "OpenViking SDK는 Apache-2.0이라 붙이는 경로가 깨끗하다" | **파이썬은 아니다.** PyPI `openviking-sdk`는 라이선스 선언이 **아예 없다** — ADR-0005 기준으로 선언된 AGPL보다 나쁘다. TS/npm SDK만 Apache-2.0이 맞다 |
+
+살아남은 좁은 진실 하나: OpenViking의 자동 커밋은 `/memories/experiences/`에만 걸리고
+preferences·entities·events에는 자동 히스토리가 없다. 그러므로 방어 가능한 문장은 *"그들은 git을 안
+쓴다"* 가 아니라 **"모든 큐레이션이 손으로 clone하고 diff할 수 있는 커밋이다"** 뿐이다. 공개 문서에
+전자를 쓰면 grep 한 번에 반증당한다.
+
+### 14.2 4자 지도 — 각자가 **거부하는 것**이 아고라의 자리다
+
+| | 무게중심 | 거부하는 것 | 계층 |
+|---|---|---|---|
+| **OpenKB** 3.7k★ | 마크다운 위키 **컴파일러** | 사실 단위 캡처 · 히스토리/revert · 레닥션 · 에이전트 출처 | T0 (문서 피드, **동거 금지**) |
+| **OpenViking** 31.5k★ | 파일시스템 패러다임 **벡터 컨텍스트 DB** | 경계 레닥션 · 비파괴 dedup · 로컬 sparse/BM25 | **T4 (별도 서비스 only)** |
+| **Graphify** 109k★ | **프롬프트 배포**(그래프는 페이로드) | 임베딩 · 산문 지식 · 오프라인 비코드 · 테넌트 경계 | T0 (아티팩트만) |
+| **아고라** | **캡처 · 거버넌스 · 보관(custody)** | — | — |
+
+### 14.3 여섯 갭 — G2가 가장 날카롭고 **4자 중 유일**하다
+
+G1 다중 에이전트 사실 캡처 · **G2 아웃바운드 인젝션 방어** · G3 지식에 대한 감사 추적 ·
+G4 정직한 `not_found` · G5 하드 테넌트 경계 · G6 결정론 규율.
+
+**G2.** Graphify는 인바운드는 잘한다 — `<|im_start|>`·`<<SYS>>`·`[INST]`·`### system:`을 제로폭
+공백으로 defang하고 sha256 `<untrusted_source>` 블록으로 감싼다. 그런데 그렇게 만든 그래프가 호스트
+에이전트로 **돌아가는** 경로는 `sanitize_label`(제어문자 제거 + 256자 컷)이 전부다. *"Ignore previous
+instructions and…"* 로 시작하는 256자 함수명은 그대로 통과한다. 자기 SECURITY.md가 그 행을 *"Prompt
+injection via node labels"* 라고 제목 붙여놓고 코드에 없는 방어를 주장한다. 아고라 쪽 대응물은
+ADR-0027 §8 센티널/루프브레이크다.
+
+**G6은 역전이다.** Graphify는 결정론을 **광고하고 실패하고**(`wiki.py`가 *"Community labels are
+LLM-generated and non-deterministic"* 라고 자기 파일에 적어놨다), 아고라는 **갖고 있으면서 광고하지
+않는다** — ADR-0010 D5 고정 문법, gold 팩 바이트 동일(#37), ADR-0012 구성상 결정론. 어느 것도 외부인이
+확인할 수 있는 형태로 공개돼 있지 않다.
+
+### 14.4 판정 — **B′: 아티팩트 위에서 합성한다, 런타임 위에서는 절대 안 한다**
+
+- **A(흡수)는 산술적으로 종결.** OpenKB 26k LOC + Graphify 62,201 LOC + 문법 25종, OpenViking은 AGPL
+  이라 어떤 가격에도 복사 불가. 아고라 `src/` 전체가 27.5k줄이다.
+- **순진한 합성도 기각.** Graphify가 그 대가를 몸으로 보여준다 — 설치 타깃 23개, 호스트 툴을 DENY하는
+  훅까지 갖고도 **내구성 아티팩트를 소유하지 못했다**: `graph.json`에 `schema_version` 없음, 최상위 키
+  집합이 라이터 버전에 따라 다름, README·skill·`serve.py`가 서로 다른 MCP 툴 집합 3종을 나열.
+- **아고라의 기반은 그 반대다.** 마크다운+git은 벤더의 포맷이 아니라 넷 다 읽을 수 있고 아무도 폐기할
+  수 없는 것이다. **inbox 경계에서 합성하고 쓰기 경로를 소유하는 것은 플러그인이 아니다.**
+
+**검색은 위임하지 않는다.** ADR-0012 §0a가 범주적으로 금지한다(*"No accelerator ever computes `lex`,
+`struct`, `fm`, `score`, `match_reason`"*) — 외부 검색 서비스는 정의상 score를 계산한다. 그리고 치명적인
+건 읽기가 아니라 **쓰기**다: `curator/bundle.py:145`가 후보마다 `wiki.query()`를 불러
+`MERGE_INTO_THEME` 타깃을 정하는데 op 어휘에 **DELETE가 없다**(`curator/plan.py:53-77`) [코드].
+비결정적 랭커 = 되돌릴 수 없는 오병합에 provenance 도장. 이슈 [#144]가 그 심(seam)이다.
+덧붙여 OpenViking의 **완전 로컬 구성은 dense-only이고 sparse/BM25 폴백이 없다** — §13이 "BM25F는 보조가
+아니라 헌법"이라고 못박은 바로 그 바닥이 없다.
+
+> **정직한 유보.** B′의 진짜 위험은 플러그인이 되는 게 아니라 **건너뛸 수 있게 되는 것**이다.
+> Graphify + OpenKB를 쓰는 사용자는 아고라를 아예 설치 안 할 수 있다. 완화책은 기능이 아니라
+> 경계다 — 셋 모두 쓰기 경로를 명시적으로 포기하거나 파괴적으로 다룬다(OpenKB는 손편집을 덮어쓰고,
+> OpenViking의 dedup은 삭제하고, Graphify는 지식을 아예 안 쓴다). 그래서 `curator/`는 **잘라내면 안
+> 되는 유일한 대형 모듈**이다. §7의 삭제 목록은 이 문장과 충돌하지 않는다 — §7이 지우려는 것은
+> 큐레이터가 아니라 그 주변의 중복 표면이다.
+
+### 14.5 라이선스 계층 T0–T4 → ADR-0005 애드덤
+
+ADR-0005에 이미 3계층이 암묵적으로 있었는데 **셋이 빠져 있었고 각각이 이미 결정 하나씩을 틀리게 했다**
+— (a) 전이 폐포(§5의 2026-08-15 `pageindex`→AGPL `pymupdf` 정정), (b) 벤더링 계층(ADR-0021이 이미
+실행했는데 문서에 없었다), (c) **아티팩트 계층**(B′를 비용 0으로 합법화하는 계층인데 한 번도 적힌 적이
+없다). 다섯 계층의 정의와 현재 배정은 [ADR-0005 애드덤](adr/0005-fully-oss-bom.md)에 있다.
+
+### 14.6 안 가져가는 것과 그 이유
+
+| | 이유 |
+|---|---|
+| OpenViking 엔진 | AGPL → **T4 영구**. C++ 벡터 인덱스 + Rust ragfs, PyPI SDK는 라이선스 선언 자체가 없음 |
+| Graphify 엔진 | 62,201줄 + 안정 스키마 부재. 그리고 **아고라 코퍼스에서 0개 노드** — `wiki/`는 100% 산문이라 DOC으로 분류돼 semantic 티어로 가고, API 키 없으면 하드 실패, `--code-only`면 모든 `.md`가 조용히 드롭된다 |
+| OpenKB 동거 | 롤백이 `wiki/concepts`·`wiki/entities`를 디렉터리째 스냅샷한 뒤 백업에 없는 라이브 파일을 `unlink()` (§10) + 도메인 파티션 무복귀선 |
+| **빌리는 것 (코드 아님, 계약)** — [#158] | Graphify `wiki.py`의 **슬러그 계약** — 비-ASCII 보존 · 링크≡디스크 파일명 · Windows MAX_PATH 예산 · 충돌 접미사 예약. 이슈 #136(이 문서 §2.2)이 터뜨린 바로 그 결함 클래스를 저쪽은 주석으로 방어해뒀다. **라이선스 무관, ADR 0개** |
+
+### 14.7 §7 로드맵 재판정 — 뒤집힌 항목은 없고, 둘이 강화됐다
+
+- **Phase 4 인증 삭제 판정 강화** — Graphify는 **인증 0으로 109k★에 도달했다.**
+- **`ingest/extractors/` 확장 삭제 판정 강화** — "직접 만들지 마라"의 근거가 늘었다(T0 문서 피드).
+- **ADR-0032(임베딩) 재개는 여전히 게이트 미충족** — §13의 실측이 그대로 유효하다.
+- **§8 Day 4–5(`agora-harvest` 분리 출시)는 취소가 아니라 재범위화** — 하베스터 자체는 더 이상 유일하지
+  않으므로(§14.1), 분리 출시의 축은 **레닥션 + 센티널**이다.
+
+### 14.8 위키 구조 — 목표안 Stratum (**미비준 Draft**)
+
+이 조사가 스키마에 남긴 진단 한 줄: 아고라의 천장은 **축이 뒤집혀 있다**는 사실이 정한다 — 경로가
+*주제*를 지고(`wiki/<domain>/`), 닫힌 4값 `type:` enum이 *종류*를 진다. OpenKB에서 가져오는 것은
+디렉터리 모양이 아니라 **원리 하나 — 디렉터리가 종류다**.
+
+목표 레이아웃(요약): `wiki/{concepts,summaries,notes,maps,entities,people}/` + 도메인은 경로를 떠나
+`subjects:` 프론트매터로 · `raw/`는 **옮기지 않는다** · 원본 바이트는 `raw/_blob/<ab>/<sha256>` 콘텐츠
+주소로. 무복귀선은 **도메인 파티션 평탄화 하나뿐**이고, 그건 뒤집기 *전에* 워커가 `domain:`을
+프론트매터에 물질화해서 닫는다.
+
+**상태: 초안, 승인 전.** 판정문 자체가 관문 둘을 선행조건으로 건다 — **A** 무결성 경계 v2(바이트 우선
+캡처가 `curator/worker.py:1591` `_is_engine_written_raw` 재작성을 강제하고, 유니코드 슬러거가
+`curator/plan.py:92` `_SAFE_TOKEN_RE_PATTERN`(ASCII 전용 **보안** 통제)에 막힌다) [코드] · **B** n=24
+하네스 재실행. 전문은 [`notes/stratum-target-architecture.md`](notes/stratum-target-architecture.md).
+
+비준은 이슈 [#153]이 소유한다 — 관문 A [#154] · 관문 B [#155] · 무복귀선 닫기 [#156]. 셋 다
+[#144]·[#146]·[#147]·[#152](레이아웃 독립 정직성 계약) 뒤에 온다.
+
+### 14.9 미결 · 반증 조건 · 남은 부채
+
+**반증 조건(하나라도 참이면 이 절을 재계산한다):** (i) OpenViking이 경계 레닥션을 넣으면 G2가 좁아진다 ·
+(ii) Graphify가 `graph.json`에 `schema_version`과 안정 키 집합을 넣으면 T0→T1 재검토 대상이다 ·
+(iii) OpenKB가 위키 콘텐츠에 히스토리/revert를 넣으면 §6의 해자 표를 다시 계산해야 한다.
+
+**남은 문서 부채:** `docs/BOM.md`(현 의존성 전부의 전이 폐포 근거) **미작성** — [#157]. —
+`docs/DESIGN.md` §9의 *"no mature OSS project combines…"* 차별화 문단은 §3 재발행으로 완전히 반증됐고,
+이 절과 같은 커밋에서 **철회(RETRACTED)** 됐다 — 지우지 않고 취소선 + 철회 사유 + 대체 주장(custody)을
+남겼다.
+
+**포지셔닝 한 문장** — 이 절이 실제로 판 것:
+
+> 아고라는 당신의 에이전트들이 배운 것에 대한 **system of record**다. 모든 사실은 append-only ·
+> 레닥션 · 출처 도장이 찍힌 인박스로 들어오고, 위키를 편집하는 라이터는 언제나 하나뿐이며, 모든
+> 변경은 diff하고 revert할 수 있는 git 커밋이다 — 당신이 어떤 컴파일러 · 그래프 · 인덱스를 가져다
+> 붙이든.
+
+이 문장이 **주장하지 않는 것**: "no vectors"(§13이 빌려온 정체성으로 이미 폐기) · "multi-tenant
+teams"(`auth/__init__.py`는 2줄 docstring) · "최고의 검색". **custody(보관 책임)** 를 주장한다 —
+넷 중 누구도 다투지 않는 유일한 절이다.
+
 ## 참조
 
 - 2026-08-15 신규 이슈: [#144](https://github.com/handochan/agora-kb/issues/144) (쓰기 경로 랭커 결합) ·
@@ -460,4 +612,29 @@ bm25 단독 r@1 **0.208** · RRF 융합 0.500이지만 **부정 정답률 1.000 
 - 관련 설계: [ADR-0014](adr/0014-okf-obsidian-interoperability.md) (Obsidian/OKF 상호운용) ·
   [ADR-0012](adr/0012-deterministic-query-ranking.md) (결정론적 랭킹) ·
   [ADR-0011](adr/0011-curator-ingest-contract.md) (§4.0/§4.2 게이트, §5.1 재시도 예산) ·
-  [`notes/retrieval-vs-vectordb.md`](notes/retrieval-vs-vectordb.md)
+  [`notes/retrieval-vs-vectordb.md`](notes/retrieval-vs-vectordb.md) ·
+  [`notes/openkb-compatible-long-document-compiler.md`](notes/openkb-compatible-long-document-compiler.md)
+  (**Draft · non-normative**, PDF 호환 + PPTX 확장) ·
+  [`notes/stratum-target-architecture.md`](notes/stratum-target-architecture.md)
+  (**Draft · non-normative**, §14.8 목표 위키 구조) ·
+  [ADR-0005 애드덤](adr/0005-fully-oss-bom.md) (라이선스 계층 T0–T4, §14.5)
+- §14 조사 원본: 2026-08-21/22 세션 워크플로(OpenViking 16 에이전트 · Graphify 8 에이전트 + 적대적
+  반증). 이 문서가 그 결론의 **저장소 측 정본**이다 — §9가 정산한 실패(결론만 휘발성 위치에 남기기)를
+  반복하지 않기 위해.
+
+[#139]: https://github.com/handochan/agora-kb/issues/139
+[#140]: https://github.com/handochan/agora-kb/issues/140
+[#144]: https://github.com/handochan/agora-kb/issues/144
+[#145]: https://github.com/handochan/agora-kb/issues/145
+[#146]: https://github.com/handochan/agora-kb/issues/146
+[#147]: https://github.com/handochan/agora-kb/issues/147
+[#148]: https://github.com/handochan/agora-kb/issues/148
+[#149]: https://github.com/handochan/agora-kb/issues/149
+[#150]: https://github.com/handochan/agora-kb/issues/150
+[#152]: https://github.com/handochan/agora-kb/issues/152
+[#153]: https://github.com/handochan/agora-kb/issues/153
+[#154]: https://github.com/handochan/agora-kb/issues/154
+[#155]: https://github.com/handochan/agora-kb/issues/155
+[#156]: https://github.com/handochan/agora-kb/issues/156
+[#157]: https://github.com/handochan/agora-kb/issues/157
+[#158]: https://github.com/handochan/agora-kb/issues/158

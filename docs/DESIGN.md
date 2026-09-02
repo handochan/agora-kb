@@ -451,9 +451,18 @@ Agora's pattern matches what the industry converged on in 2026 — *async write-
 Dreaming, Amazon Bedrock AgentCore Memory, and `mcp-memory-service`. On the storage side it shares the
 markdown-first philosophy of Basic Memory, Khoj, and the Karpathy LLM-wiki pattern.
 
-**The gap Agora fills:** no mature OSS project combines *markdown wiki × queue + sleep-time
-consolidation + MCP × local-LLM × multi-tenant teams + memory harvesting*. That intersection — a
-self-hostable, fully-OSS, multi-tenant shared-memory hub — is Agora.
+**~~The gap Agora fills:~~** ~~no mature OSS project combines *markdown wiki × queue + sleep-time
+consolidation + MCP × local-LLM × multi-tenant teams + memory harvesting*.~~ **RETRACTED 2026-09-02**
+— every clause of that sentence was falsified clause-by-clause by the 2026-08 market survey
+(`docs/STRATEGY-2026-08.md` §3, re-issued §14), including *memory harvesting*, which OpenViking ships
+as `ingest`. The only clause that survived is *multi-tenant teams*, which Agora has **not** shipped
+(`src/agora_kb/auth/__init__.py` is a two-line docstring).
+
+**What Agora actually claims instead — custody, not coverage:** Agora is a **system of record for what
+your agents learned**. Every fact enters through an append-only, redacted, provenance-stamped inbox;
+exactly one writer edits the wiki; every change is a git commit you can diff and revert — whatever
+compiler, graph, or index you bolt on. See `docs/STRATEGY-2026-08.md` §14.4 for the judgment behind
+this wording and §14.9 for what it deliberately does not claim.
 
 ## 10. Vision extensions & ecosystem posture (Step-0 ratified 2026-07-05)
 
