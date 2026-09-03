@@ -478,3 +478,54 @@ attach + promote 에어락 · capability 기반 에이전트 · 불변식 7·8 �
 
 **스틸맨 결론:** 재시작 13–18 인월 vs 진화 15–18 인월은 **노이즈 범위 안에서 동률**이고, 동률일 때는 부가 자산이 결정한다 — 살아있는 도그푸드 코퍼스, 이미 결정된 27건, 이중 유지보수 4–6개월의 부재. 셋 다 진화 편이다. 재시작의 최대 이점("하위 호환을 안
 지켜도 되는 자유")은 **이미 소유하고 있다.**
+
+---
+
+## 12.4 애드덤 (2026-09-03) — 오너 결정: 구조 전환을 앞당긴다. 세 단위 순서
+
+오너 판정: *"정식 배포 전이라 유저가 없고 마이그레이션 자체가 필요 없다. 처음부터 구조를 바꾸고 시작한다."*
+이에 따라 §3.2·§12의 "Stratum 클린 브레이크는 관문 A 통과 뒤 H2 말" 을 **철회**하고, Stratum 전체(축 뒤집기 +
+`raw/_blob` + 유니코드 슬러그 + `kb_id`)를 **day-1 포맷(schema 2)** 으로 한 번에 만든다. 코드 감사(감사 3건 +
+적대 검증 1건, 2026-09-03)가 근거다 — 관문 A는 재작성이 아니었다.
+
+| 관문 A 통제 | 실측 크기 | 근거 |
+|---|---|---|
+| D2 바이트 원본 승인 | 실행 줄 1개(`curator/worker.py:1618`) + `raw_writes` 타입 변경 ~21곳 | 1613(status)·1615(authorship) 게이트는 내용 무관, 그대로 |
+| D3 유니코드 슬러그 | src 180–260줄 + 테스트 370–490줄 | 정규식은 `curator/plan.py:92` 한 곳. 읽기 쪽(lint·wiki)은 문자 집합 무관 |
+
+**정정 둘.** (a) 축 뒤집기는 무결성 경계와 무관하지 않다 — `wiki/people/`는 큐레이터 쓰기 금지인데 allowlist
+상수(`curator/constants.py:26`)가 `wiki/` 전체를 허용하므로 카브아웃이 필요하고, `raw_writes`의 키가 경로
+도메인으로 구성된다(`curator/apply.py:208`). (b) 기준선은 뒤집기 **전에** 고정해야 한다 — `_is_moc_path`
+(`core/wiki.py:590`)가 구조 점수를 시드하므로 뒤집는 순간 랭킹과 gold 선택이 코퍼스 전체에서 바뀌고,
+`tests/core/test_wiki_lexical_evidence_146.py:142`의 strict xfail이 엉뚱한 이유로 뒤집힌다.
+
+**순서 (한 덩어리가 아니라 셋):**
+
+1. **UNIT 1 — 레이아웃 불변 무결성 수정. 작은 보안 PR로 먼저.** `_git` 두 곳(`curator/worker.py:1757`,
+   `core/repo.py`)에 `encoding="utf-8"` (로케일 디코딩 결함 하나가 D2 바이너리 TAMPER 트레이스백과 D3 비-ASCII
+   경로 오거부의 공통 원인) · bytes 모드 `_blob_at` · `raw_writes: dict[str, bytes]` + 1618만 bytes 비교 ·
+   sha256 이름이 맞는 심기(planting)도 여전히 실패하는 테스트(Stratum §5의 함정) · `curator/apply.py` 경로 구성
+   7곳에 `resolve()+is_relative_to()` 봉쇄를 **옛 ASCII 정규식 아래에서** 먼저 녹색으로 · `core/pathsafe.py`
+   (NFC 우선, 유니코드 **카테고리 allowlist** L/N/M + `-_.` — denylist 금지, Windows 예약명·끝 공백/점 거부,
+   UTF-8 바이트 캡, 전부 거부 시 빈 문자열 → #57 `note-<sha8>` 폴백 생존) **호출처 없이** + 적대 코퍼스 +
+   실제 파일시스템 NFC/NFD 왕복 테스트 · `plan.py:88-91`의 "심링크 방지" 오기 삭제(심링크 방지는
+   `worker.py:1616,1677`).
+2. **UNIT 3 — 관문 B 기준선 고정, 뒤집기 병합 전에.** #155 n=24 하네스 5갈래 + #146 네 질의를 돌려 숫자를
+   픽스처로 기록한다.
+3. **UNIT 2 — day-1 포맷 변경, 나머지 전부.** 축 뒤집기(경로에서 도메인을 읽는 5곳: `schema/lint.py:203` ·
+   `ingest/vault_import.py:622` · `curator/apply.py:795` · `core/wiki.py:599` · `faces/mcp_server.py:942`) ·
+   `people/` allowlist 카브아웃 + lint 권고(#152) · `raw/_blob` 캡처 채널(웹 업로드가 원본 바이트를 버림,
+   `faces/web/app.py:947`) + `.meta.yaml` · `raw/_pages/` 승인 클래스(lint L1-8이 blob 존재를 요구하므로 게이트와
+   같은 단위) · `plan.py:418-433`을 pathsafe로 스왑 + `adapters/ollama_brain.py:340-350`·
+   `ingest/vault_import.py:303-308` 슬러거 미러(임포터는 60자 캡·OK-RE 재검증이 없는 기존 발산) · #57 테스트
+   11개 재결정(`note-<sha8>`는 최후 폴백으로 유지) · `_meta/kb.yaml` `kb_id`(init/import만) ·
+   **`SUPPORTED_KB_SCHEMA_VERSIONS = {1, 2}`** — `{2}`로 좁히면 오너의 실KB 둘이 모든 명령에서 거부되고
+   `agora repo upgrade`(#63)는 없다. 첫 커밋은 공용 픽스처 빌더다(`tests/`에 conftest.py 0개, 파일별 헬퍼 51개).
+
+**보류:** 헤딩 앵커 슬러거(ADR-0012 A4가 이미 보류, 리더 캐시 버전과 결합) · `core/layout.py:29` `_WRITER_RE`
+(운영자 식별자, ASCII 유지) · `core/wiki.py:1444` #108 5줄(독립) · `raw/` 검색 코퍼스 진입(#139) · 장문 페이지
+컴파일러 본체(승인 클래스만 UNIT 2). **미결(오너):** `people/`의 아웃바운드 레닥션 경계가 미설계이므로 day-1에
+`people/`를 gold·`kb_context`에서 제외할지, 트리 자체를 다음 단위로 미룰지.
+
+이 애드덤은 §12 표의 H0/H1/H2 주차를 대체하지 않고 **H0 안에서 UNIT 1→3→2가 선행**됨을 뜻한다. 베타 컷라인
+(§12.3)은 UNIT 2 뒤로 옮긴다 — 첫 공개 포맷이 schema 2가 되게.
