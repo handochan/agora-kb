@@ -1,6 +1,7 @@
 # ADR-0019 — Web face stack: API-first FastAPI + server-rendered HTMX
 
 **Status:** Accepted · 2026-06-21
+**AMENDED (append-only) — [ADR-0041](0041-stratum-kind-first-layout.md) (Proposed, KB wiki schema 2): the POSTURE is kept, the PAYLOAD is not.** API-first + server-rendered is layout-free and UNCHANGED, as is the §7 per-route-viz escape hatch. But the JSON this face serves carries the per-note shape from `AgoraHandlers.browse()`/`note()` — `{rel_path, basename, type, title, status, tags, domain}` plus a top-level `domains` list — and under schema 2 every one of those fields moves: `type` → `kind`, `domain` (0..1, path-derived) → `subjects` (0..n, frontmatter-derived), the top-level `domains` aggregate becomes a `subjects` FACET (a union over notes' `subjects:`, so it can legitimately be empty), and `wiki/people/**` joins the note set. `GET /api/notes`, `GET /api/notes/{path}` and `GET /api/graph` are FACE CONTRACTS and must be released as one visible change — "the posture is layout-free" is true and is not an answer about the payload. The prose below is retained verbatim for history.
 
 Realizes the **web app** of ADR-0003 (one core, many faces — the web face is a thin face over the
 core API, never a storage shortcut) for **ROADMAP Phase 3** / DESIGN §5.2. Binds the license

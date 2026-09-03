@@ -3,6 +3,7 @@
 **Status:** Accepted · 2026-06-13 · **scope clarified by the 2026-07-29 appendix (issue #99): the
 single-writer clause bounds who may mutate the event spool, and the five-clause spool-custodian rule
 says on what terms a non-curator process may.**
+**AMENDED (append-only) — [ADR-0041](0041-stratum-kind-first-layout.md) (Proposed, KB wiki schema 2) narrows the WIKI half of the single-writer clause, in the same shape as the #99 appendix narrowed the spool half.** This ADR's Decision reads *"exactly one curator process per repo reads the inbox and edits the shared `wiki/`, indexes, and `log.md`"*; under schema 2 that clause is **re-read as governing the CURATED wiki**, with `wiki/people/**` — a HUMAN-OWNED namespace — outside it. The exception is safe on this ADR's own stated ground: the Context justifies the rule because *"file-level 'last write wins' loses data when two writers touch **the same shared file**"*, and no curator write ever touches a file under `wiki/people/**` — ADR-0041 D4.1 carves that subtree out of the ADR-0008 §4 / ADR-0011 §4.0 allowlist, so any add/modify/rename/delete under it in a curated diff FAILS the run. The two writers therefore never share a file, and the invariant the clause exists to protect is untouched. Single-writer over the curated `wiki/`, `index.md`, the indexes and `log.md`: **unchanged**. The prose below is retained verbatim for history.
 
 ## Context
 Many writers (multiple agents, multiple people, the harvester) must contribute concurrently, while the
