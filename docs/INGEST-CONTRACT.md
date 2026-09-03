@@ -146,13 +146,21 @@ Every manifest `event_id` is reachable through exactly one candidate's `provenan
 trusted to the model.
 
 ### 1.1 Pre-fetched related view (the move that makes a small Qwen reliable)
-For each candidate the worker runs the SAME deterministic `core.read` used by `kb_query`
-([ADR-0009](adr/0009-deterministic-query-contract.md)) over the current wiki and writes
+For each candidate the worker runs `core.read`'s deterministic, model-free lexical oracle
+`Wiki.query_lexical` ([ADR-0009](adr/0009-deterministic-query-contract.md),
+[ADR-0012 §0a](adr/0012-deterministic-query-ranking.md)) over the current wiki and writes
 `related/<cand-id>.json` = an ordered `QueryResult` (`status`, `hits[]` with
 repo/path/anchor/line/excerpt/match_reason/score, plus each hit's frontmatter `title,tags,sources`). The
 backend does mem0-style retrieve-then-decide with ZERO network and NO search tool, satisfying the sandbox
 invariant (ADR-0008) and the local-zero-cost goal. Top-k default `k=8` (tunable in `repo.yaml`). Bundle size
 is bounded (§1.3) so PASS 1 never silently overflows the local context window.
+
+The oracle — not `Wiki.query`, the READ face — is the pinned seam (issue #144). The two compute the
+same bytes today and share one implementation, but `query` is the method that may one day grow a
+ranking tier; the write path may not follow it there, because a mis-merge is permanent (no DELETE in
+the closed op vocabulary) while a bad read is transient. The view is additionally filtered to notes
+the CURATOR produced (ADR-0014 D1 addendum, #152): a human-written note is not a legal
+`MERGE_INTO_THEME` target, so it is never offered as one.
 
 ### 1.2 wiki_index.json is a rebuilt, advisory index
 `wiki_index.json` is regenerated **deterministically from the worktree markdown at `base_commit` on every

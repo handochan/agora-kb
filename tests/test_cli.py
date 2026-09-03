@@ -1696,6 +1696,35 @@ def test_doctor_reports_initialized_repo(
     assert "initialized" in capsys.readouterr().out
 
 
+@requires_git
+def test_doctor_notes_line_counts_what_the_curator_does_not_own(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """#152: the operator surface for a note the curator reads but will never curate.
+
+    Before #152 such a note was worse than invisible — it failed every run. Now it is quietly
+    excluded, which is only honest if somebody says so; this is the line that does. It never moves
+    the verdict: writing in `wiki/` is supported, not ill health.
+
+    (No ``--skip-probe``: a bare repo has no adapters.yaml, so no brain probe and no network call.)
+    """
+    target = tmp_path / "kb"
+    Repo.resolve(target).init()
+
+    main(["doctor", "--repo", str(target)])
+    # The seed index.md carries the engine's `timestamp:` stamp, so a fresh repo owns everything.
+    assert "  notes: 1 total, none out of schema" in capsys.readouterr().out
+
+    hand_written = target / "wiki" / "ai-tech" / "themes" / "human-note.md"
+    hand_written.parent.mkdir(parents=True, exist_ok=True)
+    hand_written.write_text("# Just a note\n\nStraight from Obsidian.\n", encoding="utf-8")
+
+    rc = main(["doctor", "--repo", str(target)])
+    out = capsys.readouterr().out
+    assert "  notes: 2 total, 1 out of schema (read + indexed, never curated)" in out
+    assert rc in (0, 1)  # observability only — the count never decides the verdict
+
+
 def test_doctor_failures_line(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     """#96 (doctor half): the failure backlog + last attempt/failure, print-only and crash-free.
 
@@ -4026,6 +4055,71 @@ def test_doctor_prints_the_connectors_line(
     assert "harvest: enabled (scope_lock=personal)" in out
     assert "file:demo (scope=personal)" in out
     assert "proposed=0" in out
+
+
+@requires_git
+def test_doctor_reports_the_session_connector_format(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`agora doctor` answers "which grammar is reading my transcripts" (issue #147).
+
+    An undeclared format prints the DEFAULT it resolves to, not a blank — an operator debugging a
+    zero-fact harvest needs the EFFECTIVE parser. The file: line stays exactly as it was: format is
+    a session-only concept and a column of `format=n/a` would be noise.
+    """
+    target, _ = _setup_harvest_repo(tmp_path)
+    ap = target / "adapters.yaml"
+    a = yaml.safe_load(ap.read_text(encoding="utf-8"))
+    a["connectors"]["session:demo"] = {"path": str(tmp_path / "s" / "*.jsonl"), "scope": "personal"}
+    a["connectors"]["session:pinned"] = {
+        "path": str(tmp_path / "s" / "*.jsonl"),
+        "scope": "personal",
+        "format": "claude-code-jsonl",
+    }
+    ap.write_text(yaml.safe_dump(a, sort_keys=False), encoding="utf-8")
+    capsys.readouterr()
+    main(["doctor", "--repo", str(target), "--skip-probe"])
+    out = capsys.readouterr().out
+    assert "session:demo (scope=personal, format=claude-code-jsonl)" in out
+    assert "session:pinned (scope=personal, format=claude-code-jsonl)" in out
+    assert "file:demo (scope=personal)" in out  # unchanged: no format column on a file: connector
+
+
+@requires_git
+def test_a_targeted_harvest_is_not_hostage_to_another_connector(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`--connector NAME` narrows BEFORE `build_connectors`, which is all-or-nothing (#147 review).
+
+    `build_connectors` raises on the FIRST spec it cannot construct, so without the pre-filter one
+    mis-declared connector disabled harvesting for every healthy one — including a run that named
+    a different connector explicitly.
+    """
+    target, _ = _setup_harvest_repo(tmp_path)
+    ap = target / "adapters.yaml"
+    a = yaml.safe_load(ap.read_text(encoding="utf-8"))
+    # A connector TYPE the config loader accepts and `build_connectors` refuses (no such family).
+    a["connectors"]["mail:nope"] = {"path": str(tmp_path / "m"), "scope": "personal"}
+    ap.write_text(yaml.safe_dump(a, sort_keys=False), encoding="utf-8")
+
+    capsys.readouterr()
+    assert main(["harvest", "--repo", str(target), "--connector", "file:demo", "--dry-run"]) == 0
+    assert "would harvest" in capsys.readouterr().out
+
+    # Un-targeted, the bad connector is still a loud, clean failure — nothing is swallowed.
+    assert main(["harvest", "--repo", str(target), "--dry-run"]) == 1
+    assert "mail:nope" in capsys.readouterr().err
+
+
+@requires_git
+def test_harvest_unknown_connector_still_lists_the_configured_set(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The "no connector named X" message names the whole configured set, not the filtered one."""
+    target, _ = _setup_harvest_repo(tmp_path)
+    capsys.readouterr()
+    assert main(["harvest", "--repo", str(target), "--connector", "file:bogus"]) == 1
+    assert "['file:demo']" in capsys.readouterr().out
 
 
 @requires_git

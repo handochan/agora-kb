@@ -51,6 +51,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 from collections.abc import Iterator
@@ -98,16 +99,20 @@ if TYPE_CHECKING:
     from ..config import ConnectorSpec
 
 __all__ = [
+    "CURATOR_STAMP_KEYS",
     "AuthorRegion",
     "Backend",
     "FakeBackend",
     "HarvestCursorDelta",
+    "LiveTree",
     "RunFailure",
     "RunReport",
     "compute_harvest_cursor_deltas",
+    "is_curator_written",
     "iter_attempt_records",
     "run",
     "recover",
+    "scan_live_tree",
 ]
 
 # §4.2 AUTHOR-failure RESET placeholder (ADR-0011 §4.2): the blockquote derived from the plan
@@ -226,6 +231,217 @@ def _is_theme_note(note: Note) -> bool:
     parts = note.rel_path.split("/")
     # wiki / <domain> / themes / <basename>.md  (exactly four POSIX segments)
     return len(parts) == 4 and parts[0] == "wiki" and parts[2] == "themes"
+
+
+# --- the producer/consumer boundary inside wiki/ (issue #152, ADR-0014 D1/D4 addendum) ----------
+#
+# A human is ALLOWED to write in `wiki/` — nothing forbids it, and a schema-valid hand-written note
+# publishes untouched. What was NOT allowed was the consequence: the note was graded as CURATOR
+# OUTPUT (strict producer) although the curator never wrote it, so one Obsidian save (Properties
+# instead of the ADR-0010 §2 frontmatter, or no fence at all) hard-rejected EVERY subsequent run,
+# forever, because the offending file sits in the base commit. The fix is a classification BEFORE
+# the producer gate, not a softer gate: L1 severities stay frozen (kb_schema.md), the closed op
+# vocabulary is untouched, and no rule changes. See the ADR-0014 addendum for the rejected
+# alternatives (severity downgrade; git authorship).
+
+# The frontmatter keys the ENGINE — never the model, never Obsidian — materializes on a note it
+# wrote. `sources:` is written by APPLY's provenance union on every theme/daily (ADR-0011 §2: "the
+# WORKER writes sources:, never the model"); `timestamp:` is the deterministic OKF
+# `<updated>T00:00:00Z` APPLY stamps on every note type it creates or re-renders and `_set_updated`
+# keeps in lock-step (ADR-0014 D2), including the seed `index.md` `repo init` writes. Presence of
+# EITHER is the curator's stamp. The union (not the intersection) is what makes the discriminator
+# total across the four note types and tolerant of a theme published before the OKF fields landed.
+CURATOR_STAMP_KEYS: frozenset[str] = frozenset({"sources", "timestamp"})
+
+# The same stamp, looked for TEXTUALLY, in a frontmatter block that does not parse. A malformed
+# block hides its keys from `frontmatter.parse`, and "malformed" is precisely where the two
+# populations must NOT be conflated: a broken CURATOR note is an integrity signal that still fails
+# the run, a broken HUMAN note is somebody's draft.
+_STAMP_LINE_RE = re.compile(r"^(?:sources|timestamp):")
+# How far into an unclosed block the textual scan looks. The scan is deliberately confined to the
+# FRONTMATTER REGION, never the body: a fenceless note whose PROSE happens to contain a line reading
+# `sources: …` must not be mistaken for a damaged curator note — that misfiling would resurrect the
+# permanent-failure bug this whole change exists to kill, for the one shape nobody would look at.
+_MAX_STAMP_SCAN_LINES = 40
+
+
+def _stamp_in_frontmatter_region(text: str) -> bool:
+    """Best-effort: does an UNPARSEABLE frontmatter block still visibly carry a curator stamp?
+
+    Only ever asked of a note whose frontmatter did NOT parse. Text that does not open with a
+    ``---`` fence has no frontmatter block at all and therefore cannot be something APPLY rendered
+    (:func:`agora_kb.core.frontmatter.render` always opens with one), so it is never stamped. For a
+    block that opens but is malformed or unclosed, the scan stops at the closing fence or after
+    :data:`_MAX_STAMP_SCAN_LINES` lines — bounding an unclosed fence to the region a real
+    frontmatter block could occupy.
+
+    The fence test tolerates a leading UTF-8 BOM and a stray CR (see below), and the discriminator
+    is deliberately TEXTUAL: a human ``Properties`` block that is YAML-invalid AND happens to carry
+    a line starting ``sources:`` / ``timestamp:`` is classified as a damaged PRODUCER artifact and
+    fails the run, naming the file. That is the conservative direction on purpose (a genuinely
+    damaged curator note must never be reclassified away as somebody's draft) and it is recorded as
+    a known residual in the ADR-0014 addendum.
+    """
+    lines = text.split("\n")
+    if not lines:
+        return False
+    # A leading UTF-8 BOM must not hide the fence. PowerShell `Set-Content`/`Out-File` and several
+    # Windows editors write UTF-8-with-BOM by default (epic #85), and `frontmatter.parse` rejects
+    # such a file — so WITHOUT this strip a BOM'd CURATOR note is silently demoted to "human",
+    # which drops it out of the producer lint scope where L1-16 (the rule that exists to catch
+    # exactly this damage) would never read it again. Stripping keeps it a damaged producer
+    # artifact: the run fails loudly and names the file, which is what the ADR-0014 addendum
+    # promises. A stray CR is stripped for the same "the fence is still a fence" reason.
+    if lines[0].lstrip("\ufeff").rstrip(" \t\r") != "---":
+        return False
+    for line in lines[1 : 1 + _MAX_STAMP_SCAN_LINES]:
+        if line.rstrip(" \t\r") == "---":
+            return False  # a closed block: the stamp was not in it
+        if _STAMP_LINE_RE.match(line):
+            return True
+    return False
+
+
+def is_curator_written(note: Note) -> bool:
+    """True iff ``note``'s frontmatter carries a curator stamp (:data:`CURATOR_STAMP_KEYS`).
+
+    The discriminator between a PRODUCER artifact (graded by the L1 gate, a legal MERGE/CONTEST
+    target) and a note a human wrote in ``wiki/`` (read, indexed, linkable — never graded, never
+    written to). Frontmatter-based ON PURPOSE: git authorship (the rejected alternative (c)) is
+    absent from a fresh clone and would misfile the legitimate case of a human hand-editing a
+    curator note, while this predicate is a pure function of the bytes in the tree.
+
+    Deliberately conservative in the one direction that matters: a human note that happens to carry
+    ``sources:``/``timestamp:`` is graded as producer output, i.e. exactly today's behaviour.
+    """
+    return any(key in note.frontmatter for key in CURATOR_STAMP_KEYS)
+
+
+def _is_structural_curator_path(rel_path: str) -> bool:
+    """True iff APPLY rewrites this path BY CONSTRUCTION, whoever last saved it (#152 follow-up).
+
+    The three structural notes the deterministic APPLY step opens without ever asking the plan gate
+    for permission: the root ``index.md`` (:func:`apply._update_index`), a domain MOC
+    ``wiki/<domain>/<domain>-moc.md`` (:func:`apply._update_moc`), and a per-domain daily
+    ``wiki/<domain>/daily/<basename>.md`` (:func:`apply._apply_append_daily`). Each of those call
+    sites does an UNGUARDED ``frontmatter.parse`` of the existing file.
+
+    THEME notes are deliberately NOT here: a MERGE/CONTEST target must clear the PLAN gate's
+    ``theme_basenames`` (built from :attr:`LiveTree.curator_paths`) before APPLY ever opens it, so a
+    malformed human theme is already rejected as a clean plan error. These three have no such gate —
+    the curator owns them by construction — so a malformed one is an integrity signal, not
+    somebody's draft, and must FAIL the run (clean, named) instead of crashing APPLY mid-batch.
+    """
+    if rel_path == "index.md":
+        return True
+    parts = rel_path.split("/")
+    if parts[0] != "wiki":
+        return False
+    # wiki / <domain> / <domain>-moc.md
+    if len(parts) == 3 and parts[2] == f"{parts[1]}-moc.md":
+        return True
+    # wiki / <domain> / daily / <basename>.md
+    return len(parts) == 4 and parts[2] == "daily"
+
+
+def _malformed_frontmatter(path: Path) -> tuple[str, str] | None:
+    """Return ``(raw_text, error message)`` if ``path``'s frontmatter does not parse, else ``None``.
+
+    Read tolerantly (``errors="replace"``) for the same reason
+    :func:`~agora_kb.schema.notes.parse_all_notes` is: a non-UTF-8 note in the live tree must not
+    raise :class:`UnicodeDecodeError` out of the classification (ADR-0014 D4).
+    """
+    text = path.read_text(encoding="utf-8", errors="replace")
+    try:
+        frontmatter.parse(text)
+    except FrontmatterError as exc:
+        return text, str(exc)
+    return None
+
+
+@dataclass(frozen=True)
+class LiveTree:
+    """The classified live-tree scan the run's registries and producer-lint scope are built from.
+
+    ``notes`` is the TOLERANT parse of every note (a malformed one degrades to empty frontmatter +
+    full body) — the read-path view, ADR-0014 D4. ``curator_paths`` are the notes carrying the
+    engine's stamp; ``human_paths`` are the rest, in deterministic path order.
+    ``malformed_curator`` is the first malformed note that still visibly carries the stamp, or sits
+    at a structural path APPLY rewrites unconditionally (:func:`_is_structural_curator_path`) — a
+    real integrity signal that must fail the run rather than be classified away.
+    """
+
+    notes: tuple[Note, ...]
+    curator_paths: frozenset[str]
+    human_paths: tuple[str, ...]
+    malformed_curator: str | None
+
+
+def scan_live_tree(layout: RepoLayout) -> LiveTree:
+    """Parse the live tree once and split it into curator-produced vs human-written notes (#152).
+
+    Replaces the strict :func:`parse_all_notes` call that used to abort the run on the FIRST
+    unparseable note in the curated tree. The strictness is not dropped, it is SCOPED: a malformed
+    note that still carries a curator stamp — or sits at one of the structural paths APPLY rewrites
+    by construction (:func:`_is_structural_curator_path`) — is reported in ``malformed_curator``
+    (the caller fails the run exactly as before); a malformed note without one is a human draft and
+    joins ``human_paths``, which the caller warns about and otherwise leaves alone.
+
+    Only notes whose PARSED frontmatter has no stamp are re-read, so the extra IO is bounded by the
+    number of human notes (zero in a purely curated repo).
+    """
+    notes = parse_all_notes(layout)  # TOLERANT: never aborts on somebody's draft
+    curator: list[str] = []
+    human: list[str] = []
+    malformed_curator: str | None = None
+    for note in notes:
+        if is_curator_written(note):
+            curator.append(note.rel_path)
+            continue
+        # No stamp in the PARSED frontmatter — either the note genuinely has none, or its block did
+        # not parse at all and the tolerant read handed us `{}`. Only the empty-frontmatter notes
+        # can be the latter, so only those are re-read.
+        if not note.frontmatter:
+            malformed = _malformed_frontmatter(layout.root / note.rel_path)
+            if malformed is not None:
+                text, message = malformed
+                # Stamped, OR at a path APPLY rewrites unconditionally. The second half is what
+                # keeps a fenceless `index.md` / domain MOC / daily out of APPLY's UNGUARDED
+                # `frontmatter.parse`: classified as a human draft it would sail past this gate and
+                # crash `run()` with a traceback, stranding the claimed batch in `_kb/processing/`
+                # while `agora status` reported `failed_events: 0` — strictly worse than the hard
+                # rejection #152 set out to remove. The curator owns those three by construction, so
+                # the clean named `_fail` IS the right answer for them.
+                if _stamp_in_frontmatter_region(text) or _is_structural_curator_path(note.rel_path):
+                    curator.append(note.rel_path)
+                    if malformed_curator is None:  # first in sorted scan order (fail-fast shape)
+                        malformed_curator = f"{note.rel_path}: {message}"
+                    continue
+        human.append(note.rel_path)
+    return LiveTree(
+        notes=tuple(notes),
+        curator_paths=frozenset(curator),
+        human_paths=tuple(human),
+        malformed_curator=malformed_curator,
+    )
+
+
+# How many out-of-scope note paths one warning line names before it summarizes the rest. The
+# warning is an operator signal, not an inventory: `agora doctor` prints the full count and the
+# notes are right there in the tree.
+_MAX_NAMED_HUMAN_NOTES = 5
+
+
+def _human_notes_warning(human_paths: tuple[str, ...]) -> str:
+    """Render the ONE operator-facing line naming the notes this run did not grade (#152)."""
+    named = ", ".join(human_paths[:_MAX_NAMED_HUMAN_NOTES])
+    if len(human_paths) > _MAX_NAMED_HUMAN_NOTES:
+        named += f", … and {len(human_paths) - _MAX_NAMED_HUMAN_NOTES} more"
+    return (
+        f"LIVE-TREE: {len(human_paths)} note(s) in the curated tree carry no curator stamp — "
+        f"left byte-identical, excluded from the plan registry and from the producer lint, still "
+        f"readable and indexed: {named}"
+    )
 
 
 def _read_notes(worktree: Path, needs_prose: dict[str, list[str]]) -> dict[str, str]:
@@ -542,7 +758,33 @@ def _run_locked(
     state_store.save(state)
 
     # ADR-0011 §1 / §5 tier-2: build the read-only bundle (candidates + provenance + related/).
-    bundle = build_bundle(layout, repo, manifest, related_k=related_k)
+    #
+    # `mergeable_paths` (#152): PASS 1 is instructed to pick its MERGE_INTO_THEME target out of the
+    # §1.1 `related/` hits, but since #152 a human-written note is NOT a legal target — naming one
+    # is a BASENAME plan error, and any plan error fails the WHOLE run. An unstamped note that
+    # lexically overlaps a candidate would otherwise sit at the top of that view on every run, so
+    # the engine would be failing runs over a menu it handed the model itself. Classified over the
+    # LIVE tree, the same files `build_bundle`'s `Wiki` reads (the worktree scan below is at
+    # `base_commit` and answers a different question: what this run is graded on).
+    #
+    # The set is the curator's own THEMES, not merely its own notes: the plan gate accepts a
+    # MERGE/CONTEST target ONLY out of `theme_basenames` (plan.py checks 5 and 8), so a curator
+    # daily, MOC or `index.md` in the view is just as run-killing a pick as a human note. This
+    # mirrors the `theme_basenames` derivation below EXACTLY — same `_is_theme_note` over the same
+    # stamped-paths set — so the menu and the gate cannot drift apart. kb_schema.md §7.1 states
+    # this property to the model; keep the three in step.
+    live_now = scan_live_tree(layout)
+    bundle = build_bundle(
+        layout,
+        repo,
+        manifest,
+        related_k=related_k,
+        mergeable_paths={
+            n.rel_path
+            for n in live_now.notes
+            if _is_theme_note(n) and n.rel_path in live_now.curator_paths
+        },
+    )
 
     # #60 batch observability: the run's claim/bundle shape + the queue depth left after the claim
     # (one cheap dir count — the un-claimed FIFO remainder the next trigger will pick up). Captured
@@ -566,33 +808,47 @@ def _run_locked(
     # the committed worktree, so the §4.1 BASENAME/LINK checks grade against the real tree.
     with repo.worktree(at=base_commit) as wt:
         wt_layout = RepoLayout(wt)
-        # Parse the live tree ONCE and derive BOTH registries: the all-basenames set (CREATE
-        # uniqueness + LINK resolvability grade against this) and the THEME-only subset (MERGE/
-        # CONTEST targets grade against this, mirroring apply._resolve_target_path theme_only).
-        # strict=True: a malformed note in the live tree is integrity-critical here (the basename /
-        # theme registries grade the model's plan), so surface it loudly rather than silently
-        # building an incomplete registry. The browse read path uses the tolerant default instead.
-        # A malformed note in the LIVE tree is an operator problem, not a crash: `run()` catches
-        # only LockHeld, so this raise escaped as a traceback that left the claimed batch stranded
-        # in `_kb/processing/` while `agora status` still printed `failed_events: 0` and
-        # `agora doctor` still printed `status: healthy` — and each `agora watch` tick recovered,
-        # re-claimed and re-crashed. One hand-edited `wiki/` note (an Obsidian note with no
-        # frontmatter fence) is enough to trigger it. Keep strict=True — an incomplete registry
-        # would misgrade the model's plan — and turn the raise into the FAILED run the contract
-        # already promises, so #96's `last_failure` names the offending path.
-        try:
-            notes = parse_all_notes(wt_layout, strict=True)
-        except FrontmatterError as exc:
+        # Parse the live tree ONCE, CLASSIFY it (#152), and derive BOTH registries: the
+        # all-basenames set (CREATE uniqueness + LINK resolvability grade against this) and the
+        # THEME-only subset (MERGE/CONTEST targets grade against this, mirroring
+        # apply._resolve_target_path theme_only).
+        #
+        # This used to be a strict parse_all_notes whose FrontmatterError failed the run. That was
+        # already an improvement on the traceback it replaced (a claimed batch stranded in
+        # `_kb/processing/` while `agora status` printed `failed_events: 0`), but it still had the
+        # wrong subject: opening the repo in Obsidian and saving ONE fenceless note failed EVERY
+        # subsequent run, forever, because the offending file sits in the base commit.
+        # `scan_live_tree` keeps the strictness where it is an integrity signal — a malformed note
+        # that still carries the curator's own stamp — and downgrades a human draft to a warning
+        # (#152, ADR-0014 D1/D4).
+        live_tree = scan_live_tree(wt_layout)
+        if live_tree.malformed_curator is not None:
             return _fail(
                 layout,
                 manifest,
                 state_store,
                 now=now,
-                reasons=[f"LIVE-TREE: unparseable note in the curated tree — {exc}"],
+                reasons=[
+                    f"LIVE-TREE: unparseable note in the curated tree — "
+                    f"{live_tree.malformed_curator}"
+                ],
                 max_attempts=max_attempts,
             )
+        notes = list(live_tree.notes)
+        # DELIBERATELY over ALL notes, human ones included. A human note is not a producer artifact,
+        # but its basename is still TAKEN: dropping it here would let a CREATE_THEME reuse that
+        # basename, and APPLY writes `wiki/<domain>/themes/<basename>.md` unconditionally — an
+        # Obsidian note saved in a `themes/` folder would be silently overwritten. The registry that
+        # must exclude human notes is the MERGE/CONTEST target set below, and it does.
         live_basenames = {n.basename for n in notes}
-        theme_basenames = {n.basename for n in notes if _is_theme_note(n)}
+        theme_basenames = {
+            n.basename for n in notes if _is_theme_note(n) and n.rel_path in live_tree.curator_paths
+        }
+        # Carried to the report (seeded into `prose_warnings` at PASS 2) so a published run says out
+        # loud which notes it did not grade — the operator surface `agora doctor` mirrors.
+        live_tree_warnings: list[str] = (
+            [_human_notes_warning(live_tree.human_paths)] if live_tree.human_paths else []
+        )
 
         # ADR-0011 §0 / §4.3: append `_agora_scratch/` to the WORKTREE's own .gitignore BEFORE
         # invoking the backend, so the backend's PASS-1 plan.json + any model scratch are writable
@@ -681,6 +937,23 @@ def _run_locked(
                 reasons=[f"PATH/ALLOWLIST: {exc}"],
                 max_attempts=max_attempts,
             )
+        except FrontmatterError as exc:
+            # DEFENCE IN DEPTH for the same contract (§4 "never an uncaught traceback out of
+            # run()"). APPLY re-opens existing notes with an UNGUARDED `frontmatter.parse` in four
+            # places — `_update_index`, `_update_moc`, `_apply_append_daily`, and the
+            # `_apply_merge`/`_apply_contested` targets. `scan_live_tree`'s structural + stamp
+            # classification is what SHOULD keep a malformed note from ever reaching them, and the
+            # plan gate covers the theme targets; this catch is the belt to that pair of braces, so
+            # no live-tree note can ever escape `run()` as a traceback that strands the claimed
+            # batch in `_kb/processing/` with `agora status` reporting `failed_events: 0`.
+            return _fail(
+                layout,
+                manifest,
+                state_store,
+                now=now,
+                reasons=[f"APPLY-PARSE: unparseable note reached APPLY — {exc}"],
+                max_attempts=max_attempts,
+            )
 
         # The post-APPLY tree is structurally complete with empty body regions (prose_complete still
         # false). Persist phase=applied BEFORE PASS 2 so a crash recovers at the right §9 entry.
@@ -721,7 +994,9 @@ def _run_locked(
         # Seeded, not appended later: an APPEND_DAILY that never flagged needs_prose contributes NO
         # region, so a plan made only of those has an empty `needs_prose` map and skips the whole
         # block below — the one shape that most needs the diagnostic (#131).
-        prose_warnings: list[str] = _plan_shape_warnings(plan)
+        # `live_tree_warnings` FIRST: a note the run refused to grade is context for everything
+        # below it, and it is the one warning a run with no prose at all still has to carry (#152).
+        prose_warnings: list[str] = [*live_tree_warnings, *_plan_shape_warnings(plan)]
         prose_counts: dict[str, int] = {}
         if needs_prose:
             base_state = {rel: (wt / rel).read_text(encoding="utf-8") for rel in needs_prose}
@@ -832,14 +1107,27 @@ def _run_locked(
             # new_state is now STALE for any cleared note (its last reader was the grading above).
             # Re-read from disk rather than trusting it if you add a reader below.
 
-        # §4.4 deterministic LINT of the full worktree — the SAME gate the dashboard runs. A lint
-        # failure is a structural failure: discard the whole diff, publish nothing (§4.4).
+        # §4.4 deterministic LINT — the SAME gate the dashboard runs, over the SAME worktree, with
+        # every rule and severity unchanged. What #152 narrows is the SUBJECT: the gate grades what
+        # the CURATOR PRODUCED, which is (a) every path THIS run added or modified — the run's own
+        # diff against base_commit, the same name-status view the final-diff gate reads — plus (b)
+        # every note carrying the curator's stamp from an earlier run. A note in neither set was
+        # written by a human; it is read (it still resolves links and feeds the orphan derivation)
+        # but never graded, so an Obsidian save can no longer hard-reject the run in perpetuity.
+        # A DELETED path is excluded: there is nothing left on disk to lint.
+        _git(wt, "add", "-A")
+        run_diff = _parse_name_status_z(
+            _git_bytes(wt, "diff", "--cached", "--name-status", "-z", base_commit).stdout
+        )
+        touched_this_run = {rel for status, rel, _old in run_diff if not status.startswith("D")}
+        producer_scope = set(live_tree.curator_paths) | touched_this_run
         lint_result = lint(
             wt_layout,
             taxonomy=taxonomy,
             run_date=run_date,
             run_id=run_id,
             max_orphans=max_orphans,
+            scope=producer_scope,
         )
         if not lint_result.ok:
             # ERRORS ONLY, matching the gate's own predicate (``LintResult.ok`` is False iff an
@@ -1035,6 +1323,10 @@ def _run_locked(
         # log.md, the commit subject and state.counters stay byte-identical, and only when the run
         # had prose to author — a run with no needs_prose keeps its small report shape.
         **prose_counts,
+        # #152: how many notes the run READ but did not GRADE (no curator stamp). Emitted ONLY when
+        # there are any, so a purely curated repo's report shape is byte-unchanged. `agora doctor`
+        # and the dashboard's health() derive the same number from the tree, outside a run.
+        **({"unmanaged_notes": len(live_tree.human_paths)} if live_tree.human_paths else {}),
     }
 
     return RunReport(

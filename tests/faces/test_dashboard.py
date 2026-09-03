@@ -256,6 +256,40 @@ def test_harvester_status_from_planted_cursor(tmp_path: Path) -> None:
     assert conn["last_scan"] == "2026-06-21T02:00:00Z"
 
 
+def test_harvester_status_reports_the_session_connector_format(tmp_path: Path) -> None:
+    """The dashboard/MCP status face answers "which grammar is reading my transcripts" too (#147).
+
+    `agora doctor` grew that line; the two OTHER human-facing surfaces read this dict, so without
+    the key they could not answer it. Each kind-specific field is `None` on the other kind rather
+    than a default that cannot take effect — the same rule `load_connector_specs` enforces when it
+    rejects `format:` on a `file:` connector.
+    """
+    repo = _init_repo(tmp_path)
+    repo.layout.kb_dir.mkdir(parents=True, exist_ok=True)
+    (repo.layout.kb_dir / "repo.yaml").write_text(
+        "name: personal\nkind: personal\nharvest:\n  enabled: true\n", encoding="utf-8"
+    )
+    (tmp_path / "adapters.yaml").write_text(
+        "backends:\n  qwen:\n    argv: [agora-ollama-brain]\n"
+        "default_backend: qwen\n"
+        "connectors:\n"
+        '  file:claude-code: { path: "~/.claude/MEMORY.md", scope: personal }\n'
+        '  session:default: { path: "~/.claude/**/*.jsonl", scope: personal }\n'
+        '  session:pinned: { path: "~/x/**/*.jsonl", scope: personal,'
+        " format: claude-code-jsonl }\n",
+        encoding="utf-8",
+    )
+
+    by_name = {c["name"]: c for c in AgoraHandlers(repo).harvester_status()["connectors"]}
+
+    assert by_name["file:claude-code"]["format"] is None
+    assert by_name["file:claude-code"]["follow_links"] is False
+    # An undeclared format reports the EFFECTIVE default, not a blank.
+    assert by_name["session:default"]["format"] == "claude-code-jsonl"
+    assert by_name["session:pinned"]["format"] == "claude-code-jsonl"
+    assert by_name["session:default"]["follow_links"] is None
+
+
 def test_harvester_status_disabled_default(tmp_path: Path) -> None:
     repo = _init_repo(tmp_path)
     h = AgoraHandlers(repo).harvester_status()

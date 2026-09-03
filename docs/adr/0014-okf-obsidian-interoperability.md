@@ -186,3 +186,146 @@ evolve independently: an internal schema bump need not change OKF conformance an
    `related:`/`children:` stay `[[basename]]`; read path + lint resolve both).
 4. **Obsidian import/normalizer (D5)** — DONE (the opt-in `agora import` admin op; verified to make a
    `~/knowledge` clone lint-clean + curate-able, non-destructively).
+
+## Addendum — D1 applies INSIDE `wiki/` too (2026-09-04, issue #152)
+
+**Status:** Accepted · amends nothing above; it FIXES an unimplemented half of D1.
+
+D1 says the strict lint applies to **curator-produced notes ONLY**. The curator did not implement
+that qualifier: its §4.4 gate graded every note in the worktree, so a note a human wrote in `wiki/`
+was scored as curator output. Measured on a real repo, one hand-written note produced:
+
+| what the human wrote | result before | after |
+|---|---|---|
+| a schema-valid note | `published`, bytes preserved | unchanged — `published`, bytes preserved |
+| an Obsidian Properties block (`tags:`/`aliases:`/`cssclass:`) | `failed` — `LINT L1-11 unknown or missing 'type'` | `published`; the note is read, not graded |
+| no frontmatter at all (Obsidian's default) | `failed` — `LIVE-TREE: unparseable note` | `published`; the note is read, not graded |
+
+No data was ever lost — the human's file is byte-identical in every row. What was lost is
+**curation itself**, permanently: the offending file lives in the base commit, so every subsequent
+run re-read it and re-failed. D4's tolerance machinery already existed; it simply was not wired to
+this path. And the stated goal of "one repo that is at once a git repo, an Obsidian vault and an
+OKF bundle, with no build step" cannot survive a rule where saving a note in Obsidian stops the
+curator forever.
+
+### Decision
+
+The producer gate keeps its subject: **what the curator produced.** Two discriminators, unioned:
+
+* **(a) this run's output** — every path the run's plan created or modified, read from the run's own
+  `git diff --name-status` against `base_commit` (the same view the final-diff gate grades). This is
+  the authoritative list of what the run is answerable for.
+* **(b) the curator's earlier output** — every note whose frontmatter carries a key only the ENGINE
+  writes: `sources:` (ADR-0011 §2: "the WORKER writes `sources:`, never the model") or `timestamp:`
+  (D2's deterministic `<updated>T00:00:00Z`, stamped on every note type APPLY creates or re-renders,
+  including the seed `index.md`). Presence of **either** is the curator's stamp.
+
+A note carrying no stamp is a **human note**. It is:
+
+* **left byte-identical** — the curator never writes it (unchanged; that was already true);
+* **excluded from the MERGE/CONTEST target registry** (`theme_basenames`), so it can never be
+  merged into — and **withheld from the `related/` view** the planning brain picks targets from
+  (`build_bundle(mergeable_paths=…)`), which is the half that makes the exclusion safe rather than
+  merely correct. Registry exclusion on its own is not a no-op for the operator: PASS 1 is
+  instructed to choose `MERGE_INTO_THEME` targets out of `related/<id>.json`, an unstamped note
+  that lexically overlaps a candidate is a legitimate top hit there, and naming it is a `BASENAME`
+  plan error — which fails the WHOLE run, not just that disposition. That is the same
+  fails-every-run-forever shape this addendum exists to remove, re-entering through the plan gate,
+  so the engine must not hand the model a menu item it will then be punished for choosing. The
+  filter is a pure path-set drop over an already-computed `QueryResult` (no `lex`/`struct`/`fm`/
+  `score`/`match_reason` is recomputed outside core, ADR-0012 §0a). The set handed to
+  `mergeable_paths` is the curator's own **THEME** notes, not merely its own notes: the plan gate
+  accepts a MERGE/CONTEST target only out of `theme_basenames`, so a curator daily, MOC or
+  `index.md` in that view is exactly as run-killing a pick as a human note. Because the filter runs
+  AFTER retrieval, the fetch over-fetches and trims back to `related_k`, so the view still carries
+  K *eligible* hits — an emptied view is what tells PASS 1 "genuinely new → `CREATE_THEME`", i.e. a
+  duplicate theme beside the note it should have merged into;
+* **kept in the basename-collision registry** (`live_basenames`) — its basename stays RESERVED.
+  This is a deliberate refinement of "excluded from the plan registry": APPLY writes
+  `wiki/<domain>/themes/<basename>.md` unconditionally, so a CREATE_THEME reusing a human note's
+  basename would **overwrite the file**. Uniqueness-reservation is what prevents that, and it is the
+  one part of the registry a human note must stay in. Link resolution follows the same set, so a
+  curator note may legally link to a human note and the L1-2 check resolves it.
+* **still read** — `kb_query`/BM25F, `kb_read`, the graph and the index cache all see it
+  (`wiki_dir.rglob("*.md")` has no schema filter), so tolerant admission buys search coverage;
+* **reported** — one `LIVE-TREE:` warning on the (published) run report naming the notes, a
+  `unmanaged_notes` count in the report and in `health()`, and an `agora doctor` `notes:` line.
+
+**Strictness is scoped, not dropped.** `parse_all_notes(strict=True)` no longer aborts the run on
+the first unparseable note; instead the scan classifies. A malformed note that still visibly carries
+the stamp is a damaged **curator** artifact — a real integrity signal — and fails the run exactly as
+before, naming the file. An unparseable note with no stamp is somebody's draft.
+
+**Three paths are the curator's by construction, stamp or no stamp.** APPLY re-opens the root
+`index.md` (`_update_index`), the domain MOC `wiki/<domain>/<domain>-moc.md` (`_update_moc`) and the
+per-domain daily (`_apply_append_daily`) with an *unguarded* `frontmatter.parse`, and — unlike a
+MERGE/CONTEST target, which must first clear `theme_basenames` — none of them is gated by the plan.
+Classifying a malformed one of those as "somebody's draft" would not tolerate it; it would let it
+reach APPLY and raise out of `run()`, stranding the claimed batch in `_kb/processing/` while
+`agora status` reports `failed_events: 0` and every `agora watch` tick re-claims and re-crashes —
+strictly worse than the hard rejection this addendum removes. So a malformed note at one of those
+three paths is classified as a damaged curator artifact and fails the run, named. The theme path a
+human actually saves into is untouched by this carve-out. A second, independent guard backs it up:
+a `FrontmatterError` escaping `apply_plan` is caught at the call site and routed through the same
+clean `_fail`, so the §4 "never an uncaught traceback out of `run()`" contract does not depend on
+the classification being exhaustive.
+
+**No rule and no severity changes.** L1 severities stay frozen by `kb_schema.md`; the closed ADR-0011
+op vocabulary is untouched; the final-diff allowlist and L1-9 are untouched. `schema.lint.lint()`
+gains one optional `scope` argument; omitted (every read-only surface — dashboard, `kb_status`,
+`agora doctor`) it grades the whole worktree byte-identically, and the dashboard deliberately keeps
+doing so: a health panel reports the tree honestly, and `unmanaged_notes` is what tells an operator
+why a finding is not being fixed by the next run.
+
+### Rejected alternatives
+
+* **Downgrade L1-11 (or L1-4) to `warning`.** `schema/lint.py` states that every L1 rule is `error`
+  because `kb_schema.md` freezes L1 as "STRUCTURAL (hard; reject the commit)". That is a
+  **schema-visible** change requiring a `schema_version` conversation (#98), and it would weaken the
+  gate for the curator's OWN output — the opposite of D1. The problem was never the severity; it was
+  the subject.
+* **Discriminator (c): git authorship** (a note is the curator's iff a curator commit created it).
+  Rejected twice over: the history is absent from a fresh clone (and from any squashed/imported
+  repo), so the classification would not survive a re-clone; and a human hand-editing a curator note
+  is legitimate and would silently reclassify it. The frontmatter stamp is a pure function of the
+  bytes in the tree, which is the same property every other deterministic gate here relies on.
+* **Forbid human writes in `wiki/`** (the OpenKB posture inverted). Nothing enforces it without a
+  write boundary Agora does not have until Phase 4, and it contradicts the no-build-step vault goal.
+  The OpenKB posture itself — accept anything, overwrite it later ("manual edits to those pages are
+  overwritten") — is rejected outright: it trades the user's bytes for convenience.
+
+### Known residuals (recorded, not fixed)
+
+* A curator note published by a build predating D2 that is a `moc`/`index` (no `sources:`, no
+  `timestamp:`) classifies as human until the curator next re-renders it — at which point APPLY
+  stamps it. The consequence is bounded: it is not lint-graded for those runs, and a `moc`/`index`
+  is not a MERGE/CONTEST target anyway.
+* A human note that happens to carry `sources:` or `timestamp:` is graded as producer output — i.e.
+  exactly today's behaviour. The discriminator is deliberately conservative in that direction.
+* **Promotion is unspecified.** Turning a human note into a curated one (a normalizer op, or
+  re-harvesting it as a candidate the way `notes/` content is) is out of scope here; the `notes/`
+  lane and tolerant `wiki/` admission coexist for now. Open in #152.
+* **A human note in `wiki/<domain>/themes/` IS adopted as a MOC child.** An earlier draft of this
+  addendum claimed the opposite ("only APPLY writes MOC children and it works from the plan").
+  APPLY's `_update_moc` derives the child set from a DIRECTORY GLOB (`themes/*.md`) unioned with
+  the run's new basenames, so any note dropped in that folder lands in the MOC's `children:` and in
+  a body bullet the next time the domain is touched. Kept deliberately — it is the friendly
+  Obsidian story (your note appears on the map of its domain) and the link resolves, since human
+  basenames stay in the link-resolution set. The bounded cost: the MOC is a graded producer
+  artifact, so if the human later deletes or renames that note, the MOC's `L1-2` broken-link check
+  fails until a run re-globs that domain. Intersecting the glob with the curator's own paths is the
+  alternative if that cost ever bites.
+* A human note whose frontmatter block is FENCED but YAML-invalid **and** contains a line starting
+  `sources:` / `timestamp:` is classified as a damaged curator artifact and fails the run — the
+  conservative direction of the textual discriminator, stated under "Strictness is scoped, not
+  dropped" above. `sources:` is an ordinary property name in a vault, so this is the one Obsidian
+  shape that can still stop the curator; the failure names the file, and removing the key or fixing
+  the YAML clears it. Narrowing the textual stamp (requiring the full engine shape) was rejected:
+  it would reclassify a genuinely damaged curator note as somebody's draft, which is the failure
+  direction that loses integrity rather than availability.
+* A leading UTF-8 BOM does NOT demote a curator note to "human": the fence test strips it before
+  looking for the stamp, so a BOM'd producer note stays a damaged producer artifact and fails
+  loudly. Without that strip it would have been reclassified as human and dropped out of the lint
+  scope where `L1-16` — the rule that exists to catch exactly that damage — reads it. This matters
+  natively on Windows (epic #85), where PowerShell `Set-Content`/`Out-File` write UTF-8-with-BOM by
+  default.

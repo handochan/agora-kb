@@ -131,7 +131,9 @@ reachable through exactly one candidate's `provenance[]`; the §4.1 coverage che
 scoped to the manifest universe only.
 
 **§1.1 Pre-fetched related view (what makes a small Qwen reliable).** For each candidate the worker runs
-the SAME deterministic `core.read` used by `kb_query` (ADR-0009) over the current wiki and writes
+`core.read`'s deterministic, model-free lexical oracle `Wiki.query_lexical` (ADR-0009; ADR-0012 §0a
+and its #144 addendum — NOT `Wiki.query`, the read face, which may one day grow a ranking tier the
+write path must not follow) over the current wiki and writes
 `related/<cand-id>.json` = an ordered `QueryResult` (`status`, `hits[]` with
 repo/path/anchor/line/excerpt/match_reason/score, plus each hit's frontmatter `title,tags,sources`). The
 backend does retrieve-then-decide with ZERO network and NO search tool — honoring the sandbox invariant

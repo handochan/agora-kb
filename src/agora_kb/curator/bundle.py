@@ -3,7 +3,7 @@
 This is the deterministic, MODEL-FREE step that sits between the FIFO claim (Stage A,
 :mod:`agora_kb.curator.claim`) and the PLAN pass: the worker reads the immutable claimed events
 from ``processing/<run-id>/events/``, collapses byte-equivalent knowledge into ONE candidate each
-(tier-2, ADR-0011 §5 / DATA-MODEL §11.2), pre-fetches the deterministic ``core.read`` related view
+(tier-2, ADR-0011 §5 / DATA-MODEL §11.2), pre-fetches the deterministic MODEL-FREE related view
 per candidate (§1.1 — what makes a small local model reliable), and materializes the read-only
 ``processing/<run-id>/bundle/`` tree the sandboxed backend later reads (§1). Nothing here invokes a
 model and nothing here writes the wiki — it is pure orchestration that produces the model's *input*.
@@ -16,9 +16,11 @@ Two pieces live here:
   verbatim ``text``, the ``domain`` hint, the WORST-CASE ``kind``/``confidence`` across the merged
   events, and the worker-computed ``is_gated`` flag (``kind == 'candidate'`` OR
   ``confidence == 'low'``, §6 — computed here, never trusted to the model).
-* :func:`build_bundle` — reads the claimed events, applies tier-2 dedup, runs the SAME deterministic
-  ``core.Wiki.query`` used by ``kb_query`` (ADR-0009/0012) for each candidate's ``related/`` view,
-  writes ``candidates.json`` + ``related/<cand-id>.json``, copies the read-only schema doc +
+* :func:`build_bundle` — reads the claimed events, applies tier-2 dedup, runs the model-free
+  lexical oracle ``core.Wiki.query_lexical`` (ADR-0012 §0a) for each candidate's ``related/`` view
+  — deliberately NOT ``core.Wiki.query``, the read face ``kb_query`` owns, which MAY one day grow a
+  ranking tier the write path must not follow (issue #144) — writes ``candidates.json`` +
+  ``related/<cand-id>.json``, copies the read-only schema doc +
   ``_meta/taxonomy.yaml`` into the bundle, and returns a :class:`BundleResult`.
 
 Tier-2 (ADR-0011 §5): group claimed events by canonical-normalized ``content_sha256`` (the worker
@@ -36,6 +38,7 @@ always produce the same bytes, so two implementations agree.
 from __future__ import annotations
 
 import json
+from collections.abc import Collection
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -43,7 +46,7 @@ from ..core import frontmatter
 from ..core.hashing import content_sha256
 from ..core.layout import RepoLayout
 from ..core.repo import Repo
-from ..core.wiki import Wiki
+from ..core.wiki import QueryResult, Wiki
 from .constants import DEFAULT_RELATED_K
 from .manifest import RunManifest
 
@@ -56,6 +59,35 @@ __all__ = ["Candidate", "BundleResult", "build_bundle"]
 # own — only a real `low` does (matching the §6 gate: is_gated iff kind==candidate OR conf==low).
 _KIND_RANK = {"candidate": 0, "capture": 1}
 _CONFIDENCE_RANK = {"low": 0, "medium": 1, "high": 2}
+
+
+# How much deeper the oracle is asked to look when the ineligible hits will be filtered out again
+# (#152 follow-up). The filter runs AFTER retrieval, so without an over-fetch a candidate whose top
+# `related_k` hits are all human notes hands the brain an EMPTY view — and an empty related view is
+# exactly what tells PASS 1 "genuinely new -> CREATE_THEME", i.e. a duplicate theme beside the
+# curator note it should have merged into. Over-fetching and trimming back to `related_k` restores
+# the K eligible hits the model was promised. A constant multiplier, not "fetch everything": the
+# view is the brain's prompt, `limit` only truncates an already-ranked list (`Wiki.query_lexical`),
+# and the trim is a pure suffix drop — so this changes RECALL, never ORDER (ADR-0012 §0a).
+_MERGEABLE_OVERFETCH = 4
+
+
+def _only_mergeable(
+    result: QueryResult, mergeable: frozenset[str] | None, *, limit: int
+) -> QueryResult:
+    """Drop ``related/`` hits that may not be a MERGE/CONTEST target (#152); ``None`` keeps all.
+
+    A pure path-set filter over an ALREADY-computed :class:`QueryResult`, then a truncation to
+    ``limit`` — no ranking input is recomputed here and no hit is reordered (ADR-0012 §0a). An
+    emptied view reports ``not_found``, the same status the oracle itself uses for "no eligible
+    evidence", so the brain reads one consistent shape.
+    """
+    if mergeable is None:
+        return result
+    kept = tuple(h for h in result.hits if h.path in mergeable)[: max(0, limit)]
+    if kept == result.hits:
+        return result
+    return result.model_copy(update={"hits": kept, "status": "ok" if kept else "not_found"})
 
 
 @dataclass(frozen=True)
@@ -104,14 +136,27 @@ def build_bundle(
     manifest: RunManifest,
     *,
     related_k: int = DEFAULT_RELATED_K,
+    mergeable_paths: Collection[str] | None = None,
 ) -> BundleResult:
     """Build the read-only input bundle for ``manifest``'s claimed events (ADR-0011 §1, §5 tier-2).
 
     DETERMINISTIC and pure-read: parses the immutable ``processing/<run-id>/events/`` files, applies
     tier-2 ``content_sha256`` dedup (union provenance over the manifest universe, §5), runs
-    :meth:`agora_kb.core.Wiki.query` over the live wiki for each candidate's ``related/`` view
-    (§1.1, the same ``core.read`` ``kb_query`` uses — ZERO network, no search tool), and writes the
-    bundle tree. No model is invoked and no wiki file is written.
+    :meth:`agora_kb.core.Wiki.query_lexical` over the live wiki for each candidate's ``related/``
+    view (§1.1, the model-free lexical oracle — ZERO network, no search tool — NOT the read face's
+    :meth:`~agora_kb.core.Wiki.query`, #144), and writes the bundle tree. No model is invoked and no
+    wiki file is written.
+
+    ``mergeable_paths`` (issue #152) is the set of repo-relative note paths that MAY legally be a
+    MERGE/CONTEST target — the curator's own THEME notes, exactly what the plan gate's
+    ``theme_basenames`` accepts (a curator daily, MOC or ``index.md`` is as illegal a target as a
+    human note). ``None`` (the default) filters nothing and is byte-identical to before. When given,
+    a ``related/`` hit outside the set is dropped from the view the planning brain reads: PASS 1 is
+    told to pick ``target_basename`` out of these hits, so offering an ineligible one is handing the
+    model a menu with a poisoned item — the plan gate rejects the pick, which fails the WHOLE run.
+    Dropping the hit is a pure PATH-SET filter followed by a truncation — it computes no
+    ``lex``/``struct``/``fm``/``score``/``match_reason`` and reorders nothing, so ADR-0012 §0a is
+    untouched.
 
     The bundle (§1):
 
@@ -135,14 +180,34 @@ def build_bundle(
     related_dir.mkdir(parents=True, exist_ok=True)
 
     wiki = Wiki(layout)
+    mergeable = None if mergeable_paths is None else frozenset(mergeable_paths)
     candidate_entries: list[dict[str, object]] = []
     provenance: dict[str, list[dict[str, object]]] = {}
     gated_candidate_ids: set[str] = set()
 
     for cand in candidates:
-        # §1.1: retrieve-then-decide. Pre-fetch the SAME deterministic core.read used by kb_query
-        # over the current wiki; the backend never holds a search tool (sandbox, ADR-0008).
-        result = wiki.query(cand.text, limit=related_k)
+        # §1.1: retrieve-then-decide. Pre-fetch the deterministic core.read view of the current
+        # wiki; the backend never holds a search tool (sandbox, ADR-0008).
+        #
+        # PERMANENT DETERMINISM PIN (issue #144, ADR-0012 §0a): this is `query_lexical`, the
+        # model-free lexical oracle, NOT `query`. `query` is the read face and MAY one day gain a
+        # ranking tier above the lexical floor; the write path may not follow it there. This
+        # `related/` view is the planning brain's tier-3 input and decides MERGE_INTO_THEME
+        # targets, and a wrong merge is permanent — the closed ADR-0011 op vocabulary has no
+        # DELETE, apply.py stamps the merged fact with real raw/ provenance, the inbox event is
+        # drained to processed/ and tier-2 content_sha256 dedup never re-proposes it. Do not
+        # "unify" this back onto query().
+        #
+        # The fetch is DEEPER than `related_k` exactly when the ineligible hits are about to be
+        # filtered out again, so the brain still gets up to `related_k` LEGAL targets in a repo the
+        # human also writes in (see `_MERGEABLE_OVERFETCH`). `mergeable is None` keeps the single
+        # `related_k` call byte-identical to before.
+        over = max(related_k, related_k * _MERGEABLE_OVERFETCH)
+        fetch_k = related_k if mergeable is None else over
+        result = wiki.query_lexical(cand.text, limit=fetch_k)
+        # #152: never offer a target the plan gate will reject (see `mergeable_paths` above), and
+        # trim the over-fetch back to the `related_k` the view is contracted to carry.
+        result = _only_mergeable(result, mergeable, limit=related_k)
         related_path = related_dir / f"{cand.candidate_id}.json"
         related_path.write_text(_to_json(result.model_dump(mode="json")), encoding="utf-8")
 

@@ -4229,40 +4229,434 @@ def test_the_clear_runs_before_the_lint_that_grades_it(
     assert "The single curator holds a flock." in seen_at_lint_time[0]
 
 
-def test_a_hand_edited_note_fails_the_run_cleanly_instead_of_crashing(tmp_path: Path) -> None:
-    """A fenceless note in the live tree FAILS the run; it does not escape as a traceback.
+# --- (19b) #152: a human-written wiki/ note must not stop curation forever ----------------------
+#
+# Writing in `wiki/` is not forbidden — a schema-valid hand-written note publishes untouched. What
+# WAS wrong is that every hand-written note was graded as CURATOR OUTPUT (the strict producer,
+# ADR-0014 D1), so an Obsidian save reached a hard-reject gate the curator's own artifacts are held
+# to. Because the offending file lives in the base commit, that verdict repeated on EVERY later run:
+# curation stopped permanently, and no data was lost only because nothing was ever published again.
+# These three fixtures are the three rows of the issue table, plus the integrity half: a malformed
+# note carrying the curator's OWN stamp is a real corruption signal and still fails the run.
 
-    `run()` catches only LockHeld, so the strict `parse_all_notes` raise escaped uncaught: the
-    claimed batch was stranded in `_kb/processing/` while `agora status` still reported
-    `failed_events: 0` and `agora doctor` still reported `status: healthy`, and every `agora watch`
-    tick recovered, re-claimed and re-crashed. Opening the repo in Obsidian and saving one note
-    without a frontmatter fence is enough to reach it — exactly the coexistence DESIGN §7 calls
-    unsupported, which must still degrade honestly rather than silently.
+# Row 3 of the issue table: Obsidian's default — a note saved with no frontmatter fence at all.
+_FENCELESS_NOTE = "# Just a note\n\nNo frontmatter fence, straight from Obsidian.\n"
+# Row 2: Obsidian "Properties" — valid YAML, none of the ADR-0010 §2 producer keys.
+_PROPERTIES_NOTE = (
+    "---\ntags:\n  - reading\naliases: []\ncssclass: wide\n---\n\n"
+    "# Reading list\n\nSaved from Obsidian's Properties editor.\n"
+)
+# Row 1: a hand-written note that DOES satisfy the schema. `sources:` is a curator stamp, so this
+# one IS graded as producer output — and it lints clean, so it publishes, exactly as it did before.
+_SCHEMA_VALID_NOTE = (
+    "---\n"
+    "title: Hand written theme\n"
+    "type: theme\n"
+    "aliases: []\n"
+    "tags: []\n"
+    "created: '2026-06-01'\n"
+    "updated: '2026-06-01'\n"
+    "status: stub\n"
+    "summary: A human wrote this one to the schema.\n"
+    "sources: []\n"
+    "related: []\n"
+    "confidence: low\n"
+    "---\n\n# Hand written theme\n"
+)
+
+
+def _plant_human_note(repo: Repo, name: str, text: str) -> Path:
+    """Commit one hand-written note into `wiki/ai-tech/themes/` (the most dangerous location)."""
+    note = repo.root / "wiki" / "ai-tech" / "themes" / f"{name}.md"
+    note.parent.mkdir(parents=True, exist_ok=True)
+    note.write_text(text, encoding="utf-8")
+    _commit_all(repo, f"chore: a human saved {name}.md in Obsidian")
+    return note
+
+
+def _registry_spy(monkeypatch: pytest.MonkeyPatch) -> dict[str, set[str]]:
+    """Capture the §1.2 registries the run hands the PLAN gate (live_basenames/theme_basenames)."""
+    captured: dict[str, set[str]] = {}
+    original = worker_mod.validate_plan
+
+    def spy(plan, **kwargs):  # type: ignore[no-untyped-def]
+        captured["live_basenames"] = set(kwargs["live_basenames"])
+        captured["theme_basenames"] = set(kwargs["theme_basenames"])
+        return original(plan, **kwargs)
+
+    monkeypatch.setattr(worker_mod, "validate_plan", spy)
+    return captured
+
+
+@pytest.mark.parametrize(
+    ("name", "text"),
+    [
+        ("fenceless-note", _FENCELESS_NOTE),
+        ("properties-note", _PROPERTIES_NOTE),
+        # The textual-stamp false positive: a fenceless note whose PROSE says `sources:`. If the
+        # scan for a damaged curator artifact reached the body, this note would be misread as one
+        # and the permanent failure would come straight back for the shape nobody would look at.
+        ("prose-says-sources", "# Notes\n\nsources: my own head\ntimestamp: whenever\n"),
+    ],
+)
+def test_a_hand_written_note_is_read_not_graded_and_the_run_still_publishes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str, text: str
+) -> None:
+    """#152: an out-of-schema human note warns, is left alone, and does not stop the run.
+
+    Both rows of the issue table that used to FAIL: the fenceless Obsidian default (`LIVE-TREE:
+    unparseable note`) and an Obsidian Properties block (`LINT L1-11 unknown or missing 'type'`).
+    Five claims in one run, because they only mean something together — the run publishes, the
+    human's bytes are untouched, the note is not a MERGE/CONTEST target, the operator is TOLD, and
+    the basename is still reserved so a CREATE can never overwrite the file.
     """
     repo = _init_repo(tmp_path)
-    hand_edited = repo.root / "wiki" / "ai-tech" / "themes" / "human-note.md"
-    hand_edited.parent.mkdir(parents=True, exist_ok=True)
-    hand_edited.write_text(
-        "# Just a note\n\nNo frontmatter fence, straight from Obsidian.\n", "utf-8"
+    note = _plant_human_note(repo, name, text)
+    before = note.read_bytes()
+    registries = _registry_spy(monkeypatch)
+
+    e1 = _write_capture(Inbox(repo.layout), text="One curator advances the branch.", second=10)
+    _seed_raw(repo, e1)
+    report = _run(
+        repo,
+        FakeBackend(
+            _create_theme_plan("ignored", "c1", e1),
+            prose={region_sentinel_id("ignored", "c1"): "The single curator holds a lock."},
+        ),
     )
-    _commit_all(repo, "chore: a human saved a note in Obsidian")
+
+    assert report.status == "published", report.failure
+    # The human's file is BYTE-IDENTICAL — in the working copy and in the published commit.
+    assert note.read_bytes() == before
+    with repo.worktree(at=report.published_commit) as published:  # type: ignore[arg-type]
+        assert (published / "wiki" / "ai-tech" / "themes" / f"{name}.md").read_bytes() == before
+    # Not a producer artifact: it can never be a MERGE/CONTEST target...
+    assert name not in registries["theme_basenames"]
+    # ...but its basename stays RESERVED, so a CREATE_THEME can never write over it.
+    assert name in registries["live_basenames"]
+    # The operator is told, by name, on the report that still says `published`.
+    assert any("LIVE-TREE" in w and f"{name}.md" in w for w in report.warnings)
+    assert report.counts["unmanaged_notes"] == 1
+
+
+def test_a_schema_valid_hand_written_note_is_still_graded_and_still_publishes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Row 1 of the issue table, unchanged: schema-valid ⇒ graded as producer output ⇒ published.
+
+    The regression guard on the OTHER side of #152. A note carrying the curator's stamp (`sources:`)
+    is producer output whoever typed it: it is linted, it is a legal MERGE target, and it raises no
+    "not graded" warning. Only notes with no stamp fall out of the gate's subject.
+    """
+    repo = _init_repo(tmp_path)
+    note = _plant_human_note(repo, "hand-written-theme", _SCHEMA_VALID_NOTE)
+    before = note.read_bytes()
+    registries = _registry_spy(monkeypatch)
+
+    e1 = _write_capture(Inbox(repo.layout), text="One curator advances the branch.", second=10)
+    _seed_raw(repo, e1)
+    report = _run(
+        repo,
+        FakeBackend(
+            _create_theme_plan("ignored", "c1", e1),
+            prose={region_sentinel_id("ignored", "c1"): "The single curator holds a lock."},
+        ),
+    )
+
+    assert report.status == "published", report.failure
+    assert note.read_bytes() == before
+    assert "hand-written-theme" in registries["theme_basenames"]
+    assert "unmanaged_notes" not in report.counts
+    assert not any("LIVE-TREE" in w for w in report.warnings)
+
+
+def test_a_malformed_note_carrying_the_curator_stamp_still_fails_the_run(tmp_path: Path) -> None:
+    """The integrity half: corruption of a note the CURATOR wrote is still a hard, clean failure.
+
+    The #152 classification must not become a blanket amnesty. A frontmatter block that does not
+    parse but still visibly carries the engine's own stamp (`timestamp:`/`sources:` — nothing else
+    writes them) is a damaged producer artifact, not somebody's draft: the run fails, names the
+    file, publishes nothing, and does not strand the batch in `_kb/processing/` (the #138 contract).
+    """
+    repo = _init_repo(tmp_path)
+    # A curator-stamped note whose YAML is broken exactly the way Obsidian breaks it (D3/#138).
+    _plant_human_note(
+        repo,
+        "corrupt-theme",
+        "---\ntimestamp: '2026-06-01T00:00:00Z'\nlinks: [[a]], [[b]]\n---\n\n# Corrupt\n",
+    )
 
     e1 = _write_capture(Inbox(repo.layout), text="One curator advances the branch.", second=10)
     _seed_raw(repo, e1)
     base = repo.head_commit()
-    plan = _create_theme_plan("hand-edit-run", "c1", e1)
 
-    report = _run(repo, FakeBackend(plan, prose=PLAN_REJECTED_PROSE))
+    report = _run(
+        repo, FakeBackend(_create_theme_plan("corrupt-run", "c1", e1), prose=PLAN_REJECTED_PROSE)
+    )
 
     assert report.status == "failed"
     assert report.failure is not None
     assert any("LIVE-TREE" in r for r in report.failure.reasons)
-    assert any("human-note.md" in r for r in report.failure.reasons)
+    assert any("corrupt-theme.md" in r for r in report.failure.reasons)
     assert repo.branch_commit() == base  # nothing published
     # The batch is disposed of, not stranded: no processing/ dir survives the run.
     assert not list(repo.layout.processing_dir.glob("*/")) or not any(
         (d / "events").exists() for d in repo.layout.processing_dir.glob("*/")
     )
+
+
+def test_a_merge_into_a_hand_written_note_is_rejected_at_the_plan_gate(tmp_path: Path) -> None:
+    """The registry exclusion, end to end: the curator cannot be talked into editing a human note.
+
+    `theme_basenames` is what §4.1 check 5 grades a MERGE/CONTEST target against, so dropping the
+    unstamped note from it is not bookkeeping — it is the reason a backend that names the human's
+    file gets a deterministic PLAN rejection instead of a rewrite of somebody's prose.
+    """
+    repo = _init_repo(tmp_path)
+    note = _plant_human_note(repo, "properties-note", _PROPERTIES_NOTE)
+    before = note.read_bytes()
+
+    e1 = _write_capture(Inbox(repo.layout), text="One curator advances the branch.", second=10)
+    _seed_raw(repo, e1)
+    base = repo.head_commit()
+
+    report = _run(
+        repo,
+        FakeBackend(_merge_plan("merge-run", e1, "properties-note"), prose=PLAN_REJECTED_PROSE),
+    )
+
+    assert report.status == "failed"
+    assert report.failure is not None
+    assert any("properties-note" in r for r in report.failure.reasons)
+    assert repo.branch_commit() == base
+    assert note.read_bytes() == before
+
+
+class _RelatedSpyBackend(FakeBackend):
+    """A :class:`FakeBackend` that records the ``related/`` views PASS 1 was actually handed."""
+
+    def __init__(self, plan_text: str, prose: dict[str, str] | None = None) -> None:
+        super().__init__(plan_text, prose)
+        self.related: dict[str, dict] = {}
+
+    def plan(self, bundle_dir: Path) -> str:
+        self.related = {
+            path.name: json.loads(path.read_text(encoding="utf-8"))
+            for path in sorted((bundle_dir / "related").iterdir())
+        }
+        return super().plan(bundle_dir)
+
+
+def test_the_related_view_never_offers_a_hand_written_note_as_a_merge_target(
+    tmp_path: Path,
+) -> None:
+    """Registry exclusion alone was not enough: PASS 1 must not SEE the illegal target (#152).
+
+    `theme_basenames` makes naming a human note a `BASENAME` plan error — and any plan error fails
+    the WHOLE run. Meanwhile the §1.1 `related/` view is where PASS 1 is told to pick its
+    `MERGE_INTO_THEME` target from, and an unstamped note that lexically overlaps the candidate is
+    a legitimate top hit there. Left unfiltered, the engine hands the model a poisoned menu and
+    then fails the run for eating from it — the same fails-forever shape #152 exists to remove,
+    re-entering through the plan gate.
+    """
+    repo = _init_repo(tmp_path)
+    overlap = "The curator holds a per-repo lock so one writer advances the branch."
+    human = _plant_human_note(repo, "human-lock-note", f"# Locking\n\n{overlap}\n")
+
+    # Non-vacuity: the model-free oracle really does rank this note for the candidate text.
+    from agora_kb.core.wiki import Wiki
+
+    assert human.name.removesuffix(".md") == "human-lock-note"
+    assert "wiki/ai-tech/themes/human-lock-note.md" in {
+        h.path for h in Wiki(repo.layout).query_lexical(overlap).hits
+    }
+
+    e1 = _write_capture(Inbox(repo.layout), text=overlap, second=10)
+    _seed_raw(repo, e1)
+    backend = _RelatedSpyBackend(
+        _create_theme_plan("ignored", "c1", e1),
+        prose={region_sentinel_id("ignored", "c1"): "The single curator holds a lock."},
+    )
+    report = _run(repo, backend)
+
+    assert report.status == "published", report.failure
+    assert backend.related, "PASS 1 was handed no related/ view — the assertion below is vacuous"
+    offered = {hit["path"] for view in backend.related.values() for hit in view["hits"]}
+    assert "wiki/ai-tech/themes/human-lock-note.md" not in offered
+
+
+def test_a_bom_does_not_demote_a_damaged_curator_note_to_human(tmp_path: Path) -> None:
+    """A UTF-8 BOM must not hide the fence — the classification is by CONTENT, not by encoding.
+
+    `frontmatter.parse` rejects a BOM'd file, so the note reaches the textual stamp scan. If the
+    fence test did not strip the BOM, a damaged CURATOR note would be filed as a human draft: it
+    would leave `theme_basenames` forever, and the scoped producer lint would never even read it —
+    so L1-16, the rule that exists to catch exactly this damage, would never fire. The corruption
+    would be silent and permanent instead of a named failure. Windows writes UTF-8-with-BOM by
+    default (epic #85), so this is the ordinary path there, not an exotic one.
+    """
+    repo = _init_repo(tmp_path)
+    damaged = _plant_human_note(repo, "bom-theme", "\ufeff" + _SCHEMA_VALID_NOTE)
+    drafted = _plant_human_note(repo, "bom-draft", "\ufeff" + _PROPERTIES_NOTE)
+
+    tree = worker_mod.scan_live_tree(repo.layout)
+
+    # The stamped one is a damaged PRODUCER artifact: it fails the run and names the file.
+    assert "wiki/ai-tech/themes/bom-theme.md" in tree.curator_paths
+    assert tree.malformed_curator is not None
+    assert "bom-theme.md" in tree.malformed_curator
+    # The unstamped one is still somebody's draft — a BOM does not make a human note the engine's.
+    assert "wiki/ai-tech/themes/bom-draft.md" in tree.human_paths
+    assert damaged.read_text(encoding="utf-8").startswith("\ufeff")
+    assert drafted.read_text(encoding="utf-8").startswith("\ufeff")
+
+
+# --- (19c) #152 follow-up: tolerance must never turn a hard reject into a CRASH ------------------
+#
+# Downgrading the malformed-note gate to a classification opened a hole the strict gate had closed
+# by accident: three notes are re-opened by APPLY with an UNGUARDED `frontmatter.parse` — the root
+# `index.md` (`_update_index`), the domain MOC (`_update_moc`) and the per-domain daily
+# (`_apply_append_daily`) — and unlike a MERGE/CONTEST target none of them passes through the plan
+# gate first. Classified as "somebody's draft", a fenceless one of those reaches APPLY and raises
+# out of `run()`: the claimed batch is STRANDED in `_kb/processing/` while `agora status` reports
+# `failed_events: 0`, and every `agora watch` tick re-claims and re-crashes. The curator owns those
+# three by construction, so a malformed one is an integrity signal and the clean named `_fail` is
+# the right answer.
+
+
+def _plant_at(repo: Repo, rel_path: str, text: str) -> Path:
+    """Commit one file at an arbitrary repo-relative path (a human saving over a curator note)."""
+    path = repo.root / rel_path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+    _commit_all(repo, f"chore: a human saved {rel_path}")
+    return path
+
+
+@pytest.mark.parametrize(
+    "rel_path",
+    [
+        "index.md",  # apply._update_index
+        "wiki/ai-tech/ai-tech-moc.md",  # apply._update_moc
+        "wiki/ai-tech/daily/ai-tech-2026-06-13.md",  # apply._apply_append_daily
+    ],
+)
+def test_a_fenceless_structural_note_fails_the_run_cleanly_instead_of_crashing(
+    tmp_path: Path, rel_path: str
+) -> None:
+    """A structural note the curator MUST rewrite is graded, however it got that way.
+
+    The three assertions are the difference between a rejection and a crash: the run reports
+    `failed` (not a traceback), the reason NAMES the file, and the claimed batch is DISPOSED OF
+    rather than stranded in `_kb/processing/` — which is what made the crash shape self-repeating.
+    """
+    repo = _init_repo(tmp_path)
+    _plant_at(repo, rel_path, _FENCELESS_NOTE)
+
+    e1 = _write_capture(Inbox(repo.layout), text="One curator advances the branch.", second=10)
+    _seed_raw(repo, e1)
+    base = repo.head_commit()
+
+    report = _run(
+        repo,
+        FakeBackend(
+            _create_theme_plan("ignored", "c1", e1),
+            prose={region_sentinel_id("ignored", "c1"): "The single curator holds a lock."},
+        ),
+    )
+
+    assert report.status == "failed", (report.status, report.counts, report.warnings)
+    assert report.failure is not None
+    assert any(rel_path in r for r in report.failure.reasons), report.failure.reasons
+    assert repo.branch_commit() == base  # nothing published
+    assert not any((d / "events").exists() for d in repo.layout.processing_dir.glob("*/"))
+
+
+def test_a_hand_written_theme_is_still_only_a_draft_not_a_structural_note(tmp_path: Path) -> None:
+    """The structural rule is NARROW: it must not undo #152 for the ordinary Obsidian save.
+
+    `wiki/<domain>/themes/<basename>.md` is the shape a human actually saves into, and it has a
+    gate of its own (a malformed theme never enters `theme_basenames`, so a MERGE naming it is a
+    clean PLAN rejection). Only the three ungated structural paths are reclaimed.
+    """
+    repo = _init_repo(tmp_path)
+    _plant_human_note(repo, "fenceless-note", _FENCELESS_NOTE)
+
+    tree = worker_mod.scan_live_tree(repo.layout)
+
+    assert tree.malformed_curator is None
+    assert "wiki/ai-tech/themes/fenceless-note.md" in tree.human_paths
+
+
+def test_a_frontmatter_error_out_of_apply_is_a_failed_run_not_a_traceback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Defence in depth for §4's "never an uncaught traceback out of run()".
+
+    APPLY re-opens existing notes with an unguarded `frontmatter.parse` in four places. The
+    classification above is what SHOULD keep a malformed note away from them; this asserts the
+    belt as well as the braces, so no future APPLY parse site can strand a claimed batch.
+    """
+    repo = _init_repo(tmp_path)
+    e1 = _write_capture(Inbox(repo.layout), text="One curator advances the branch.", second=10)
+    _seed_raw(repo, e1)
+    base = repo.head_commit()
+
+    def exploding_apply(*args, **kwargs):  # type: ignore[no-untyped-def]
+        raise frontmatter.FrontmatterError("document does not start with a '---' frontmatter fence")
+
+    monkeypatch.setattr(worker_mod, "apply_plan", exploding_apply)
+
+    report = _run(
+        repo,
+        FakeBackend(
+            _create_theme_plan("ignored", "c1", e1),
+            prose={region_sentinel_id("ignored", "c1"): "The single curator holds a lock."},
+        ),
+    )
+
+    assert report.status == "failed"
+    assert report.failure is not None
+    assert any("APPLY-PARSE" in r for r in report.failure.reasons), report.failure.reasons
+    assert repo.branch_commit() == base
+    assert not any((d / "events").exists() for d in repo.layout.processing_dir.glob("*/"))
+
+
+def test_the_related_menu_offers_only_themes_never_the_index_or_a_moc(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The menu and the plan gate must accept the SAME set (#152 follow-up).
+
+    `theme_basenames` is theme-only (plan.py checks 5 and 8), so a curator DAILY / MOC / `index.md`
+    in the `related/` view is exactly as run-killing a pick as a human note — the seed `index.md`
+    carries the engine's `timestamp:` stamp, so a "curator-produced" filter alone would offer it.
+    """
+    captured: dict[str, set[str]] = {}
+    original = worker_mod.build_bundle
+
+    def spy(layout, repo_, manifest, **kwargs):  # type: ignore[no-untyped-def]
+        captured["mergeable_paths"] = set(kwargs["mergeable_paths"])
+        return original(layout, repo_, manifest, **kwargs)
+
+    monkeypatch.setattr(worker_mod, "build_bundle", spy)
+
+    repo = _init_repo(tmp_path)
+    _plant_human_note(repo, "hand-written-theme", _SCHEMA_VALID_NOTE)  # stamped -> curator-graded
+    e1 = _write_capture(Inbox(repo.layout), text="One curator advances the branch.", second=10)
+    _seed_raw(repo, e1)
+
+    report = _run(
+        repo,
+        FakeBackend(
+            _create_theme_plan("ignored", "c1", e1),
+            prose={region_sentinel_id("ignored", "c1"): "The single curator holds a lock."},
+        ),
+    )
+
+    assert report.status == "published", report.failure
+    mergeable = captured["mergeable_paths"]
+    assert mergeable == {"wiki/ai-tech/themes/hand-written-theme.md"}
+    assert "index.md" not in mergeable  # stamped, curator-owned — and NOT a legal merge target
 
 
 # --- (20) #131: an APPEND_DAILY nobody will author must not leave a region nobody will fill ------

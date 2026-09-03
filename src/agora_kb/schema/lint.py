@@ -37,17 +37,25 @@ TWO L1 rules are explicitly OUT of that surface because they are diff / before-a
 taxonomy pair, which a single-worktree read does not have. L1-3 (ambiguous wikilink) emits no
 finding — it is belt-and-suspenders behind L1-1/L1-15 and subsumed by them. The L2 HEALTH signals
 (orphan/stale/…) are DERIVED at read/dashboard time and are not part of this hard gate.
+
+The optional ``scope`` argument narrows WHICH notes are graded as producer artifacts (issue #152 /
+the ADR-0014 D1 addendum) — never which rules run, and never a severity. Omitted (every read-only
+surface, and every call before #152) it grades the whole worktree, byte-identically. The curator
+passes the notes IT produced, so a human's hand-written ``wiki/`` note is READ but not GRADED: it is
+not a producer artifact, and grading it as one stopped curation of the whole repo forever.
 """
 
 from __future__ import annotations
 
 import datetime
 import re
+from collections.abc import Collection
 from dataclasses import dataclass, field
 from typing import Literal
 
 import yaml
 
+from agora_kb.core import frontmatter
 from agora_kb.core.frontmatter import FrontmatterError
 from agora_kb.core.layout import RepoLayout
 
@@ -86,12 +94,19 @@ _NOTE_TYPES = frozenset({"index", "moc", "theme", "daily"})
 _STATUS_VALUES = frozenset({"active", "stub", "contested", "deprecated"})
 
 # The unparameterized members of the inbox `source` enum (DATA-MODEL §1), copied byte-for-byte as
-# the `origin` enum (ADR-0010 D4 — the prior `upload` value is removed). `web:<user>` and
-# `harvest:<agent>` are the two PARAMETERIZED forms, validated by prefix below.
+# the `origin` enum (ADR-0010 D4 — the prior `upload` value is removed). `agent:<name>`,
+# `web:<user>` and `harvest:<agent>` are the three PARAMETERIZED forms, validated by prefix below.
+#
+# EQUALITY WITH THE SOURCE ENUM IS THE CONTRACT, not a coincidence: `kb_schema.md` §2.2/§9 and
+# ADR-0010 D4 both call `origin` an EXACT copy, and L1-19's message says so out loud. So when
+# `core.models` grows a source form, this grows with it — issue #147 added `agent:<name>` there and
+# `tests/schema/test_lint.py` now pins the two together, because a divergence is not a lint bug an
+# operator can act on: it is a note (an imported vault, an OKF bundle from another Agora) that is
+# hard-rejected forever for carrying a value the writer half calls legal.
 _ORIGIN_PLAIN = frozenset(
     {"claude-code", "codex", "qwen", "gemini", "opencode", "hermes", "manual"}
 )
-_ORIGIN_PREFIXES = ("web:", "harvest:")
+_ORIGIN_PREFIXES = ("agent:", "web:", "harvest:")
 
 # A YYYY-MM-DD calendar date (L1-12 date-format half). Frozen so two linters agree byte-for-byte.
 _DATE_RE = re.compile(r"\A\d{4}-\d{2}-\d{2}\Z")
@@ -128,7 +143,7 @@ def _origin_ok(origin: str) -> bool:
     """Return True iff ``origin`` is a member of the inbox `source` enum (D4 / L1-19)."""
     if origin in _ORIGIN_PLAIN:
         return True
-    # `web:<user>` / `harvest:<agent>` — a non-empty parameter after the prefix.
+    # `agent:<name>` / `web:<user>` / `harvest:<agent>` — a non-empty parameter after the prefix.
     return any(origin.startswith(p) and len(origin) > len(p) for p in _ORIGIN_PREFIXES)
 
 
@@ -271,15 +286,43 @@ def _candidate_note_paths(layout: RepoLayout) -> list[str]:
     return sorted(paths)
 
 
-def _scan_encoding(layout: RepoLayout) -> list[LintFinding]:
-    """L1-16 pre-pass over every candidate note file (runs even if frontmatter then fails parse)."""
+def _scan_encoding(layout: RepoLayout, graded: frozenset[str] | None = None) -> list[LintFinding]:
+    """L1-16 pre-pass over every candidate note file (runs even if frontmatter then fails parse).
+
+    ``graded`` is :func:`lint`'s producer scope (``None`` ⇒ every candidate path, today's
+    behaviour). An out-of-scope path is not even READ: a human/Obsidian note is allowed to be CRLF
+    or BOM-prefixed, and the point of the scope is that its bytes are none of the producer gate's
+    business (ADR-0014 D1/D4, issue #152).
+    """
     findings: list[LintFinding] = []
     for rel in _candidate_note_paths(layout):
+        if graded is not None and rel not in graded:
+            continue
         if not _is_utf8_lf_no_bom((layout.root / rel).read_bytes()):
             findings.append(
                 LintFinding("L1-16", "error", rel, "not UTF-8-no-BOM with LF line endings")
             )
     return findings
+
+
+def _first_malformed(layout: RepoLayout, graded: frozenset[str]) -> tuple[str, str] | None:
+    """Return ``(rel_path, message)`` of the FIRST in-scope note whose frontmatter does not parse.
+
+    Only reached in SCOPED mode, where :func:`parse_all_notes` is called tolerantly so that an
+    out-of-scope human note can never abort the pass (issue #152). The in-scope half of the strict
+    contract is preserved here: a producer artifact whose frontmatter is malformed is still the
+    ``L1-4`` hard reject it has always been, reported fail-fast (first file in sorted scan order)
+    exactly like the unscoped path. Reads only in-scope files.
+    """
+    for rel in _candidate_note_paths(layout):
+        if rel not in graded:
+            continue
+        text = (layout.root / rel).read_text(encoding="utf-8", errors="replace")
+        try:
+            frontmatter.parse(text)
+        except FrontmatterError as exc:
+            return rel, f"{rel}: {exc}"
+    return None
 
 
 # --- per-note required-frontmatter tables (ADR-0010 §2) ---------------------------------------
@@ -411,7 +454,10 @@ def _resolve_targets(notes: list[Note]) -> set[str]:
 
     ``[[X]]`` resolves iff ``X`` matches a note basename or an entry in some note's ``aliases:``
     (byte-for-byte, no folding). Used by L1-2 (broken link) after L1-1/L1-15 have validated that the
-    union is globally unique.
+    union is globally unique. In SCOPED mode (#152) that validation narrows: only GRADED notes are
+    checked, so two notes may share a basename when one of them is out of scope (deliberate — the
+    curator cannot fix a collision whose other half it may not touch). What IS still enforced is
+    the half the curator owns: a graded ALIAS may not take an out-of-scope note's basename.
     """
     known: set[str] = set()
     for n in notes:
@@ -528,6 +574,7 @@ def lint(
     run_date: str | None = None,
     run_id: str | None = None,
     max_orphans: int | None = None,
+    scope: Collection[str] | None = None,
 ) -> LintResult:
     """Run the deterministic L1 lint over the worktree at ``layout`` (ADR-0010 §6 / ADR-0011 §4.4).
 
@@ -557,39 +604,73 @@ def lint(
     (ambiguous wikilink) emits no finding here: it is belt-and-suspenders behind L1-1/L1-15 and is
     subsumed by them.
 
+    ``scope`` (issue #152 / ADR-0014 D1 addendum) restricts WHICH notes are graded as PRODUCER
+    artifacts, without changing a single rule or severity. ``None`` (the default, and what every
+    read-only surface passes) grades the whole worktree exactly as before — byte-identical. When a
+    collection of POSIX repo-relative note paths IS given, only those notes carry findings; every
+    other note is still READ (it populates the link-resolution target set and the L2-1 orphan
+    derivation, so a curator note may legitimately link to one) but can never raise one. The
+    curator passes the set of notes IT PRODUCED — this run's diff plus the notes carrying its own
+    stamp — so that a human's hand-written ``wiki/`` note, which the curator neither wrote nor may
+    touch, cannot hard-reject the run forever. Parsing turns TOLERANT in scoped mode for the same
+    reason (a malformed OUT-OF-SCOPE note no longer aborts the pass); an in-scope malformed note is
+    still the fail-fast ``L1-4`` hard reject.
+
     Returns a :class:`LintResult` whose ``findings`` are sorted by ``(path, code)`` (D5) and whose
     ``ok`` is True iff no error-severity finding was raised.
     """
     tax = taxonomy if taxonomy is not None else _load_taxonomy(layout)
     allowed_tags = set(tax.allowed_tags)
     allowed_domains = set(tax.domains)
+    graded: frozenset[str] | None = None if scope is None else frozenset(scope)
 
     findings: list[LintFinding] = []
 
     # L1-16 encoding pre-pass — runs over raw bytes BEFORE parsing, so a BOM/CRLF file is flagged
     # even when its (BOM-prefixed) frontmatter then fails to parse.
-    findings.extend(_scan_encoding(layout))
+    findings.extend(_scan_encoding(layout, graded))
 
     # Parse all notes; a malformed frontmatter block is itself an L1 reject (not a valid note).
     # parse_all_notes is fail-fast: it raises on the FIRST malformed file (in sorted scan order), so
     # a worktree with several malformed notes surfaces one L1-4 per lint pass — deterministic given
     # the bytes, and successive passes report the next file as each is fixed.
-    try:
-        notes = parse_all_notes(layout, strict=True)
-    except FrontmatterError as exc:
-        # parse_all_notes prefixes the message with "<rel_path>: ..."; recover the path for the
-        # finding so the result still sorts deterministically and points at the broken file. Fall
-        # back to a sentinel path if the message ever lacks the ":" separator, so the finding never
-        # carries an empty path (which would otherwise sort first and be ambiguous).
-        msg = str(exc)
-        rel = msg.split(":", 1)[0] if ":" in msg else "<unknown>"
-        findings.append(LintFinding("L1-4", "error", rel, f"malformed frontmatter: {msg}"))
-        findings.sort(key=lambda f: (f.path, f.code))
-        return LintResult(ok=False, findings=tuple(findings))
+    if graded is None:
+        try:
+            notes = parse_all_notes(layout, strict=True)
+        except FrontmatterError as exc:
+            # parse_all_notes prefixes the message with "<rel_path>: ..."; recover the path for the
+            # finding so the result still sorts deterministically and points at the broken file.
+            # Fall back to a sentinel path if the message ever lacks the ":" separator, so the
+            # finding never carries an empty path (which would otherwise sort first and be
+            # ambiguous).
+            msg = str(exc)
+            rel = msg.split(":", 1)[0] if ":" in msg else "<unknown>"
+            findings.append(LintFinding("L1-4", "error", rel, f"malformed frontmatter: {msg}"))
+            findings.sort(key=lambda f: (f.path, f.code))
+            return LintResult(ok=False, findings=tuple(findings))
+    else:
+        # SCOPED: read tolerantly so an out-of-scope note that does not parse degrades (empty
+        # frontmatter + full text as body) instead of aborting the whole pass — the ADR-0014 D4
+        # tolerant-consumer read the browse face already uses. The strict half is re-applied to the
+        # in-scope files only, with the same fail-fast shape and the same message.
+        notes = parse_all_notes(layout)
+        malformed = _first_malformed(layout, graded)
+        if malformed is not None:
+            rel, msg = malformed
+            findings.append(LintFinding("L1-4", "error", rel, f"malformed frontmatter: {msg}"))
+            findings.sort(key=lambda f: (f.path, f.code))
+            return LintResult(ok=False, findings=tuple(findings))
+
+    # The GRADED population for the cross-note uniqueness rules (L1-1 / L1-13 / L1-15) and the
+    # per-note loop. Identical to `notes` when no scope was given. Deliberately NOT used for
+    # `_resolve_targets` below: link RESOLUTION must see every note on disk, or a curator note that
+    # links to an out-of-scope note (its basename is still reserved in the plan-gate registry)
+    # would be flagged L1-2 broken for a target that plainly exists.
+    graded_notes = notes if graded is None else [n for n in notes if n.rel_path in graded]
 
     # --- L1-1 duplicate basename / L1-13 second index ----------------------------------------
     by_basename: dict[str, list[str]] = {}
-    for n in notes:
+    for n in graded_notes:
         by_basename.setdefault(n.basename, []).append(n.rel_path)
     for base, paths in by_basename.items():
         if len(paths) > 1:
@@ -615,8 +696,19 @@ def lint(
     # Seed with all basenames; then add aliases one at a time, flagging any clash with the union so
     # far. This catches alias==basename, alias==alias, and (implicitly) basename duplicates.
     seen_names: set[str] = set(by_basename)
+    # SCOPED mode: an out-of-scope note is not GRADED, but its basename is still RESERVED against
+    # the curator's ALIASES — the same asymmetry the plan gate's `live_basenames` already uses
+    # (ADR-0014 addendum). `_resolve_targets` below spans every note on disk, so without this a
+    # curator alias could silently take a human note's basename and `[[X]]` would then resolve to
+    # two different notes with the linter blessing it. An alias is the curator's OWN field, so it
+    # is the half the curator can fix — unlike an L1-1 basename collision with a scoped-out note,
+    # which stays unreported on purpose (the curator may not touch the other half). Their ALIASES
+    # are likewise not reserved: an ungraded note's frontmatter was never validated. Empty (hence
+    # byte-identical) whenever no scope was given.
+    if graded is not None:
+        seen_names |= {n.basename for n in notes if n.rel_path not in graded}
     # Sort by path so alias-collision findings are reported deterministically against the union.
-    for n in sorted(notes, key=lambda nn: nn.rel_path):
+    for n in sorted(graded_notes, key=lambda nn: nn.rel_path):
         for a in _str_items(n.frontmatter.get("aliases")):
             if a in seen_names:
                 findings.append(
@@ -632,7 +724,7 @@ def lint(
     known = _resolve_targets(notes)
 
     # --- per-note rules ----------------------------------------------------------------------
-    for n in notes:
+    for n in graded_notes:
         path = n.rel_path
         fm = n.frontmatter
 

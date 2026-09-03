@@ -814,6 +814,50 @@ def test_l1_19_web_origin_ok(tmp_path: Path) -> None:
     assert "L1-19" not in _codes(result.findings)
 
 
+def test_l1_19_agent_origin_ok(tmp_path: Path) -> None:
+    """`agent:<name>` is a member of the inbox `source` enum (#147), so it is a legal `origin`.
+
+    The two enums are declared EQUAL by kb_schema.md §2.2/§9 and ADR-0010 D4, and L1-19's own
+    message says so. Widening `source` without widening this one made a note carrying
+    `origin: agent:aelix` — an imported vault, an OKF bundle from another Agora — a hard reject
+    forever, for a value the writer half calls legal.
+    """
+    layout = _valid_repo(tmp_path)
+    _write(
+        layout,
+        "wiki/ai-tech/themes/curator-concurrency.md",
+        _theme_fm(origin="agent:aelix", related=["[[single-writer-stub]]"]),
+        "See [[single-writer-stub]].",
+    )
+    result = lint(layout, taxonomy=_TAXONOMY, run_date=RUN_DATE)
+    assert "L1-19" not in _codes(result.findings)
+
+
+def test_the_origin_enum_tracks_the_inbox_source_enum() -> None:
+    """The sync test that was missing when #147 widened `source` and left `origin` behind.
+
+    `lint` holds its own copy of the vocabulary (it grades markdown, not inbox events, and must not
+    import the writer's models to do it). That duplication is only safe with this assertion: every
+    fixed source is a legal origin, and every parametric form the writer accepts is accepted here.
+    """
+    from agora_kb.core.models import FIXED_SOURCES, InboxItem
+    from agora_kb.schema.lint import _ORIGIN_PLAIN, _origin_ok
+
+    assert _ORIGIN_PLAIN == FIXED_SOURCES
+    # One concrete value per parametric form, validated against the WRITER itself so this cannot
+    # drift into asserting the linter agrees with a hard-coded list of its own making.
+    for value in ("agent:aelix", "web:alice", "harvest:claude-code", *sorted(FIXED_SOURCES)):
+        InboxItem(
+            id="2026-06-13T03-00-00.000Z--000000",
+            source=value,
+            writer="dochan",
+            created="2026-06-13T03:00:00Z",
+            content_sha256="0" * 64,
+            body="x",
+        )
+        assert _origin_ok(value), value
+
+
 def test_l1_19_empty_parameter_origin_fails(tmp_path: Path) -> None:
     # A bare prefix with no parameter ("harvest:") must fail — locks the len(origin) > len(prefix)
     # guard so a regression accepting a parameterless harvest:/web: prefix is caught.
@@ -1054,3 +1098,159 @@ def test_l2_6_stays_silent_on_a_malformed_marker_note_l1_20_already_rejects(
     assert "L1-20" in codes  # the hard gate fires
     assert "L2-6" not in codes  # …and the soft one stays quiet
     assert result.ok is False
+
+
+# --- the producer scope (issue #152 / ADR-0014 D1 addendum) -----------------------------------
+#
+# `lint()` grades PRODUCER artifacts. A human's hand-written `wiki/` note is not one, and grading it
+# as one hard-rejected every curator run for as long as the file stayed in the tree. `scope` narrows
+# WHICH notes are graded — never which rules run, never a severity (kb_schema.md freezes L1 as
+# error). Omitting it is the unchanged whole-worktree verdict every read-only surface still gets.
+
+# The four notes `_valid_repo` writes — i.e. "everything the curator produced".
+_CURATED_SCOPE = frozenset(
+    {
+        "index.md",
+        "wiki/ai-tech/ai-tech-moc.md",
+        "wiki/ai-tech/themes/curator-concurrency.md",
+        "wiki/ai-tech/themes/single-writer-stub.md",
+    }
+)
+
+
+def _write_raw(layout: RepoLayout, rel: str, text: str) -> Path:
+    """Write a note as RAW BYTES — the shape a human/Obsidian save actually leaves on disk."""
+    path = layout.root / rel
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+def test_the_default_scope_is_todays_whole_worktree_verdict(tmp_path: Path) -> None:
+    """No ``scope`` ⇒ byte-identical to before #152: a fenceless note is still an L1-4 hard reject.
+
+    The regression lock on the read-only surfaces (dashboard, ``kb_status``, ``agora doctor``): they
+    report the WHOLE tree honestly. Only the curator narrows the subject, and only for its own gate.
+    """
+    layout = _valid_repo(tmp_path)
+    _write_raw(layout, "wiki/ai-tech/themes/human-note.md", "# Just a note\n\nNo fence.\n")
+
+    result = lint(layout, taxonomy=_TAXONOMY, run_date=RUN_DATE)
+
+    assert result.ok is False
+    assert [(f.code, f.path) for f in result.findings] == [
+        ("L1-4", "wiki/ai-tech/themes/human-note.md")
+    ]
+
+
+def test_a_scoped_out_note_carries_no_finding_of_any_code(tmp_path: Path) -> None:
+    """The three shapes the issue measured, in one pass: fenceless, Obsidian Properties, CRLF.
+
+    Each of them alone used to fail the run — an unparseable-frontmatter L1-4, an L1-11 missing
+    ``type``, an L1-16 encoding reject. Out of scope, not one of them raises a finding, and the pass
+    still says ``ok``: the curator's own artifacts are all it was ever grading.
+    """
+    layout = _valid_repo(tmp_path)
+    _write_raw(layout, "wiki/ai-tech/themes/fenceless.md", "# Just a note\n\nNo fence.\n")
+    _write_raw(
+        layout,
+        "wiki/ai-tech/themes/properties.md",
+        "---\ntags:\n  - reading\naliases: []\ncssclass: wide\n---\n\n# Reading list\n",
+    )
+    _write_raw(layout, "wiki/ai-tech/themes/crlf.md", "---\r\ntype: theme\r\n---\r\n\r\n# CRLF\r\n")
+
+    result = lint(layout, taxonomy=_TAXONOMY, run_date=RUN_DATE, scope=_CURATED_SCOPE)
+
+    assert result.ok is True
+    assert result.findings == ()
+
+
+def test_a_scoped_out_note_is_still_a_resolvable_link_target(tmp_path: Path) -> None:
+    """Out of the GATE's subject, still in the tree: a link to it is not a broken link.
+
+    Load-bearing, not a nicety. The curator's plan gate keeps an unstamped note's basename RESERVED
+    (so a CREATE can never overwrite the file), which means a plan may legally link to it — and if
+    link resolution were narrowed to the scope too, that link would be graded L1-2 broken against a
+    note that plainly exists, self-locking the run on the very shape #152 exists to unblock.
+    """
+    layout = _valid_repo(tmp_path)
+    _write_raw(layout, "wiki/ai-tech/themes/human-note.md", "# Just a note\n\nNo fence.\n")
+    _write(
+        layout,
+        "wiki/ai-tech/themes/curator-concurrency.md",
+        _theme_fm(related=["[[single-writer-stub]]", "[[human-note]]"]),
+        "Exactly one curator advances the branch. See [[single-writer-stub]].",
+    )
+
+    result = lint(layout, taxonomy=_TAXONOMY, run_date=RUN_DATE, scope=_CURATED_SCOPE)
+
+    assert result.ok is True
+    assert all(f.code != "L1-2" for f in result.findings)
+
+
+def test_a_curator_alias_may_not_take_a_scoped_out_notes_basename(tmp_path: Path) -> None:
+    """Scoping narrows the SUBJECT of the grade, not the namespace links resolve in.
+
+    `_resolve_targets` still spans every note on disk (it must — a curator note may legally link to
+    a human one), so if the uniqueness rules only ever saw the graded half, a curator alias could
+    take a human note's basename and `[[X]]` would resolve to two different notes with the linter
+    calling the repo clean. The out-of-scope note's basename is therefore RESERVED — the same
+    asymmetry the plan gate's `live_basenames` already uses — while the note itself stays ungraded.
+    """
+    layout = _valid_repo(tmp_path)
+    _write_raw(layout, "wiki/ai-tech/themes/human-note.md", "# Just a note\n\nNo fence.\n")
+    _write(
+        layout,
+        "wiki/ai-tech/themes/curator-concurrency.md",
+        _theme_fm(aliases=["human-note"], related=["[[single-writer-stub]]"]),
+        "Exactly one curator advances the branch. See [[single-writer-stub]].",
+    )
+
+    result = lint(layout, taxonomy=_TAXONOMY, run_date=RUN_DATE, scope=_CURATED_SCOPE)
+
+    assert result.ok is False
+    assert [(f.code, f.path) for f in result.findings] == [
+        ("L1-15", "wiki/ai-tech/themes/curator-concurrency.md")
+    ]
+
+
+def test_an_in_scope_malformed_note_is_still_the_l1_4_hard_reject(tmp_path: Path) -> None:
+    """Scoping is not amnesty: a PRODUCER artifact whose frontmatter does not parse still fails.
+
+    Same code, same path, same fail-fast shape as the unscoped pass — the strictness moved subject,
+    it did not weaken.
+    """
+    layout = _valid_repo(tmp_path)
+    _write_raw(
+        layout, "wiki/ai-tech/themes/broken.md", "---\nlinks: [[a]], [[b]]\n---\n\n# Broken\n"
+    )
+
+    result = lint(
+        layout,
+        taxonomy=_TAXONOMY,
+        run_date=RUN_DATE,
+        scope=_CURATED_SCOPE | {"wiki/ai-tech/themes/broken.md"},
+    )
+
+    assert result.ok is False
+    assert [(f.code, f.path) for f in result.findings] == [
+        ("L1-4", "wiki/ai-tech/themes/broken.md")
+    ]
+
+
+def test_a_scoped_out_duplicate_basename_does_not_reject_the_curator_note(tmp_path: Path) -> None:
+    """L1-1 grades the curator's notes against EACH OTHER, not against what a human filed nearby.
+
+    A cross-note uniqueness rule is the subtle half of the scope: reporting the duplicate on the
+    IN-scope side would have kept the permanent failure alive under a different code — the curator
+    cannot fix a collision whose other half it may not touch.
+    """
+    layout = _valid_repo(tmp_path)
+    _write_raw(layout, "wiki/economy/curator-concurrency.md", "# A human's own take\n\nNo fence.\n")
+
+    scoped = lint(layout, taxonomy=_TAXONOMY, run_date=RUN_DATE, scope=_CURATED_SCOPE)
+    unscoped = lint(layout, taxonomy=_TAXONOMY, run_date=RUN_DATE)
+
+    assert scoped.ok is True
+    assert all(f.code != "L1-1" for f in scoped.findings)
+    assert unscoped.ok is False  # the whole-tree read still reports both halves honestly

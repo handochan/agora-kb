@@ -663,6 +663,37 @@ class Wiki:
         ``limit`` caps the number of hits (default 20, the ADR's ``max_hits``). Returns
         ``status='not_found'`` with empty ``hits`` when there is no eligible evidence above the
         floor, when the question is empty/all-stopwords, or when the repo has no notes.
+
+        This is the READ face's entry point (``kb_query`` / the web face). Today it is exactly the
+        deterministic lexical oracle and nothing else; it is the method that MAY one day grow a
+        further tier above that floor. Callers on the curator WRITE path must not use it — they
+        call :meth:`query_lexical` (issue #144).
+
+        Structurally a pure delegation to :meth:`query_lexical`: a ranking tier added here can only
+        be written INSIDE this body, which is where both docstrings say it belongs. Editing the
+        oracle instead would silently re-couple the write path.
+        """
+        return self.query_lexical(question, limit=limit)
+
+    def query_lexical(self, question: str, *, limit: int = MAX_HITS) -> QueryResult:
+        """Return the deterministic, model-free lexical result for ``question``.
+
+        This is the BM25F + structural + frontmatter oracle of ADR-0012 §0a — byte-for-byte what
+        :meth:`query` computes today, sharing one private implementation with it. It is the seam
+        the curator's write path is pinned to (``curator/bundle.py``, the §1.1 ``related/`` view
+        that feeds the planning brain's MERGE targets).
+
+        **This method will NEVER gain a model tier.** ADR-0012 §0a puts lex / struct / fm / score /
+        match_reason inside core and nowhere else; issue #144 records why the WRITE path in
+        particular must stay model-free: a mis-merge is permanent (the closed ADR-0011 op
+        vocabulary has no DELETE, and ``apply.py`` stamps the merged fact with real ``raw/``
+        provenance), while a bad read is merely transient. If a ranking tier is ever added, it is
+        added to :meth:`query` — never here. Any change to this method's ordering is a change to
+        what the curator merges, and must be justified as such.
+
+        This method IS the implementation (``query`` delegates DOWN to it, never the reverse), on
+        purpose: the seam a future tier author would naturally edit has to be ``query``'s body, not
+        a shared private helper whose name reads like ``query``'s own half.
         """
         policy = self._index_policy()
         notes = self._load_notes(policy)

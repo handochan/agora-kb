@@ -42,7 +42,8 @@ DEFAULT_MAX_ATTEMPTS = 3
 DEFAULT_BODY_BYTE_BOUND = 8192
 
 # §1.3 default related-notes retrieval breadth for the bundle — the per-candidate
-# ``wiki.query(limit=…)`` fan-out (``repo.yaml curator.related_k``). Default; tuning via config.
+# ``wiki.query_lexical(limit=…)`` fan-out (``repo.yaml curator.related_k``). NOT ``query``: the
+# write path is pinned to the model-free oracle (#144, ADR-0012 §0a). Default; tuning via config.
 DEFAULT_RELATED_K = 8
 
 # §1.3 default per-run candidate cap (``repo.yaml curator.limits.max_candidates_per_run``): the

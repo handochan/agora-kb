@@ -1155,6 +1155,15 @@ def _cmd_harvest(args: argparse.Namespace) -> int:
         )
         return 1
 
+    # `--connector NAME` narrows BEFORE the build, not only inside `Harvester.run`: building is
+    # all-or-nothing (one connector that cannot be constructed raises out of `build_connectors`), so
+    # a targeted run must not be hostage to an unrelated connector's config. The unfiltered name
+    # list is kept for the "no connector named X" message below, which is still about the whole
+    # configured set.
+    configured_names = [s.name for s in specs]
+    if args.connector is not None and args.connector in configured_names:
+        specs = [s for s in specs if s.name == args.connector]
+
     try:
         connectors = build_connectors(specs, redact=redact)
     except (ConnectorError, ValueError) as exc:
@@ -1171,9 +1180,7 @@ def _cmd_harvest(args: argparse.Namespace) -> int:
     )
 
     if args.connector is not None and not report.connectors:
-        print(
-            f"harvest: no connector named {args.connector!r} (have: {[c.name for c in connectors]})"
-        )
+        print(f"harvest: no connector named {args.connector!r} (have: {configured_names})")
         return 1
 
     mode = " [dry-run]" if args.dry_run else ""
@@ -1864,6 +1871,11 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
     # Reporting only; never affects the health verdict and never crashes on malformed config.
     _doctor_connectors(layout)
 
+    # Issue #152: observability — how much of `wiki/` the curator does NOT own. Reporting only;
+    # never affects the health verdict (a human note in the tree is not ill health) and never
+    # crashes on an unreadable note.
+    _doctor_notes(layout)
+
     # ADR-0012 §2 / issue #26: observability — the derived reader-cache state (present/fresh/stale).
     # Reporting only; never affects the health verdict and never crashes on malformed config.
     _doctor_index(layout)
@@ -1923,9 +1935,14 @@ def _doctor_connectors(layout: RepoLayout) -> None:
     ``repo.yaml`` / ``adapters.yaml`` is noted (``agora harvest`` surfaces the real config error
     loudly). Shows whether harvesting is enabled, the ``scope_lock``, and for each connector its
     scope and cursor (last scan + the §6 ``proposed`` / ``accepted`` / ``rejected`` counters — the
-    latter two are curator-owned and remain 0 until that wiring lands, ADR-0017).
+    latter two are curator-owned and remain 0 until that wiring lands, ADR-0017). A ``session:``
+    connector also reports the EFFECTIVE transcript format (issue #147) — the parser actually
+    running, with an undeclared ``format:`` shown as the default it resolves to rather than as
+    blank, so "which grammar is reading my transcripts" is answerable without reading the code, and
+    a name this build has no reader for is marked as such rather than printed as if it were running.
     """
     from .harvester import CursorStore
+    from .harvester.session_sources import DEFAULT_SESSION_FORMAT, is_implemented_format
 
     try:
         policy = load_harvest_policy(layout)
@@ -1960,7 +1977,43 @@ def _doctor_connectors(layout: RepoLayout) -> None:
                 counters += f" redacted={{{breakdown}}}"
         except Exception as exc:  # noqa: BLE001 — a bad connector name must not crash doctor.
             counters = f"cursor unreadable ({exc})"
-        print(f"    {spec.name} (scope={spec.scope}): {counters}")
+        fields = f"scope={spec.scope}"
+        if spec.name.startswith("session:"):
+            fmt = spec.format or DEFAULT_SESSION_FORMAT
+            # Belt-and-braces: `load_connector_specs` already rejects a name this build cannot
+            # parse, so this branch should be unreachable — but a doctor line that names a parser
+            # must never name one that does not exist (a healthy verdict beside a connector that
+            # cannot build is exactly the report an operator acts on wrongly).
+            suffix = "" if is_implemented_format(fmt) else " — NO READER IN THIS BUILD"
+            fields += f", format={fmt}{suffix}"
+        print(f"    {spec.name} ({fields}): {counters}")
+
+
+def _doctor_notes(layout: RepoLayout) -> None:
+    """Print how many notes the curator owns vs does not (issue #152). Never crashes.
+
+    A note carrying no curator stamp was written by a human: since #152 it is READ (query, graph,
+    the index cache) but is not graded by the producer lint and can never be a MERGE/CONTEST target.
+    That used to be invisible — and before #152 it was worse than invisible, because one such note
+    failed every run. This is the line that says "N of your notes are outside the curator's reach",
+    so an operator can tell a quiet exclusion from a bug. Never moves the verdict: a human writing
+    in `wiki/` is a supported thing to do, not ill health.
+    """
+    from .curator.worker import is_curator_written
+    from .schema.notes import parse_all_notes
+
+    try:
+        notes = parse_all_notes(layout)  # TOLERANT: doctor is a read path (ADR-0014 D4)
+    except Exception as exc:  # noqa: BLE001 — doctor must never crash on an unreadable tree.
+        print(f"  notes: unreadable ({exc})")
+        return
+    unmanaged = sum(1 for n in notes if not is_curator_written(n))
+    detail = (
+        f"{unmanaged} out of schema (read + indexed, never curated)"
+        if unmanaged
+        else "none out of schema"
+    )
+    print(f"  notes: {len(notes)} total, {detail}")
 
 
 def _doctor_index(layout: RepoLayout) -> None:

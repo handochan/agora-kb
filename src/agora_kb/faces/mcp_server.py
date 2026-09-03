@@ -75,7 +75,9 @@ __all__ = ["AgoraHandlers", "build_server", "main"]
 # connection, never from a tool argument (DESIGN §5.1 / §7).
 DEFAULT_WRITER = "local"
 # The MCP source tag used for captures that arrive without a more specific origin. ``manual`` is one
-# of the FIXED_SOURCES the core accepts (DATA-MODEL §1).
+# of the FIXED_SOURCES the core accepts (DATA-MODEL §1). An agent that wants its capture attributed
+# to ITSELF passes ``agent:<name>`` instead (issue #147) — the parametric form that needs no core
+# change and no blessed name; the fixed names stay for back-compat with events already on disk.
 DEFAULT_SOURCE = "manual"
 
 # Knowledge-graph viz bounds (faces/web /graph seam — ADR-0019 §7 / graph-plan). The global graph is
@@ -291,11 +293,14 @@ class AgoraHandlers:
         — dashboard mode, so no historical note is flagged as a future date), so this never
         reimplements a health check. ``orphans`` is a small read-time link-graph derivation (L2-1:
         a theme nothing links TO — lint() emits no orphan finding, so it is NOT a lint signal).
+        ``unmanaged_notes`` counts the notes the curator did NOT write (issue #152): read, indexed
+        and linkable, but outside the producer lint's subject and never a MERGE/CONTEST target.
         ``contested`` counts notes whose frontmatter ``status == 'contested'``;
         ``last_consolidation`` is from :meth:`status`. This panel runs lint() + a full note scan,
         so it is the heavy one — refreshed on load + a manual button, not a poll.
         """
         from agora_kb.config import load_repo_config
+        from agora_kb.curator.worker import is_curator_written
         from agora_kb.schema.lint import lint
         from agora_kb.schema.notes import body_link_basenames, wikilinks
 
@@ -341,6 +346,14 @@ class AgoraHandlers:
                     if isinstance(item, str):
                         referenced.update(wikilinks(item))
         orphans = sum(1 for n in notes if n.type == "theme" and n.basename not in referenced)
+        # Issue #152: how many of those notes the curator does NOT own — no curator stamp, so they
+        # are read, indexed and linkable but never graded by the producer lint and never a
+        # MERGE/CONTEST target. The SAME predicate the curator classifies its live tree with, so the
+        # dashboard and the run can never disagree about who wrote what. Some of the `lint_findings`
+        # above may therefore belong to notes the curator will not act on — the dashboard reports
+        # the whole tree honestly (it is a health panel, not the gate); this number is what tells an
+        # operator why a finding is not being fixed by the next run.
+        unmanaged_notes = sum(1 for n in notes if not is_curator_written(n))
 
         return {
             "note_total": note_total,
@@ -349,6 +362,7 @@ class AgoraHandlers:
             "by_status": by_status,
             "tag_distribution": tag_distribution,
             "orphans": orphans,
+            "unmanaged_notes": unmanaged_notes,
             "broken_links": broken_links,
             "contested": contested,
             "lint_ok": result.ok,
@@ -385,8 +399,10 @@ class AgoraHandlers:
         :func:`agora_kb.config.load_connector_specs` + :class:`agora_kb.harvester.CursorStore` per
         connector. ``accepted`` / ``rejected`` are the curator-owned cursor counters DEFERRED to
         ADR-0017 §7 — they are CURRENTLY 0 and are rendered as-is (never faked); they light up later
-        without a redesign here. Tolerant: an unreadable ``repo.yaml`` / ``adapters.yaml`` degrades
-        to ``enabled=False`` / no connectors rather than crashing the read-only panel.
+        without a redesign here. ``format`` is the effective transcript grammar of a ``session:``
+        connector (issue #147; ``None`` for any other kind, as ``follow_links`` is for a session
+        one). Tolerant: an unreadable ``repo.yaml`` / ``adapters.yaml`` degrades to
+        ``enabled=False`` / no connectors rather than crashing the read-only panel.
         """
         from agora_kb.config import (
             ConfigError,
@@ -394,6 +410,7 @@ class AgoraHandlers:
             load_harvest_policy,
         )
         from agora_kb.harvester import CursorStore
+        from agora_kb.harvester.session_sources import DEFAULT_SESSION_FORMAT
 
         try:
             policy = load_harvest_policy(self._repo.layout)
@@ -416,7 +433,20 @@ class AgoraHandlers:
                     "name": spec.name,
                     "path": spec.path,
                     "scope": spec.scope,
-                    "follow_links": spec.follow_links,
+                    # `follow_links` is a file:-connector concern and `format` a session: one; each
+                    # is None on the other kind rather than a default that cannot take effect (the
+                    # same "a key that cannot take effect must not look accepted" rule
+                    # load_connector_specs enforces). `format` is the EFFECTIVE transcript grammar
+                    # (issue #147), mirroring the `agora doctor` line, so the dashboard can answer
+                    # "which grammar is reading my transcripts" too.
+                    "follow_links": (
+                        None if spec.name.startswith("session:") else spec.follow_links
+                    ),
+                    "format": (
+                        (spec.format or DEFAULT_SESSION_FORMAT)
+                        if spec.name.startswith("session:")
+                        else None
+                    ),
                     "last_scan": (None if cursor.last_scan is None else _iso_z(cursor.last_scan)),
                     "proposed": cursor.proposed,
                     "accepted": cursor.accepted,
@@ -1035,6 +1065,12 @@ def build_server(*, repo_path: Path, writer: str = DEFAULT_WRITER) -> FastMCP:
         """Capture knowledge: append it to the inbox (non-blocking). Returns id/queued/inbox_depth.
 
         The writer identity is the connecting agent (server config), not an argument.
+
+        ``source`` says what KIND of thing produced the capture. Pass ``agent:<your-name>`` (e.g.
+        ``agent:aelix``) to capture first-class under your own identity — any name matching
+        ``[A-Za-z0-9][A-Za-z0-9._-]*`` is accepted, no core change needed. Also valid: the fixed
+        names ``claude-code``/``codex``/``qwen``/``gemini``/``opencode``/``hermes``/``manual`` (the
+        default) and ``web:<user>``. A BARE name without the ``agent:`` prefix is rejected.
         """
         return handlers.remember(text, target=target, domain=domain, tags=tags, source=source)
 
