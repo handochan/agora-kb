@@ -8,7 +8,9 @@ helper; :func:`call_ollama` / :func:`list_ollama_models` are monkeypatched so no
 
 from __future__ import annotations
 
+import io
 import json
+import sys
 
 import pytest
 
@@ -1873,3 +1875,29 @@ def test_run_author_grounded_prompt_not_reused_across_multiple_targets(
     assert len(captured) == 2
     # Guard kicked in (2 targets) -> per-region fallback; the single grounded source is not reused.
     assert all("ONLY-C1-SOURCE-FACT" not in p for p in captured)
+
+
+# --- main() stdio pinning (postfix-2) -------------------------------------------------------------
+def test_main_pins_stdio_to_utf8_before_reading_stdin(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``agora-ollama-brain`` must pin its OWN stdio, not rely on the parent's env vars.
+
+    The ADR-0013 **bwrap** sandbox spawns with ``--clearenv`` and re-sets only HOME/TMPDIR/PATH, so
+    ``PYTHONIOENCODING``/``PYTHONUTF8`` — the mechanism ``curator.backends.with_utf8_child_env``
+    uses — never reach this shim on the confined ``network: 'none'`` path. ADR-0016's third-party
+    launcher has the same gap. The reconfigure closes both, and it must happen BEFORE
+    ``sys.stdin.read()`` (a TextIOWrapper refuses to be reconfigured after its first read).
+    """
+    order: list[str] = []
+    monkeypatch.setattr(ob, "reconfigure_stdio_utf8", lambda: order.append("reconfigure"))
+
+    class _Stdin(io.StringIO):
+        def read(self, *args: object, **kwargs: object) -> str:
+            order.append("read")
+            return "PLAN\n"
+
+    monkeypatch.setattr(sys, "stdin", _Stdin())
+    monkeypatch.setattr(ob, "detect_mode", lambda _prompt: "plan")
+    monkeypatch.setattr(ob, "run_plan", lambda *a, **k: "{}")
+
+    assert ob.main([]) == 0
+    assert order == ["reconfigure", "read"]

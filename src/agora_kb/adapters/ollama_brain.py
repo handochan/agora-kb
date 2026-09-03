@@ -68,6 +68,7 @@ __all__ = [
     "call_ollama",
     "run_plan",
     "run_author",
+    "reconfigure_stdio_utf8",
     "main",
 ]
 
@@ -1388,6 +1389,43 @@ def parse_shim_args(argv: list[str]) -> argparse.Namespace | None:
     return namespace
 
 
+def reconfigure_stdio_utf8() -> None:
+    """BEST-EFFORT: pin ``sys.stdin``/``stdout``/``stderr`` to UTF-8, keeping each stream's own
+    error handler (#85).
+
+    :func:`agora_kb.curator.backends.with_utf8_child_env` already forces ``PYTHONIOENCODING=utf-8``
+    / ``PYTHONUTF8=1`` into this process's env before it is spawned, which makes CPython open these
+    streams as UTF-8. This call is the belt to that suspenders, and it is load-bearing in two real
+    cases the env vars do NOT reach: the shim launched by a THIRD PARTY that sets no such env
+    (ADR-0016 calls this out — a direct ``agora-ollama-brain`` / ``agora-cli-brain`` invocation, a
+    differently-orchestrated registry), and the ADR-0013 **bwrap** sandbox, which spawns with
+    ``--clearenv`` and re-sets only ``HOME``/``TMPDIR``/``PATH`` — every other variable, these two
+    included, is dropped before the shim starts.
+
+    Two properties the obvious one-liner gets WRONG, both measured:
+
+    - ``reconfigure(encoding=...)`` with no ``errors=`` RESETS the handler to ``"strict"``, and
+      CPython's ``sys.stderr`` defaults to ``"backslashreplace"``. Silently downgrading it would
+      make this shim's own diagnostics raise ``UnicodeEncodeError`` on any message carrying a
+      surrogate (an ``OSError`` naming a path decoded by ``os.fsdecode`` with ``surrogateescape``) —
+      i.e. strictly LESS robust than doing nothing. Each stream's existing ``errors`` is therefore
+      read and passed back through.
+    - The guard cannot be ``hasattr``: a real :class:`io.TextIOWrapper` that is CLOSED raises
+      ``ValueError``, and one already READ FROM raises ``io.UnsupportedOperation`` (a ``ValueError``
+      subclass) — both while HAVING the attribute. A launcher handing us a closed stdin must get
+      the pre-existing clean failure when the stream is actually used, never a traceback out of the
+      first statement of :func:`main`.
+    """
+    for stream in (sys.stdin, sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:  # not a TextIOWrapper (an io.StringIO a test injected, say)
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors=getattr(stream, "errors", None) or "strict")
+        except ValueError:  # closed, or already read (io.UnsupportedOperation ⊂ ValueError)
+            continue
+
+
 def main(argv: list[str] | None = None) -> int:
     """Entrypoint the registry shells: read stdin, dispatch on :func:`detect_mode`, exit 0/1.
 
@@ -1397,6 +1435,7 @@ def main(argv: list[str] | None = None) -> int:
     in place and returns 0; only a TOTAL failure (missing file / daemon down before any region)
     returns 1.
     """
+    reconfigure_stdio_utf8()
     args = _build_arg_parser().parse_args(argv)
 
     stdin_prompt = sys.stdin.read()

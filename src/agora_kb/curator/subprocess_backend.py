@@ -46,7 +46,13 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from .apply import body_sentinels
-from .backends import BackendRegistry, BackendResult, BackendSpec, run_backend
+from .backends import (
+    BackendRegistry,
+    BackendResult,
+    BackendSpec,
+    run_backend,
+    with_utf8_child_env,
+)
 from .constants import DEFAULT_BODY_BYTE_BOUND
 from .isolation import (
     BackendIsolation,
@@ -416,7 +422,13 @@ class SubprocessBackend:
                 tmp_dir=tmp_dir,
                 read_roots=self._resolve_read_roots(worktree),
                 stdin_data=prompt.encode("utf-8"),
-                env=os.environ,
+                # The UTF-8 child-stdio pin (#85) must ALSO cover this path: `_invoke_sandboxed`
+                # never reaches `run_backend`, so without this a `network: none` backend — the only
+                # kind that gets confined — would be the one spawn point still handing the shim a
+                # locale-driven stdio encoding while we write UTF-8 bytes on its stdin above.
+                # `build_sandbox_spec` scrubs this env (G3) and the adapters union HOME/TMPDIR/PATH
+                # over it, none of which touch these two keys.
+                env=with_utf8_child_env(os.environ),
                 timeout_s=timeout_s,
                 network="none",
             )

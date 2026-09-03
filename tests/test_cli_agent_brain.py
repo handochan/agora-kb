@@ -19,6 +19,12 @@ from agora_kb.adapters import cli_agent_brain as cb
 from agora_kb.adapters.cli_agent_brain import CliAgentError, _parse_args, call_cli_agent
 from agora_kb.adapters.ollama_brain import BrainError
 
+try:
+    "x".encode("cp949")
+    _HAS_CP949 = True
+except LookupError:  # pragma: no cover - defensive only; cp949 ships with CPython
+    _HAS_CP949 = False
+
 
 # --- call_cli_agent (real subprocess) ------------------------------------------------------------
 def test_call_cli_agent_feeds_stdin_returns_stdout() -> None:
@@ -28,6 +34,18 @@ def test_call_cli_agent_feeds_stdin_returns_stdout() -> None:
         timeout=30,
     )
     assert out == "HELLO WORLD"
+
+
+def test_call_cli_agent_round_trips_non_ascii_prompt_and_output() -> None:
+    # Pins the #85 encoding pin (tests-3): a Korean candidate body must survive both the stdin
+    # ENCODE and the stdout DECODE regardless of the process locale — this exercises the real
+    # subprocess path, not a mocked one, so it fails if the `encoding="utf-8"` pin regresses.
+    out = call_cli_agent(
+        "한국어 메모",
+        argv=[sys.executable, "-c", "import sys; sys.stdout.write(sys.stdin.read())"],
+        timeout=30,
+    )
+    assert out == "한국어 메모"
 
 
 def test_call_cli_agent_nonzero_exit_raises() -> None:
@@ -53,6 +71,108 @@ def test_call_cli_agent_empty_output_raises() -> None:
 def test_cli_agent_error_is_a_brain_error() -> None:
     # So the reused drivers' ``except BrainError`` treats a CLI failure like an Ollama failure.
     assert issubclass(CliAgentError, BrainError)
+
+
+def test_call_cli_agent_env_carries_forced_utf8_vars() -> None:
+    # (codex-P1) call_cli_agent's env must carry BOTH vars regardless of what the outer process env
+    # says, so a Python-based CLI-agent child opens its own stdio as UTF-8 (#85).
+    out = call_cli_agent(
+        "x",
+        argv=[
+            sys.executable,
+            "-c",
+            "import os,sys; sys.stdout.write("
+            "os.environ.get('PYTHONIOENCODING','') + '|' + os.environ.get('PYTHONUTF8',''))",
+        ],
+        timeout=30,
+    )
+    assert out == "utf-8|1"
+
+
+@pytest.mark.skipif(not _HAS_CP949, reason="cp949 codec unavailable in this interpreter")
+def test_call_cli_agent_round_trips_korean_despite_hostile_outer_pythonioencoding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # (codex-P1) Pinning encoding="utf-8" on THIS process's end of the pipe does not touch the
+    # CHILD's own locale-driven stdio encoding: a Python child inheriting a non-UTF-8
+    # PYTHONIOENCODING (a cp949 Windows console, say) would otherwise fail to decode a UTF-8 prompt
+    # on the way in. Setting a hostile PYTHONIOENCODING on the OUTER (this-process) env must not
+    # leak into the child, because call_cli_agent forces its own child env regardless.
+    monkeypatch.setenv("PYTHONIOENCODING", "cp949")
+    out = call_cli_agent(
+        "한국어 메모",
+        argv=[sys.executable, "-c", "import sys; sys.stdout.write(sys.stdin.read())"],
+        timeout=30,
+    )
+    assert out == "한국어 메모"
+
+
+# --- stdio reconfiguration (codex-P1: the shim must be correct even launched by a third party) ----
+# The helper itself lives in ollama_brain (BOTH shims' main() calls it); these exercise it through
+# the cli_agent_brain namespace it is imported into, which is where main() reaches it.
+def test_reconfigure_stdio_utf8_is_a_noop_on_streams_without_reconfigure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # io.StringIO (what tests inject as sys.stdin below, and what a caller could plausibly pass)
+    # has no `reconfigure` method — must be skipped, never raise AttributeError.
+    monkeypatch.setattr(sys, "stdin", io.StringIO("x"))
+    monkeypatch.setattr(sys, "stdout", io.StringIO())
+    monkeypatch.setattr(sys, "stderr", io.StringIO())
+    cb.reconfigure_stdio_utf8()  # must not raise
+
+
+def test_reconfigure_stdio_utf8_reconfigures_a_real_text_stream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, str | None]] = []
+
+    class _FakeStream:
+        errors = "backslashreplace"
+
+        def reconfigure(self, *, encoding: str, errors: str | None = None) -> None:
+            calls.append((encoding, errors))
+
+    monkeypatch.setattr(sys, "stdin", _FakeStream())
+    monkeypatch.setattr(sys, "stdout", _FakeStream())
+    monkeypatch.setattr(sys, "stderr", _FakeStream())
+    cb.reconfigure_stdio_utf8()
+    # The encoding is PINNED; the stream's own error handler is CARRIED THROUGH, never reset.
+    assert calls == [("utf-8", "backslashreplace")] * 3
+
+
+def test_reconfigure_stdio_utf8_keeps_stderr_writable_for_surrogates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # (postfix-1) `reconfigure(encoding=...)` with no `errors=` silently resets the handler to
+    # "strict", and CPython's sys.stderr defaults to "backslashreplace". Downgrading it would make
+    # main()'s own `print(f"... {exc}", file=sys.stderr)` raise UnicodeEncodeError on any message
+    # carrying a surrogate (an OSError naming an os.fsdecode'd path) — the shim's diagnostics would
+    # be strictly LESS robust than before the #85 pin. The handler must survive.
+    raw = io.BytesIO()
+    stderr = io.TextIOWrapper(raw, encoding="utf-8", errors="backslashreplace")
+    monkeypatch.setattr(sys, "stderr", stderr)
+    cb.reconfigure_stdio_utf8()
+    assert stderr.encoding == "utf-8"
+    print("boom \udcff", file=sys.stderr)  # must NOT raise UnicodeEncodeError
+    stderr.flush()
+    assert b"\\udcff" in raw.getvalue()
+
+
+@pytest.mark.parametrize("break_it", ["close", "read"])
+def test_reconfigure_stdio_utf8_tolerates_an_unreconfigurable_stream(
+    monkeypatch: pytest.MonkeyPatch, break_it: str
+) -> None:
+    # (postfix-3) A closed TextIOWrapper raises ValueError from reconfigure(), and one already read
+    # from raises io.UnsupportedOperation (a ValueError subclass) — both while HAVING the attribute,
+    # so an `is not None` guard does not cover them. A third-party launcher starting the shim with
+    # stdin closed must NOT get a traceback out of main()'s first statement.
+    stream = io.TextIOWrapper(io.BytesIO(b"xy"), encoding="utf-8")
+    if break_it == "close":
+        stream.close()
+    else:
+        stream.read(1)
+    monkeypatch.setattr(sys, "stdin", stream)
+    cb.reconfigure_stdio_utf8()  # must not raise
 
 
 # --- argv parsing ---------------------------------------------------------------------------------
