@@ -333,6 +333,35 @@ def test_git_error_on_missing_cwd(tmp_path: Path) -> None:
         r.head_commit()
 
 
+def test_git_error_message_is_printable_when_stderr_has_invalid_utf8(
+    repo: Repo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # (codex-P2) `_git` decodes stderr with errors="surrogateescape" (#85) so an undecodable byte
+    # never raises out of the subprocess call — a remote/server-hook message this process does not
+    # control (push_backup's stderr, most realistically) can carry one. Embedding that decoded
+    # string directly (rather than via `!r`) would put a lone surrogate straight into the GitError
+    # message, which raises UnicodeEncodeError the moment an operator-facing print/log encodes it
+    # under a strict stream — turning a best-effort failure into a crash. The message AND the
+    # `.stderr` attribute must always encode cleanly under UTF-8 strict.
+    import agora_kb.core.repo as repo_module
+
+    bad_byte = b"\xff".decode("utf-8", errors="surrogateescape")
+
+    class _FakeCompletedProcess:
+        returncode = 1
+        stdout = ""
+        stderr = f"server-hook said: {bad_byte}"
+
+    monkeypatch.setattr(repo_module.subprocess, "run", lambda *a, **k: _FakeCompletedProcess())
+
+    with pytest.raises(GitError) as excinfo:
+        repo._git("status")
+
+    str(excinfo.value).encode("utf-8", errors="strict")  # must not raise UnicodeEncodeError
+    assert excinfo.value.stderr is not None
+    excinfo.value.stderr.encode("utf-8", errors="strict")  # ditto for the carried attribute
+
+
 # --- push_backup (push-only git backup, issue #64) ----------------------------------------------
 def _bare_remote(tmp_path: Path, name: str = "remote.git") -> Path:
     """Create a local bare repo (on branch main) to act as the push destination."""
@@ -391,6 +420,30 @@ def test_push_backup_non_fast_forward_is_refused_and_names_issue_46(
     assert "non-fast-forward" in msg
     assert "#46" in msg  # divergence resolution is the multi-machine ADR's territory
     assert _git(remote, "rev-parse", "refs/heads/main") == ahead  # remote untouched (no force)
+
+
+def test_push_backup_error_message_is_printable_when_stderr_has_invalid_utf8(
+    repo: Repo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # (codex-P2) The exact scenario the finding names: a push whose remote/server hook emits
+    # invalid UTF-8 on stderr must still raise a GitError whose message encodes cleanly, not a
+    # UnicodeEncodeError out of best-effort backup machinery (_auto_backup_push and friends).
+    bad_byte = b"\xff".decode("utf-8", errors="surrogateescape")
+
+    def _fake_git(self, *args, cwd=None, env=None, check=True, timeout=None):  # noqa: ANN001
+        class _FakeCompletedProcess:
+            returncode = 1
+            stdout = ""
+            stderr = f"remote rejected: {bad_byte}"
+
+        return _FakeCompletedProcess()
+
+    monkeypatch.setattr(Repo, "_git", _fake_git)
+
+    with pytest.raises(GitError) as excinfo:
+        repo.push_backup("origin")
+
+    str(excinfo.value).encode("utf-8", errors="strict")  # must not raise UnicodeEncodeError
 
 
 def test_push_backup_rejects_malformed_remote_values(repo: Repo) -> None:

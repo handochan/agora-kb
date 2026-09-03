@@ -19,8 +19,12 @@ entire integrity boundary. We cover the four contractually-distinct outcomes:
 
 from __future__ import annotations
 
+import codecs
+import hashlib
 import json
+import locale
 import os
+import sys
 from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
@@ -45,6 +49,7 @@ from agora_kb.curator.worker import (
     FakeBackend,
     RunFailure,
     RunReport,
+    _is_engine_written_raw,
     _unauthored_regions,
     recover,
     run,
@@ -1356,6 +1361,94 @@ class _RawForgingBackend(FakeBackend):
         planted.write_text("planted by brain\n", encoding="utf-8")
 
 
+class _BinaryRawForgingBackend(FakeBackend):
+    """A :class:`FakeBackend` that forges an engine-written ``raw/`` source with NON-TEXT bytes.
+
+    The binary half of the #135 attack. ``_RawForgingBackend`` forges with valid UTF-8, so the
+    gate's byte comparison only ever had to read decodable files; a capture that is BINARY (or
+    merely non-UTF-8 — an imported latin-1 vault file) made that read raise
+    :class:`UnicodeDecodeError` and the whole run died with a traceback INSTEAD of the ordinary
+    FINAL-DIFF TAMPER rejection. A crash is not a rejection: it produces no ``error.json``, no
+    ``failed_checks``, and nothing an operator can triage.
+    """
+
+    def __init__(self, plan_text: str, *, forge_ref: str, forged: bytes, **kw: object) -> None:
+        super().__init__(plan_text, **kw)  # type: ignore[arg-type]
+        self._forge_ref = forge_ref
+        self._forged = forged
+
+    def author(
+        self,
+        worktree: Path,
+        needs_prose: dict[str, list[str]],
+        context: dict[str, AuthorRegion],
+    ) -> None:
+        super().author(worktree, needs_prose, context)
+        forged = worktree / self._forge_ref
+        forged.parent.mkdir(parents=True, exist_ok=True)
+        forged.write_bytes(self._forged)
+
+
+class _PlantingBackend(FakeBackend):
+    """A :class:`FakeBackend` that PLANTS one arbitrary file (path + exact bytes) during PASS 2."""
+
+    def __init__(self, plan_text: str, *, plant_ref: str, content: bytes, **kw: object) -> None:
+        super().__init__(plan_text, **kw)  # type: ignore[arg-type]
+        self._plant_ref = plant_ref
+        self._content = content
+
+    def author(
+        self,
+        worktree: Path,
+        needs_prose: dict[str, list[str]],
+        context: dict[str, AuthorRegion],
+    ) -> None:
+        super().author(worktree, needs_prose, context)
+        planted = worktree / self._plant_ref
+        planted.parent.mkdir(parents=True, exist_ok=True)
+        planted.write_bytes(self._content)
+
+
+@pytest.fixture
+def ascii_locale() -> Iterator[None]:
+    """Force the PROCESS locale encoding to ASCII for the duration of one test.
+
+    A stand-in for the real deployment shape this guards: a Windows console on cp949 (or any
+    non-UTF-8 codepage). ``subprocess.run(..., text=True)`` with NO ``encoding=`` decodes git's
+    stdout with the LOCALE encoding, so a non-ASCII path in ``git diff --cached --name-status -z``
+    is mis-decoded or raises (#85). Both ``_git`` helpers now pin ``encoding="utf-8"``, which is
+    what git actually emits; under this fixture the pin is the ONLY thing making the run work.
+
+    Restores the previous locale unconditionally, and SKIPS (rather than lying) on a host whose
+    ``C`` locale still reports a UTF-8 encoding — e.g. under ``PYTHONUTF8=1`` / ``-X utf8``, where
+    the interpreter overrides the locale and the defect is unreproducible by construction.
+    """
+    saved = locale.setlocale(locale.LC_ALL)
+    try:
+        locale.setlocale(locale.LC_ALL, "C")
+    except locale.Error:  # pragma: no cover — host without a usable "C" locale
+        pytest.skip("host has no usable 'C' locale")
+    try:
+        # ``subprocess.run(..., text=True)`` with no ``encoding=`` decodes via a ``TextIOWrapper``
+        # constructed with ``encoding=None``, which resolves to
+        # ``locale.getpreferredencoding(False)`` — NOT ``locale.getencoding()``. Under PEP 540
+        # UTF-8 mode (auto-enabled whenever the startup locale is C/POSIX, the default on many
+        # minimal Linux containers) the two accessors disagree: ``getencoding()`` still reports
+        # "ascii" while ``getpreferredencoding(False)`` reports "utf-8", so a guard on the former
+        # would report ASCII and NOT skip while the actual subprocess decode is UTF-8 and the
+        # defect is unreproducible — silently turning this test vacuous instead of skipped.
+        effective = locale.getpreferredencoding(False)
+        if sys.flags.utf8_mode or codecs.lookup(effective).name != "ascii":  # pragma: no cover
+            pytest.skip(
+                f"the C locale's effective subprocess encoding is {effective!r} "
+                f"(utf8_mode={sys.flags.utf8_mode}) — "
+                "the locale-decode defect cannot be reproduced on this interpreter"
+            )
+        yield
+    finally:
+        locale.setlocale(locale.LC_ALL, saved)
+
+
 # --- (5) §4.2 AUTHOR degrade-or-publish ---------------------------------------------------------
 
 
@@ -1723,6 +1816,266 @@ def test_brain_cannot_forge_or_plant_raw_during_pass2(
     # off-allowlist FINAL-DIFF entries on a raw/ path.
     assert any("FINAL-DIFF" in c and "raw" in c for c in checks)
     assert any("FINAL-DIFF" in c and "planted-by-brain" in c for c in checks)
+
+
+def test_binary_forge_of_engine_raw_source_is_a_tamper_rejection_not_a_traceback(
+    tmp_path: Path, prose_pending_is_the_point: None
+) -> None:
+    """A BINARY forge of an engine-written ``raw/`` source fails the run CLEANLY (#135 + #85).
+
+    The #135 matrix only ever forged with valid UTF-8, so the gate's equality check was allowed to
+    read the file as TEXT. ``raw/`` is the immutable capture tier: its bytes are whatever was
+    captured, which may be binary or non-UTF-8. ``read_text(encoding="utf-8")`` on such a forge
+    raised :class:`UnicodeDecodeError` straight out of :func:`_assert_final_diff_allowlisted` — the
+    run died with a traceback, wrote NO ``error.json``, and an operator saw a crash where the
+    security control was supposed to report a TAMPER. Comparing ``read_bytes()`` makes the verdict
+    total over every byte string: the forged source is simply not what the engine wrote, so the run
+    FAILS with a named FINAL-DIFF check and the branch does not move.
+    """
+    repo = _init_repo(tmp_path)
+    layout = repo.layout
+    inbox = Inbox(layout)
+
+    e1 = _write_capture(inbox, text="One curator advances the branch under a lock.", second=10)
+    base = repo.head_commit()
+    plan = _create_theme_plan("ignored", "c1", e1)
+
+    forge_ref = f"raw/ai-tech/{e1}.md"
+    backend = _BinaryRawForgingBackend(
+        plan,
+        forge_ref=forge_ref,
+        # NUL + a lone 0xFF: not valid UTF-8 under any decoding, and not text under any locale.
+        forged=b"\x00\xff\xfe FORGED BINARY BASELINE \x00\n",
+        prose={region_sentinel_id("ignored", "c1"): "legit prose"},
+    )
+
+    report = _run(repo, backend)
+
+    assert report.status == "failed"  # a REJECTION, reached without an exception escaping run()
+    assert repo.branch_commit() == base
+    error_files = list(layout.failed_dir.rglob("error.json"))
+    assert error_files
+    checks = json.loads(error_files[0].read_text(encoding="utf-8"))["failed_checks"]
+    assert any("FINAL-DIFF" in c and e1 in c for c in checks)
+    # §4.2 deliberately declines to sanitize an off-allowlist path, so the forged bytes were still
+    # on disk when §4.0 read them — and the whole run was discarded, so nothing (forged source or
+    # theme) reached the curated tree.
+    assert not (repo.root / forge_ref).exists()
+
+
+def test_non_utf8_engine_raw_source_does_not_crash_the_pass2_baseline_read(
+    tmp_path: Path, prose_pending_is_the_point: None
+) -> None:
+    """A NON-UTF-8 ``raw/`` source already in the base tree survives the PASS-2 baseline read.
+
+    Second, independent decode site: for every path PASS 2 touched that is outside ``needs_prose``,
+    the worker fetches the post-APPLY base content with ``git show <tree>:<path>`` to grade the
+    §4.2 diff on real bytes. Through the TEXT-mode git helper that raised
+    :class:`UnicodeDecodeError` inside the PASS-2 collection loop, killing the run before the
+    integrity gate ever ran. Here the cited capture is committed as latin-1 (an imported vault
+    file is a realistic shape) and the brain overwrites it: the run must reach the FINAL-DIFF gate
+    and REJECT, not crash.
+    """
+    repo = _init_repo(tmp_path)
+    layout = repo.layout
+    inbox = Inbox(layout)
+
+    e1 = _write_capture(inbox, text="One curator advances the branch under a lock.", second=10)
+    # Seed the cited raw/ capture as NON-UTF-8 bytes and commit it, so it is the engine's immutable
+    # re-cite (apply records read_bytes()) AND the base blob _blob_at must read back.
+    raw = repo.root / "raw" / "ai-tech" / f"{e1}.md"
+    raw.parent.mkdir(parents=True, exist_ok=True)
+    raw.write_bytes("raw capture café naïve\n".encode("latin-1"))
+    _commit_all(repo, "chore: seed a latin-1 raw capture")
+    base = repo.head_commit()
+    plan = _create_theme_plan("ignored", "c1", e1)
+
+    backend = _BinaryRawForgingBackend(
+        plan,
+        forge_ref=f"raw/ai-tech/{e1}.md",
+        forged="FORGED éè\n".encode("latin-1"),
+        prose={region_sentinel_id("ignored", "c1"): "legit prose"},
+    )
+
+    report = _run(repo, backend)
+
+    assert report.status == "failed"
+    assert repo.branch_commit() == base
+    error_files = list(layout.failed_dir.rglob("error.json"))
+    assert error_files
+    checks = json.loads(error_files[0].read_text(encoding="utf-8"))["failed_checks"]
+    assert any("FINAL-DIFF" in c and e1 in c for c in checks)
+
+
+def test_hash_named_raw_plant_still_fails_because_it_is_not_in_raw_writes(
+    tmp_path: Path, prose_pending_is_the_point: None
+) -> None:
+    """A brain-planted, CORRECTLY content-addressed ``raw/`` file must STILL fail the run.
+
+    The trap this pins shut: once ``_is_engine_written_raw`` compares bytes, the byte comparison
+    LOOKS like it subsumes the membership test — "if the content matches its own sha256 name, the
+    file is intact, so why also require it in ``raw_writes``?" It does not, and the two checks
+    answer different questions. ``full.read_bytes() == raw_writes[path]`` is INTEGRITY ("this file
+    is what it claims to be"); ``path not in raw_writes`` is AUTHORSHIP ("the ENGINE, not the brain,
+    wrote this path this run"). A brain can trivially satisfy integrity for bytes it invented — it
+    just hashes them — so a self-consistent ``raw/_blob/<ab>/<sha256>.bin`` plant is exactly the
+    shape that would sail through an integrity-only gate. It is rejected here for the ONE right
+    reason: the engine never wrote that path, so it is absent from ``raw_writes``.
+
+    Written now, while ``raw/_blob/`` is still hypothetical, so the future content-addressed capture
+    channel (Stratum unit 2) cannot be built on the assumption its own hash is an admission ticket.
+    """
+    repo = _init_repo(tmp_path)
+    layout = repo.layout
+    inbox = Inbox(layout)
+
+    e1 = _write_capture(inbox, text="One curator advances the branch under a lock.", second=10)
+    base = repo.head_commit()
+    plan = _create_theme_plan("ignored", "c1", e1)
+
+    content = b"\x89PNG\r\n\x1a\n plausible captured blob bytes\n"
+    digest = hashlib.sha256(content).hexdigest()
+    plant_ref = f"raw/_blob/{digest[:2]}/{digest}.bin"
+    # The plant is genuinely self-consistent: its basename IS the sha256 of its own bytes. If it
+    # were not, this test would be re-proving the ordinary forge case instead of the trap.
+    assert Path(plant_ref).stem == hashlib.sha256(content).hexdigest()
+
+    backend = _PlantingBackend(
+        plan,
+        plant_ref=plant_ref,
+        content=content,
+        prose={region_sentinel_id("ignored", "c1"): "legit prose"},
+    )
+
+    report = _run(repo, backend)
+
+    assert report.status == "failed"
+    assert repo.branch_commit() == base
+    error_files = list(layout.failed_dir.rglob("error.json"))
+    assert error_files
+    checks = json.loads(error_files[0].read_text(encoding="utf-8"))["failed_checks"]
+    assert any("FINAL-DIFF" in c and digest in c for c in checks)
+
+
+def test_content_addressing_is_integrity_and_never_substitutes_for_authorship(
+    tmp_path: Path,
+) -> None:
+    """The same self-consistent blob is admitted or refused SOLELY by membership in ``raw_writes``.
+
+    The unit-level statement of the trap the run-level test above exercises end to end, written so
+    the contract survives any refactor that moves where the gate is called from. Both calls see the
+    IDENTICAL file with the IDENTICAL correct content-address; the only difference is whether the
+    engine recorded the path this run. Integrity (bytes match) and authorship (the engine wrote it)
+    are independent, and no amount of the first implies the second.
+    """
+    content = b"\x89PNG\r\n\x1a\n plausible captured blob bytes\n"
+    digest = hashlib.sha256(content).hexdigest()
+    rel = f"raw/_blob/{digest[:2]}/{digest}.bin"
+    full = tmp_path / rel
+    full.parent.mkdir(parents=True, exist_ok=True)
+    full.write_bytes(content)
+
+    # Self-consistent by construction: the basename IS the sha256 of the bytes on disk.
+    assert Path(rel).stem == hashlib.sha256(full.read_bytes()).hexdigest()
+
+    # Nobody recorded it → REFUSED, even though it hashes to its own name.
+    assert _is_engine_written_raw(rel, "A", tmp_path, {}) is False
+    # The engine recorded it → admitted. Same file, same hash; membership is the whole difference.
+    assert _is_engine_written_raw(rel, "A", tmp_path, {rel: content}) is True
+    # Recorded but with different bytes → refused again (the integrity self-check still bites).
+    assert _is_engine_written_raw(rel, "A", tmp_path, {rel: b"other"}) is False
+    # A delete of a recorded path is NEVER admitted here (the status gate, unchanged).
+    assert _is_engine_written_raw(rel, "D", tmp_path, {rel: content}) is False
+
+
+def test_non_ascii_final_diff_path_is_decoded_under_a_non_utf8_locale(
+    tmp_path: Path, ascii_locale: None, prose_pending_is_the_point: None
+) -> None:
+    """A non-ASCII path in the final diff is read correctly whatever the host locale says (#85).
+
+    ``git diff --cached --name-status -z`` emits RAW UTF-8 path bytes (``-z`` disables git's own
+    quoting entirely). Decoding them with the process locale — which ``text=True`` does when no
+    ``encoding=`` is given — makes the integrity gate's view of the tree a function of the
+    operator's console codepage: on a cp949 Windows shell (simulated here by the C/ASCII locale) the
+    decode either mangles the path or raises, and a mangled path fails ``path not in raw_writes``
+    for a reason that has nothing to do with what the brain did.
+
+    So the assertion is about ATTRIBUTION, not merely about not crashing: the run must fail naming
+    the EXACT path, character for character, so the operator can act on it.
+    """
+    repo = _init_repo(tmp_path)
+    layout = repo.layout
+    inbox = Inbox(layout)
+
+    e1 = _write_capture(inbox, text="One curator advances the branch under a lock.", second=10)
+    _seed_raw(repo, e1)
+    base = repo.head_commit()
+    plan = _create_theme_plan("ignored", "c1", e1)
+
+    # Off-allowlist AND non-ASCII: the FINAL-DIFF reason is the only place the decoded path shows
+    # up, so a mis-decode is directly observable in the operator-facing failure record.
+    plant_ref = "_templates/한글-테플릿.md"
+    backend = _PlantingBackend(
+        plan,
+        plant_ref=plant_ref,
+        content="planted 한글\n".encode(),
+        prose={region_sentinel_id("ignored", "c1"): "legit prose"},
+    )
+
+    report = _run(repo, backend)
+
+    assert report.status == "failed"
+    assert repo.branch_commit() == base
+    error_files = list(layout.failed_dir.rglob("error.json"))
+    assert error_files
+    checks = json.loads(error_files[0].read_text(encoding="utf-8"))["failed_checks"]
+    assert any("FINAL-DIFF" in c and plant_ref in c for c in checks), checks
+
+
+def test_core_repo_git_decodes_utf8_output_under_a_non_utf8_locale(
+    tmp_path: Path, ascii_locale: None
+) -> None:
+    """The twin helper in ``core.repo`` is pinned to UTF-8 too — the curator gate is not the only
+    caller of git in this codebase, and a locale-decoded ``core.repo._git`` breaks the ordinary
+    publish path (``git commit`` echoes the subject line it just wrote) long before any brain is
+    involved. Committing a non-ASCII subject under an ASCII locale is the smallest end-to-end proof.
+    """
+    repo = _init_repo(tmp_path)
+    (repo.root / "wiki" / "ai-tech").mkdir(parents=True, exist_ok=True)
+    (repo.root / "wiki" / "ai-tech" / "note.md").write_text("# note\n", encoding="utf-8")
+
+    sha = repo.commit_worktree(
+        repo.root,
+        "chore: 한글 커밋 메시지",
+        when=datetime(2026, 6, 12, 2, 0, 0, tzinfo=UTC),
+    )
+
+    assert len(sha) == 40
+    assert repo.head_commit() == sha
+
+
+def test_worker_git_error_message_is_printable_when_stderr_has_invalid_utf8(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # (codex-P2) worker.py's own `_git` mirrors core.repo._git's errors="surrogateescape" pin
+    # (#85), which means a git stderr byte that is not valid UTF-8 can reach this function's
+    # RuntimeError message as a lone surrogate. Embedding it directly (rather than via `!r`) would
+    # raise UnicodeEncodeError the moment that message is printed/logged under a strict stream
+    # (turning a clean integrity-gate rejection into an uncaught crash) — the message must always
+    # encode cleanly under UTF-8 strict.
+    bad_byte = b"\xff".decode("utf-8", errors="surrogateescape")
+
+    class _FakeCompletedProcess:
+        returncode = 1
+        stdout = ""
+        stderr = f"server-hook said: {bad_byte}"
+
+    monkeypatch.setattr(worker_mod.subprocess, "run", lambda *a, **k: _FakeCompletedProcess())
+
+    with pytest.raises(RuntimeError) as excinfo:
+        worker_mod._git(tmp_path, "status")
+
+    str(excinfo.value).encode("utf-8", errors="strict")  # must not raise UnicodeEncodeError
 
 
 def test_scratch_only_writes_do_not_break_publish(tmp_path: Path) -> None:

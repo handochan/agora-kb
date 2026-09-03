@@ -375,8 +375,9 @@ change to them fails the run. The schema doc (`AGENTS.md`/`SCHEMA.md`) and its s
    within the plan (daily exempt); each `target_basename` exists in the live tree. (The bundle registry is
    advisory; this check re-scans the tree, §1.2.)
 6. **PATH/ALLOWLIST** — every implied target path resolves under the canonical `ALLOWLIST` (§4.0); no `_kb/`,
-   `_templates/`, `raw/`, git internals, hooks, symlinks introduced/modified by the plan, or `..` escapes
-   (ADR-0008 §4; symlink scope per §4.5).
+   `_templates/`, `raw/`, git internals, hooks, or `..` escapes (ADR-0008 §4). Symlinks are NOT graded
+   here — this check is a pure function over plan-implied path *names*, and a name cannot disclose that
+   it names a symlink; symlink rejection is the diff-scoped §4.5 FINAL-DIFF gate.
 7. **LINK RESOLVABILITY** — every `links[]` target resolves to an existing (live-tree) or same-plan basename.
 8. **PROVENANCE** — every `CREATE_THEME`/`APPEND_DAILY`/`MERGE_INTO_THEME` lists ≥1 `event_id`;
    `MERGE_INTO_THEME`/`MARK_CONTESTED` `target_basename` exists in the live tree.

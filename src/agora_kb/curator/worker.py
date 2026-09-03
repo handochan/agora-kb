@@ -72,6 +72,8 @@ from ..schema.emit import Taxonomy
 from ..schema.lint import lint
 from ..schema.notes import Note, parse_all_notes
 from .apply import (
+    ApplyError,
+    _contained,
     apply_plan,
     body_sentinels,
     region_sentinel_id,
@@ -652,17 +654,33 @@ def _run_locked(
         # MOC/index/sentinels. confidence is MIRRORED from the candidate worst-case (never a plan
         # field) so the backend can never inflate it.
         confidence = {c.candidate_id: c.confidence for c in bundle.candidates if c.confidence}
-        # raw_writes is the EXACT {raw_ref: content} set the engine materialized this run (ADR-0010
+        # raw_writes is the EXACT {raw_ref: bytes} set the engine materialized this run (ADR-0010
         # D3). The final-diff gate admits ONLY these exact paths-with-content under raw/; any other
         # raw/ change (a brain-planted file, or a PASS-2 overwrite of an engine-written source) is
         # then rejected off-allowlist, so the brain still never writes raw/.
-        raw_writes = apply_plan(
-            plan,
-            worktree=wt,
-            run_date=run_date,
-            provenance=bundle.provenance,
-            confidence=confidence,
-        )
+        # A containment failure (`_contained` / `_resolve_target_path` raising ApplyError) is a
+        # tamper signal, not a crash: it must produce the same clean FAILED run + error.json every
+        # other integrity rejection does (ADR-0011 §4 "never an uncaught traceback out of run()"),
+        # not an escaping traceback. This is latent while plan.py's ASCII PATH/ALLOWLIST regex
+        # keeps every escaping token from ever reaching APPLY — pinned here regardless, before
+        # that charset is ever widened, so a later widening cannot be blamed for this failure mode.
+        try:
+            raw_writes = apply_plan(
+                plan,
+                worktree=wt,
+                run_date=run_date,
+                provenance=bundle.provenance,
+                confidence=confidence,
+            )
+        except ApplyError as exc:
+            return _fail(
+                layout,
+                manifest,
+                state_store,
+                now=now,
+                reasons=[f"PATH/ALLOWLIST: {exc}"],
+                max_attempts=max_attempts,
+            )
 
         # The post-APPLY tree is structurally complete with empty body regions (prose_complete still
         # false). Persist phase=applied BEFORE PASS 2 so a crash recovers at the right §9 entry.
@@ -736,9 +754,9 @@ def _run_locked(
             # baseline, so a write outside `needs_prose` reaches check 1 instead of being invisible.
             _git(wt, "add", "-A")
             pass2_diff = _parse_name_status_z(
-                _git(wt, "diff", "--cached", "--name-status", "-z", applied_tree).stdout
+                _git_bytes(wt, "diff", "--cached", "--name-status", "-z", applied_tree).stdout
             )
-            changed = sorted({rel for _status, rel in pass2_diff})
+            changed = sorted({rel for _status, rel, _old in pass2_diff})
             # The validator reads BOTH sides for `log.md` (and for any needs_prose note); supply
             # every changed path so an out-of-scope edit is graded on real bytes, never on a
             # defaulted empty string that would silently compare equal.
@@ -746,7 +764,7 @@ def _run_locked(
             per_file_new = dict(new_state)
             for rel in changed:
                 if rel not in per_file_old:
-                    per_file_old[rel] = _blob_at(wt, applied_tree, rel)
+                    per_file_old[rel] = _blob_text_at(wt, applied_tree, rel)
                 if rel not in per_file_new:
                     per_file_new[rel] = _worktree_text(wt / rel)
             author_errors = validate_author_diff(
@@ -1589,7 +1607,7 @@ def _strip_region_stray_links(text: str, candidate_id: str, allowed: set[str]) -
 
 
 def _is_engine_written_raw(
-    path: str, status: str, worktree: Path, raw_writes: dict[str, str]
+    path: str, status: str, worktree: Path, raw_writes: dict[str, bytes]
 ) -> bool:
     """True iff ``path`` is EXACTLY an engine-written canonical ``raw/`` source (ADR-0010 D3).
 
@@ -1600,6 +1618,22 @@ def _is_engine_written_raw(
     * the file's current bytes equal what the engine wrote (``raw_writes[path]``) — a PASS-2
       OVERWRITE of an engine source (same path, forged content; appears as ``A``/``M`` in the cached
       diff vs ``base_commit``) has mismatched bytes → rejected.
+
+    The two are NOT interchangeable and the second NEVER subsumes the first. The membership test is
+    the AUTHORSHIP check ("the engine wrote this path this run"); the byte comparison is only an
+    ADDITIONAL self-check that the engine's own write survived PASS 2 intact (Stratum note §5). No
+    property computable from a file's own content — a content-addressed ``raw/_blob/<ab>/<sha256>``
+    basename that correctly hashes its own bytes, most of all — may ever be substituted for
+    membership: a brain can always compute that hash for bytes it invents, so "self-consistent" is
+    an integrity claim, never an authorship one. Hash-named plants stay rejected because they are
+    absent from ``raw_writes``, and that is the only reason they are rejected.
+
+    Comparison is on RAW BYTES (``read_bytes()``), not decoded text: ``raw/`` captures may be binary
+    or non-UTF-8, and decoding them as text raised :class:`UnicodeDecodeError` here (#85). Comparing
+    bytes obliges the writer to write bytes too — hence ``write_bytes`` in
+    ``_materialize_raw_source`` — which is a NEW obligation, not a fix for a prior false reject: the
+    old text/text pair's ``write_text`` newline translation was cancelled by ``read_text``'s
+    universal-newline decode on the read side, so it did not previously mismatch on LF-only bodies.
 
     This replaces the prior blanket ``raw/``-prefix admit, which waved through ANY ``raw/`` add or
     modify and so let a brain forge the immutable verification baseline during PASS 2 (the §4.2
@@ -1615,11 +1649,11 @@ def _is_engine_written_raw(
     full = worktree / path
     if not full.is_file() or full.is_symlink():
         return False
-    return full.read_text(encoding="utf-8") == raw_writes[path]
+    return full.read_bytes() == raw_writes[path]
 
 
 def _assert_final_diff_allowlisted(
-    worktree: Path, *, base_commit: str, raw_writes: dict[str, str]
+    worktree: Path, *, base_commit: str, raw_writes: dict[str, bytes]
 ) -> list[str]:
     """Assert the worktree's pending diff touches ONLY canonical-ALLOWLIST paths (ADR-0011 §4.0).
 
@@ -1639,12 +1673,42 @@ def _assert_final_diff_allowlisted(
     sorted for deterministic error records. This catches any out-of-allowlist file the backend
     physically wrote that the §4.1 PLAN gate (which only constrains plan-IMPLIED paths) cannot see.
     ``_kb/``, ``_meta/``, ``_templates/``, git internals, and hooks stay REJECTED.
+
+    A rename/copy's SOURCE path is graded too, not just its destination: ``git`` reports only the
+    NEW path in ``--name-status`` by default, so a PASS-2 rename of a protected file (a ``_kb/``
+    inbox entry, an engine ``raw/`` source, a schema symlink) INTO the allowlist would otherwise
+    read as an ordinary in-allowlist add with the deletion of the protected original invisible —
+    silently exfiltrating it into the curated tree. A rename out of a non-allowlisted prefix is
+    graded as though it were a delete of that protected path.
     """
     _git(worktree, "add", "-A")
-    out = _git(worktree, "diff", "--cached", "--name-status", "-z").stdout
+    out = _git_bytes(worktree, "diff", "--cached", "--name-status", "-z").stdout
 
     reasons: list[str] = []
-    for status, path in _parse_name_status_z(out):
+    for status, path, old_path in _parse_name_status_z(out):
+        old_has_surrogate = old_path is not None and _has_surrogate_escape(old_path)
+        if _has_surrogate_escape(path) or old_has_surrogate:
+            reasons.append(
+                f"FINAL-DIFF: {path!r} ({status}) is not valid UTF-8 — refusing to grade an "
+                f"unnameable path"
+            )
+            continue
+        # The rename/copy SOURCE: graded exactly as the destination would be, BEFORE the
+        # destination checks below, so an off-allowlist source is rejected even when the
+        # destination alone would look like an ordinary in-allowlist add.
+        if old_path is not None:
+            if old_path in SCHEMA_SYMLINKS:
+                reasons.append(
+                    f"FINAL-DIFF: schema symlink {old_path!r} was modified ({status}, rename "
+                    f"source) — immutable"
+                )
+                continue
+            if not is_allowlisted_path(old_path):
+                reasons.append(
+                    f"FINAL-DIFF: rename/copy source {old_path!r} ({status}) is outside the "
+                    f"canonical ALLOWLIST — treated as a delete of a protected path"
+                )
+                continue
         # §4.5: a NEW/MODIFIED schema symlink (or any change touching one) fails the run; an
         # unchanged pre-existing symlink never appears in the diff, so any appearance here is an
         # illegal mutation.
@@ -1689,17 +1753,34 @@ def _worktree_text(path: Path) -> str:
     return path.read_text(encoding="utf-8", errors="replace")
 
 
-def _blob_at(worktree: Path, tree: str, rel: str) -> str:
-    """``rel``'s text in ``tree``, or ``""`` when the path did not exist there (a PASS-2 ADD).
+def _blob_at(worktree: Path, tree: str, rel: str) -> bytes:
+    """``rel``'s RAW BYTES in ``tree``, or ``b""`` when the path did not exist there (a PASS-2 ADD).
 
-    Used to give :func:`agora_kb.curator.apply.validate_author_diff` the real base bytes for a path
-    outside ``needs_prose`` (whose text ``base_state`` never captured), so the ``log.md`` equality
-    check grades actual content instead of two defaulted empty strings.
+    Bytes, not text, because ``rel`` ranges over the FULL PASS-2 changed set — which includes
+    ``raw/``, where a capture may legitimately be binary or non-UTF-8. Decoding here made
+    ``git show`` raise :class:`UnicodeDecodeError` out of the PASS-2 collection loop, so a forged
+    BINARY ``raw/`` file crashed the run with a traceback instead of producing the ordinary #135
+    FINAL-DIFF TAMPER rejection. Callers that genuinely need text go through :func:`_blob_text_at`.
     """
     try:
-        return _git(worktree, "show", f"{tree}:{rel}").stdout
+        return _git_bytes(worktree, "show", f"{tree}:{rel}").stdout
     except RuntimeError:
-        return ""
+        return b""
+
+
+def _blob_text_at(worktree: Path, tree: str, rel: str) -> str:
+    """``rel``'s text in ``tree`` (lossy-decoded), or ``""`` when it did not exist there.
+
+    Used to give :func:`agora_kb.curator.apply.validate_author_diff` the real base content for a
+    path outside ``needs_prose`` (whose text ``base_state`` never captured), so the ``log.md``
+    equality check grades actual content instead of two defaulted empty strings.
+    ``errors="replace"`` MIRRORS :func:`_worktree_text`, the NEW side of that comparison, so both
+    are mangled identically and an UNCHANGED undecodable file still compares equal. The residual —
+    two DIFFERENT undecodable blobs collapsing to the same replaced string — can only make §4.2
+    under-report, and §4.2 merely degrades the prose pass; the enforcing gate for ``raw/`` is
+    :func:`_is_engine_written_raw`, which compares RAW BYTES and is unaffected.
+    """
+    return _blob_at(worktree, tree, rel).decode("utf-8", errors="replace")
 
 
 def _restore_out_of_scope(worktree: Path, tree: str, paths: list[str]) -> None:
@@ -1723,27 +1804,70 @@ def _restore_out_of_scope(worktree: Path, tree: str, paths: list[str]) -> None:
             (worktree / rel).unlink(missing_ok=True)
 
 
-def _parse_name_status_z(out: str) -> list[tuple[str, str]]:
-    """Parse ``git diff --name-status -z`` output into ``[(status, path), ...]`` (NUL-separated).
+def _parse_name_status_z(out: bytes) -> list[tuple[str, str, str | None]]:
+    """Parse ``git diff --name-status -z`` output into ``[(status, path, old_path), ...]``.
 
     ``-z`` separates every field by NUL: ``A\\0path\\0`` for simple statuses, and for
     renames/copies ``R<score>\\0old\\0new\\0`` (three NUL fields). We report the NEW path for a
-    rename/copy (the one that lands in the curated tree). Empty trailing tokens are ignored.
+    rename/copy (the one that lands in the curated tree) as ``path``, and the OLD path as the third
+    element (``None`` for a non-rename/copy status) so a caller can grade the SOURCE side too — a
+    rename out of a protected prefix is a delete of a protected file, which the new-path-only view
+    cannot see. Empty trailing tokens are ignored.
+
+    Takes RAW BYTES, split on the NUL byte BEFORE any decoding, and each field is then decoded with
+    ``errors="surrogateescape"`` (never raises, #85 / #135): a text-mode read here would (a) let a
+    non-UTF-8 byte raise :class:`UnicodeDecodeError` out of the integrity gate as an uncaught
+    traceback instead of a rejection, and (b) run ``-z``'s NUL-framed, otherwise-untouched byte
+    stream through universal-newline translation, silently rewriting an embedded ``\\r`` in a path
+    to ``\\n`` before the gate ever compares it. Splitting bytes on ``\\0`` first sidesteps both.
     """
-    tokens = [t for t in out.split("\0") if t != ""]
-    pairs: list[tuple[str, str]] = []
+    tokens = [t for t in out.split(b"\0") if t != b""]
+    decoded = [t.decode("utf-8", errors="surrogateescape") for t in tokens]
+    pairs: list[tuple[str, str, str | None]] = []
     i = 0
-    while i < len(tokens):
-        status = tokens[i]
-        if status[:1] in ("R", "C") and i + 2 < len(tokens):
-            pairs.append((status, tokens[i + 2]))  # new path
+    while i < len(decoded):
+        status = decoded[i]
+        if status[:1] in ("R", "C") and i + 2 < len(decoded):
+            pairs.append((status, decoded[i + 2], decoded[i + 1]))  # new path, old path
             i += 3
-        elif i + 1 < len(tokens):
-            pairs.append((status, tokens[i + 1]))
+        elif i + 1 < len(decoded):
+            pairs.append((status, decoded[i + 1], None))
             i += 2
         else:  # pragma: no cover — malformed/truncated git output
             break
     return pairs
+
+
+def _has_surrogate_escape(text: str) -> bool:
+    """True if ``text`` contains a lone surrogate — i.e. it round-tripped through
+    ``errors="surrogateescape"`` from bytes that are not valid UTF-8.
+
+    A path a legitimate git operation can ever produce is always valid UTF-8 (git stores/emits path
+    bytes verbatim and this codebase only ever writes UTF-8 paths); a surrogate here means the byte
+    stream held un-decodable bytes, which :func:`_parse_name_status_z` no longer raises on. Grading
+    it explicitly turns an unnameable path into a named FINAL-DIFF rejection rather than either a
+    traceback (the pre-surrogateescape behaviour) or a silent pass-through.
+    """
+    return any(0xD800 <= ord(ch) <= 0xDFFF for ch in text)
+
+
+def _git_bytes(worktree: Path, *args: str) -> subprocess.CompletedProcess[bytes]:
+    """Run a hermetic, no-shell ``git`` command in ``worktree``, capturing stdout as RAW BYTES.
+
+    The bytes-mode twin of :func:`_git`, for the one thing git can legitimately print that is not
+    text: the CONTENT of a blob. ``git show <tree>:<path>`` on a binary or non-UTF-8 ``raw/``
+    capture has no valid text decoding, and decoding it would raise
+    :class:`UnicodeDecodeError` out of the caller instead of letting the integrity gate reject the
+    file (#135). stderr is still decoded (UTF-8, replacing) purely to build the error message.
+    """
+    cmd = ["git", "-c", f"core.hooksPath={os.devnull}", *args]
+    cp = subprocess.run(  # noqa: S603 (argv list, no shell)
+        cmd, cwd=str(worktree), capture_output=True
+    )
+    if cp.returncode != 0:
+        stderr = cp.stderr.decode("utf-8", errors="replace").strip()
+        raise RuntimeError(f"git {' '.join(args)} failed (rc={cp.returncode}): {stderr}")
+    return cp
 
 
 def _git(worktree: Path, *args: str) -> subprocess.CompletedProcess[str]:
@@ -1752,13 +1876,41 @@ def _git(worktree: Path, *args: str) -> subprocess.CompletedProcess[str]:
     ``core.hooksPath=<devnull>`` neutralizes any host/repo hook so the deterministic gate can never
     execute planted code (ADR-0008 step 3). argv list, never a shell string. Raises on failure so a
     git error in the integrity gate surfaces rather than being silently treated as a clean diff.
+
+    stdout is decoded as UTF-8 EXPLICITLY, never with the host locale: git emits UTF-8 path bytes,
+    so a cp949 / latin-1 console would otherwise mis-decode the non-ASCII paths in
+    ``diff --cached --name-status -z`` and turn a legitimate engine write into a spurious
+    off-allowlist FINAL-DIFF rejection (#85). The ``-z`` name-status callers now go through
+    :func:`_git_bytes` + :func:`_parse_name_status_z` directly (bytes end-to-end, never raising on
+    an invalid path), so this function's remaining callers only ever see git's own ASCII output
+    (shas, ref names, ``add``/``checkout`` silence) — but ``errors="surrogateescape"`` (never
+    ``strict``) is still used rather than assumed, so a surprising non-UTF-8 byte in stderr (e.g. a
+    server-hook message) degrades to an unprintable-but-decoded string instead of raising
+    UnicodeDecodeError out of the integrity gate. Blob CONTENT never comes through here — see
+    :func:`_git_bytes`.
     """
     cmd = ["git", "-c", f"core.hooksPath={os.devnull}", *args]
     cp = subprocess.run(  # noqa: S603 (argv list, no shell)
-        cmd, cwd=str(worktree), capture_output=True, text=True
+        cmd,
+        cwd=str(worktree),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="surrogateescape",
     )
     if cp.returncode != 0:
-        raise RuntimeError(f"git {' '.join(args)} failed (rc={cp.returncode}): {cp.stderr.strip()}")
+        # ``cp.stderr`` was decoded with ``errors="surrogateescape"`` above, so a non-UTF-8 byte in
+        # git's stderr (e.g. a server-hook message this process does not control) can be present as
+        # a lone surrogate code point. Embedding it directly (rather than via ``!r``) would raise
+        # ``UnicodeEncodeError`` the moment an operator-facing print/log tries to encode this
+        # message under a strict stream — re-encode/decode through ``replace`` (U+FFFD) so the
+        # message is always printable (mirrors ``core.repo._printable``).
+        stderr = (
+            cp.stderr.strip()
+            .encode("utf-8", errors="surrogateescape")
+            .decode("utf-8", errors="replace")
+        )
+        raise RuntimeError(f"git {' '.join(args)} failed (rc={cp.returncode}): {stderr}")
     return cp
 
 
@@ -1845,21 +1997,41 @@ def _disposition_note_rel_path(disp: Disposition, worktree: Path, run_date: str)
     worker-side (ADR-0011 §2/§3.1, daily basenames are not a model field). Without this default a
     §4.1-valid APPEND_DAILY that omits ``basename`` (the normal case) would build no sentinel entry,
     leaving APPLY's authored region unfilled and failing the §4.4 lint.
+
+    This is the SINGLE funnel every downstream ``needs_prose``/``sentinels`` write and read site
+    goes through (:func:`_needs_prose_map`, :func:`_strip_stray_links`, :func:`_degrade_prose`,
+    :func:`_clear_body_status`), so the containment check
+    (:func:`agora_kb.curator.apply._contained`, the same helper APPLY's own write sites use) is
+    applied HERE, once, rather than re-derived at each call site — matching
+    :func:`agora_kb.curator.apply._resolve_target_path`'s exact-name (not glob-pattern) lookup so a
+    ``target_basename`` containing a glob metacharacter cannot widen the search onto another note.
     """
+    candidate: Path
     if disp.op == "CREATE_THEME" and disp.domain and disp.basename:
-        return f"wiki/{disp.domain}/themes/{disp.basename}.md"
-    if disp.op == "APPEND_DAILY" and disp.domain:
+        candidate = worktree / "wiki" / disp.domain / "themes" / f"{disp.basename}.md"
+    elif disp.op == "APPEND_DAILY" and disp.domain:
         basename = disp.basename or f"{disp.domain}-{run_date}"
-        return f"wiki/{disp.domain}/daily/{basename}.md"
-    if disp.op == "MERGE_INTO_THEME" and disp.target_basename:
+        candidate = worktree / "wiki" / disp.domain / "daily" / f"{basename}.md"
+    elif disp.op == "MERGE_INTO_THEME" and disp.target_basename:
+        wanted = f"{disp.target_basename}.md"
         matches = sorted(
             p
-            for p in (worktree / "wiki").rglob(f"{disp.target_basename}.md")
-            if p.is_file() and p.parent.name == "themes"
+            for p in (worktree / "wiki").rglob("*.md")
+            if p.is_file() and p.name == wanted and p.parent.name == "themes"
         )
-        if matches:
-            return matches[0].relative_to(worktree).as_posix()
-    return None
+        if not matches:
+            return None
+        candidate = matches[0]
+    else:
+        return None
+    try:
+        contained = _contained(worktree, candidate)
+    except ApplyError:
+        # Unreachable while plan.py's ASCII PATH/ALLOWLIST regex still gates every domain/basename
+        # token (UNIT 1 is layout-invariant); kept fail-CLOSED (treated as "no note") rather than
+        # letting a future charset widening turn this funnel into an escape.
+        return None
+    return contained.relative_to(worktree).as_posix()
 
 
 def _present_sentinel_ids(path: Path) -> set[str]:

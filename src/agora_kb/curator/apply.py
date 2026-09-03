@@ -122,6 +122,65 @@ class ApplyError(ValueError):
     """
 
 
+def _contained(worktree: Path, candidate: Path) -> Path:
+    """Return ``candidate`` unchanged, having PROVED it lands inside ``worktree``; else raise.
+
+    Every filesystem path in this module is composed from caller-supplied tokens — ``disp.domain``,
+    ``disp.basename``, ``disp.target_basename``, a provenance ``event_id`` — and is then handed
+    straight to ``mkdir(parents=True)`` / ``write_text`` / ``write_bytes``. Until this helper
+    existed the ONLY thing between a token and a write outside the repo was the §4.1 PATH/ALLOWLIST
+    safe-token regex in :mod:`agora_kb.curator.plan`, one gate one caller up: a ``basename`` of
+    ``"../../../../tmp/x"`` or ``"/etc/x"`` composes an escaping path here, and nothing downstream
+    re-checks it. A gate that lives in a DIFFERENT module than the write is a gate that a refactor,
+    a new caller, or a widened charset can silently remove; this is the same check restated AT the
+    write, where it cannot be bypassed by reaching :func:`apply_plan` some other way.
+
+    The check is ``resolve(strict=False)`` on both sides plus
+    :meth:`~pathlib.Path.is_relative_to`. Resolving is what makes it total rather than textual: it
+    normalizes ``..`` (a token like ``a/../../b``), it absolutizes ``/etc/passwd`` (which
+    ``worktree / "/etc/passwd"`` yields as an ABSOLUTE path — pathlib discards the left operand),
+    and it follows symlinks, so a component that is a symlink pointing OUT of the worktree is
+    rejected on the target it actually names rather than on its innocent-looking name. ``strict``
+    stays ``False`` because the common case is a path that does not exist yet — that is the whole
+    point of the write.
+
+    Returns the ORIGINAL ``candidate``, not the resolved twin, deliberately: callers keep using the
+    exact path they composed, so a worktree reached through a symlinked ancestor (``/tmp`` →
+    ``/private/tmp`` on macOS) still satisfies the ``path.relative_to(worktree)`` derivations in
+    :func:`_apply_merge` / :func:`_apply_contested`, and the bytes this module writes stay
+    byte-identical to what it wrote before the check existed. Containment is *asserted*, never
+    *repaired*: the resolved form is used only to decide, because silently rewriting an escaping
+    path to some in-tree path would turn an integrity failure into a wrong-file write.
+
+    This does NOT subsume the ``curator/worker.py`` FINAL-DIFF symlink gates and is not subsumed by
+    them: those grade the committed tree, this refuses the write in the first place.
+
+    Applied at every site that turns a token into a path. The handful of paths built from LITERALS
+    alone — root ``index.md``, the ``wiki/`` root in :func:`_update_index` — are deliberately left
+    bare, since there is no token there to escape with; a literal site that later gains a token
+    must be routed through here at the same time.
+
+    :param worktree: the repo worktree every curated write must stay inside.
+    :param candidate: the composed path to check.
+    :returns: ``candidate``, unmodified.
+    :raises ApplyError: when ``candidate`` resolves outside ``worktree``.
+    """
+    root = worktree.resolve(strict=False)
+    resolved = candidate.resolve(strict=False)
+    if not resolved.is_relative_to(root):
+        raise ApplyError(
+            f"PATH/ALLOWLIST: {str(candidate)!r} resolves to {str(resolved)!r}, outside the "
+            f"worktree {str(root)!r} — refusing to touch it"
+        )
+    # Return the ORIGINAL candidate, not `resolved`: `worktree` itself is generally UNRESOLVED (the
+    # caller's own composed path — e.g. a tempdir under macOS's /var -> /private/var symlink), so a
+    # RESOLVED return value would make `path.relative_to(worktree)` at call sites such as
+    # `_apply_merge` raise ValueError even on a fully legitimate, contained path. `resolved` is used
+    # only to DECIDE containment; the value callers keep composing with must match the unresolved
+    # `worktree` they already hold.
+    return candidate
+
+
 def region_sentinel_id(run_id: str, candidate_id: str) -> str:
     """Return the globally-unique PERSISTED body-sentinel id for a region (ADR-0011 §3 / §3.1).
 
@@ -170,7 +229,7 @@ def _sources_union(
     provenance: list[dict[str, object]],
     *,
     worktree: Path,
-    raw_writes: dict[str, str],
+    raw_writes: dict[str, bytes],
 ) -> list[str]:
     """Return the ordered, de-duplicated ``sources:`` list, MATERIALIZING each cited ``raw/`` (§2).
 
@@ -215,7 +274,7 @@ def _sources_union(
 
 
 def _materialize_raw_source(
-    worktree: Path, ref: str, body: object, *, raw_writes: dict[str, str]
+    worktree: Path, ref: str, body: object, *, raw_writes: dict[str, bytes]
 ) -> None:
     """Write the cited ``raw/`` free-text capture into the worktree, immutably (ADR-0010 D3).
 
@@ -236,15 +295,25 @@ def _materialize_raw_source(
     """
     if not isinstance(body, str):
         return
-    path = worktree / ref
+    # ``ref`` is the one path token here the §4.1 PATH/ALLOWLIST regex never graded: it is composed
+    # as ``raw/<domain>/<event_id>.md`` from the PROVENANCE tuple, and ``event_id`` comes from the
+    # manifest, not the plan. Checked HERE and before the ``exists()`` probe — a containment failure
+    # must not even disclose whether an out-of-tree file exists. (An EXPLICIT ``raw_ref`` on the
+    # tuple never reaches this function at all: _sources_union cites it and materializes nothing.)
+    path = _contained(worktree, worktree / ref)
     if path.exists():
         # Immutable: never overwrite. The engine still OWNS this ref this run (an immutable
         # re-cite), so record its current bytes — a later PASS-2 overwrite changes them, fails gate.
-        raw_writes[ref] = path.read_text(encoding="utf-8")
+        raw_writes[ref] = path.read_bytes()
         return
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(body, encoding="utf-8")
-    raw_writes[ref] = body
+    # write_BYTES, never write_text: text mode translates "\n" to os.linesep, so on Windows the
+    # file on disk would NOT equal the bytes recorded here and the §4.0 byte-equality admit would
+    # reject the engine's OWN write (#85). Byte equality is the whole contract — write the exact
+    # bytes recorded, record the exact bytes written.
+    data = body.encode("utf-8")
+    path.write_bytes(data)
+    raw_writes[ref] = data
 
 
 def _is_harvest_origin(provenance: list[dict[str, object]]) -> str | None:
@@ -512,8 +581,14 @@ def _theme_child_link(base: str, *, domain: str, worktree: Path) -> str:
     and an OKF bundle, ADR-0014 D3). The link TEXT is the theme's ``title`` (basename fallback). The
     child basename is recoverable from the path (``_basename_from_link_path``), keeping L1-6 / L1-2
     / read-path graph seeding total.
+
+    ``_contained`` here is defence-in-depth, not the primary gate: ``base`` is always either a
+    ``new_basenames`` token already checked at its ``_apply_create_theme`` write
+    (:func:`apply_plan`) or a live on-disk stem from ``themes_dir.glob`` in :func:`_update_moc`'s
+    caller, so an escaping token cannot reach this READ. Kept anyway so a future caller of this
+    helper does not have to re-derive that reasoning to stay safe.
     """
-    theme_path = worktree / "wiki" / domain / "themes" / f"{base}.md"
+    theme_path = _contained(worktree, worktree / "wiki" / domain / "themes" / f"{base}.md")
     title = _link_text(_note_title(theme_path, base), fallback=base)
     return f"- [{title}](themes/{base}.md)"
 
@@ -526,9 +601,14 @@ def _moc_child_link(moc_base: str, *, worktree: Path) -> str:
     the index's directory (the root) to the MOC is ``wiki/<domain>/<domain>-moc.md`` — no leading
     ``/`` or ``./`` (ADR-0014 D3). The link TEXT is the MOC's ``title`` (basename fallback).
     ``<domain>`` is recovered as ``moc_base`` minus the ``-moc`` suffix.
+
+    ``_contained`` here is defence-in-depth, not the primary gate: ``moc_base`` derives from a
+    ``created_themes_by_domain`` domain key, itself a plan ``disp.domain`` token already graded by
+    :func:`_apply_create_theme`'s own write, so an escaping token cannot reach this READ. Kept
+    anyway so a future caller does not have to re-derive that reasoning to stay safe.
     """
     domain = moc_base[: -len("-moc")] if moc_base.endswith("-moc") else moc_base
-    moc_path = worktree / "wiki" / domain / f"{moc_base}.md"
+    moc_path = _contained(worktree, worktree / "wiki" / domain / f"{moc_base}.md")
     title = _link_text(_note_title(moc_path, moc_base), fallback=moc_base)
     return f"- [{title}](wiki/{domain}/{moc_base}.md)"
 
@@ -543,10 +623,10 @@ def apply_plan(
     run_date: str,
     provenance: dict[str, list[dict[str, object]]],
     confidence: dict[str, str] | None = None,
-) -> dict[str, str]:
+) -> dict[str, bytes]:
     """Materialize a validated ``plan`` into the ``worktree`` deterministically (ADR-0011 §3).
 
-    Returns ``{raw_ref: exact_content}`` for every engine-WRITTEN canonical ``raw/`` source this run
+    Returns ``{raw_ref: exact_bytes}`` for every engine-WRITTEN canonical ``raw/`` source this run
     materialized (ADR-0010 D3) — the EXACT path-and-content set the worker's final-diff gate admits
     into the curated diff. Any OTHER ``raw/`` change in the committed tree (a brain-planted file, or
     a PASS-2 overwrite of one of these — same path, different content) is therefore rejected, so the
@@ -589,11 +669,11 @@ def apply_plan(
     run_id = plan.run_id
     conf_map = confidence or {}
 
-    # The EXACT set of engine-written canonical raw/ sources (ref -> exact content) materialized
+    # The EXACT set of engine-written canonical raw/ sources (ref -> exact BYTES) materialized
     # this run, accumulated across every disposition's _sources_union. Returned so the worker's
     # final-diff gate admits ONLY these exact paths-with-content (ADR-0010 D3); anything else under
     # raw/ in the committed tree is a brain write and is rejected off-allowlist.
-    raw_writes: dict[str, str] = {}
+    raw_writes: dict[str, bytes] = {}
 
     # Track domain -> theme basenames added this run, so MOC/index maintenance is a single pass at
     # the end (idempotent set-union with whatever themes already live in the worktree tree).
@@ -668,7 +748,7 @@ def _apply_create_theme(
     run_date: str,
     provenance: list[dict[str, object]],
     confidence: str,
-    raw_writes: dict[str, str],
+    raw_writes: dict[str, bytes],
 ) -> None:
     """Create ``wiki/<domain>/themes/<basename>.md`` with full C2 frontmatter + a body sentinel."""
     if not disp.domain or not disp.basename:
@@ -684,7 +764,7 @@ def _apply_create_theme(
         body = _empty_body_region(region_sentinel_id(run_id, disp.candidate_id))
     else:
         body = ""
-    path = worktree / "wiki" / disp.domain / "themes" / f"{disp.basename}.md"
+    path = _contained(worktree, worktree / "wiki" / disp.domain / "themes" / f"{disp.basename}.md")
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(frontmatter.render(fm, body), encoding="utf-8")
 
@@ -696,13 +776,13 @@ def _apply_append_daily(
     run_id: str,
     run_date: str,
     provenance: list[dict[str, object]],
-    raw_writes: dict[str, str],
+    raw_writes: dict[str, bytes],
 ) -> None:
     """Create-or-append the per-domain daily, one dated section per ``needs_prose`` disposition."""
     if not disp.domain:
         raise ApplyError(f"candidate {disp.candidate_id!r}: APPEND_DAILY requires a domain")
     basename = disp.basename or f"{disp.domain}-{run_date}"
-    path = worktree / "wiki" / disp.domain / "daily" / f"{basename}.md"
+    path = _contained(worktree, worktree / "wiki" / disp.domain / "daily" / f"{basename}.md")
     # A body region is placed ONLY for a disposition flagged `needs_prose` — the placement rule
     # ADR-0011 §3 and INGEST-CONTRACT §3 already state ("place body sentinels ... for notes flagged
     # needs_prose"), and the SAME gate `_apply_create_theme` and `_apply_merge` apply. This function
@@ -764,8 +844,27 @@ def _resolve_target_path(domain_target: str, worktree: Path, *, theme_only: bool
     and MARK_CONTESTED are theme-scoped ops (§2 op table), so resolving to a daily/moc/index must be
     rejected here as a precondition violation rather than mutating a non-theme note (the §4.1
     BASENAME check only verifies existence, not type).
+
+    The lookup compares ``p.name`` EXACTLY instead of interpolating the basename into an
+    ``rglob`` PATTERN. A pattern would read the token as a glob: ``"*"`` matches every note in the
+    tree and ``"[a-z]"`` matches a whole class, so a single crafted ``target_basename`` would WIDEN
+    the search and — since the first sorted match wins — silently retarget the merge/contest write
+    onto an unrelated note. Exact-name matching cannot widen, cannot traverse (``p.name`` never
+    contains a separator, so ``"../x"`` matches nothing), and needs no ``glob.escape`` reasoning
+    about which metacharacters today's charset happens to exclude. Cost is unchanged: ``rglob``
+    walks the same directories either way.
+
+    Not reachable today through the normal call path: PASS-1's §4.1 BASENAME check
+    (:mod:`agora_kb.curator.plan`) already requires ``target_basename`` to be an existing THEME
+    basename in the live tree before :func:`agora_kb.curator.worker.run` ever calls
+    :func:`apply_plan`, so a crafted glob token is rejected before reaching this lookup. The fix
+    still holds independently of that gate (a caller that skips ``validate_plan``, or a repo that
+    genuinely contains a note whose basename happens to be a glob-metacharacter string) — this is
+    defence-in-depth at the write site, not a closure of a live hole.
     """
-    matches = sorted(p for p in (worktree / "wiki").rglob(f"{domain_target}.md") if p.is_file())
+    wiki = _contained(worktree, worktree / "wiki")
+    wanted = f"{domain_target}.md"
+    matches = sorted(p for p in wiki.rglob("*.md") if p.name == wanted and p.is_file())
     if theme_only:
         matches = [p for p in matches if p.parent.name == "themes"]
     if not matches:
@@ -774,7 +873,10 @@ def _resolve_target_path(domain_target: str, worktree: Path, *, theme_only: bool
             if theme_only
             else f"target basename {domain_target!r} not found in the live worktree tree"
         )
-    return matches[0]
+    # The match came from walking the tree, so its NAME is trusted — but a matched file reached
+    # through a symlinked directory still resolves outside the worktree, and this path is about to
+    # be read AND written by _apply_merge / _apply_contested. Prove containment before returning it.
+    return _contained(worktree, matches[0])
 
 
 def _apply_merge(
@@ -784,7 +886,7 @@ def _apply_merge(
     run_id: str,
     run_date: str,
     provenance: list[dict[str, object]],
-    raw_writes: dict[str, str],
+    raw_writes: dict[str, bytes],
 ) -> None:
     """Union provenance into the target theme's ``sources:`` + append an augmentation sub-region."""
     if not disp.target_basename:
@@ -835,7 +937,7 @@ def _apply_contested(
     worktree: Path,
     run_date: str,
     provenance: list[dict[str, object]],
-    raw_writes: dict[str, str],
+    raw_writes: dict[str, bytes],
 ) -> None:
     """Set the §2.1 contested frontmatter + render the ``> [!contested]`` callout on the target."""
     if not disp.target_basename:
@@ -908,13 +1010,13 @@ def _update_moc(
     (Obsidian-Properties-native; OKF preserves them). Both sides derive from the same sorted
     basename set, so L1-6 (children == child-bullet basename set) holds by construction.
     """
-    themes_dir = worktree / "wiki" / domain / "themes"
+    themes_dir = _contained(worktree, worktree / "wiki" / domain / "themes")
     existing = (
         {p.stem for p in themes_dir.glob("*.md") if p.is_file()} if themes_dir.is_dir() else set()
     )
     children = sorted(existing | new_basenames)
 
-    moc_path = worktree / "wiki" / domain / f"{_moc_basename(domain)}.md"
+    moc_path = _contained(worktree, worktree / "wiki" / domain / f"{_moc_basename(domain)}.md")
     body = "\n".join(_theme_child_link(b, domain=domain, worktree=worktree) for b in children)
     if moc_path.is_file():
         fm, _ = frontmatter.parse(moc_path.read_text(encoding="utf-8"))

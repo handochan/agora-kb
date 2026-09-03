@@ -85,10 +85,22 @@ _STATUS_VALUES: frozenset[str] = frozenset({"active", "stub", "contested", "depr
 # The canonical INGEST allowlist (ADR-0011 §4.0, matching ADR-0008 §4 verbatim):
 #   { wiki/** , index.md , <domain>-moc.md , log.md , assets/** }
 # A disposition's implied note path is always under ``wiki/<domain>/{themes,daily}/`` — i.e. under
-# ``wiki/**`` — so PATH/ALLOWLIST (§4.1.6) reduces to: the domain + basename tokens must be safe
-# path components (no separator, no ``..``, no leading dot) that cannot escape ``wiki/`` into
-# ``_kb/`` / ``_templates/`` / ``raw/`` / git internals / hooks / a symlink. A single safe-token
-# regex enforces all of those at once.
+# ``wiki/**`` — so PATH/ALLOWLIST (§4.1.6) reduces to a CHARACTER rule on the domain + basename
+# tokens: each must be one safe path component (no separator, no ``..``, no leading dot), which is
+# what stops a token from spelling its way out of ``wiki/`` into ``_kb/`` / ``_templates/`` /
+# ``raw/`` / git internals / hooks. One safe-token regex enforces the whole character rule.
+#
+# What this regex canNOT do, stated so nobody re-derives a false guarantee from it:
+#   * It cannot see the filesystem. A SYMLINK is an inode property, not a spelling — a perfectly
+#     regex-clean name can BE a symlink pointing anywhere. Symlink prevention lives in the curator's
+#     FINAL-DIFF gates (``curator/worker.py``: the ``_is_engine_written_raw`` ``is_symlink`` check
+#     and the ``_assert_final_diff_allowlisted`` A/M/R symlink reject, §4.5), which grade the
+#     committed tree.
+#   * It cannot bind a caller. It is a gate in THIS module, one call up from the writes; anything
+#     that reaches ``apply_plan`` by another route skips it entirely. Containment at the write site
+#     is ``apply.py``'s ``_contained`` (``resolve()`` + ``is_relative_to(worktree)``), which holds
+#     independently of this pattern — which is also why this pattern can later be widened for
+#     non-ASCII without that widening becoming the escape.
 _SAFE_TOKEN_RE_PATTERN = r"\A[A-Za-z0-9][A-Za-z0-9._-]*\Z"
 
 SUPPORTED_SCHEMA_VERSIONS: frozenset[int] = frozenset({1})
@@ -410,11 +422,13 @@ def validate_plan(
                 )
 
     # 6. PATH/ALLOWLIST — every NEW implied path resolves under the canonical ALLOWLIST (wiki/**)
-    #    with no _kb/ / _templates/ / raw/ / git / hook / symlink / ".." escape. Because a content
-    #    disposition's path is always wiki/<domain>/{themes,daily}/<basename>.md, the check reduces
-    #    to: domain + basename are SAFE path-component tokens (the regex forbids "/", "..", a
-    #    leading dot). MERGE/MARK_CONTESTED/DROP/NOOP imply no NEW path (target paths come from the
-    #    live tree at APPLY), so they are not path-checked here.
+    #    with no _kb/ / _templates/ / raw/ / git / hook / ".." escape. (NOT symlinks — see the
+    #    header note above; a regex sees only a spelling, never an inode, so symlink rejection is
+    #    worker.py's FINAL-DIFF gate, not this check.) Because a content disposition's path is
+    #    always wiki/<domain>/{themes,daily}/<basename>.md, the check reduces to: domain + basename
+    #    are SAFE path-component tokens (the regex forbids "/", "..", a leading dot).
+    #    MERGE/MARK_CONTESTED/DROP/NOOP imply no NEW path (target paths come from the live tree at
+    #    APPLY), so they are not path-checked here.
     safe_token = re.compile(_SAFE_TOKEN_RE_PATTERN)
     for disp in plan.dispositions:
         if disp.op not in _BASENAME_OPS:

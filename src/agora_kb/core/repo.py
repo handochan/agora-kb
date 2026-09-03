@@ -100,6 +100,25 @@ def _require_commit_sha(value: str) -> None:
         raise ValueError(f"expected a full non-zero hex object id, got {value!r}")
 
 
+def _printable(text: str) -> str:
+    """Return ``text`` with any ``errors="surrogateescape"`` lone surrogate made printable.
+
+    ``_git`` decodes git's stdout/stderr with ``errors="surrogateescape"`` (#85) so an invalid byte
+    never raises out of the subprocess call; that is correct for round-tripping, but it means a
+    string built from ``cp.stderr`` (e.g. a remote/server-hook message on ``push_backup``, which
+    this process does not control) can carry a lone surrogate code point straight into a
+    :class:`GitError` message. Embedding it directly (``f"{stderr}"``, as opposed to ``{stderr!r}``)
+    then raises ``UnicodeEncodeError`` the moment an operator-facing ``print``/log tries to encode
+    that message under a strict stream (a redirected cp949 console,
+    ``PYTHONIOENCODING=utf-8:strict``) — turning a best-effort failure (a push, a watch tick) into
+    a crash instead of a clean error.
+    Re-encoding with ``surrogateescape`` and decoding back with ``replace`` (U+FFFD) is lossy but
+    always printable, which is what an error MESSAGE needs; nothing here is byte-compared, so the
+    lossiness costs nothing meaningful.
+    """
+    return text.encode("utf-8", errors="surrogateescape").decode("utf-8", errors="replace")
+
+
 class GitError(RuntimeError):
     """A git command failed to run or exited non-zero (carries command/returncode/stderr)."""
 
@@ -162,6 +181,21 @@ class Repo:
                 cwd=str(cwd or self.root),
                 capture_output=True,
                 text=True,
+                # git emits UTF-8 path bytes regardless of the host console codepage. WITHOUT an
+                # explicit encoding, ``text=True`` decodes with the LOCALE encoding, so a cp949 /
+                # latin-1 Windows console mis-decodes (or raises on) any non-ASCII path or commit
+                # message git prints back (#85). Pin UTF-8 so the decode is host-independent.
+                encoding="utf-8",
+                # ``errors="strict"`` (the default) would let a byte sequence that is not valid
+                # UTF-8 — realistic on ``push_backup``'s remote/server-hook output, which this
+                # process does not control — raise UnicodeDecodeError. That is a ValueError, which
+                # matches neither the TimeoutExpired/OSError handlers below nor any GitError catch
+                # at a caller, so it would escape this method as a raw exception instead of the
+                # GitError every caller (init/commit_worktree/push_backup/sync) is written against.
+                # ``surrogateescape`` never raises and round-trips the exact bytes losslessly, so an
+                # undecodable byte still reaches ``cp.stderr``/``cp.stdout`` — just as an
+                # unprintable surrogate — for GitError's message to report.
+                errors="surrogateescape",
                 env=env,
                 timeout=timeout,
             )
@@ -176,11 +210,12 @@ class Repo:
                 f"git {' '.join(args)} could not run: {exc}", command=tuple(args)
             ) from exc
         if check and cp.returncode != 0:
+            stderr = _printable(cp.stderr.strip())
             raise GitError(
-                f"git {' '.join(args)} failed (rc={cp.returncode}): {cp.stderr.strip()}",
+                f"git {' '.join(args)} failed (rc={cp.returncode}): {stderr}",
                 command=tuple(args),
                 returncode=cp.returncode,
-                stderr=cp.stderr.strip(),
+                stderr=stderr,
             )
         return cp
 
@@ -376,7 +411,7 @@ class Repo:
         env = None if interactive else self._non_interactive_push_env()
         cp = self._git("push", "--", remote, refspec, check=False, env=env, timeout=timeout)
         if cp.returncode != 0:
-            stderr = cp.stderr.strip()
+            stderr = _printable(cp.stderr.strip())
             if "non-fast-forward" in stderr or "[rejected]" in stderr:
                 raise GitError(
                     f"push to {remote!r} rejected (non-fast-forward): the remote's {name!r} is "

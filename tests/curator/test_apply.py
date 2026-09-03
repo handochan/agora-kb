@@ -333,6 +333,25 @@ def test_create_theme_materializes_cited_raw_source_from_body(tmp_path: Path) ->
     assert result.ok, [f for f in result.findings]
 
 
+def test_materialized_raw_source_is_written_and_recorded_as_exact_bytes(tmp_path: Path) -> None:
+    # _materialize_raw_source writes BYTES, not text (write_bytes, never write_text): text mode
+    # would translate "\n" to os.linesep on write, so on a platform where that differs from "\n"
+    # the file on disk would NOT equal the bytes the §4.0 final-diff gate compares against in
+    # `raw_writes` (#85) — a mismatch that cannot be provoked on POSIX (os.linesep == "\n" there),
+    # so this asserts the CONTRACT directly rather than relying on a platform-specific repro.
+    wt = _bare_worktree(tmp_path)
+    plan = _plan(_create_theme())
+    body = "line one\nline two\n"
+    raw_writes = apply_plan(
+        plan,
+        worktree=wt,
+        run_date=RUN_DATE,
+        provenance=_provenance("c1", E1, body=body),
+    )
+    ref = f"raw/ai-tech/{E1}.md"
+    assert raw_writes[ref] == (wt / ref).read_bytes() == body.encode("utf-8")
+
+
 def test_raw_source_is_immutable_not_overwritten(tmp_path: Path) -> None:
     # The raw/ source is immutable: APPLY writes it ONCE and NEVER overwrites a pre-existing file
     # (ADR-0010 D3). A pre-seeded raw/ artifact keeps its original content even when the provenance
