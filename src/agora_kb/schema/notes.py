@@ -1,11 +1,20 @@
-"""Note parsing foundation + the FROZEN content grammars (ADR-0010, the schema authority).
+"""Note parsing foundation + the FROZEN content grammars (ADR-0010/ADR-0041, the schema authority).
 
-A KB wiki repo holds exactly four note types (``index | moc | theme | daily``), each a markdown
-file opening with a YAML frontmatter block (parsed by :mod:`agora_kb.core.frontmatter`). This module
-provides the deterministic, model-free reading layer the linter (ADR-0010 §6) and ``core.read``
-(ADR-0009) both build on:
+A KB wiki repo holds notes: markdown files opening with a YAML frontmatter block (parsed by
+:mod:`agora_kb.core.frontmatter`). **Two on-disk schemas are read here.** Schema 1 (ADR-0010) puts
+the SUBJECT in the path (``wiki/<domain>/themes/<slug>.md``) and the KIND in a closed four-value
+``type:`` enum (``index | moc | theme | daily``). Schema 2 (ADR-0041) flips that axis: the first
+segment under ``wiki/`` IS the kind (``concepts | summaries | notes | maps | entities | people``,
+plus the root ``index.md``) and the subject moves into the ``subjects:`` frontmatter list.
 
-* :class:`Note` — a parsed note (its relative path, basename, declared ``type``, frontmatter, body).
+This module provides the deterministic, model-free reading layer the linter (ADR-0010 §6) and
+``core.read`` (ADR-0009) both build on:
+
+* :class:`Note` — a parsed note (its relative path, basename, declared ``type``, frontmatter, body)
+  plus the schema-2 accessors :attr:`Note.kind`, :attr:`Note.subjects`, :attr:`Note.kb`,
+  :attr:`Note.provenance` and :attr:`Note.derived`. ``kind`` is derived for BOTH schemas — a
+  schema-1 ``type:`` is mapped through the frozen ADR-0041 D2.5 table — so a read-side caller has
+  ONE kind vocabulary regardless of which schema the repo is on.
 * :func:`parse_all_notes` — scans ``index.md`` + ``wiki/**/*.md`` in deterministic path order,
   SKIPPING the parse-exempt schema doc (``AGENTS.md`` / ``SCHEMA.md``) by exact basename and its
   symlinks (``CLAUDE.md`` / ``QWEN.md`` / ``GEMINI.md``) by symlink identity (ADR-0010 §1).
@@ -24,8 +33,10 @@ a deterministic, testable retrieval path (ADR-0010 "Consequences").
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import MappingProxyType
 
 from agora_kb.core import frontmatter
 from agora_kb.core.frontmatter import FrontmatterError
@@ -33,14 +44,123 @@ from agora_kb.core.layout import RepoLayout
 
 __all__ = [
     "Note",
+    "Provenance",
     "parse_all_notes",
+    "resolve_schema_version",
     "wikilinks",
     "child_bullets",
     "body_link_basenames",
     "heading_slug",
     "note_basename",
     "PARSE_EXEMPT_BASENAMES",
+    "V1_TYPE_TO_KIND",
+    "SCHEMA2_DECLARABLE_KINDS",
+    "SCHEMA2_KINDS",
+    "KIND_BY_DIRECTORY",
+    "DIRECTORY_BY_KIND",
+    "PEOPLE_DIR_PREFIX",
+    "is_people_path",
+    "kind_directory_segment",
+    "path_kind",
+    "kind_from_type",
+    "v1_path_domain",
 ]
+
+# --- the schema-2 kind vocabulary (ADR-0041 D1/D2.5/D3.1, frozen) -------------------------------
+
+#: The v1 ``type:`` → schema-2 ``kind:`` table (ADR-0041 D2.5), frozen. It is what lets a schema-1
+#: repo be READ through the schema-2 vocabulary without touching a byte on disk: nothing derives a
+#: kind from a v1 path, so the mapping is total over the four v1 types and empty elsewhere.
+V1_TYPE_TO_KIND: Mapping[str, str] = MappingProxyType(
+    {"theme": "concept", "daily": "note", "moc": "map", "index": "index"}
+)
+
+#: The CLOSED set of kinds a curator may DECLARE in ``kind:`` (ADR-0041 D2 common base). ``person``
+#: is NOT here: it is DERIVED from ``wiki/people/`` and never authored (D2.5/D3.3).
+SCHEMA2_DECLARABLE_KINDS = frozenset({"concept", "summary", "note", "map", "entity", "index"})
+
+#: Every schema-2 kind, including the derived ``person``.
+SCHEMA2_KINDS = SCHEMA2_DECLARABLE_KINDS | {"person"}
+
+#: ``wiki/<segment-1>`` → kind (ADR-0041 D1/D3.1). The directory is AUTHORITATIVE and ``kind:`` is a
+#: mirror (D2.1). ``index`` is absent on purpose: the root map lives at ``index.md``, not under a
+#: kind directory, so the directory rule cannot name it (D1.2).
+KIND_BY_DIRECTORY: Mapping[str, str] = MappingProxyType(
+    {
+        "concepts": "concept",
+        "summaries": "summary",
+        "notes": "note",
+        "maps": "map",
+        "entities": "entity",
+        "people": "person",
+    }
+)
+
+#: The inverse of :data:`KIND_BY_DIRECTORY` — the directory a kind is written to.
+DIRECTORY_BY_KIND: Mapping[str, str] = MappingProxyType(
+    {kind: directory for directory, kind in KIND_BY_DIRECTORY.items()}
+)
+
+#: The human-owned namespace the curator may never write and lint never grades (ADR-0041 D3.3).
+PEOPLE_DIR_PREFIX = "wiki/people/"
+
+
+def is_people_path(rel_path: str) -> bool:
+    """Return True iff ``rel_path`` is inside the human-owned ``wiki/people/`` tree (D3.3).
+
+    Schema 2 only. The tree is outside invariant 2's subject: the curator never writes it, lint
+    never grades it, and its basenames are outside the global ``[[basename]]`` identity space.
+    """
+    return rel_path.startswith(PEOPLE_DIR_PREFIX)
+
+
+def kind_directory_segment(rel_path: str) -> str | None:
+    """Return segment 1 under ``wiki/`` when it is a DIRECTORY component, else ``None``.
+
+    ``wiki/concepts/foo.md`` → ``"concepts"``; ``wiki/concepts/a/b.md`` → ``"concepts"``. A note
+    sitting DIRECTLY under ``wiki/`` (``wiki/foo.md``) has no kind directory at all and yields
+    ``None`` — lint L1-22 rejects it rather than treating its filename as a kind.
+    """
+    parts = rel_path.split("/")
+    if len(parts) >= 3 and parts[0] == "wiki":
+        return parts[1]
+    return None
+
+
+def path_kind(rel_path: str) -> str | None:
+    """Return the schema-2 kind a PATH declares, or ``None`` when the path declares none.
+
+    The directory is authoritative (ADR-0041 D2.1): the root ``index.md`` is ``index`` (D1.2) and
+    ``wiki/<dir>/…`` maps through :data:`KIND_BY_DIRECTORY`. An unknown segment-1 directory, or a
+    note directly under ``wiki/``, returns ``None`` (lint L1-22).
+    """
+    if rel_path == "index.md":
+        return "index"
+    segment = kind_directory_segment(rel_path)
+    if segment is None:
+        return None
+    return KIND_BY_DIRECTORY.get(segment)
+
+
+def kind_from_type(type_value: object) -> str | None:
+    """Map a schema-1 ``type:`` to its schema-2 kind (the frozen D2.5 table), else ``None``."""
+    if not isinstance(type_value, str):
+        return None
+    return V1_TYPE_TO_KIND.get(type_value)
+
+
+def v1_path_domain(rel_path: str) -> str | None:
+    """Return a SCHEMA-1 note's domain — the first path component under ``wiki/`` — or ``None``.
+
+    ``wiki/<domain>/...`` ⇒ ``<domain>``. The root ``index.md`` (and any other non-``wiki/`` note)
+    has no domain. This is the v1 subject carrier; schema 2 records the subject in ``subjects:``
+    and NO code derives one from a path (ADR-0041 D3.2).
+    """
+    parts = rel_path.split("/")
+    if len(parts) >= 2 and parts[0] == "wiki":
+        return parts[1]
+    return None
+
 
 # The schema doc and its symlinks are NOT notes: excluded from parse_all_notes and every L1 note
 # rule (ADR-0010 §1). The doc itself is skipped by exact basename; the symlinks are *additionally*
@@ -113,14 +233,49 @@ _SLUG_NON_ALNUM_RE = re.compile(r"[^a-z0-9]+")
 
 
 @dataclass(frozen=True)
+class Provenance:
+    """A note's ADR-0041 D2.3 ``provenance:`` block, split into its two deliberately-unequal lists.
+
+    ``writers`` holds AUTHENTICATED principals and is TRUSTED. ``agents`` holds agent
+    SELF-DECLARATIONS and is RECORDED, NEVER TRUSTED. The split is the whole point: without it an
+    unauthenticated self-declared agent name would be indistinguishable from an authenticated one,
+    and the custody claim Agora makes would be false. Both are empty on a schema-1 note (the block
+    does not exist there) and on any note that omits the key.
+    """
+
+    writers: tuple[str, ...] = ()
+    agents: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class Note:
-    """One parsed wiki note (ADR-0010 §1).
+    """One parsed wiki note (ADR-0010 §1 / ADR-0041 D2).
 
     ``rel_path`` is POSIX-style and relative to the repo root (so it is stable across platforms and
     sorts deterministically). ``basename`` is the filename without its ``.md`` suffix — the key the
     ``[[basename]]`` resolver matches against (§3.1). ``type`` is the declared ``type:`` frontmatter
     value, or ``None`` when the key is absent (the linter, not this parser, decides that is an
     error). ``frontmatter`` is the raw parsed mapping and ``body`` the markdown beneath it.
+
+    The remaining attributes are the ADR-0041 reading layer, and every one of them is DERIVED at
+    parse time under the repo's ``schema_version`` so a read-side caller never has to branch:
+
+    * ``kind`` — the schema-2 kind. On schema 2 the DIRECTORY is authoritative (D2.1) and the
+      frontmatter ``kind:`` is only consulted when the path declares none (an off-layout note lint
+      L1-22 rejects). On schema 1 it is the ``type:`` value mapped through the frozen D2.5 table
+      (``theme→concept``, ``daily→note``, ``moc→map``, ``index→index``), so both schemas are read
+      through ONE vocabulary. ``None`` when neither source yields a kind.
+    * ``subjects`` — the note's subjects. On schema 2 the ``subjects:`` frontmatter list (``()`` is
+      a legal, honest value, D2.2). On schema 1 the single path domain (``wiki/<domain>/…``), or
+      ``()`` for the root index — the v1 path IS the subject carrier.
+    * ``kb`` — the ``_meta/kb.yaml`` ``kb_id`` stamped into the note (D1.5), or ``None``.
+    * ``provenance`` — the D2.3 trusted/untrusted split (see :class:`Provenance`).
+    * ``derived`` — D2.4's marker for output of a proposal/derivation plane; ``False`` by default.
+    * ``schema_version`` — the schema the note was READ under, recorded so a caller that keeps a
+      ``Note`` past the read can tell which derivation produced ``kind``/``subjects``.
+
+    Every pre-ADR-0041 attribute keeps its exact meaning and position, and every new one has a
+    default, so existing callers and constructions are unaffected.
     """
 
     rel_path: str
@@ -128,6 +283,12 @@ class Note:
     type: str | None
     frontmatter: dict[str, object] = field(default_factory=dict)
     body: str = ""
+    kind: str | None = None
+    subjects: tuple[str, ...] = ()
+    kb: str | None = None
+    provenance: Provenance = field(default_factory=Provenance)
+    derived: bool = False
+    schema_version: int = 1
 
 
 def note_basename(path: Path) -> str:
@@ -164,7 +325,76 @@ def _iter_note_paths(layout: RepoLayout) -> list[Path]:
     return sorted(kept, key=lambda p: p.relative_to(root).as_posix())
 
 
-def parse_all_notes(layout: RepoLayout, *, strict: bool = False) -> list[Note]:
+def _str_tuple(value: object) -> tuple[str, ...]:
+    """Return the string elements of a frontmatter list value, else ``()`` (tolerant accessor)."""
+    if not isinstance(value, list):
+        return ()
+    return tuple(v for v in value if isinstance(v, str))
+
+
+def _derive_kind(
+    rel_path: str, fm: dict[str, object], type_str: str | None, version: int
+) -> str | None:
+    """Derive a note's kind under ``version`` (ADR-0041 D2.1 / D2.5).
+
+    Schema 2: the DIRECTORY wins (D2.1 — it cannot be falsified by a brain writing prose), and the
+    frontmatter ``kind:`` mirror is consulted only when the path declares no kind at all. Schema 1:
+    the ``type:`` value through the frozen D2.5 table. Neither derivation reads the other's source,
+    so a v1 repo is never re-interpreted by directory and a v2 repo never by ``type:``.
+    """
+    if version >= 2:
+        from_path = path_kind(rel_path)
+        if from_path is not None:
+            return from_path
+        declared = fm.get("kind")
+        return declared if isinstance(declared, str) else None
+    return kind_from_type(type_str)
+
+
+def _derive_subjects(rel_path: str, fm: dict[str, object], version: int) -> tuple[str, ...]:
+    """Derive a note's subjects under ``version`` (ADR-0041 D2.2 / D3.2).
+
+    Schema 2 reads ``subjects:`` and NOTHING else — no code derives a subject from a path (D3.2),
+    and an empty list is a legal, honest value. Schema 1 has exactly one subject and it lives in
+    the path segment, so the single path domain is lifted into the same tuple shape.
+    """
+    if version >= 2:
+        return _str_tuple(fm.get("subjects"))
+    domain = v1_path_domain(rel_path)
+    return (domain,) if domain is not None else ()
+
+
+def _derive_provenance(fm: dict[str, object]) -> Provenance:
+    """Read the D2.3 ``provenance:`` block tolerantly (a malformed block degrades to empty)."""
+    block = fm.get("provenance")
+    if not isinstance(block, dict):
+        return Provenance()
+    return Provenance(
+        writers=_str_tuple(block.get("writers")), agents=_str_tuple(block.get("agents"))
+    )
+
+
+def resolve_schema_version(layout: RepoLayout) -> int:
+    """Resolve the repo's KB wiki schema version from disk, defaulting to ``1`` (ADR-0010 §5.1).
+
+    One question, one answer, canonical source: ``_meta/taxonomy.yaml`` wins and ``_kb/repo.yaml``
+    is consulted only when it is absent — the precedence :func:`agora_kb.config.load_repo_config`
+    and the #98 entry-point guard already use. An INDETERMINATE version (unparseable YAML, a
+    non-integer value, a directory that is no Agora repo) resolves to ``1``: the conservative
+    answer, because the v1 derivation is what every pre-ADR-0041 release produced.
+
+    The import is function-local ON PURPOSE and not an oversight: ``agora_kb.config`` imports
+    ``agora_kb.schema`` (for :class:`~agora_kb.schema.emit.Taxonomy`), so a module-level import
+    here would close that cycle. This is the only direction the dependency may run.
+    """
+    from agora_kb.config import read_kb_schema_version
+
+    return read_kb_schema_version(layout) or 1
+
+
+def parse_all_notes(
+    layout: RepoLayout, *, strict: bool = False, schema_version: int | None = None
+) -> list[Note]:
     """Parse every wiki note in ``layout`` into :class:`Note` objects, in deterministic path order.
 
     Scans ``index.md`` and ``wiki/**/*.md`` (the schema doc ``AGENTS.md`` / ``SCHEMA.md`` and its
@@ -177,7 +407,23 @@ def parse_all_notes(layout: RepoLayout, *, strict: bool = False) -> list[Note]:
     foreign note can never crash a read path (the browse face, ADR-0019). Pass ``strict=True`` to
     re-raise :class:`agora_kb.core.frontmatter.FrontmatterError` (with the offending relative path)
     for callers that must surface a malformed note rather than degrade it (e.g. the producer lint).
+
+    ``schema_version`` selects the KB wiki schema the repo is on (``_meta/taxonomy.yaml``
+    ``schema_version``, ADR-0010 §5.1). It changes NOTHING about which files are scanned, how they
+    are decoded, or what ``rel_path`` / ``basename`` / ``type`` / ``frontmatter`` / ``body`` hold —
+    only how :attr:`Note.kind` and :attr:`Note.subjects` are DERIVED (ADR-0041 D2.1/D2.2).
+
+    ``None`` (the default) RESOLVES it from the repo, exactly as :func:`agora_kb.schema.lint.lint`
+    does, so a caller that does not pass one is correct on both schemas without a call-site change.
+    That default is what makes the promise in :class:`Note`'s docstring true — "derived under the
+    repo's ``schema_version`` so a read-side caller never has to branch" — and it closes the trap a
+    hardcoded ``1`` would otherwise set for the read side: on a schema-2 repo a defaulted caller
+    would silently get ``subjects`` derived FROM THE PATH (the kind directory) and ``kind = None``,
+    the exact path-derived subject ADR-0041 D3.2 forbids. Schema-1 repos resolve to ``1`` and are
+    byte-identical. An explicit value still overrides the repo — the escape hatch for a converter
+    writing a destination repo, and for a test.
     """
+    version = resolve_schema_version(layout) if schema_version is None else schema_version
     notes: list[Note] = []
     for path in _iter_note_paths(layout):
         # Decode LOSSILY (errors="replace") so a non-UTF8 note in a foreign/not-yet-normalized
@@ -197,13 +443,21 @@ def parse_all_notes(layout: RepoLayout, *, strict: bool = False) -> list[Note]:
             fm, body = {}, text
         type_value = fm.get("type")
         type_str = type_value if isinstance(type_value, str) else None
+        rel_path = path.relative_to(layout.root).as_posix()
+        kb_value = fm.get("kb")
         notes.append(
             Note(
-                rel_path=path.relative_to(layout.root).as_posix(),
+                rel_path=rel_path,
                 basename=note_basename(path),
                 type=type_str,
                 frontmatter=fm,
                 body=body,
+                kind=_derive_kind(rel_path, fm, type_str, version),
+                subjects=_derive_subjects(rel_path, fm, version),
+                kb=kb_value if isinstance(kb_value, str) else None,
+                provenance=_derive_provenance(fm),
+                derived=fm.get("derived") is True,
+                schema_version=version,
             )
         )
     return notes

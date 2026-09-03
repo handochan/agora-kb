@@ -1,4 +1,16 @@
-"""Deterministic L1 lint ruleset (ADR-0010 §6 / the L1-1..L1-19 table).
+"""Deterministic L1 lint ruleset (ADR-0010 §6 / the L1-1..L1-24 table).
+
+**Two rulesets, one entry point (ADR-0041 D6).** :func:`lint` reads the repo's KB wiki
+``schema_version`` (canonically ``_meta/taxonomy.yaml``, ADR-0010 §5.1; overridable with the
+``schema_version=`` kwarg) and dispatches. Schema 1 is ADR-0010's ruleset, UNCHANGED and
+byte-identical — the subject is the path segment and the kind is the ``type:`` enum. Schema 2 is
+the ADR-0041 ruleset recorded rule-by-rule in ADR-0010's supersession banner: the predicates that
+read ``type`` read ``kind`` instead (L1-6/7/8/8b/10/11/14/19, L2-1), the domain check reads
+``subjects:`` (L1-5), ``wiki/people/**`` is permanently ungraded (L1-9/D3.3), and three rules are
+added — **L1-22** (a ``wiki/`` segment-1 directory outside the closed kind set), **L1-23** (a
+taxonomy domain beginning with ``_``, the ``raw/`` reserved-prefix namespace) and **L1-24** (a map
+``children:`` bullet whose child kind is not admitted). **L1-21 stays pre-reserved** for the L2-6
+promotion after ``agora repo upgrade`` (#63) and is NOT reused. Every L1 severity stays ``error``.
 
 This is the model-free, wall-clock-free integrity gate that ADR-0011 §4.4 runs after APPLY +
 AUTHOR (before commit) and that the dashboard / ``kb_status`` reuse verbatim — the SAME code path,
@@ -73,12 +85,18 @@ from agora_kb.core.sentinel import BODY_START_LINE_RE as _BODY_SENTINEL_START_RE
 from agora_kb.core.sentinel import has_unauthored_region
 from agora_kb.schema.emit import Taxonomy
 from agora_kb.schema.notes import (
+    KIND_BY_DIRECTORY,
     PARSE_EXEMPT_BASENAMES,
+    SCHEMA2_DECLARABLE_KINDS,
     Note,
     body_link_basenames,
     child_bullets,
+    is_people_path,
+    kind_directory_segment,
     note_basename,
     parse_all_notes,
+    path_kind,
+    v1_path_domain,
     wikilinks,
 )
 
@@ -116,6 +134,34 @@ _CONTESTED_CALLOUT_RE = re.compile(r"^> \[!contested\]", re.MULTILINE)
 
 # A daily basename is `<domain>-YYYY-MM-DD`; the trailing 10 chars are the date (ADR-0010, L1-14).
 _DAILY_DATE_RE = re.compile(r"-(?P<date>\d{4}-\d{2}-\d{2})\Z")
+
+# --- schema-2 rule predicates (ADR-0041, via ADR-0010's supersession banner) -------------------
+#
+# Each set below replaces ONE v1 `type`-keyed predicate. They are named after the rule group they
+# gate so a future reader can check them against the banner line by line rather than by guessing.
+
+# L1-7 / L1-8 / L1-8b / L1-10 / L1-19 and the L2-1 orphan population. `entity` is DELIBERATELY
+# absent: ADR-0041 D2 lets an entity carry empty `sources:` while `status: stub`, the banner
+# EXCLUDES it from L1-7's non-stub-needs-sources rule by name, and `wiki/entities/` has no day-1
+# producer at all (OD-8), so there is nothing for the rule to grade.
+_V2_SOURCED_KINDS = frozenset({"concept", "summary"})
+
+# L1-6 (children == child-bullet set) and L1-24 (admitted child kinds). The v1 predicate was
+# `type in (moc, index)`; the set-equality check itself is unchanged.
+_V2_MAP_KINDS = frozenset({"map", "index"})
+
+# L1-24: the child kinds a map may list (ADR-0041 D1.3). `note` is the v1 "dailies MUST NOT appear
+# in children:" prose finally given an enforcement point; `entity` is excluded on day 1 for the
+# #146 thin-page seeding reason (OD-2); `person` can never be a child (the curator may not author a
+# bullet into a tree it may not write, D3.3).
+_V2_ADMITTED_CHILD_KINDS = frozenset({"concept", "summary", "map"})
+
+# The schema-2 `note` journal path: wiki/notes/<yyyy>/<mm>/<yyyy>-<mm>-<dd>.md (D1.1 / D2.6).
+_V2_NOTES_DIR = "wiki/notes"
+
+# `body_status:` is present ONLY as `pending`, and only while PASS-2 prose is unauthored; it is
+# DROPPED (key absent) once authored (ADR-0010 §2.6, the L2-6 contract).
+_BODY_STATUS_PENDING = "pending"
 
 
 def _date_str(value: object) -> str | None:
@@ -216,16 +262,18 @@ def _load_taxonomy(layout: RepoLayout) -> Taxonomy:
 
 
 def _note_domain(rel_path: str) -> str | None:
-    """Return a note's domain — the first path component under ``wiki/`` — or ``None``.
+    """Return a SCHEMA-1 note's domain — the first path component under ``wiki/`` — or ``None``.
 
     ``wiki/<domain>/...`` ⇒ ``<domain>``. The root ``index.md`` (and any other non-``wiki/`` note)
     has NO domain and is therefore exempt from the L1-5 domain-membership check (the index lists
     domain MOCs; it does not itself belong to a domain).
+
+    SCHEMA 2 NEVER CALLS THIS. ADR-0041 D3.2 leaves exactly one place a subject is recorded — the
+    ``subjects:`` frontmatter list — and no code derives one from a path. Delegates to
+    :func:`agora_kb.schema.notes.v1_path_domain` so the v1 derivation has one home, shared with the
+    ``Note.subjects`` accessor; the behaviour is unchanged, character for character.
     """
-    parts = rel_path.split("/")
-    if len(parts) >= 2 and parts[0] == "wiki":
-        return parts[1]
-    return None
+    return v1_path_domain(rel_path)
 
 
 def _as_str_list(value: object) -> list[str] | None:
@@ -286,18 +334,47 @@ def _candidate_note_paths(layout: RepoLayout) -> list[str]:
     return sorted(paths)
 
 
-def _scan_encoding(layout: RepoLayout, graded: frozenset[str] | None = None) -> list[LintFinding]:
+def _graded_candidate_paths(
+    layout: RepoLayout, graded: frozenset[str] | None, *, skip_people: bool
+) -> list[str]:
+    """Return the candidate note paths that are GRADED as producer artifacts, in scan order.
+
+    Two independent narrowings, both of which must be applied by every pass that reads BYTES rather
+    than parsed notes (the L1-16 encoding pre-pass and the strict frontmatter re-check):
+
+    * ``graded`` — the caller's ``scope`` (issue #152). ``None`` means "every candidate".
+    * ``skip_people`` — the schema-2 ``wiki/people/**`` exclusion (ADR-0041 D3.3). It lives INSIDE
+      :func:`lint` rather than in a caller-supplied argument on purpose: every caller (curator,
+      dashboard, ``kb_status``, ``/metrics``, ``health()``) must behave identically, or a read-only
+      surface would report a red KB over a file the curator is FORBIDDEN to fix.
+
+    With ``graded=None`` and ``skip_people=False`` this is :func:`_candidate_note_paths` verbatim,
+    which is what keeps schema 1 byte-identical.
+    """
+    kept: list[str] = []
+    for rel in _candidate_note_paths(layout):
+        if graded is not None and rel not in graded:
+            continue
+        if skip_people and is_people_path(rel):
+            continue
+        kept.append(rel)
+    return kept
+
+
+def _scan_encoding(
+    layout: RepoLayout, graded: frozenset[str] | None = None, *, skip_people: bool = False
+) -> list[LintFinding]:
     """L1-16 pre-pass over every candidate note file (runs even if frontmatter then fails parse).
 
     ``graded`` is :func:`lint`'s producer scope (``None`` ⇒ every candidate path, today's
     behaviour). An out-of-scope path is not even READ: a human/Obsidian note is allowed to be CRLF
     or BOM-prefixed, and the point of the scope is that its bytes are none of the producer gate's
-    business (ADR-0014 D1/D4, issue #152).
+    business (ADR-0014 D1/D4, issue #152). ``skip_people`` applies the same reasoning permanently to
+    ``wiki/people/**`` under schema 2 (ADR-0041 D3.3): a human writing in Obsidian on Windows may
+    well produce CRLF, and that is not a producer finding.
     """
     findings: list[LintFinding] = []
-    for rel in _candidate_note_paths(layout):
-        if graded is not None and rel not in graded:
-            continue
+    for rel in _graded_candidate_paths(layout, graded, skip_people=skip_people):
         if not _is_utf8_lf_no_bom((layout.root / rel).read_bytes()):
             findings.append(
                 LintFinding("L1-16", "error", rel, "not UTF-8-no-BOM with LF line endings")
@@ -305,18 +382,20 @@ def _scan_encoding(layout: RepoLayout, graded: frozenset[str] | None = None) -> 
     return findings
 
 
-def _first_malformed(layout: RepoLayout, graded: frozenset[str]) -> tuple[str, str] | None:
-    """Return ``(rel_path, message)`` of the FIRST in-scope note whose frontmatter does not parse.
+def _first_malformed(
+    layout: RepoLayout, graded: frozenset[str] | None, *, skip_people: bool = False
+) -> tuple[str, str] | None:
+    """Return ``(rel_path, message)`` of the FIRST GRADED note whose frontmatter does not parse.
 
-    Only reached in SCOPED mode, where :func:`parse_all_notes` is called tolerantly so that an
-    out-of-scope human note can never abort the pass (issue #152). The in-scope half of the strict
-    contract is preserved here: a producer artifact whose frontmatter is malformed is still the
-    ``L1-4`` hard reject it has always been, reported fail-fast (first file in sorted scan order)
-    exactly like the unscoped path. Reads only in-scope files.
+    Reached whenever :func:`parse_all_notes` was called tolerantly so that an ungraded note can
+    never abort the pass — SCOPED mode (issue #152) and every schema-2 pass (a malformed
+    ``wiki/people/**`` note must not hard-reject a curator run it has nothing to do with, ADR-0041
+    D3.3). The graded half of the strict contract is preserved here: a producer artifact whose
+    frontmatter is malformed is still the ``L1-4`` hard reject it has always been, reported
+    fail-fast (first file in sorted scan order) exactly like the unscoped v1 path. Reads only
+    graded files.
     """
-    for rel in _candidate_note_paths(layout):
-        if rel not in graded:
-            continue
+    for rel in _graded_candidate_paths(layout, graded, skip_people=skip_people):
         text = (layout.root / rel).read_text(encoding="utf-8", errors="replace")
         try:
             frontmatter.parse(text)
@@ -334,14 +413,179 @@ _COMMON_LIST_KEYS = ("tags", "aliases")
 _DATE_KEYS = ("created", "updated")
 
 
-def _check_required_frontmatter(note: Note) -> list[LintFinding]:
+# Schema-2 common base (ADR-0041 D2). `kb:` is REQUIRED and new: the `_meta/kb.yaml` `kb_id`
+# stamped by APPLY (D1.5), so a note copied out of the repo still names its origin. `subjects:`
+# joins tags/aliases as required-as-typed — an EMPTY list is legal and honest (D2.2).
+_V2_COMMON_STR_KEYS = ("title", "summary", "kb")
+_V2_COMMON_LIST_KEYS = ("tags", "aliases", "subjects")
+
+
+def _check_provenance(note: Note) -> list[LintFinding]:
+    """L1-4 shape check for the ADR-0041 D2.3 ``provenance:`` block (OPTIONAL, typed when present).
+
+    Two lists, deliberately not one: ``writers`` (authenticated principals, trusted) and ``agents``
+    (agent self-declarations, recorded but never trusted). Lint checks only the SHAPE — whether a
+    principal is genuinely authenticated is an auth-plane question (Phase 4), not something a
+    single-worktree read can answer, and pretending otherwise would be worse than saying nothing.
+    """
+    block = note.frontmatter.get("provenance")
+    if block is None:
+        return []
+    if not isinstance(block, dict):
+        return [
+            LintFinding(
+                "L1-4",
+                "error",
+                note.rel_path,
+                "'provenance' must be a mapping with 'writers'/'agents' lists",
+            )
+        ]
+    findings: list[LintFinding] = []
+    for key in ("writers", "agents"):
+        if key in block and _as_str_list(block.get(key)) is None:
+            findings.append(
+                LintFinding(
+                    "L1-4",
+                    "error",
+                    note.rel_path,
+                    f"'provenance.{key}' must be a list of strings",
+                )
+            )
+    return findings
+
+
+def _check_body_status_value(note: Note) -> list[LintFinding]:
+    """L1-4: ``body_status:`` is present ONLY as ``pending`` (ADR-0010 §2.6, carried into schema 2).
+
+    The key is a two-state flag whose ``absent`` state is the KEY BEING ABSENT — there is no
+    ``body_status: absent`` value. Any other value is a malformed producer artifact. Whether a
+    *present* ``pending`` is STALE is L2-6's (warning-severity) question, not this one's.
+    """
+    value = note.frontmatter.get("body_status")
+    if value is None or value == _BODY_STATUS_PENDING:
+        return []
+    return [
+        LintFinding(
+            "L1-4",
+            "error",
+            note.rel_path,
+            f"'body_status' must be {_BODY_STATUS_PENDING!r} when present (the key is DROPPED "
+            f"once authored), got {value!r}",
+        )
+    ]
+
+
+def _check_required_frontmatter_v2(note: Note) -> list[LintFinding]:
+    """L1-4 (missing required key for kind) + L1-11 (unknown kind/status, kind≠directory), schema 2.
+
+    The ADR-0010 banner's amendment of L1-4 and L1-11, implemented literally:
+
+    * **L1-11** grades ``kind:`` against the CLOSED declarable set (``person`` is derived from
+      ``wiki/people/`` and never authored, D2.5/D3.3) and then cross-checks it against the
+      DIRECTORY, which is authoritative where the two disagree (D2.1). ``status:`` is unchanged.
+    * **L1-4** applies the D2 common base — now including a REQUIRED ``kb:`` — plus the per-kind
+      additions, whose SHAPE carries over from v1 unchanged: ``concept``/``summary`` add
+      ``sources:``/``related:``/``confidence:``/``body_status:``, ``note`` adds
+      ``date:``/``run_id:``/``sources:``/``body_status:``, ``map``/``index`` add ``children:``, and
+      ``entity`` adds ``sources:``/``related:`` (empty ``sources:`` is legal for an entity — the
+      non-empty rule is L1-7 and entity is excluded from it).
+
+    The per-kind branch keys off ``note.kind`` — the DIRECTORY-derived value — so a note in
+    ``wiki/concepts/`` claiming ``kind: map`` is graded as the concept it structurally is, and the
+    lie is reported separately by L1-11 rather than silently choosing the liar's rule set.
+    ``origin:`` (L1-19) and the contested triple (L1-10) keep their own rules; they are not
+    duplicated here, exactly as in v1.
+    """
+    findings: list[LintFinding] = []
+    fm = note.frontmatter
+    path = note.rel_path
+
+    def miss(code: str, msg: str) -> None:
+        findings.append(LintFinding(code, "error", path, msg))
+
+    declared_raw = fm.get("kind")
+    declared = declared_raw if isinstance(declared_raw, str) else None
+    if declared is None or declared not in SCHEMA2_DECLARABLE_KINDS:
+        miss(
+            "L1-11",
+            f"unknown or missing 'kind' {declared_raw!r}; expected one of "
+            f"{sorted(SCHEMA2_DECLARABLE_KINDS)}",
+        )
+    from_path = path_kind(path)
+    if declared is not None and from_path is not None and declared != from_path:
+        miss(
+            "L1-11",
+            f"'kind' {declared!r} contradicts its directory (kind {from_path!r}); the DIRECTORY is "
+            f"authoritative and 'kind:' only mirrors it (ADR-0041 D2.1)",
+        )
+
+    status = fm.get("status")
+    if status is None:
+        miss("L1-4", "missing required 'status'")
+    elif not (isinstance(status, str) and status in _STATUS_VALUES):
+        miss("L1-11", f"unknown 'status' {status!r}; expected one of {sorted(_STATUS_VALUES)}")
+
+    for key in _V2_COMMON_STR_KEYS:
+        v = fm.get(key)
+        if v is None:
+            miss("L1-4", f"missing required '{key}'")
+        elif not isinstance(v, str):
+            miss("L1-4", f"'{key}' must be a string, got {type(v).__name__}")
+    for key in _V2_COMMON_LIST_KEYS:
+        if key in fm and _as_str_list(fm.get(key)) is None:
+            miss("L1-4", f"'{key}' must be a list of strings")
+    for key in _DATE_KEYS:
+        if fm.get(key) is None:
+            miss("L1-4", f"missing required '{key}'")
+    if "derived" in fm and not isinstance(fm.get("derived"), bool):
+        miss("L1-4", f"'derived' must be a bool, got {type(fm.get('derived')).__name__}")
+    findings.extend(_check_provenance(note))
+
+    kind = note.kind
+    if kind in _V2_SOURCED_KINDS:
+        for key in ("sources", "related"):
+            if key in fm and _as_str_list(fm.get(key)) is None:
+                miss("L1-4", f"'{key}' must be a list of strings")
+        conf = fm.get("confidence")
+        if conf is not None and conf not in ("high", "medium", "low"):
+            miss("L1-4", f"'confidence' must be high|medium|low, got {conf!r}")
+        findings.extend(_check_body_status_value(note))
+    elif kind == "note":
+        if fm.get("date") is None:
+            miss("L1-4", "missing required 'date' on note")
+        if fm.get("run_id") is None:
+            miss("L1-4", "missing required 'run_id' on note")
+        if "sources" in fm and _as_str_list(fm.get("sources")) is None:
+            miss("L1-4", "'sources' must be a list of strings")
+        findings.extend(_check_body_status_value(note))
+    elif kind in _V2_MAP_KINDS:
+        if "children" not in fm:
+            miss("L1-4", f"missing required 'children' on {kind}")
+        elif _as_str_list(fm.get("children")) is None:
+            miss("L1-4", "'children' must be a list of strings")
+    elif kind == "entity":
+        # `sources:` MAY be empty while `status: stub` (D2), and entity is excluded from L1-7, so
+        # only the TYPE is graded here.
+        for key in ("sources", "related"):
+            if key in fm and _as_str_list(fm.get(key)) is None:
+                miss("L1-4", f"'{key}' must be a list of strings")
+
+    return findings
+
+
+def _check_required_frontmatter(note: Note, schema_version: int = 1) -> list[LintFinding]:
     """L1-4 (missing required key for type) + L1-11 (unknown type/status) for one note.
 
     Implements the §2 required-field tables: the common base for all types, plus the type-specific
     additions (theme: sources/related/confidence; daily: date/run_id; moc & index: children). Type
     errors (a key present but wrong-typed) are reported under L1-4 alongside absences, since both
     mean "the required frontmatter for this type is not satisfied".
+
+    ``schema_version`` 2 dispatches to :func:`_check_required_frontmatter_v2` (the ADR-0041 D2
+    tables keyed on ``kind``); the body below is the schema-1 ruleset, untouched.
     """
+    if schema_version >= 2:
+        return _check_required_frontmatter_v2(note)
     findings: list[LintFinding] = []
     fm = note.frontmatter
     path = note.rel_path
@@ -400,7 +644,7 @@ def _check_required_frontmatter(note: Note) -> list[LintFinding]:
     return findings
 
 
-def _check_dates(note: Note, run_date: str | None) -> list[LintFinding]:
+def _check_dates(note: Note, run_date: str | None, schema_version: int = 1) -> list[LintFinding]:
     """L1-12: created/updated/date must be ``YYYY-MM-DD`` (always), and ``<= run_date`` when given.
 
     The FORMAT check (must be ``YYYY-MM-DD``) is structural and runs unconditionally. The
@@ -412,7 +656,7 @@ def _check_dates(note: Note, run_date: str | None) -> list[LintFinding]:
     """
     findings: list[LintFinding] = []
     fm = note.frontmatter
-    keys = ("created", "updated") + (("date",) if note.type == "daily" else ())
+    keys = ("created", "updated") + (("date",) if _is_journal_kind(note, schema_version) else ())
     for key in keys:
         raw = fm.get(key)
         if raw is None:
@@ -447,6 +691,176 @@ def _basename_date(basename: str) -> str | None:
     """Return the trailing ``YYYY-MM-DD`` of a daily basename ``<domain>-YYYY-MM-DD``, or None."""
     m = _DAILY_DATE_RE.search(basename)
     return m.group("date") if m is not None else None
+
+
+# --- the version-keyed rule predicates (one per v1 `type` test the banner amends) --------------
+#
+# Each returns the SCHEMA-1 expression verbatim for version 1, so the v1 verdict is byte-identical
+# by construction rather than by inspection, and the ADR-0041 kind predicate for version 2.
+
+
+def _is_sourced_kind(note: Note, schema_version: int) -> bool:
+    """L1-7/8/8b/10/19 gate: v1 ``type == theme`` → v2 ``kind in {concept, summary}``."""
+    if schema_version >= 2:
+        return note.kind in _V2_SOURCED_KINDS
+    return note.type == "theme"
+
+
+def _is_map_kind(note: Note, schema_version: int) -> bool:
+    """L1-6 / L1-24 gate: v1 ``type in (moc, index)`` → v2 ``kind in (map, index)``."""
+    if schema_version >= 2:
+        return note.kind in _V2_MAP_KINDS
+    return note.type in ("moc", "index")
+
+
+def _is_journal_kind(note: Note, schema_version: int) -> bool:
+    """L1-12 ``date`` key / L1-14 gate: v1 ``type == daily`` → v2 ``kind == note``."""
+    if schema_version >= 2:
+        return note.kind == "note"
+    return note.type == "daily"
+
+
+def _check_wiki_kind_directory(note: Note) -> list[LintFinding]:
+    """L1-22 (schema 2): a note under ``wiki/`` whose segment-1 directory is not a known kind.
+
+    This is what makes the kind vocabulary CLOSED AT THE DIRECTORY LEVEL (ADR-0041 D3.1) — a
+    stronger guarantee than a frontmatter enum a brain writes prose into, because adding a kind
+    becomes an explicit reviewable act rather than the side effect of a model inventing a folder.
+    A note sitting DIRECTLY under ``wiki/`` has no kind directory at all and is rejected too: its
+    filename must not be mistaken for a kind.
+    """
+    path = note.rel_path
+    if not path.startswith("wiki/") or path_kind(path) is not None:
+        return []
+    segment = kind_directory_segment(path)
+    if segment is None:
+        return [
+            LintFinding(
+                "L1-22",
+                "error",
+                path,
+                "note sits directly under wiki/ with no kind directory; expected "
+                f"wiki/<{'|'.join(sorted(KIND_BY_DIRECTORY))}>/… (ADR-0041 D3.1)",
+            )
+        ]
+    return [
+        LintFinding(
+            "L1-22",
+            "error",
+            path,
+            f"unknown wiki/ kind directory {segment!r}; the kind set is closed at the directory "
+            f"level: {sorted(KIND_BY_DIRECTORY)} (ADR-0041 D3.1)",
+        )
+    ]
+
+
+def _check_reserved_domains(taxonomy: Taxonomy) -> list[LintFinding]:
+    """L1-23 (schema 2): a ``_meta/taxonomy.yaml`` ``domains`` entry beginning with ``_``.
+
+    ``raw/<domain>/`` and ``raw/_blob/`` share ONE namespace (ADR-0041 D1.4), so a domain literally
+    named ``_blob`` would make APPLY write an event into the content-addressed tree. This is
+    **layer 2** of a two-layer reservation and NOT a restatement of layer 1: ``_meta/taxonomy.yaml``
+    is human-written and never passes through the plan validator, while a plan token never passes
+    through taxonomy load — neither layer covers the other's input. Reported once per offending
+    domain, in sorted order, against the taxonomy file itself.
+    """
+    return [
+        LintFinding(
+            "L1-23",
+            "error",
+            "_meta/taxonomy.yaml",
+            f"domain {d!r} begins with '_', which is RESERVED for the raw/ prefix namespace "
+            f"(raw/_blob, raw/_pages) — ADR-0041 D1.4",
+        )
+        for d in sorted(set(taxonomy.domains))
+        if d.startswith("_")
+    ]
+
+
+def _check_note_shard(note: Note, run_date: str | None, run_id: str | None) -> list[LintFinding]:
+    """L1-14 (schema 2): the ``wiki/notes/<yyyy>/<mm>/<yyyy>-<mm>-<dd>.md`` date/shard identity.
+
+    The successor to v1's daily rule. One journal per ``run_date``, repo-wide (ADR-0041 D2.6), so
+    the basename is the bare date rather than ``<domain>-YYYY-MM-DD`` and the note↔``run_id``
+    relation is 1:1 — which turns a per-domain fan-out into a clean identity check:
+
+    * the basename IS the date (``YYYY-MM-DD``);
+    * ``date:`` equals it;
+    * the ``<yyyy>/<mm>`` path shard equals the year and month of ``date:`` (ADR-0041 D1.1 — the
+      shard is DERIVED from ``run_date`` by the path composer, never parsed out of a model-supplied
+      basename, and this is the at-rest assertion of that);
+    * and, when the run injects them, ``date == run_date`` and ``run_id`` matches byte-for-byte —
+      both carried over from v1 verbatim.
+    """
+    fm = note.frontmatter
+    base = note.basename
+    bdate = base if _DATE_RE.match(base) else None
+    date_value = _date_str(fm.get("date"))
+    run_id_value = fm.get("run_id")
+    problems: list[str] = []
+
+    if bdate is None:
+        problems.append(f"basename {base!r} is not YYYY-MM-DD")
+    elif date_value is not None and date_value != bdate:
+        problems.append(f"date {date_value!r} != basename {bdate!r}")
+
+    # The shard is graded against `date:` (D1.1's own wording) and falls back to the basename only
+    # when `date:` is absent/unparseable — its absence is already L1-4's finding, and a missing
+    # required key must not make the shard rule fail open.
+    shard_key = date_value if date_value is not None and _DATE_RE.match(date_value) else bdate
+    if shard_key is not None:
+        expected = f"{_V2_NOTES_DIR}/{shard_key[:4]}/{shard_key[5:7]}/{base}.md"
+        if note.rel_path != expected:
+            problems.append(f"path {note.rel_path!r} != {expected!r}")
+
+    if run_date is not None:
+        if date_value is not None and date_value != run_date:
+            problems.append(f"date {date_value!r} != run_date {run_date!r}")
+        if isinstance(run_id_value, str):
+            if run_id is not None:
+                if run_id_value != run_id:
+                    problems.append(f"run_id {run_id_value!r} != injected run_id {run_id!r}")
+            elif run_id_value[:10] != run_date:
+                problems.append(f"run_id {run_id_value!r} date-portion != run_date {run_date!r}")
+
+    if not problems:
+        return []
+    return [
+        LintFinding(
+            "L1-14", "error", note.rel_path, "note date/shard mismatch: " + "; ".join(problems)
+        )
+    ]
+
+
+def _check_admitted_children(
+    note: Note, children: set[str], kind_by_basename: dict[str, str | None]
+) -> list[LintFinding]:
+    """L1-24 (schema 2): a map ``children:`` bullet whose child's kind is not admitted (D1.3).
+
+    ``concept``/``summary``/``map`` YES; ``note`` NEVER (a dated journal churns the map every run —
+    this is v1's UNENFORCED prose rule finally given a rule number); ``entity`` NO on day 1 (every
+    map child is an ADR-0012 ``d_moc = 0`` seed and a population of thin entity pages is exactly
+    the #146 husk shape, OD-2); ``person`` never resolves at all (people basenames are outside the
+    identity space, D3.3 — an attempt is L1-2's broken link).
+
+    Graded over the UNION of the declared ``children:`` set and the body child bullets, so the rule
+    fires on whichever side carries the inadmissible child even when L1-6 is also failing. A child
+    that resolves to no note is skipped: that is L1-2's finding, not this one's.
+    """
+    findings: list[LintFinding] = []
+    for child in sorted(children):
+        child_kind = kind_by_basename.get(child)
+        if child_kind is not None and child_kind not in _V2_ADMITTED_CHILD_KINDS:
+            findings.append(
+                LintFinding(
+                    "L1-24",
+                    "error",
+                    note.rel_path,
+                    f"child {child!r} has kind {child_kind!r}, which a map may not list "
+                    f"(admitted: {sorted(_V2_ADMITTED_CHILD_KINDS)} — ADR-0041 D1.3)",
+                )
+            )
+    return findings
 
 
 def _resolve_targets(notes: list[Note]) -> set[str]:
@@ -575,6 +989,7 @@ def lint(
     run_id: str | None = None,
     max_orphans: int | None = None,
     scope: Collection[str] | None = None,
+    schema_version: int | None = None,
 ) -> LintResult:
     """Run the deterministic L1 lint over the worktree at ``layout`` (ADR-0010 §6 / ADR-0011 §4.4).
 
@@ -616,6 +1031,15 @@ def lint(
     reason (a malformed OUT-OF-SCOPE note no longer aborts the pass); an in-scope malformed note is
     still the fail-fast ``L1-4`` hard reject.
 
+    ``schema_version`` selects the RULESET (ADR-0041 D6). ``None`` (the default) reads it from the
+    resolved :class:`~agora_kb.schema.emit.Taxonomy` — i.e. from ``_meta/taxonomy.yaml``, the
+    canonical home (ADR-0010 §5.1) — so no caller has to learn a new argument and a repo carries its
+    own ruleset. ``1`` is ADR-0010's ruleset, byte-identical to every release before ADR-0041.
+    ``2`` is the ADR-0041 ruleset: predicates key off ``kind`` instead of ``type``, L1-5 reads
+    ``subjects:`` instead of the path, ``wiki/people/**`` is never graded (D3.3), and L1-22 / L1-23
+    / L1-24 are added. An explicit value overrides the taxonomy — the escape hatch for a caller that
+    knows the version out of band (a converter writing a destination repo, a test).
+
     Returns a :class:`LintResult` whose ``findings`` are sorted by ``(path, code)`` (D5) and whose
     ``ok`` is True iff no error-severity finding was raised.
     """
@@ -623,20 +1047,27 @@ def lint(
     allowed_tags = set(tax.allowed_tags)
     allowed_domains = set(tax.domains)
     graded: frozenset[str] | None = None if scope is None else frozenset(scope)
+    version = tax.schema_version if schema_version is None else schema_version
+    # ADR-0041 D3.3: `wiki/people/**` is PERMANENTLY excluded from the graded population, inside
+    # lint() itself rather than behind a caller-supplied lever, so the curator, the dashboard,
+    # `kb_status`, `/metrics` and `health()` can never disagree about a file the curator is
+    # forbidden to fix. It is an exclusion from GRADING, not a severity downgrade: this module's
+    # whole value is that it has one severity axis, and a subtree-keyed second one would end that.
+    skip_people = version >= 2
 
     findings: list[LintFinding] = []
 
     # L1-16 encoding pre-pass — runs over raw bytes BEFORE parsing, so a BOM/CRLF file is flagged
     # even when its (BOM-prefixed) frontmatter then fails to parse.
-    findings.extend(_scan_encoding(layout, graded))
+    findings.extend(_scan_encoding(layout, graded, skip_people=skip_people))
 
     # Parse all notes; a malformed frontmatter block is itself an L1 reject (not a valid note).
     # parse_all_notes is fail-fast: it raises on the FIRST malformed file (in sorted scan order), so
     # a worktree with several malformed notes surfaces one L1-4 per lint pass — deterministic given
     # the bytes, and successive passes report the next file as each is fixed.
-    if graded is None:
+    if graded is None and not skip_people:
         try:
-            notes = parse_all_notes(layout, strict=True)
+            notes = parse_all_notes(layout, strict=True, schema_version=version)
         except FrontmatterError as exc:
             # parse_all_notes prefixes the message with "<rel_path>: ..."; recover the path for the
             # finding so the result still sorts deterministically and points at the broken file.
@@ -649,24 +1080,39 @@ def lint(
             findings.sort(key=lambda f: (f.path, f.code))
             return LintResult(ok=False, findings=tuple(findings))
     else:
-        # SCOPED: read tolerantly so an out-of-scope note that does not parse degrades (empty
-        # frontmatter + full text as body) instead of aborting the whole pass — the ADR-0014 D4
-        # tolerant-consumer read the browse face already uses. The strict half is re-applied to the
-        # in-scope files only, with the same fail-fast shape and the same message.
-        notes = parse_all_notes(layout)
-        malformed = _first_malformed(layout, graded)
+        # SCOPED (and every schema-2 pass): read tolerantly so an UNGRADED note that does not parse
+        # degrades (empty frontmatter + full text as body) instead of aborting the whole pass — the
+        # ADR-0014 D4 tolerant-consumer read the browse face already uses, and, under schema 2, the
+        # only way a malformed `wiki/people/**` note can fail to hard-reject a curator run it has
+        # nothing to do with. The strict half is re-applied to the GRADED files only, with the same
+        # fail-fast shape and the same message.
+        notes = parse_all_notes(layout, schema_version=version)
+        malformed = _first_malformed(layout, graded, skip_people=skip_people)
         if malformed is not None:
             rel, msg = malformed
             findings.append(LintFinding("L1-4", "error", rel, f"malformed frontmatter: {msg}"))
             findings.sort(key=lambda f: (f.path, f.code))
             return LintResult(ok=False, findings=tuple(findings))
 
+    # Schema 2: the human-owned tree, excluded from grading AND from the basename identity space
+    # (ADR-0041 D3.3). Empty on schema 1, which keeps every expression below unchanged there.
+    people_paths = frozenset(
+        n.rel_path for n in notes if skip_people and is_people_path(n.rel_path)
+    )
+
     # The GRADED population for the cross-note uniqueness rules (L1-1 / L1-13 / L1-15) and the
-    # per-note loop. Identical to `notes` when no scope was given. Deliberately NOT used for
-    # `_resolve_targets` below: link RESOLUTION must see every note on disk, or a curator note that
-    # links to an out-of-scope note (its basename is still reserved in the plan-gate registry)
-    # would be flagged L1-2 broken for a target that plainly exists.
-    graded_notes = notes if graded is None else [n for n in notes if n.rel_path in graded]
+    # per-note loop. Identical to `notes` when no scope was given and no people tree exists.
+    # Deliberately NOT used for `_resolve_targets` below: link RESOLUTION must see every note on
+    # disk, or a curator note that links to an out-of-scope note (its basename is still reserved in
+    # the plan-gate registry) would be flagged L1-2 broken for a target that plainly exists.
+    if graded is None and not people_paths:
+        graded_notes = notes
+    else:
+        graded_notes = [
+            n
+            for n in notes
+            if (graded is None or n.rel_path in graded) and n.rel_path not in people_paths
+        ]
 
     # --- L1-1 duplicate basename / L1-13 second index ----------------------------------------
     by_basename: dict[str, list[str]] = {}
@@ -706,7 +1152,9 @@ def lint(
     # are likewise not reserved: an ungraded note's frontmatter was never validated. Empty (hence
     # byte-identical) whenever no scope was given.
     if graded is not None:
-        seen_names |= {n.basename for n in notes if n.rel_path not in graded}
+        seen_names |= {
+            n.basename for n in notes if n.rel_path not in graded and n.rel_path not in people_paths
+        }
     # Sort by path so alias-collision findings are reported deterministically against the union.
     for n in sorted(graded_notes, key=lambda nn: nn.rel_path):
         for a in _str_items(n.frontmatter.get("aliases")):
@@ -721,7 +1169,20 @@ def lint(
                 )
             seen_names.add(a)
 
-    known = _resolve_targets(notes)
+    # `known` spans every note that IS in the `[[basename]]` identity space. Under schema 2 that
+    # deliberately EXCLUDES `wiki/people/**`: a people note is addressed by PATH, never by
+    # `[[basename]]` (ADR-0041 D3.3), so a link into the tree is an L1-2 broken link — stated by the
+    # ADR rather than discovered. Without the exclusion a human file at `wiki/people/x/agora.md`
+    # would silently reserve the basename `agora` against the curator, which is the exact inverse of
+    # "human-owned, curator never touches it".
+    linkable = notes if not people_paths else [n for n in notes if n.rel_path not in people_paths]
+    known = _resolve_targets(linkable)
+
+    # L1-24 needs each child's KIND, keyed by the identity a child bullet resolves to. Built once,
+    # over the linkable population, and only for schema 2 (the rule does not exist in v1).
+    kind_by_basename: dict[str, str | None] = (
+        {n.basename: n.kind for n in linkable} if version >= 2 else {}
+    )
 
     # --- per-note rules ----------------------------------------------------------------------
     for n in graded_notes:
@@ -750,8 +1211,12 @@ def lint(
                     LintFinding("L1-2", "error", path, f"broken wikilink [[{key}]] (no such note)")
                 )
 
-        # L1-4 / L1-11 required frontmatter + enums.
-        findings.extend(_check_required_frontmatter(n))
+        # L1-4 / L1-11 required frontmatter + enums (keyed on `type` in v1, on `kind` in v2).
+        findings.extend(_check_required_frontmatter(n, version))
+
+        # L1-22 (schema 2 only): the kind vocabulary is CLOSED at the directory level (D3.1).
+        if version >= 2:
+            findings.extend(_check_wiki_kind_directory(n))
 
         # L1-20 body-sentinel integrity (no unmatched/nested/duplicated agora:body markers,
         # ADR-0011 §4.4 check 6). Runs on every note; only theme/daily carry markers, so a
@@ -764,7 +1229,7 @@ def lint(
         findings.extend(_check_body_status(n))
 
         # L1-12 dates (format always; no-future only when run_date given).
-        findings.extend(_check_dates(n, run_date))
+        findings.extend(_check_dates(n, run_date, version))
 
         # L1-5 tag/domain membership in the FIXED taxonomy.
         for tag in _str_items(fm.get("tags")):
@@ -772,11 +1237,25 @@ def lint(
                 findings.append(
                     LintFinding("L1-5", "error", path, f"tag {tag!r} not in taxonomy allowed_tags")
                 )
-        domain = _note_domain(path)
-        if domain is not None and domain not in allowed_domains:
-            findings.append(
-                LintFinding("L1-5", "error", path, f"domain {domain!r} not in taxonomy domains")
-            )
+        if version >= 2:
+            # ADR-0041 D2.2/D3.2: the subject lives in `subjects:` and NOWHERE else. Each entry must
+            # already exist in the taxonomy (ADR-0010 D6 preserved exactly — the model still cannot
+            # widen the controlled vocabulary), and an EMPTY list is legal and honest: a capture
+            # whose subject could not be resolved is filed with no subject rather than a possibly
+            # false one, which is what retires ADR-0022 §A's `domains[0]` floor on the wiki side.
+            for subject in _str_items(fm.get("subjects")):
+                if subject not in allowed_domains:
+                    findings.append(
+                        LintFinding(
+                            "L1-5", "error", path, f"subject {subject!r} not in taxonomy domains"
+                        )
+                    )
+        else:
+            domain = _note_domain(path)
+            if domain is not None and domain not in allowed_domains:
+                findings.append(
+                    LintFinding("L1-5", "error", path, f"domain {domain!r} not in taxonomy domains")
+                )
 
         # L1-6 MOC/index children == child-bullet set. The two sides use different normalizers by
         # design: `children:` entries go through wikilinks() (strips interior `[[ ]]` padding) while
@@ -784,24 +1263,28 @@ def lint(
         # `[[`). `children:` entries are therefore EXPECTED to be canonical `[[basename]]` tokens
         # with no interior whitespace — exactly what APPLY materializes — matching the body grammar;
         # a padded body bullet (`- [[ a ]]`) is malformed and correctly diverges from the set.
-        if n.type in ("moc", "index"):
+        if _is_map_kind(n, version):
             declared = {k for entry in _str_items(fm.get("children")) for k in wikilinks(entry)}
-            if declared != child_bullets(n.body):
+            bullets = child_bullets(n.body)
+            if declared != bullets:
                 findings.append(
                     LintFinding(
                         "L1-6",
                         "error",
                         path,
-                        f"children: {sorted(declared)} != child-bullet set "
-                        f"{sorted(child_bullets(n.body))}",
+                        f"children: {sorted(declared)} != child-bullet set {sorted(bullets)}",
                     )
                 )
+            # L1-24 (schema 2 only): the ADMITTED child set, which v1 stated as prose and never
+            # enforced — L1-6 is pure set equality and never inspects a child's kind.
+            if version >= 2:
+                findings.extend(_check_admitted_children(n, declared | bullets, kind_by_basename))
 
         # Theme-specific rules: L1-7/L1-8/L1-8b sources, L1-10 contested shape, L1-19 origin.
         # L1-8/L1-8b (sources existence + no sidecar) are intentionally THEME-SCOPED: a daily's
         # `sources:` are advisory and MAY be empty (ADR-0010 §2.3 — "a daily is not durable
         # provenance"; §3.4 frames source citation around themes), so they are not checked here.
-        if n.type == "theme":
+        if _is_sourced_kind(n, version):
             status = fm.get("status")
             sources_raw = fm.get("sources")
             sources = sources_raw if isinstance(sources_raw, list) else []
@@ -871,7 +1354,13 @@ def lint(
         # run_date). When the FULL injected run_id is supplied, run_id is asserted BYTE-FOR-BYTE
         # (ADR-0010 L1-14 / ADR-0011 §4.4 item 1 — the daily's run_id is the back-link to the run,
         # D1); without it, only the date-portion (run_id[:10] == run_date) can be checked.
-        if n.type == "daily":
+        if version >= 2:
+            # Schema 2: the wiki/notes/<yyyy>/<mm>/<yyyy>-<mm>-<dd>.md identity (D1.1/D2.6). The v1
+            # branch below is NOT reachable here even for a note carrying a stale `type: daily` —
+            # `type:` is RETIRED as an authority in schema 2 (D2.5) and must not select a rule.
+            if _is_journal_kind(n, version):
+                findings.extend(_check_note_shard(n, run_date, run_id))
+        elif n.type == "daily":
             bdate = _basename_date(n.basename)
             date_value = _date_str(fm.get("date"))
             run_id_value = fm.get("run_id")
@@ -905,6 +1394,10 @@ def lint(
     # --- L1-17 schema_version drift across locations present in the worktree -----------------
     findings.extend(_check_schema_version(layout, tax))
 
+    # --- L1-23 reserved `_`-prefixed taxonomy domain (schema 2 only; ADR-0041 D1.4 layer 2) ---
+    if version >= 2:
+        findings.extend(_check_reserved_domains(tax))
+
     # --- L2-1 orphan-theme count (DERIVED, warning-only; ADR-0022 step 2) ---------------------
     # OFF by default (max_orphans is None ⇒ byte-identical). When set, replicate health()'s exact
     # whole-tree derivation: a THEME whose basename is referenced by NO other note's body markdown
@@ -913,14 +1406,28 @@ def lint(
     # the §4.4 curator gate or the dashboard; it is a signal, not a per-note error (INGEST §4.4).
     if max_orphans is not None:
         referenced: set[str] = set()
+        # Schema 2: links OUT of a people note are ungraded (ADR-0041 D3.3), so they do not feed
+        # the reference universe either. Otherwise one human file linking a concept would silently
+        # suppress that concept's orphan count — a human-owned tree acquiring a vote on the signal
+        # that gates a curator run (curator.lint.max_orphans, ADR-0022). Empty on schema 1, so the
+        # v1 derivation is byte-identical. W2.3 must land the SAME answer in the two duplicate
+        # derivations in `faces/mcp_server.py` (health()), or the dashboard and lint will disagree.
         for n in notes:
+            if n.rel_path in people_paths:
+                continue
             referenced.update(body_link_basenames(n.body))
             for fkey in ("related", "children"):
                 fval = n.frontmatter.get(fkey)
                 for item in fval if isinstance(fval, list) else [fval]:
                     if isinstance(item, str):
                         referenced.update(wikilinks(item))
-        orphans = sum(1 for n in notes if n.type == "theme" and n.basename not in referenced)
+        # The orphan POPULATION follows the same predicate as the sourced-kind rules: v1 themes,
+        # v2 `kind in {concept, summary}`. `entity` and `person` are EXEMPT by construction —
+        # entities may not be map children (D1.3) and the curator may not link into `people/` at
+        # all (D3.3), so both are orphans by design and counting them would make the signal noise.
+        orphans = sum(
+            1 for n in notes if _is_sourced_kind(n, version) and n.basename not in referenced
+        )
         if orphans > max_orphans:
             findings.append(
                 LintFinding(

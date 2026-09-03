@@ -1254,3 +1254,83 @@ def test_a_scoped_out_duplicate_basename_does_not_reject_the_curator_note(tmp_pa
     assert scoped.ok is True
     assert all(f.code != "L1-1" for f in scoped.findings)
     assert unscoped.ok is False  # the whole-tree read still reports both halves honestly
+
+
+# --- the ADR-0041 schema dispatch: schema 1 is UNCHANGED ------------------------------------------
+
+
+def test_schema_1_is_the_default_and_the_v1_ruleset_is_byte_identical(tmp_path: Path) -> None:
+    """ADR-0041's dispatch must not move a single schema-1 finding (the additive-wave contract).
+
+    Three ways of asking for the v1 ruleset — defaulted from ``_meta/taxonomy.yaml``, defaulted from
+    an explicitly passed ``Taxonomy``, and pinned with ``schema_version=1`` — must return the SAME
+    :class:`LintResult`, findings and order included, over a repo that exercises several rules at
+    once. Every other test in this module is the second half of the proof: they all run through the
+    same dispatch and none of them changed.
+    """
+    layout = _valid_repo(tmp_path)
+    _write(layout, "wiki/ai-tech/themes/thin.md", _theme_fm(title="Thin", sources=[]))
+    _write(layout, "wiki/nope/themes/off.md", _theme_fm(title="Off vocabulary"))
+
+    from_disk = lint(layout, run_date=RUN_DATE, run_id=RUN_ID)
+    from_taxonomy = lint(layout, taxonomy=_TAXONOMY, run_date=RUN_DATE, run_id=RUN_ID)
+    pinned = lint(layout, taxonomy=_TAXONOMY, run_date=RUN_DATE, run_id=RUN_ID, schema_version=1)
+
+    assert from_disk == from_taxonomy == pinned
+    assert from_disk.ok is False
+    assert {f.code for f in from_disk.findings} == {"L1-5", "L1-7"}
+
+
+def test_the_v1_layout_is_rejected_when_graded_as_schema_2(tmp_path: Path) -> None:
+    """The dispatch is REAL, not a defaulted no-op: the same bytes get a different verdict at v2.
+
+    ``wiki/<domain>/themes/`` is not a schema-2 kind directory (L1-22) and ``type:`` is not a
+    ``kind:`` (L1-11), so a clean v1 repo is a pile of findings under the ADR-0041 ruleset. Without
+    this the "unchanged" test above would also pass if v2 had silently never been reached.
+    """
+    layout = _valid_repo(tmp_path)
+    assert lint(layout, taxonomy=_TAXONOMY, run_date=RUN_DATE, run_id=RUN_ID).ok is True
+
+    as_v2 = lint(layout, taxonomy=_TAXONOMY, run_date=RUN_DATE, run_id=RUN_ID, schema_version=2)
+    assert as_v2.ok is False
+    codes = {f.code for f in as_v2.findings}
+    assert "L1-22" in codes
+    assert "L1-11" in codes
+
+
+def test_the_v2_only_rules_never_fire_under_schema_1(tmp_path: Path) -> None:
+    """L1-22 / L1-23 / L1-24 are ADDED by ADR-0041 and must be unreachable on a v1 repo."""
+    layout = _valid_repo(tmp_path)
+    result = lint(layout, taxonomy=_TAXONOMY, run_date=RUN_DATE, run_id=RUN_ID)
+    assert {"L1-22", "L1-23", "L1-24"}.isdisjoint({f.code for f in result.findings})
+
+
+def test_a_people_tree_is_still_graded_under_schema_1(tmp_path: Path) -> None:
+    """The D3.3 carve-out belongs to schema 2 ONLY — a v1 repo's verdict must not move under it."""
+    layout = _valid_repo(tmp_path)
+    _write_raw(layout, "wiki/people/hando/rough.md", "no frontmatter fence here\n")
+
+    result = lint(layout, taxonomy=_TAXONOMY, run_date=RUN_DATE, run_id=RUN_ID)
+    assert result.ok is False
+    assert [(f.code, f.path) for f in result.findings] == [("L1-4", "wiki/people/hando/rough.md")]
+
+
+def test_the_reading_layer_maps_schema_1_types_onto_the_one_kind_vocabulary(
+    tmp_path: Path,
+) -> None:
+    """ADR-0041 D2.5: a v1 ``type:`` is read through the frozen table so callers branch once.
+
+    The subject stays where v1 put it — the path segment — lifted into the same ``subjects`` tuple
+    a schema-2 note fills from frontmatter, so a read-side caller never asks which schema it is on.
+    """
+    from agora_kb.schema.notes import parse_all_notes
+
+    layout = _valid_repo(tmp_path)
+    notes = {n.rel_path: n for n in parse_all_notes(layout)}
+
+    assert notes["index.md"].kind == "index"
+    assert notes["wiki/ai-tech/ai-tech-moc.md"].kind == "map"
+    assert notes["wiki/ai-tech/themes/curator-concurrency.md"].kind == "concept"
+    assert notes["wiki/ai-tech/themes/curator-concurrency.md"].subjects == ("ai-tech",)
+    assert notes["index.md"].subjects == ()
+    assert notes["index.md"].schema_version == 1
