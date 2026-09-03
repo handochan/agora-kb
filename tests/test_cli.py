@@ -26,8 +26,13 @@ from agora_kb import __version__
 from agora_kb import cli as cli_mod
 from agora_kb.adapters import cli_agent_brain, ollama_brain
 from agora_kb.cli import main
-from agora_kb.config import load_backend_registry
+from agora_kb.config import (
+    ReadOnlySchemaVersionError,
+    load_backend_registry,
+    load_kb_identity,
+)
 from agora_kb.core import Inbox, Repo, RepoLayout, StateStore, failed_event_count
+from agora_kb.core.ids import is_ulid
 from agora_kb.core.inbox import InboxReturn
 from agora_kb.core.state import LastFailure
 from agora_kb.core.wiki import Wiki
@@ -168,6 +173,351 @@ def test_repo_init_emits_schema_and_repo_config_and_lints_clean(
     assert (layout.kb_dir / "repo.yaml").is_file()
     # The freshly-initialized repo lints CLEAN (the schema.lint ok contract for `repo init`).
     assert lint(layout).ok
+
+
+# --- repo init --schema 2 (ADR-0041 D6; OPT-IN in this wave) ------------------------------------
+_V2_KIND_DIRS = ("concepts", "summaries", "notes", "maps", "entities", "people")
+
+
+@requires_git
+def test_repo_init_schema_2_emits_the_v2_seed_and_lints_clean(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`repo init --schema 2` produces a repo that passes the SCHEMA-2 lint with zero findings.
+
+    This is the whole point of the flag: the seed must satisfy the ruleset it declares, or the
+    first thing an operator sees on a fresh v2 repo is a red KB it did not cause.
+    """
+    target = tmp_path / "kb"
+    argv = ["repo", "init", str(target), "--schema", "2", "--domain", "ai-tech", "--tag", "arch"]
+    assert main(argv) == 0
+    assert len(capsys.readouterr().out.strip()) in (40, 64)  # the admin commit sha
+
+    layout = RepoLayout(target)
+    # The emitted contract is ADR-0041's, and its header mirrors the canonical taxonomy (L1-17).
+    doc = layout.schema_file.read_text(encoding="utf-8")
+    assert "KB Wiki Schema v2" in doc
+    assert "is **`2`**" in doc
+    taxonomy = yaml.safe_load((target / "_meta" / "taxonomy.yaml").read_text(encoding="utf-8"))
+    assert taxonomy["schema_version"] == 2
+    repo_yaml = yaml.safe_load((layout.kb_dir / "repo.yaml").read_text(encoding="utf-8"))
+    assert repo_yaml["schema_version"] == 2  # the MIRROR agrees, or L1-17 fires
+
+    # Zero findings under BOTH the taxonomy-derived ruleset and an explicit schema-2 lint.
+    assert lint(layout).findings == ()
+    assert lint(layout, schema_version=2).findings == ()
+
+
+@requires_git
+def test_repo_init_schema_2_mints_kb_identity_mirrored_into_the_index(tmp_path: Path) -> None:
+    """`_meta/kb.yaml` carries a ULID `kb_id`, and the root map's `kb:` mirrors it (D1.5)."""
+    target = tmp_path / "kb"
+    assert main(["repo", "init", str(target), "--schema", "2", "--kind", "team"]) == 0
+
+    identity = load_kb_identity(RepoLayout(target))
+    assert identity is not None
+    assert is_ulid(identity.kb_id)
+    assert identity.name == "kb"
+    assert identity.declared_kind == "team"  # ADVISORY; the enforcing kind stays in _kb/repo.yaml
+
+    index = yaml.safe_load((target / "index.md").read_text(encoding="utf-8").split("---\n")[1])
+    assert index["kind"] == "index"
+    assert index["kb"] == identity.kb_id
+    assert index["subjects"] == []
+    assert index["children"] == []  # an EMPTY root map: no children, no child bullets
+    assert index["type"] == "index"  # the OKF mirror of `kind` (ADR-0041 OD-3), not the authority
+
+
+@requires_git
+def test_repo_init_schema_2_materializes_the_kind_directories(tmp_path: Path) -> None:
+    """The six kind directories exist with a .gitkeep, and the tree is fully committed.
+
+    The directory IS the kind under schema 2, so the tree is the schema's own statement of what
+    kinds exist — including the two that ship EMPTY (summaries, entities) and the one the curator
+    may never create (people). An uncommitted placeholder would leave `repo init` handing back a
+    dirty worktree.
+    """
+    target = tmp_path / "kb"
+    assert main(["repo", "init", str(target), "--schema", "2"]) == 0
+    for name in _V2_KIND_DIRS:
+        assert (target / "wiki" / name / ".gitkeep").is_file()
+    status = subprocess.run(
+        ["git", "status", "--porcelain"], cwd=target, capture_output=True, text=True, check=True
+    )
+    assert status.stdout == ""
+
+
+@requires_git
+def test_repo_init_schema_2_writes_per_kind_templates(tmp_path: Path) -> None:
+    target = tmp_path / "kb"
+    assert main(["repo", "init", str(target), "--schema", "2"]) == 0
+    templates = target / "_templates"
+    assert (templates / "concept.md").is_file()
+    assert (templates / "note.md").is_file()
+    assert not (templates / "theme.md").exists()  # the per-TYPE pair belongs to schema 1
+
+
+@requires_git
+def test_repo_init_schema_2_is_idempotent_and_never_remints_kb_id(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A kb_id is minted ONCE at repo creation and never rewritten (ADR-0041 D1.5).
+
+    Re-minting on a re-init would silently re-identify the knowledge base, orphaning the `kb:`
+    stamp already mirrored into every note.
+    """
+    target = tmp_path / "kb"
+    assert main(["repo", "init", str(target), "--schema", "2"]) == 0
+    first_sha = capsys.readouterr().out.strip()
+    identity = load_kb_identity(RepoLayout(target))
+    assert identity is not None
+
+    assert main(["repo", "init", str(target), "--schema", "2"]) == 0
+    assert capsys.readouterr().out.strip() == first_sha  # no new curated commit
+    again = load_kb_identity(RepoLayout(target))
+    assert again is not None
+    assert again.kb_id == identity.kb_id
+
+
+@requires_git
+def test_repo_init_defaults_to_schema_1_unchanged(tmp_path: Path) -> None:
+    """No --schema flag == today's behaviour exactly: v1 doc, v1 seed, no schema-2 artifacts."""
+    target = tmp_path / "kb"
+    assert main(["repo", "init", str(target), "--domain", "ai-tech"]) == 0
+
+    layout = RepoLayout(target)
+    assert "KB Wiki Schema v1" in layout.schema_file.read_text(encoding="utf-8")
+    assert (
+        yaml.safe_load((target / "_meta" / "taxonomy.yaml").read_text(encoding="utf-8"))[
+            "schema_version"
+        ]
+        == 1
+    )
+    assert (
+        yaml.safe_load((layout.kb_dir / "repo.yaml").read_text(encoding="utf-8"))["schema_version"]
+        == 1
+    )
+    # None of the schema-2 skeleton is created on the default path.
+    assert not (target / "_meta" / "kb.yaml").exists()
+    assert not (target / "wiki").exists()
+    assert (target / "_templates" / "theme.md").is_file()
+    index = (target / "index.md").read_text(encoding="utf-8")
+    assert "type: index" in index and "kind: index" not in index
+    assert lint(layout).findings == ()
+
+
+@requires_git
+def test_repo_init_refuses_to_convert_an_existing_schema_1_repo_and_writes_NOTHING(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """ADR-0041 D6: "there is no in-place migrator", and no command silently upgrades a repo.
+
+    The regression this pins is a HALF-migration: seeding the schema-2 skeleton and re-stamping the
+    git-ignored `_kb/repo.yaml` mirror to 2 over a canonical `_meta/taxonomy.yaml` that stays at 1
+    leaves a previously healthy v1 repo permanently L1-17-broken, with the failure arriving only at
+    the lint gate AFTER the writes. The refusal must therefore come BEFORE anything is written.
+    """
+    target = tmp_path / "kb"
+    assert main(["repo", "init", str(target), "--domain", "general"]) == 0
+    capsys.readouterr()
+    before = sorted(q.relative_to(target).as_posix() for q in target.rglob("*") if q.is_file())
+
+    assert main(["repo", "init", str(target), "--schema", "2", "--domain", "general"]) == 1
+    err = capsys.readouterr().err
+    assert "no in-place migrator" in err
+    assert "import --from-kb" in err
+
+    # Nothing was written: same files, same mirror, and the repo still lints clean.
+    assert sorted(q.relative_to(target).as_posix() for q in target.rglob("*") if q.is_file()) == (
+        before
+    )
+    layout = RepoLayout(target)
+    assert not (target / "_meta" / "kb.yaml").exists()
+    assert not (target / "wiki").exists()
+    assert (
+        yaml.safe_load((layout.kb_dir / "repo.yaml").read_text(encoding="utf-8"))["schema_version"]
+        == 1
+    )
+    assert lint(layout).ok
+
+
+@requires_git
+def test_repo_init_refuses_to_downgrade_an_existing_schema_2_repo(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The refusal is symmetric — a conversion in either direction is a re-import, not an edit."""
+    target = tmp_path / "kb"
+    assert main(["repo", "init", str(target), "--schema", "2"]) == 0
+    capsys.readouterr()
+
+    assert main(["repo", "init", str(target), "--schema", "1"]) == 1
+    assert "import --from-kb" in capsys.readouterr().err
+    assert lint(RepoLayout(target)).ok
+
+
+@requires_git
+def test_repo_init_re_init_without_the_flag_KEEPS_the_repos_own_schema_version(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A bare re-init is IDEMPOTENT (this command's own docstring) on a schema-2 repo too.
+
+    The regression: `--schema` defaulting to 1 made a flagless re-init rewrite the `_kb/repo.yaml`
+    MIRROR to 1 while the canonical `_meta/taxonomy.yaml` kept saying 2 — permanent L1-17 drift
+    that fails every later lint and therefore the curator's §4.4 gate, clearable only by hand.
+    """
+    target = tmp_path / "kb"
+    assert main(["repo", "init", str(target), "--schema", "2"]) == 0
+    first_sha = capsys.readouterr().out.strip()
+
+    assert main(["repo", "init", str(target)]) == 0  # no --schema at all
+    assert capsys.readouterr().out.strip() == first_sha
+
+    layout = RepoLayout(target)
+    mirror = yaml.safe_load((layout.kb_dir / "repo.yaml").read_text(encoding="utf-8"))
+    canonical = yaml.safe_load((target / "_meta" / "taxonomy.yaml").read_text(encoding="utf-8"))
+    assert mirror["schema_version"] == canonical["schema_version"] == 2
+    assert lint(layout).ok  # no L1-17 drift
+
+
+@requires_git
+def test_repo_init_refuses_a_declaration_that_runs_AHEAD_of_the_tree(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A hand-bumped `_meta/taxonomy.yaml` must NOT make a flagless re-init seed a v2 skeleton.
+
+    "Edit the declared version" is the first thing an operator reaches for when asking how to
+    migrate (ADR-0041 D6 answers "you don't"). Resolving the version from the declaration is
+    right, but SEEDING schema 2 into the schema-1 tree underneath it is the same half-migration
+    the `--schema` contradiction refusal exists to prevent: it leaves `_meta/kb.yaml`, a v2 root
+    map and six `wiki/<kind>/` directories as untracked residue behind a failed lint gate, on this
+    run and on every re-run. A repo we refuse gets ZERO writes.
+    """
+    target = tmp_path / "kb"
+    assert main(["repo", "init", str(target)]) == 0  # a plain schema-1 repo
+    capsys.readouterr()
+    taxonomy_path = target / "_meta" / "taxonomy.yaml"
+    taxonomy = yaml.safe_load(taxonomy_path.read_text(encoding="utf-8"))
+    taxonomy["schema_version"] = 2
+    taxonomy_path.write_text(yaml.safe_dump(taxonomy, sort_keys=False), encoding="utf-8")
+
+    assert main(["repo", "init", str(target)]) == 1  # a refusal, not a warning
+    err = capsys.readouterr().err
+    assert "import --from-kb" in err  # the D6 remedy, not a list of lint codes
+
+    # No residue: nothing the schema-2 seed would have written exists.
+    assert not (target / "_meta" / "kb.yaml").exists()
+    assert not (target / "wiki" / "maps").exists()
+    assert not (target / "wiki" / "concepts").exists()
+
+
+@requires_git
+def test_repo_init_never_lets_the_git_ignored_mirror_decide_the_schema(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`_kb/repo.yaml` is git-ignored, operator-local and rewritten HERE — never the authority.
+
+    A pre-#98-shaped repo (canonical taxonomy with no `schema_version` key) plus a mirror
+    hand-edited to 2 must still resolve to the canonical default 1: an untracked local edit may not
+    reshape a shared, git-tracked tree.
+    """
+    target = tmp_path / "kb"
+    assert main(["repo", "init", str(target)]) == 0
+    capsys.readouterr()
+    layout = RepoLayout(target)
+
+    taxonomy_path = target / "_meta" / "taxonomy.yaml"
+    taxonomy = yaml.safe_load(taxonomy_path.read_text(encoding="utf-8"))
+    taxonomy.pop("schema_version", None)
+    taxonomy_path.write_text(yaml.safe_dump(taxonomy, sort_keys=False), encoding="utf-8")
+    mirror_path = layout.kb_dir / "repo.yaml"
+    mirror = yaml.safe_load(mirror_path.read_text(encoding="utf-8"))
+    mirror["schema_version"] = 2
+    mirror_path.write_text(yaml.safe_dump(mirror, sort_keys=False), encoding="utf-8")
+
+    assert main(["repo", "init", str(target)]) == 0
+    capsys.readouterr()
+    assert not (target / "_meta" / "kb.yaml").exists()
+    assert not (target / "wiki" / "maps").exists()
+    # The mirror is re-stamped from the CANONICAL resolution, not from its own stale value.
+    assert yaml.safe_load(mirror_path.read_text(encoding="utf-8"))["schema_version"] == 1
+    # ...and it never gets to veto an explicit --schema either: the canonical file says 1.
+    assert main(["repo", "init", str(target), "--schema", "2"]) == 1
+    assert "schema-1 KB" in capsys.readouterr().err
+
+
+@requires_git
+def test_repo_init_says_out_loud_that_schema_2_is_not_yet_curate_able(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The write path still emits v1 paths, so `agora curate` cannot publish into a v2 repo yet."""
+    assert main(["repo", "init", str(tmp_path / "kb"), "--schema", "2"]) == 0
+    assert "not yet curate-able" in capsys.readouterr().err
+
+
+@requires_git
+@pytest.mark.parametrize("reserved", ["_blob", "_pages"])
+def test_repo_init_refuses_a_reserved_underscore_domain(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], reserved: str
+) -> None:
+    """The tool must never mint a repo whose taxonomy a later load refuses (ADR-0041 D1.4/L1-23).
+
+    `raw/<domain>/` and `raw/_blob/` share one namespace, so the reservation is enforced at the
+    DECLARATION site as well as at load and by lint — before anything is written.
+    """
+    target = tmp_path / "kb"
+    assert main(["repo", "init", str(target), "--domain", reserved]) == 1
+    assert reserved in capsys.readouterr().err
+    assert not (target / "_meta").exists()
+
+
+@requires_git
+def test_curate_reports_an_invalid_config_as_one_line_not_a_traceback(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A config refusal on the write path is an operator message, like every other command's."""
+    target = tmp_path / "kb"
+    assert main(["repo", "init", str(target)]) == 0
+    capsys.readouterr()
+    (RepoLayout(target).kb_dir / "repo.yaml").write_text("name: [broken\n", encoding="utf-8")
+
+    assert main(["curate", "--repo", str(target)]) == 1
+    captured = capsys.readouterr()
+    assert "curate: invalid config" in captured.err
+    assert "Traceback" not in captured.err
+
+
+@requires_git
+def test_curate_renders_a_schema_refusal_as_itself_not_as_an_invalid_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`ReadOnlySchemaVersionError` is a `ConfigError` — the arms must be ORDERED, as elsewhere.
+
+    W2.2 wires `assert_writable_kb_schema_version` into exactly this command. Caught by the blanket
+    `except ConfigError`, "this KB is READ-ONLY for this agora build" would print as
+    `invalid config: ...` and send the operator to edit a repo.yaml that is perfectly fine.
+    """
+    target = tmp_path / "kb"
+    assert main(["repo", "init", str(target)]) == 0
+    capsys.readouterr()
+
+    def _refuse(layout: RepoLayout) -> None:
+        raise ReadOnlySchemaVersionError(1, repo=layout.root)
+
+    monkeypatch.setattr(cli_mod, "load_repo_config", _refuse)
+
+    assert main(["curate", "--repo", str(target)]) == 1
+    err = capsys.readouterr().err
+    assert "invalid config" not in err
+    assert "Traceback" not in err
+    assert "READ-ONLY" in err.upper()
+
+
+def test_repo_init_rejects_an_unknown_schema_version(capsys: pytest.CaptureFixture[str]) -> None:
+    """argparse gates the version at the boundary — 3 is not a schema this build can emit."""
+    with pytest.raises(SystemExit) as exc:
+        main(["repo", "init", "unused", "--schema", "3"])
+    assert exc.value.code == 2
+    assert "--schema" in capsys.readouterr().err
 
 
 def test_repo_without_subcommand_returns_2(capsys: pytest.CaptureFixture[str]) -> None:
