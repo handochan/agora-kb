@@ -18,15 +18,20 @@ import yaml
 from agora_kb.config import (
     BackupPolicy,
     ConfigError,
+    KbIdentity,
     RepoConfig,
     WebConfig,
     load_backend_registry,
     load_backup_policy,
+    load_harvest_policy,
+    load_kb_identity,
     load_repo_config,
     load_web_config,
     repo_config_path,
     write_default_repo_config,
+    write_kb_identity,
 )
+from agora_kb.core.ids import new_ulid
 from agora_kb.core.layout import RepoLayout
 from agora_kb.curator.constants import (
     DEFAULT_BODY_BYTE_BOUND,
@@ -835,3 +840,233 @@ def test_connector_max_files_fails_loud_on_a_bad_value(tmp_path: Path, bad: str)
 
     with pytest.raises(ConfigError, match="max_files"):
         load_connector_specs(p)
+
+
+# --- (k) _meta/kb.yaml — the KB identity, closed key set (ADR-0041 D1.5) ------------------------
+
+
+def _write_kb_yaml(layout: RepoLayout, text: str) -> None:
+    (layout.root / "_meta").mkdir(parents=True, exist_ok=True)
+    layout.kb_meta_file.write_text(text, encoding="utf-8")
+
+
+def test_kb_identity_absent_file_is_none_not_an_error(tmp_path: Path) -> None:
+    """Every schema-1 repo predates the file; the LOADER cannot know which schema it is under.
+
+    So absence is "no identity declared" and the caller decides what that means — a schema-2 write
+    path treats it as a broken repo, a read path and ``agora doctor`` carry on (ADR-0041 D1.5).
+    """
+    assert load_kb_identity(_layout(tmp_path)) is None
+
+
+def test_kb_identity_round_trips_through_write_and_load(tmp_path: Path) -> None:
+    layout = _layout(tmp_path)
+    identity = KbIdentity(kb_id=new_ulid(), name="general", declared_kind="personal")
+
+    path = write_kb_identity(layout, identity)
+
+    assert path == layout.kb_meta_file
+    assert load_kb_identity(layout) == identity
+    assert yaml.safe_load(path.read_text(encoding="utf-8")) == {
+        "kb_id": identity.kb_id,
+        "name": "general",
+        "declared_kind": "personal",
+    }
+
+
+def test_kb_identity_omits_an_unset_declared_kind_rather_than_writing_null(tmp_path: Path) -> None:
+    """A null advisory field reads as a value; the key is simply absent when unset."""
+    layout = _layout(tmp_path)
+    write_kb_identity(layout, KbIdentity(kb_id=new_ulid(), name="general"))
+
+    raw = yaml.safe_load(layout.kb_meta_file.read_text(encoding="utf-8"))
+    assert "declared_kind" not in raw
+    assert load_kb_identity(layout).declared_kind is None
+
+
+def test_kb_identity_write_is_idempotent_and_replaces(tmp_path: Path) -> None:
+    layout = _layout(tmp_path)
+    kb_id = new_ulid()
+    write_kb_identity(layout, KbIdentity(kb_id=kb_id, name="one"))
+    first = layout.kb_meta_file.read_text(encoding="utf-8")
+    write_kb_identity(layout, KbIdentity(kb_id=kb_id, name="one"))
+
+    assert layout.kb_meta_file.read_text(encoding="utf-8") == first
+    write_kb_identity(layout, KbIdentity(kb_id=kb_id, name="two"))
+    assert load_kb_identity(layout).name == "two"
+
+
+def test_kb_identity_kb_id_must_be_a_ulid(tmp_path: Path) -> None:
+    """``kb_id`` is a ULID minted once (D1.5) — a free-form string would split the join identity."""
+    with pytest.raises(ValueError, match="ULID"):
+        KbIdentity(kb_id="not-a-ulid", name="general")
+
+    layout = _layout(tmp_path)
+    _write_kb_yaml(layout, "kb_id: nope\nname: general\n")
+    with pytest.raises(ConfigError, match="ULID"):
+        load_kb_identity(layout)
+
+
+def test_kb_identity_rejects_a_blank_name(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="non-empty display name"):
+        KbIdentity(kb_id=new_ulid(), name="   ")
+
+
+def test_kb_identity_declared_kind_vocabulary_is_validated(tmp_path: Path) -> None:
+    """Advisory does not mean free-form: a typo'd advisory value is one nobody can act on."""
+    with pytest.raises(ValueError, match="declared_kind"):
+        KbIdentity(kb_id=new_ulid(), name="general", declared_kind="persnoal")
+
+
+def test_kb_identity_declared_kind_is_advisory_and_never_the_enforcing_kind(tmp_path: Path) -> None:
+    """THE D1.5 SAFETY PROPERTY: a git-tracked declaration must not become a remote claim.
+
+    ``_meta/kb.yaml`` travels with a clone. If ``declared_kind`` were enforcing, an UPSTREAM
+    author's ``declared_kind: personal`` would unlock a DOWNSTREAM operator's personal-scope
+    connectors. The enforcing value stays ``kind`` in git-ignored ``_kb/repo.yaml``, which is what
+    :func:`load_harvest_policy` reads for the ADR-0007 scope lock — asserted here rather than only
+    stated, with the two files DISAGREEING so the assertion has teeth.
+    """
+    layout = _layout(tmp_path)
+    _write_repo_yaml(layout, "name: r\nkind: team\n")
+    write_kb_identity(layout, KbIdentity(kb_id=new_ulid(), name="r", declared_kind="personal"))
+
+    assert load_repo_config(layout).kind == "team"  # repo.yaml wins…
+    assert load_harvest_policy(layout).repo_kind == "team"  # …including for the scope lock
+    assert load_kb_identity(layout).declared_kind == "personal"  # …while the advisory is recorded
+
+
+@pytest.mark.parametrize(
+    "policy_key",
+    ["kind", "harvest", "curator", "domains", "allowed_tags", "schema_version", "web"],
+)
+def test_kb_identity_rejects_policy_keys_with_a_pointed_message(
+    tmp_path: Path, policy_key: str
+) -> None:
+    """POLICY MUST NEVER LIVE IN kb.yaml (D1.5) — and the refusal says why, not "unknown key"."""
+    layout = _layout(tmp_path)
+    _write_kb_yaml(layout, f"kb_id: {new_ulid()}\nname: general\n{policy_key}: personal\n")
+
+    with pytest.raises(ConfigError) as excinfo:
+        load_kb_identity(layout)
+    message = str(excinfo.value)
+    assert policy_key in message
+    assert "policy" in message.lower()
+    assert "_kb/repo.yaml" in message
+
+
+def test_kb_identity_key_set_is_closed_to_any_extra(tmp_path: Path) -> None:
+    """Deliberately the OPPOSITE of repo.yaml's tolerant unknown-key rule — kb.yaml is git-TRACKED.
+
+    An unknown key in git-ignored ``_kb/repo.yaml`` is a local typo; an unknown key here arrived
+    from whoever authored the repo, so it fails loud.
+    """
+    layout = _layout(tmp_path)
+    _write_kb_yaml(layout, f"kb_id: {new_ulid()}\nname: general\nnickname: kb\n")
+
+    with pytest.raises(ConfigError, match="CLOSED"):
+        load_kb_identity(layout)
+
+    # The model enforces the same set by construction, so the writer cannot emit a fourth key.
+    with pytest.raises(ValueError):
+        KbIdentity(kb_id=new_ulid(), name="general", nickname="kb")
+
+
+def test_kb_identity_present_but_incomplete_fails_loud(tmp_path: Path) -> None:
+    layout = _layout(tmp_path)
+    _write_kb_yaml(layout, "name: general\n")
+    with pytest.raises(ConfigError, match="kb_id"):
+        load_kb_identity(layout)
+
+
+@pytest.mark.parametrize("text", ["", "- a\n- b\n", "just a string\n"])
+def test_kb_identity_present_but_not_a_mapping_fails_loud(tmp_path: Path, text: str) -> None:
+    layout = _layout(tmp_path)
+    _write_kb_yaml(layout, text)
+    with pytest.raises(ConfigError):
+        load_kb_identity(layout)
+
+
+def test_kb_identity_malformed_yaml_fails_loud(tmp_path: Path) -> None:
+    layout = _layout(tmp_path)
+    _write_kb_yaml(layout, "kb_id: [unclosed\n")
+    with pytest.raises(ConfigError):
+        load_kb_identity(layout)
+
+
+def test_kb_identity_is_not_part_of_repo_config(tmp_path: Path) -> None:
+    """Two files, two loaders: ``load_repo_config`` never reads (or is broken by) kb.yaml."""
+    layout = _layout(tmp_path)
+    write_kb_identity(layout, KbIdentity(kb_id=new_ulid(), name="identity-name"))
+
+    cfg = load_repo_config(layout)
+    assert cfg.name == "personal"  # the repo.yaml default, NOT the kb.yaml display name
+    assert not hasattr(cfg, "kb_id")
+
+
+# --- (k.1) reserved raw/ domain prefix — the D1.4 layer-2 taxonomy control (L1-23) --------------
+
+
+@pytest.mark.parametrize("reserved", ["_blob", "_pages", "_kb", "_anything"])
+def test_taxonomy_rejects_a_domain_beginning_with_underscore(tmp_path: Path, reserved: str) -> None:
+    """``raw/<domain>/`` and ``raw/_blob/`` share ONE namespace (ADR-0041 D1.4 layer 2).
+
+    A taxonomy declaring a domain literally named ``_blob`` would make APPLY write
+    ``raw/_blob/<event_id>.md`` into the content-addressed tree. SCHEMA 2, matching lint's own
+    ``version >= 2`` gate on L1-23 (a rule ADDED by ADR-0041 D3.1).
+    """
+    layout = _layout(tmp_path)
+    _write_meta_taxonomy(layout, f"schema_version: 2\ndomains: [general, {reserved}]\n")
+
+    with pytest.raises(ConfigError) as excinfo:
+        load_repo_config(layout)
+    assert reserved in str(excinfo.value)
+    assert "raw/" in str(excinfo.value)
+
+
+def test_taxonomy_reserved_domain_rejected_in_the_repo_yaml_fallback_too(tmp_path: Path) -> None:
+    """The fallback path is the SAME namespace: a pre-emit repo must not slip one through."""
+    layout = _layout(tmp_path)
+    _write_repo_yaml(layout, "name: r\nschema_version: 2\ndomains: [general, _blob]\n")
+
+    with pytest.raises(ConfigError, match="_blob"):
+        load_repo_config(layout)
+
+
+@pytest.mark.parametrize("reserved", ["_blob", "_pages"])
+def test_taxonomy_reserved_domain_is_NOT_a_load_failure_on_a_schema_1_repo(
+    tmp_path: Path, reserved: str
+) -> None:
+    """A schema-1 repo LOADS exactly as it did before ADR-0041 — the wave's additivity contract.
+
+    L1-23 is a rule ADDED by ADR-0041 D3.1 (the ADR-0010 supersession banner) and ``schema/lint.py``
+    gates its half on ``version >= 2``. Enforcing it at LOAD time for schema 1 too would be a new
+    hard failure on the one class of repo this wave promises to leave untouched — and because
+    every read surface loads config first (``agora curate``, ``AgoraHandlers.health()``, the
+    dashboard, ``agora doctor``), it would arrive as an exception out of a READ path rather than as
+    the lint finding ADR-0041 specifies.
+    """
+    layout = _layout(tmp_path)
+    _write_meta_taxonomy(layout, f"schema_version: 1\ndomains: [general, {reserved}]\n")
+
+    assert load_repo_config(layout).taxonomy.domains == ("general", reserved)
+
+
+def test_taxonomy_ordinary_domains_are_unaffected(tmp_path: Path) -> None:
+    """The control is a leading underscore ONLY — an internal one is a legal kebab-ish token."""
+    layout = _layout(tmp_path)
+    _write_meta_taxonomy(
+        layout, "schema_version: 1\ndomains: [general, ai-tech, snake_case, a_b]\n"
+    )
+
+    assert load_repo_config(layout).taxonomy.domains == ("general", "ai-tech", "snake_case", "a_b")
+
+
+def test_taxonomy_load_reads_the_schema_version_on_both_sides_of_the_gate(tmp_path: Path) -> None:
+    """The reserved-domain gate is schema-keyed, so the version read itself must stay exact."""
+    layout = _layout(tmp_path)
+    _write_meta_taxonomy(layout, "schema_version: 1\ndomains: [general]\n")
+    assert load_repo_config(layout).taxonomy.schema_version == 1
+
+    _write_meta_taxonomy(layout, "schema_version: 2\ndomains: [general]\n")
+    assert load_repo_config(layout).taxonomy.schema_version == 2
