@@ -14,7 +14,7 @@ The unit of capture (the "event" in the append-only log). Markdown with YAML fro
 ```yaml
 ---
 id: 2026-06-13T10-22-33.481Z--a1b2c3      # time-sortable ISO + short random ⇒ globally unique, FIFO-ordered
-source: claude-code | codex | qwen | gemini | opencode | hermes | web:<user> | harvest:<agent> | manual
+source: claude-code | ... | manual | agent:<name> | web:<user> | harvest:<agent>   # see the table below
 writer: dochan                            # who/what captured it (namespacing + provenance)
 cwd: /Users/handochan/dev/analytics/psa   # where captured, if applicable (provenance)
 target: personal | team:engineering       # which repo this routes to (default: personal)
@@ -36,6 +36,21 @@ by location: `_kb/inbox/` (pending) → `_kb/processing/<run-id>/` (claimed) →
 in the processing directory. `event_key` provides delivery idempotency; identical `content_sha256`
 values are equivalent content whose distinct sources/writers must still be preserved and merged into
 provenance.
+
+**The `source` vocabulary.** `source` records *what kind of thing produced the capture*, and it is
+deliberately open at the edges — the engine must never hold a blessed list of agent names
+(invariant 6). Three of its forms are parametric, so a new agent, user or team needs no core change:
+
+| form | meaning | notes |
+|---|---|---|
+| `claude-code` \| `codex` \| `qwen` \| `gemini` \| `opencode` \| `hermes` \| `manual` | the fixed names the engine shipped with | kept for BACK-COMPAT (events already on disk carry them); not the way a new agent is added |
+| `agent:<name>` | any agent capturing under its own identity — `agent:aelix`, `agent:copilot` | a first-class `kind=capture`; `<name>` is `[A-Za-z0-9][A-Za-z0-9._-]*` and is stamped VERBATIM into provenance. A bare `aelix` (no prefix) is REJECTED, so a typo can never be silently blessed as a new agent |
+| `web:<user>` | the web face, per authenticated/asserted user (#67) | |
+| `harvest:<agent>` | the read-side harvester, per connector agent | enters GATED as `kind=candidate` (ADR-0007): the curator may `MERGE_INTO_THEME` / `MARK_CONTESTED` / `DROP` it, never create a note from it |
+
+The distinction that matters is `agent:<name>` vs `harvest:<agent>`: the first is an agent
+*asserting* something it wants remembered (a full capture), the second is Agora *pulling* from an
+agent's memory or transcripts without being asked (a gated candidate). Both stay attributable.
 
 **Back-edges.** Two transitions return an event to `_kb/inbox/`. Both are a single `os.replace` — the
 bytes, the `id` and the frontmatter are preserved, so a back-edge never mints a second event for one
@@ -165,8 +180,8 @@ These promote three previously-hardcoded/inert tunables (ADR-0011 §1.3) to oper
 
 - `curator.limits.body_byte_bound` (default `8192`) — the `{n_bytes}` body ceiling surfaced to the
   brain (authoritative §4.2 enforcement is unchanged).
-- `curator.limits.related_k` (default `8`) — the `wiki.query(limit=…)` breadth for the bundle's
-  related-notes fetch.
+- `curator.limits.related_k` (default `8`) — the `wiki.query_lexical(limit=…)` breadth for the
+  bundle's related-notes fetch (the model-free oracle the write path is pinned to, #144).
 - `curator.lint.max_orphans` (default **absent ⇒ check skipped**, byte-identical to today) — when set,
   `lint` emits **one `warning`-severity** `L2-1` finding if the whole-tree orphan-theme count exceeds
   it; a warning never flips `LintResult.ok`, so it does not break the §4.4 gate or the dashboard.
@@ -454,6 +469,8 @@ and every inbox item carries `source`. The harvester additionally marks origin s
 are **never re-harvested** back into the KB:
 
 - inbox `source=harvest:<agent>` → curator tags the resulting note region with `origin: harvest:<agent>`.
+  The `origin` vocabulary is an EXACT copy of the `source` enum above (ADR-0010 D4), `agent:<name>`
+  included — the L1-19 lint enum tracks §1 rather than freezing a subset of it.
 - A connector skips any fact whose origin trace points back to Agora (breaks the KB→memory→KB loop).
 
 ## 8. Adapter config — `adapters.yaml`
@@ -483,6 +500,8 @@ extractors:
 connectors:
   file:claude-code: { path: "~/.claude/**/MEMORY.md", scope: personal, follow_links: true }
   file:hermes:      { path: "~/.hermes/MEMORY.md",    scope: personal }
+  session:claude-code: { path: "~/.claude/projects/**/*.jsonl", scope: personal,
+                         format: claude-code-jsonl }   # format optional; this is the default
   # letta:   { api: "...", scope: personal }
   # mem0:    { api: "...", scope: personal }
 ```
@@ -491,6 +510,12 @@ connectors:
 `follow_links` (optional, default `false`; ADR-0018) makes a `file:` connector follow a bullet's
 `[Title](sibling.md)` link and harvest the sibling's content (frontmatter stripped) instead of the
 thin one-line summary — opt-in, one hop, confined to the source file's own directory subtree.
+`format` (optional, `session:` connectors only; default `claude-code-jsonl`) names the transcript
+grammar the connector's files are parsed with. It is the config-visible half of the `SessionReader`
+seam: without it every `session:<agent>` connector in the world was parsed as Claude Code JSONL,
+which privileged one agent's format in the engine (invariant 6). The engine dispatches on this
+DECLARED format, never on the `<agent>` half of the key; an unknown name is a hard config error, and
+`harvester.session_sources.SESSION_READERS` is the registry a new grammar is added to.
 
 The exact argv is backend/version-specific and validated by the adapter. The registry stores an argv
 array rather than a shell command, and prompt data travels over stdin or a read-only file. Backend

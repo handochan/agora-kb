@@ -94,3 +94,57 @@ def test_frozen_is_immutable() -> None:
 def test_extra_fields_forbidden() -> None:
     with pytest.raises(ValueError):
         _item(unexpected="nope")
+
+
+# --- agent:<name> — the tool-agnostic source form (issue #147, invariant #6) --------------------
+
+
+@pytest.mark.parametrize("good", ["agent:aelix", "agent:copilot", "agent:some-agent.v2"])
+def test_agent_source_accepted_and_stamped_verbatim(good: str) -> None:
+    """A new agent gets a first-class capture WITHOUT a core PR — and keeps its own name.
+
+    The stamped value must be byte-identical to what the caller supplied: provenance that
+    normalized or aliased the name would make two agents indistinguishable downstream.
+    """
+    item = _item(source=good)
+    assert item.source == good
+    assert item.to_frontmatter()["source"] == good
+
+
+def test_agent_source_is_a_capture_not_a_gated_candidate() -> None:
+    """`agent:<name>` is an assertion by the agent, so it defaults to `kind=capture`.
+
+    This is the whole point of the form: `harvest:<agent>` (Agora PULLING from an agent) enters
+    gated, and the gate's closed op set cannot create a note. An agent capturing under its own
+    identity must not be forced through that door.
+    """
+    assert _item(source="agent:aelix").kind is Kind.capture
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "aelix",  # a BARE name stays rejected — no silent blessing of an unprefixed source
+        "agent:",  # the <name> token is required
+        "agent:a b",  # whitespace never reaches provenance
+        "agent:.hidden",  # must start alphanumeric (same rule as team:<name>)
+        "agent:a/b",  # no path separators
+        "agent:aelix\n",  # \A...\Z, so a trailing newline cannot slip through
+    ],
+)
+def test_bad_agent_source_rejected(bad: str) -> None:
+    with pytest.raises(ValueError):
+        _item(source=bad)
+
+
+def test_fixed_sources_are_not_widened_by_the_parametric_form() -> None:
+    """The back-compat set stays exactly what it was — `agent:<name>` is the growth path.
+
+    A regression here would mean someone added an agent name to the core again, which is the
+    invariant-6 violation issue #147 closed.
+    """
+    from agora_kb.core.models import FIXED_SOURCES
+
+    assert FIXED_SOURCES == frozenset(
+        {"claude-code", "codex", "qwen", "gemini", "opencode", "hermes", "manual"}
+    )

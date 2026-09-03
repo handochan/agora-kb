@@ -91,6 +91,18 @@ __all__ = [
 # Scope enum) so this config seam never imports the harvester package — the harvester imports
 # config, not the reverse, so the dependency stays acyclic. The harvester maps these to its enum.
 _SCOPE_VALUES = ("personal", "team")
+# Session-transcript format names a `session:` connector may declare (issue #147). Held HERE as
+# plain strings for the SAME reason _SCOPE_VALUES is: this config seam never imports the
+# harvester package (the harvester imports config, not the reverse), so the dependency stays
+# acyclic. The registry that maps these names to reader classes is
+# `harvester.session_sources.SESSION_READERS`; a sync test asserts the two never drift.
+#
+# This is the IMPLEMENTED subset of that registry (`session_sources.implemented_session_formats()`),
+# NOT every registered key: a registered-but-unbuilt SLOT must fail HERE, at config load, as an
+# unknown format. Accepting it would defer the failure to `build_connectors`, which builds every
+# connector before `agora harvest` applies `--connector` — so one aspirational line would disable
+# harvesting for unrelated healthy connectors while `agora doctor` still reported the repo healthy.
+_SESSION_FORMATS = ("claude-code-jsonl",)
 
 # DATA-MODEL §3: the per-repo config lives in the git-ignored operational spool at _kb/repo.yaml.
 _REPO_CONFIG_NAME = "repo.yaml"
@@ -493,7 +505,10 @@ def write_default_adapters_yaml(layout: RepoLayout, *, model: str | None = None)
         "# and harvests the sibling's content instead of the thin one-line summary. A session:\n"
         "# connector (ADR-0023) distills agent SESSION transcripts (assistant reflections with a\n"
         "# durable-knowledge marker); it redacts secrets at its boundary per harvest.redact\n"
-        "# (default on). Uncomment + point at a real source to enable harvesting.\n"
+        "# (default on). Its optional format: key picks the transcript parser (default\n"
+        "# claude-code-jsonl); harvester.session_sources.implemented_session_formats() lists the\n"
+        "# names this build can actually parse — any other name is rejected when this file loads.\n"
+        "# Uncomment + point at a real source to enable harvesting.\n"
         "# connectors:\n"
         '#   file:claude-code: { path: "~/.claude/**/MEMORY.md", scope: personal }\n'
         '#   file:hermes: { path: "~/.hermes/MEMORY.md", scope: personal, follow_links: true }\n'
@@ -727,7 +742,8 @@ class ConnectorSpec:
     ``file:claude-code`` — the ``<type>:<agent>`` form). ``scope`` is the validated source scope
     (``personal`` | ``team``, a plain string here; the harvester maps it to its ``Scope`` enum).
     ``path`` is the source locator (a glob for a file connector; ``None`` for deferred API
-    connectors).
+    connectors). ``format`` is the ``session:`` connector's transcript grammar (issue #147);
+    ``None`` keeps the harvester's default so an existing file behaves byte-identically.
     """
 
     name: str
@@ -741,6 +757,13 @@ class ConnectorSpec:
     #: whole-source digest, editing it did not even re-trigger a scan, so its facts were unreachable
     #: rather than merely delayed.
     max_files: int | None = None
+    #: The transcript grammar a ``session:`` connector's files are parsed with (issue #147).
+    #: ``None`` means the harvester's default (``claude-code-jsonl``) — today's behaviour, so an
+    #: existing ``adapters.yaml`` keeps parsing byte-identically. Meaningful ONLY for ``session:``
+    #: connectors; it is the config-visible half of the reader seam that previously existed in code
+    #: but was unreachable, which made EVERY agent's transcript get Claude Code's parser
+    #: (invariant #6).
+    format: str | None = None
 
 
 def load_connector_specs(path: str | Path) -> list[ConnectorSpec] | None:
@@ -750,8 +773,9 @@ def load_connector_specs(path: str | Path) -> list[ConnectorSpec] | None:
     :func:`load_backend_registry`'s None-on-absent contract, so the caller surfaces a clear "no
     connectors configured" note rather than crashing). The existing :class:`BackendRegistry` IGNORES
     the ``connectors:`` block, so this is the connector family's OWN parser and it owns all
-    validation: a non-mapping block, a non-mapping entry, or an unknown ``scope`` value raises
-    :class:`ConfigError` (FAIL LOUD — operator config is a trust boundary, ADR-0007). An absent
+    validation: a non-mapping block, a non-mapping entry, an unknown ``scope`` value, or an
+    unknown / misplaced ``format`` raises :class:`ConfigError` (FAIL LOUD — operator config is a
+    trust boundary, ADR-0007). An absent
     per-entry ``scope`` defaults to ``personal`` (the most restrictive scope; it may feed only a
     personal repo). Commented-out ``letta:`` / ``mem0:`` examples are simply not present after YAML
     parse and so are tolerated.
@@ -790,6 +814,22 @@ def load_connector_specs(path: str | Path) -> list[ConnectorSpec] | None:
         )
         if max_files is not None and max_files < 1:
             raise ConfigError(f"connector {name!r}: max_files must be >= 1, got {max_files!r}")
+        # format (issue #147) selects the session-transcript parser. Validated HERE against the
+        # names the harvester registry knows, so a typo is an actionable config error at load time
+        # rather than a connector that silently parses a Codex transcript with Claude Code's
+        # grammar and harvests nothing. Rejected outright on a non-session connector: a key that
+        # cannot possibly take effect must not look accepted (the same footgun max_files documents).
+        fmt = _opt_str_loud(spec.get("format"), key=f"connector {name!r}: format")
+        if fmt is not None:
+            if not str(name).startswith("session:"):
+                raise ConfigError(
+                    f"connector {name!r}: format is only meaningful for a 'session:' connector"
+                )
+            if fmt not in _SESSION_FORMATS:
+                raise ConfigError(
+                    f"connector {name!r}: unknown format {fmt!r}; "
+                    f"known formats are {list(_SESSION_FORMATS)}"
+                )
         specs.append(
             ConnectorSpec(
                 name=str(name),
@@ -797,6 +837,7 @@ def load_connector_specs(path: str | Path) -> list[ConnectorSpec] | None:
                 path=_opt_str(spec.get("path")),
                 follow_links=follow_links,
                 max_files=max_files,
+                format=fmt,
             )
         )
     return specs

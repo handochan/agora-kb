@@ -7,8 +7,8 @@ validate and serialize that frontmatter; (de)serialization to the on-disk markdo
 
 Invariants enforced here: events are immutable (model is frozen) and carry no mutable processing
 status (lifecycle is by file location only, DATA-MODEL §1); ``source`` and ``target`` accept the
-fixed enum *plus* the parametric ``web:<user>`` / ``harvest:<agent>`` (source) and ``team:<name>``
-(target) forms.
+fixed enum *plus* the parametric ``web:<user>`` / ``harvest:<agent>`` / ``agent:<name>`` (source)
+and ``team:<name>`` (target) forms.
 """
 
 from __future__ import annotations
@@ -23,8 +23,12 @@ from .ids import is_valid_event_id
 
 __all__ = ["Kind", "Confidence", "InboxItem", "FIXED_SOURCES"]
 
-# Fixed (non-parametric) values of the inbox `source` enum (DATA-MODEL §1). The parametric
-# `web:<user>` and `harvest:<agent>` forms are validated separately.
+# Fixed (non-parametric) values of the inbox `source` enum (DATA-MODEL §1). Kept verbatim for
+# BACK-COMPAT: every event already on disk carries one of these, and the names the engine shipped
+# with must keep round-tripping. It is NOT the way a new agent becomes first-class — that is the
+# parametric `agent:<name>` form below (invariant #6: the engine must never hold a blessed list of
+# agent names, and adding one must never require a core PR). The parametric `web:<user>`,
+# `harvest:<agent>` and `agent:<name>` forms are validated separately.
 FIXED_SOURCES = frozenset(
     {"claude-code", "codex", "qwen", "gemini", "opencode", "hermes", "manual"}
 )
@@ -32,6 +36,14 @@ FIXED_SOURCES = frozenset(
 # \A...\Z (not ^...$) so a trailing newline cannot pass validation ($ matches before a final \n).
 _WEB_RE = re.compile(r"\Aweb:.+\Z")
 _HARVEST_RE = re.compile(r"\Aharvest:.+\Z")
+# `agent:<name>` — the tool-agnostic first-class capture source (issue #147, invariant #6). Any
+# agent (aelix, copilot, a tool that does not exist yet) may stamp its OWN name here and get a
+# `kind=capture` event, with no core change and no impersonation of a blessed name. The <name>
+# token carries the SAME charset rule as `team:<name>` — the only parametric form that has ever
+# constrained one — so a source cannot smuggle whitespace, a path separator or a newline into
+# provenance. A BARE name (`aelix`) stays REJECTED: the prefix is what makes the claim explicit,
+# so a typo'd fixed source can never be silently blessed as a new agent.
+_AGENT_RE = re.compile(r"\Aagent:[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 _TEAM_RE = re.compile(r"\Ateam:[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 _SHA256_RE = re.compile(r"\A[0-9a-f]{64}\Z")
 _KEBAB_RE = re.compile(r"\A[a-z0-9]+(-[a-z0-9]+)*\Z")
@@ -86,11 +98,11 @@ class InboxItem(BaseModel):
     @field_validator("source")
     @classmethod
     def _check_source(cls, v: str) -> str:
-        if v in FIXED_SOURCES or _WEB_RE.match(v) or _HARVEST_RE.match(v):
+        if v in FIXED_SOURCES or _WEB_RE.match(v) or _HARVEST_RE.match(v) or _AGENT_RE.match(v):
             return v
         raise ValueError(
             f"invalid source {v!r}: expected one of {sorted(FIXED_SOURCES)} "
-            "or 'web:<user>'/'harvest:<agent>'"
+            "or 'web:<user>'/'harvest:<agent>'/'agent:<name>'"
         )
 
     @field_validator("target")

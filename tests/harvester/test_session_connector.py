@@ -17,6 +17,12 @@ from agora_kb.core.hashing import content_sha256
 from agora_kb.core.redact import RedactionPolicy
 from agora_kb.harvester.connectors import Connector, ConnectorError, Scope
 from agora_kb.harvester.session_connector import SessionConnector
+from agora_kb.harvester.session_sources import (
+    DEFAULT_SESSION_FORMAT,
+    ClaudeCodeJsonlReader,
+    TurnRecord,
+    build_session_reader,
+)
 
 
 def _jsonl(*records: dict) -> str:
@@ -255,3 +261,49 @@ def test_gold_pack_transcripts_are_excluded(tmp_path: Path) -> None:
     scan = _conn(tmp_path).scan(last_content_sha256=None)
     assert scan.facts == ()
     assert any("excluded gold-pack path" in n for n in scan.notes)
+
+
+# --- the injected reader (issue #147, invariant #6) ----------------------------------------------
+
+
+class _FakeReader:
+    """A SessionReader for a made-up transcript grammar: one fact per non-empty line."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def read_turns(self, text: str):
+        self.calls += 1
+        for line in text.splitlines():
+            if line.strip():
+                yield TurnRecord(role="assistant", text=line.strip())
+
+
+def test_default_reader_is_the_registry_default_not_a_hard_coded_class(tmp_path: Path) -> None:
+    """An omitted reader resolves through the ONE registry, so config and direct construction agree.
+
+    Behaviour is unchanged (the default format is still Claude Code JSONL) — this pins WHERE that
+    decision is made, because two independent defaults are how they silently drift apart.
+    """
+    conn = _conn(tmp_path)
+    assert isinstance(conn._reader, ClaudeCodeJsonlReader)
+    assert type(conn._reader) is type(build_session_reader(DEFAULT_SESSION_FORMAT))
+
+
+def test_injected_reader_is_used_instead_of_the_claude_code_parser(tmp_path: Path) -> None:
+    """A non-Claude-Code grammar actually parses: the seam is reachable, not decorative.
+
+    The transcript below is NOT valid Claude Code JSONL — the real reader would yield zero turns
+    and the scan would produce zero facts. Facts appearing proves the injected reader ran.
+    """
+    src = tmp_path / "s"
+    src.mkdir(parents=True, exist_ok=True)
+    (src / "t.jsonl").write_text(
+        "The root cause was a stale cursor.\nordinary narration line\n", encoding="utf-8"
+    )
+    reader = _FakeReader()
+    scan = _conn(tmp_path, reader=reader).scan(last_content_sha256=None)
+    assert reader.calls == 1
+    assert [f.text for f in scan.facts] == ["The root cause was a stale cursor."]
+    # ...and the stock parser really would have found nothing in these bytes.
+    assert _conn(tmp_path).scan(last_content_sha256=None).facts == ()

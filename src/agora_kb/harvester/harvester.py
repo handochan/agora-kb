@@ -45,6 +45,7 @@ from agora_kb.core.redact import DEFAULT_POLICY, RedactionPolicy, redact
 
 from .connectors import Connector, ConnectorError, FileConnector, HarvestedFact, Scope
 from .session_connector import SessionConnector
+from .session_sources import SessionFormatError, build_session_reader
 
 __all__ = [
     "ScopeViolation",
@@ -225,6 +226,12 @@ def build_connectors(
     is built with NO redaction policy — the operator's explicit escape hatch (ADR-0023 addendum §5).
     ``file:`` connectors never redact
     (byte-identical write path, #39), so ``redact`` does not touch them.
+
+    ``spec.format`` selects the ``session:`` connector's transcript parser through
+    :func:`~agora_kb.harvester.session_sources.build_session_reader` (issue #147) — the injection
+    point that makes the ``SessionReader`` seam reachable from operator config. An unknown or
+    not-yet-implemented format is re-raised as :class:`ConnectorError` so ``agora harvest`` reports
+    it as the config error it is, naming the connector.
     """
     if redact is not None and not redact.enabled:
         session_policy: RedactionPolicy | None = None  # kill-switch off
@@ -246,11 +253,21 @@ def build_connectors(
                 )
             )
         elif spec.name.startswith("session:"):
+            # The transcript grammar comes from the DECLARED format (issue #147), never from the
+            # connector's <agent> half — an engine that inferred "this is Claude Code, use the
+            # Claude Code parser" from a name would be the invariant-6 violation this fixes. An
+            # absent format resolves to DEFAULT_SESSION_FORMAT, so an existing adapters.yaml is
+            # byte-identical in behaviour.
+            try:
+                reader = build_session_reader(spec.format)
+            except SessionFormatError as exc:
+                raise ConnectorError(f"connector {spec.name!r}: {exc}") from exc
             connectors.append(
                 SessionConnector(
                     name=spec.name,
                     path=spec.path or "",
                     scope=Scope(spec.scope),
+                    reader=reader,
                     redact_policy=session_policy,
                     **caps,
                 )

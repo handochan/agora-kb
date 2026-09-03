@@ -12,7 +12,7 @@
   <table class="connectors">
     <thead>
       <tr>
-        <th>Connector</th><th>Scope</th><th>Links</th><th>Source</th>
+        <th>Connector</th><th>Scope</th><th>Links</th><th>Format</th><th>Source</th>
         <th>Last scan</th><th>Proposed</th><th>Accepted</th><th>Rejected</th>
       </tr>
     </thead>
@@ -21,7 +21,8 @@
         <tr>
           <td class="mono">{{ c.name }}</td>
           <td>{{ c.scope }}</td>
-          <td>{{ 'yes' if c.follow_links else 'no' }}</td>
+          <td>{{ '—' if c.follow_links is none else ('yes' if c.follow_links else 'no') }}</td>
+          <td class="mono">{{ c.format or "—" }}</td>
           <td class="mono">{{ c.path or "—" }}</td>
           <td class="mono">{{ c.last_scan or "never" }}</td>
           <td>{{ c.proposed }}</td>
