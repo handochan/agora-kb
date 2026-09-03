@@ -4588,3 +4588,178 @@ def test_doctor_backup_line_compresses_and_survives_corrupt_state(
         capsys.readouterr()
         main(["doctor", "--repo", str(target), "--skip-probe"])
         assert "last_push=unreadable" in capsys.readouterr().out
+
+
+# --- eval (the deterministic ranking snapshot, issue #44) ---------------------------------------
+_EVAL_INDEX = """\
+# personal
+
+- [Eng MOC](wiki/eng/eng-moc.md)
+"""
+
+_EVAL_MOC = """\
+---
+status: active
+type: moc
+title: eng MOC
+summary: Map of content for the eng domain.
+---
+# eng MOC
+
+- [Deadlock recovery](themes/deadlock-recovery.md)
+"""
+
+_EVAL_THEME = """\
+---
+status: active
+type: theme
+tags: [locking]
+---
+# Deadlock recovery
+
+A deadlock is recovered by dropping the younger advisory lock and letting the older writer
+proceed; recovery is deterministic and leaves no partial write.
+"""
+
+
+def _eval_repo(root: Path) -> Path:
+    """A minimal v1-layout KB — no git, no config, no model. `agora eval` needs none of them."""
+    (root / "wiki" / "eng" / "themes").mkdir(parents=True)
+    (root / "index.md").write_text(_EVAL_INDEX, encoding="utf-8")
+    (root / "wiki" / "eng" / "eng-moc.md").write_text(_EVAL_MOC, encoding="utf-8")
+    (root / "wiki" / "eng" / "themes" / "deadlock-recovery.md").write_text(
+        _EVAL_THEME, encoding="utf-8"
+    )
+    return root
+
+
+def _eval_queries(path: Path, *, expect_unrelated: str = "not_found") -> Path:
+    path.write_text(
+        "- id: q-deadlock\n"
+        "  question: deadlock recovery\n"
+        "  expect: ok\n"
+        "- id: q-unrelated\n"
+        "  question: quantum biology photosynthesis\n"
+        f"  expect: {expect_unrelated}\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+def test_eval_prints_a_table_and_exits_zero_when_expects_hold(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The happy path: every query matched its declared expect, so `agora eval` is a green gate."""
+    repo = _eval_repo(tmp_path / "kb")
+    queries = _eval_queries(tmp_path / "q.yaml")
+    assert main(["eval", "--repo", str(repo), "--queries", str(queries)]) == 0
+    out = capsys.readouterr().out
+    assert "fm=" in out and "cache=" in out
+    assert "q-deadlock" in out and "deadlock-recovery" in out
+    assert "0 violating expect" in out
+
+
+def test_eval_writes_the_full_json_snapshot_with_out(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`--out` is the golden-file producer: basename identity, no paths, header + per-query hits."""
+    repo = _eval_repo(tmp_path / "kb")
+    queries = _eval_queries(tmp_path / "q.yaml")
+    out = tmp_path / "nested" / "baseline.json"  # parent dirs are created, not demanded
+    assert main(["eval", "--repo", str(repo), "--queries", str(queries), "--out", str(out)]) == 0
+    assert f"wrote {out}" in capsys.readouterr().out
+
+    record = json.loads(out.read_text(encoding="utf-8"))
+    assert record["header"]["query_count"] == 2
+    assert record["header"]["corpus_note_count"] == 3
+    [deadlock] = [q for q in record["queries"] if q["id"] == "q-deadlock"]
+    assert deadlock["status"] == "ok"
+    assert deadlock["hits"][0]["note"] == "deadlock-recovery"  # BASENAME, survives a layout move
+    assert deadlock["hits"][0]["rank"] == 1
+    assert "wiki/" not in out.read_text(encoding="utf-8")
+
+
+def test_eval_exits_one_and_names_the_query_when_an_expect_is_violated(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The CI gate: a query whose status differs from its expect fails the command, on stderr."""
+    repo = _eval_repo(tmp_path / "kb")
+    queries = _eval_queries(tmp_path / "q.yaml", expect_unrelated="ok")
+    assert main(["eval", "--repo", str(repo), "--queries", str(queries)]) == 1
+    captured = capsys.readouterr()
+    assert "MISMATCH: q-unrelated expected ok, got not_found" in captured.err
+    assert "1 violating expect" in captured.out
+
+
+def test_eval_exits_one_on_an_unusable_query_file(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A malformed / missing query file is loud and non-zero — never a silently smaller eval set."""
+    repo = _eval_repo(tmp_path / "kb")
+    missing = tmp_path / "nope.yaml"
+    assert main(["eval", "--repo", str(repo), "--queries", str(missing)]) == 1
+    assert "eval: cannot read query file" in capsys.readouterr().err
+
+    bad = tmp_path / "bad.yaml"
+    bad.write_text("id: a\nquestion: x\n", encoding="utf-8")  # a mapping, not a list
+    assert main(["eval", "--repo", str(repo), "--queries", str(bad)]) == 1
+    assert "expected a LIST" in capsys.readouterr().err
+
+
+def test_eval_fm_and_limit_flags_reach_the_snapshot(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`--fm off` pins the ADR-0012 §8 Phase-1a column; `--limit` caps hits per query."""
+    repo = _eval_repo(tmp_path / "kb")
+    queries = _eval_queries(tmp_path / "q.yaml")
+    out = tmp_path / "off.json"
+    args = ["eval", "--repo", str(repo), "--queries", str(queries), "--out", str(out)]
+    assert main([*args, "--fm", "off", "--limit", "1"]) == 0
+    capsys.readouterr()
+    record = json.loads(out.read_text(encoding="utf-8"))
+    assert record["header"]["fm_enabled"] is False
+    assert record["header"]["limit"] == 1
+    assert all(len(q["hits"]) <= 1 for q in record["queries"])
+
+    assert main([*args, "--fm", "on"]) == 0
+    capsys.readouterr()
+    assert json.loads(out.read_text(encoding="utf-8"))["header"]["fm_enabled"] is True
+
+
+@pytest.mark.parametrize("limit", ["0", "-3"])
+def test_eval_rejects_a_non_positive_limit(tmp_path: Path, limit: str) -> None:
+    """`--limit 0` must not be a permanently green gate that records nothing.
+
+    `Wiki.query` fixes `status` from the eligible set BEFORE slicing `eligible[: max(0, limit)]`,
+    so `--limit 0` used to exit 0 with `status: ok` and an EMPTY hit list for every query — a
+    baseline that pins no ranking while looking green, which a copied CI line or a typo could
+    produce silently. argparse refuses it instead (exit 2, the usage-error code).
+    """
+    repo = _eval_repo(tmp_path / "kb")
+    queries = _eval_queries(tmp_path / "q.yaml")
+    with pytest.raises(SystemExit) as exc:
+        main(["eval", "--repo", str(repo), "--queries", str(queries), "--limit", limit])
+    assert exc.value.code == 2
+
+
+def test_eval_needs_no_git_no_model_and_no_server(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The gate must run on a bare directory of markdown — that is what makes it usable in CI.
+
+    `_eval_repo` writes no `.git`, no `_kb/repo.yaml`, and no `adapters.yaml`; an EMPTY directory
+    likewise answers `not_found` (ADR-0012 §5 gate (d)) instead of crashing.
+    """
+    repo = _eval_repo(tmp_path / "kb")
+    assert not (repo / ".git").exists()
+    queries = _eval_queries(tmp_path / "q.yaml")
+    assert main(["eval", "--repo", str(repo), "--queries", str(queries)]) == 0
+    capsys.readouterr()
+
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    all_not_found = _eval_queries(tmp_path / "nf.yaml")
+    all_not_found.write_text(
+        "- id: q-deadlock\n  question: deadlock recovery\n  expect: not_found\n", encoding="utf-8"
+    )
+    assert main(["eval", "--repo", str(empty), "--queries", str(all_not_found)]) == 0

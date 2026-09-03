@@ -1,0 +1,418 @@
+# The query set the ranking golden is recorded over (Stratum UNIT 3, gate B).
+#
+# SHAPE: a top-level LIST of entries; each entry is
+#
+#   id:        stable identifier, referenced by the recorded golden
+#   question:  the exact string handed to `Wiki.query` (verbatim, never rewritten)
+#   expect:    "ok" | "not_found" — the QueryResult.status this query must produce
+#   note:      for a positive, the basename of the expected TOP hit; null for a negative
+#   rationale: why this query is in the set — which ranking behaviour it exercises
+#
+# `expect`/`note` are the INTENT of the query, verified against today's ranker over
+# tests/rank_golden/corpus.py at authoring time. They are NOT the golden: per ADR-0012 §0a
+# nothing outside core computes lex/struct/fm/score/match_reason, so the fixture RECORDS what
+# `Wiki.query` returns (full hit lists, scores, anchors, reasons) and these fields only say what
+# the query was written to ask.
+#
+# Composition: the 4 issue-#146 queries VERBATIM (q146-*), 30 positives (p01–p24, never a verbatim
+# note title — 6 Korean, 2 mixed-script — plus the p25–p30 MECHANISM probes, each of which is the
+# only query in the set that observes one ranking term), and 10 negatives (n01–n10, 2 Korean) whose
+# subject matter is absent from the corpus.
+#
+# `observed_rank: <N>` is the honest way to record a positive whose expected note is NOT rank 1
+# (p27 is the one). The gate asserts that exact rank, so a declared gap stays pinned rather than
+# becoming a hole; tuning the corpus until the note came first would tune the fixture to flatter
+# the ranker.
+#
+# Korean queries exercise the #56 CJK bigram tokenizer: `배당금` and the note's `배당` share the
+# bigram `배당`, which is the whole reason a Korean question is answerable at all.
+
+# --- the four #146 queries, VERBATIM (do not paraphrase these) -----------------------------------
+
+- id: q146-1
+  question: "unbilled receivables"
+  expect: ok
+  note: unbilled-receivables-recognition
+  rationale: >-
+    The #146 anchor. Two candidates carry the words: the theme (title weight 3.0) and its finance
+    MOC, whose body bullet repeats the theme title at body weight 1.0. Pins that the substantive
+    note outranks the map that merely points at it — the ordering half of #146.
+
+- id: q146-2
+  question: "investing index funds"
+  expect: ok
+  note: index-fund-investing
+  rationale: >-
+    Every token here is also structural furniture — "index" names the root note, "investing" is
+    spread over several finance themes — so this pins that lexical concentration in one theme beats
+    diffuse corpus-wide token presence.
+
+- id: q146-3
+  question: "cooking finance investing"
+  expect: ok
+  note: cooking-as-a-finance-habit
+  rationale: >-
+    The cross-domain probe, and the one that exercises the ADR-0012 §4 Stage-1 DOMAIN FOCUS: two
+    query tokens are domain names ("cooking", "finance"), and the focus rule seeds only the FIRST
+    matching domain's MOC in sorted path order (cooking). The defined best answer is the cooking
+    theme that is genuinely about all three words; the cooking MOC is expected right behind it.
+
+- id: q146-4
+  question: "finance segment reporting thresholds"
+  expect: ok
+  note: segment-reporting-thresholds
+  rationale: >-
+    A query whose distinctive term also titles an H2 ("## Quantitative thresholds"), so it pins the
+    §6 heading/linked-theme reason precedence as well as the ordering. Also domain-focused
+    ("finance"), so the finance MOC is the seeded root.
+
+# --- positive paraphrases (never a verbatim title) -----------------------------------------------
+
+- id: p01
+  question: "work delivered but not yet invoiced"
+  expect: ok
+  note: unbilled-receivables-recognition
+  rationale: >-
+    The concept in a reader's words with none of the title's tokens; pins that body/summary evidence
+    alone still resolves the right note.
+
+- id: p02
+  question: "buying the whole market instead of picking stocks"
+  expect: ok
+  note: index-fund-investing
+  rationale: >-
+    Paraphrase matching only the note's H2 and body ("Why the whole market"), so the hit is earned
+    without any title-weight help.
+
+- id: p03
+  question: "when does an operating segment have to be disclosed separately"
+  expect: ok
+  note: segment-reporting-thresholds
+  rationale: >-
+    A question-shaped query whose leading words are all stopwords; pins that the §3 stopword filter
+    leaves enough signal and that the surviving terms still find the right theme.
+
+- id: p04
+  question: "money collected before the work is done"
+  expect: ok
+  note: deferred-revenue-basics
+  rationale: >-
+    Deliberately close in wording to p01 (both are about timing between work and cash) so the pair
+    pins DISCRIMINATION between two neighbouring finance themes, not just recall.
+
+- id: p05
+  question: "how much does a yearly fund fee cost over decades"
+  expect: ok
+  note: expense-ratio-drag
+  rationale: >-
+    Targets a note that also carries an alias ("fund-fee-drag"), so the #56 aliases field (weight
+    3.0, b=0) is in play alongside ordinary body evidence.
+
+- id: p06
+  question: "payout is not the same as what you actually earned"
+  expect: ok
+  note: dividend-yield-vs-total-return
+  rationale: >-
+    Shares its topic vocabulary with the Korean dividend note; pins that a purely English query does
+    not drift into a Korean note whose CJK bigrams cannot match it.
+
+- id: p07
+  question: "thirteen week rolling cash horizon"
+  expect: ok
+  note: cash-flow-forecast-window
+  rationale: >-
+    A number-carrying query ("thirteen", spelled out) over the treasury pair; pins digit/word token
+    handling and discrimination against working-capital-cycle.
+
+- id: p08
+  question: "days between paying suppliers and getting paid"
+  expect: ok
+  note: working-capital-cycle
+  rationale: >-
+    The other half of the treasury pair, phrased entirely from the body. Together with p07 it pins
+    that two same-domain, same-tag notes stay separable.
+
+- id: p09
+  question: "the ladder approach with rungs and reinvestment"
+  expect: ok
+  note: bond-ladder-basics
+  rationale: >-
+    An ORPHAN theme (absent from its MOC, so d_moc=3 and struct=0.25 against 1.0 for every
+    MOC-linked note). Reaching it needs terms that appear nowhere else in the corpus — this query is
+    the pin on the union frontier's recall for correct-but-unlinked notes, and on how expensive that
+    recall is: adding one ordinary word shared with a MOC-linked note flips the top hit.
+
+- id: p10
+  question: "profit basis or revenue basis for judging a misstatement"
+  expect: ok
+  note: audit-materiality-threshold
+  rationale: >-
+    The CONTESTED note. `status: contested` maps to fm=0 while every active competitor gets +0.10
+    (ADR-0012 §8), so this pins the frontmatter demotion of a contested theme relative to its
+    neighbours.
+
+- id: p11
+  question: "cook at home to save money"
+  expect: ok
+  note: cooking-as-a-finance-habit
+  rationale: >-
+    The plain-language form of the q146-3 cross-domain theme, carrying NO domain-name token — so it
+    pins the same note WITHOUT the Stage-1 domain-focus optimization firing.
+
+- id: p12
+  question: "batch components on the weekend"
+  expect: ok
+  note: weeknight-meal-prep
+  rationale: >-
+    Related by `related:` to the q146-3 target; pins that a frontmatter relation feeds in-degree
+    without letting the neighbour steal the hit.
+
+- id: p13
+  question: "hold a stew below a boil so tough meat softens"
+  expect: ok
+  note: braising-temperature-window
+  rationale: >-
+    A technique note reachable only through body prose; also a note the cooking daily links, so its
+    in-degree comes from two different link surfaces.
+
+- id: p14
+  question: "put new tins behind old tins"
+  expect: ok
+  note: pantry-staples-rotation
+  rationale: >-
+    The second aliased note ("pantry-first-in-first-out"). Pins alias-bearing scoring on a note
+    whose title shares no token with the question.
+
+- id: p15
+  question: "torn tail record after an unclean restart"
+  expect: ok
+  note: write-ahead-log-recovery
+  rationale: >-
+    A second ORPHAN target, this time in the stubs-only engineering domain: the domain MOC links
+    nothing but stubs, so no substantive engineering note has any inbound link at all.
+
+- id: p16
+  question: "fleets, traffic switching and rollback"
+  expect: ok
+  note: blue-green-deploy-window
+  rationale: >-
+    Keyword-shaped rather than sentence-shaped (how people actually search), and a third orphan.
+    Written from tokens unique to the note because anything shared with a MOC-linked note wins on
+    the structural term instead.
+
+- id: p17
+  question: "배당금 받을 때 세금 얼마나 떼나요"
+  expect: ok
+  note: dividend-tax-korea
+  rationale: >-
+    Korean. The note says 배당금/원천징수; the question adds the particle-laden 받을 때/떼나요 that
+    a whole-word Korean index could never match. Bigram overlap (배당/당금/세금) is what makes it
+    retrievable at all (#56).
+
+- id: p18
+  question: "주석 어디부터 읽어야 하나"
+  expect: ok
+  note: footnote-reading-korea
+  rationale: >-
+    Korean, and a near-miss test: the note's H2 is 읽는 순서 while the query says 읽어야, so only the
+    stem bigrams overlap — exactly the agglutination case bigrams exist for.
+
+- id: p19
+  question: "김치찌개 국물 비율"
+  expect: ok
+  note: kimchi-stew-ratio
+  rationale: >-
+    Korean, and the strongest available Korean signal (the dish name is in the title). The control
+    against which the harder Korean probes are read.
+
+- id: p20
+  question: "육수 맑게 우리는 법"
+  expect: ok
+  note: stock-simmering-basics
+  rationale: >-
+    Korean, competing against p19's note inside the same domain and the same tag — pins Korean
+    DISCRIMINATION, not just Korean recall.
+
+- id: p21
+  question: "요청 식별자 전파해서 로그 추적"
+  expect: ok
+  note: log-correlation-tracing
+  rationale: >-
+    Korean AND an orphan (engineering). The Korean recall path and the unlinked-note recall path
+    have to hold at the same time for this one to land.
+
+- id: p22
+  question: "소비자가 느릴 때 신호를 어디서 만들까"
+  expect: ok
+  note: backpressure-design-stub
+  rationale: >-
+    Korean against a STUB (fm=0) whose MOC bullet carries its Korean title and summary — so the MOC
+    is a genuine lexical competitor. The query deliberately uses body terms (소비자/신호) the MOC
+    bullet does not repeat; a query built from the bullet's own words returns the MOC instead, which
+    is the #146 thin-page residual.
+
+- id: p23
+  question: "김치찌개 ratio for broth"
+  expect: ok
+  note: kimchi-stew-ratio
+  rationale: >-
+    MIXED SCRIPT. One CJK run and several ASCII runs in one question; pins that the scanner emits
+    both token kinds from a single string and that the ASCII half (matching nothing in the Korean
+    note) does not drag the hit away.
+
+- id: p24
+  question: "배당 dividend 원천징수"
+  expect: ok
+  note: dividend-tax-korea
+  rationale: >-
+    MIXED SCRIPT with the ASCII half pointing at a DIFFERENT note (the English dividend theme) than
+    the Korean half. Pins which side wins when a bilingual question straddles two notes.
+
+# --- the mechanism probes: one query per ranking term that nothing else pins --------------------
+#
+# p25–p30 exist because a query set can look thorough and still leave a term unobserved. Each of
+# these was chosen by MUTATING the ranker and keeping only the queries that go red — see the
+# "Known gaps in the COVERAGE" table in README.md for what each one is the sole evidence of.
+
+- id: p25
+  question: "deadlock recovery playbook"
+  expect: ok
+  note: engineering-moc
+  rationale: >-
+    The #146 HUSK probe, and the only query that reaches `_passes_gate`'s second branch as the sole
+    reason a candidate is admitted. Every word here lives in the engineering MOC's bullet LABEL for
+    the husk note, and in NONE of that note's own scoring fields, so the husk arrives at lex=0 and
+    `_combined`'s #146 guard is what keeps it out of the results: revert that guard and the husk
+    scores 0.35*0.7 = 0.245 > FLOOR and appears as a hit. The MOC itself answers, because the label
+    puts the words in the MOC's own body — the thin-page residual #146 explicitly does not close.
+
+- id: p26
+  question: "superseded note that collapsed a distinction"
+  expect: ok
+  note: finance-moc
+  rationale: >-
+    The ADR-0012 §8 NEGATIVE frontmatter term. The deprecated near-duplicate of the receivables
+    note is second here by 0.087 — less than the 0.15 demotion — so removing `deprecated: -0.15`
+    puts it FIRST. It is the only query in the set whose top hit is decided by the demotion.
+
+- id: p27
+  question: "gilt staircase over two decades"
+  expect: ok
+  note: bond-ladder-basics
+  observed_rank: 2
+  rationale: >-
+    The ALIAS probe. "gilt"/"staircase" appear in exactly one field of one note — the aliases of
+    the ORPHAN `bond-ladder-basics` — so the #56 addendum's title-equivalent weight 3.0 and its
+    `FIELD_B['aliases'] = 0` exemption are jointly what lift an orphan (struct 0.175) into second
+    place. Cutting the weight to 1.0, removing the b-exemption, or dropping `aliases` from
+    `_FIELDS` each move it to rank 4 or out of the results entirely.
+    DECLARED GAP (`observed_rank: 2`): the expected note is NOT first. "over two decades" is
+    long-horizon vocabulary that `expense-ratio-drag` owns outright, and it wins on lexical
+    concentration. Recorded rather than corrected — tuning the corpus until the ladder note came
+    first would be tuning the fixture to flatter the ranker.
+
+- id: p28
+  question: "the only knife worth sharpening"
+  expect: ok
+  note: knife-sharpening-angles
+  rationale: >-
+    The FLOOR probe, UPPER side. Its last hit is the deprecated orphan at 0.205086 — the closest a
+    recorded hit gets to FLOOR=0.18 — reached through the single common token "only". Raising the
+    floor by 0.05 drops that hit and reddens the golden; before this query the floor could be set
+    anywhere in [0.0, 0.504] without changing a byte.
+
+- id: p29
+  question: "every quarterly close checklist step"
+  expect: ok
+  note: quarterly-close-checklist
+  rationale: >-
+    The FLOOR probe, LOWER side. The same deprecated orphan is admitted by the §6 gate here and
+    scores 0.174154 — just UNDER the floor — so it is absent from the record. Lowering the floor by
+    0.05 admits it (as rank 14, inside the limit) and reddens the golden. The two probes together
+    bracket FLOOR to (0.174, 0.205].
+
+- id: p30
+  question: "puppy vaccination schedule"
+  expect: ok
+  note: sourdough-starter-schedule
+  rationale: >-
+    Restored after being reworded away during authoring (see n05). The near-miss it was thought to
+    record is NOT a floor property: measured, its top hit scores 0.874645, 4.9x FLOOR. What it
+    actually pins is that ONE shared common word ("schedule") against an otherwise absent subject
+    still answers — the §5 floor is not a topical-relevance test, and p28/p29 are what constrain
+    the floor's position.
+
+# --- negatives: the corpus must answer not_found ------------------------------------------------
+#
+# ADR-0012 §5: honesty when evidence is absent. Each subject is absent from the corpus, so every
+# candidate either has lex=0 (dropped by the §6 gate, and since the #146 addendum earning no
+# structural term either) or falls under FLOOR=0.18. A negative that starts returning hits means
+# the floor or the gate moved.
+
+- id: n01
+  question: "how do I tune a violin"
+  expect: not_found
+  note: null
+  rationale: An absent subject phrased as a question, so the surviving tokens are content words.
+
+- id: n02
+  question: "volcanic eruption prediction models"
+  expect: not_found
+  note: null
+  rationale: Absent subject in the same noun-phrase register as the positives.
+
+- id: n03
+  question: "knitting cable patterns"
+  expect: not_found
+  note: null
+  rationale: A craft adjacent to cooking in tone but sharing no vocabulary with any note.
+
+- id: n04
+  question: "orbital rendezvous maneuvers"
+  expect: not_found
+  note: null
+  rationale: Technical register, zero corpus overlap — the engineering-domain decoy.
+
+- id: n05
+  question: "puppy vaccination visits at the vet"
+  expect: not_found
+  note: null
+  rationale: >-
+    Deliberately re-worded during authoring: the earlier "puppy vaccination schedule" DID return a
+    hit, because "schedule" alone matched a MOC-linked note's title at weight 3.0. Kept as a
+    negative with that word removed. The original is back as p30 — measured, it clears the floor by
+    4.9x, so it was never the floor-adjacent probe this note once claimed; p28/p29 are.
+
+- id: n06
+  question: "medieval cathedral architecture"
+  expect: not_found
+  note: null
+  rationale: Absent subject whose words never appear in the corpus, in any domain.
+
+- id: n07
+  question: "scuba decompression tables"
+  expect: not_found
+  note: null
+  rationale: Absent subject that sounds like it could be a reporting note but is not one.
+
+- id: n08
+  question: "beekeeping hive inspection"
+  expect: not_found
+  note: null
+  rationale: Absent subject adjacent to the food domain without sharing its vocabulary.
+
+- id: n09
+  question: "헌법 개정 절차"
+  expect: not_found
+  note: null
+  rationale: >-
+    Korean negative. Required by the #56 addendum's test list: without it, a Korean tokenizer that
+    over-generates bigrams would look correct on recall while quietly answering everything.
+
+- id: n10
+  question: "빙하 융해 속도 관측"
+  expect: not_found
+  note: null
+  rationale: >-
+    Second Korean negative, chosen so no bigram it produces occurs in any Korean note — the
+    honest-not_found counterpart to p17–p22.
