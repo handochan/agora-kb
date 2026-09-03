@@ -140,7 +140,7 @@ Everything else that would let you retract something is also absent:
   their lifecycle is represented by *location*, never by mutation
   ([`DATA-MODEL.md`](DATA-MODEL.md):33-37).
 - No face offers a delete. `agora --help` lists `repo · import · status · curate · requeue ·
-  harvest · index · gold · sync · watch · serve · web · doctor`. The MCP face exposes
+  harvest · index · gold · eval · sync · watch · serve · web · doctor`. The MCP face exposes
   `kb_remember`, `kb_query`, `kb_read`, `kb_neighbors`, `kb_context`, `kb_status`, `kb_curate`
   (`faces/mcp_server.py:1022-1134`). The web face has no delete route.
 - `wiki/` is git history. Retracting a published note means rewriting that history by hand, on

@@ -18,6 +18,11 @@ A dependency-light :mod:`argparse` front-end over the core API. Subcommands:
 - ``agora sync [--repo PATH]`` — push-only git backup (issue #64): push the curated branch to the
   ``backup.remote`` configured in ``_kb/repo.yaml`` (fast-forward only, never ``--force``); with no
   remote configured it is a guided no-op. Pull/fetch/bidirectional is deferred to #46.
+- ``agora eval --queries FILE [--repo PATH] [--out JSON] [--fm on|off] [--limit N>=1]`` — run a
+  query file through the deterministic ADR-0012 ranker and snapshot what it returns (issue #44). No
+  model, no network, no server. Exits ``1`` when any query's status differs from its declared
+  ``expect``, so it gates CI; ``--out`` writes the full JSON golden record, keyed on note BASENAMES
+  so it stays comparable across a wiki-layout move.
 - ``agora serve [--repo PATH] [--writer W]`` — run the MCP stdio server face. The face is imported
   lazily so the rest of the CLI works even when an MCP transport dependency is missing.
 - ``agora web [--repo PATH] [--host H] [--port P] [--writer W] [--user U]`` — run the FastAPI + HTMX
@@ -112,6 +117,24 @@ from .schema import Taxonomy, emit_schema, lint
 __all__ = ["main", "build_parser"]
 
 _PROG = "agora"
+
+
+def _positive_int(text: str) -> int:
+    """An argparse ``type=`` that rejects zero and negatives loudly.
+
+    ``agora eval --limit 0`` used to exit ``0`` while recording zero hits for every query:
+    :meth:`Wiki.query` slices ``eligible[: max(0, limit)]`` AFTER deciding ``status``, so the
+    statuses all still matched their ``expect`` and the only gate ``eval`` applies could not be
+    violated. A copied CI line with a typo would have produced a permanently green baseline that
+    pinned no ranking at all — the exact failure mode the snapshot exists to prevent.
+    """
+    try:
+        value = int(text)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"{text!r} is not an integer") from exc
+    if value < 1:
+        raise argparse.ArgumentTypeError(f"must be >= 1, got {value}")
+    return value
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -311,6 +334,32 @@ def build_parser() -> argparse.ArgumentParser:
     p_gold_status.add_argument("--pack", default="default", help="pack name (default: default)")
     p_gold_status.set_defaults(func=_cmd_gold_status)
     p_gold.set_defaults(func=_cmd_gold_missing)
+
+    # eval — the model-free deterministic ranking snapshot (issue #44). A flat command, not a
+    # group: it does ONE thing (run a query file, record what the ADR-0012 oracle returns) and a
+    # `build`/`status` split would imply state it deliberately keeps none of.
+    p_eval = sub.add_parser(
+        "eval",
+        help="run a query file through the deterministic ranker and snapshot the results (#44)",
+    )
+    p_eval.add_argument("--repo", default=".", help="repo root (default: .)")
+    p_eval.add_argument(
+        "--queries", required=True, help="query file (YAML or JSON list of {id, question, expect})"
+    )
+    p_eval.add_argument("--out", default=None, help="write the full JSON snapshot to this path")
+    p_eval.add_argument(
+        "--fm",
+        choices=("on", "off"),
+        default=None,
+        help="force the ADR-0012 §8 frontmatter boost on/off (default: the build's live mode)",
+    )
+    p_eval.add_argument(
+        "--limit",
+        type=_positive_int,
+        default=None,
+        help="max hits per query, >= 1 (default: the ADR's max_hits)",
+    )
+    p_eval.set_defaults(func=_cmd_eval)
 
     # sync — push-only git backup of the curated branch (issue #64).
     p_sync = sub.add_parser(
@@ -1769,6 +1818,69 @@ def _cmd_gold_status(args: argparse.Namespace) -> int:
 def _cmd_gold_missing(args: argparse.Namespace) -> int:
     print("usage: agora gold <build|status> [--repo PATH] [--pack NAME] [--check]")
     return 2
+
+
+def _cmd_eval(args: argparse.Namespace) -> int:
+    """``agora eval``: snapshot what the deterministic ranker returns for a query file (#44).
+
+    Model-free, network-free, server-free — it constructs a :class:`Wiki` over the repo on disk and
+    calls :meth:`Wiki.query`, which is the whole point: the Stratum layout flip moves every note's
+    path, and ``core.wiki._is_moc_path`` seeds the structural score from the path, so a baseline
+    recorded BEFORE the flip is the only way to attribute a ranking change to it. The record is
+    keyed on note BASENAMES, so it stays comparable across the move.
+
+    Exit code is the CI gate: ``1`` when any query's ``status`` differs from its declared
+    ``expect`` (or the query file is unusable), ``0`` otherwise. Nothing is written unless ``--out``
+    is given.
+    """
+    from .core.rank_snapshot import QueryFileError, dumps, load_queries, snapshot
+    from .core.wiki import Wiki
+
+    layout = RepoLayout(Path(args.repo))
+    try:
+        queries = load_queries(args.queries)
+    except QueryFileError as exc:
+        print(f"{_PROG}: eval: {exc}", file=sys.stderr)
+        return 1
+
+    fm = None if args.fm is None else args.fm == "on"
+    record = snapshot(Wiki(layout), queries, fm=fm, limit=args.limit)
+    header = record["header"]
+    rows = record["queries"]
+
+    print(f"repo: {layout.root}")
+    print(
+        f"  queries={header['query_count']} notes={header['corpus_note_count']} "
+        f"fm={'on' if header['fm_enabled'] else 'off'} "
+        f"cache={'on' if header['index_cache_enabled'] else 'off'} "
+        f"cache_used={'yes' if header['index_cache_used'] else 'no'} limit={header['limit']}"
+    )
+    id_width = max([2, *(len(str(row["id"])) for row in rows)])
+    print(f"  {'ID':<{id_width}}  {'EXPECT':<9}  {'STATUS':<9}  {'TOP HIT':<28}  SCORE")
+    for row in rows:
+        top = row["hits"][0] if row["hits"] else None
+        note = top["note"] if top else "-"
+        score = f"{top['score']:.6f}" if top else "-"
+        print(
+            f"  {row['id']:<{id_width}}  {row['expect']:<9}  {row['status']:<9}  "
+            f"{note:<28}  {score}"
+        )
+
+    violations = [row for row in rows if row["status"] != row["expect"]]
+    for row in violations:
+        print(
+            f"  MISMATCH: {row['id']} expected {row['expect']}, got {row['status']}",
+            file=sys.stderr,
+        )
+
+    if args.out is not None:
+        out = Path(args.out)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_text(out, dumps(record), exclusive=False)
+        print(f"  wrote {out}")
+
+    print(f"  {len(rows)} queries, {len(violations)} violating expect")
+    return 1 if violations else 0
 
 
 # agora doctor's brain probe budget (#96 criterion 5). Deliberately SHORTER than the shim's own 10s

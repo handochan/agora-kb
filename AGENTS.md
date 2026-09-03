@@ -42,7 +42,8 @@ src/agora_kb/
   core/        single internal API: inbox(write) · wiki(read) + index_cache.py (the ADR-0012 §2
                derived query reader cache, _kb/index/, issue #26) + gold.py (ADR-0027 pack
                assembler, _kb/gold/) + redact.py/sentinel.py (outbound redaction + the §8 sentinel,
-               ADR-0023/0027) · repo/tenant · state
+               ADR-0023/0027) + rank_snapshot.py (the model-free deterministic ranking snapshot
+               behind `agora eval`, #44) · repo/tenant · state
   curator/     sleep-time consolidation worker + backends (BackendRegistry, per-act plan/author
                routing — ADR-0015) + triggers + isolation/ (OS sandbox)
   adapters/    curator-brain shims invoked via adapters.yaml argv: ollama_brain.py
@@ -65,7 +66,7 @@ src/agora_kb/
   schema/      the KB wiki schema (AGENTS.md template emitted into each knowledge repo) + lint
   config.py    load config (adapters.yaml, repo.yaml, triggers + harvest policy + connector specs)
   cli.py       `agora` entry point (repo init · import · status · curate · harvest · index · gold ·
-               sync · watch · serve · web · doctor)
+               eval · sync · watch · serve · web · doctor)
   # --- not yet implemented (later phases) ---
   auth/        (Phase 4+ — stub) authn/authz (tokens, OpenFGA/Forgejo delegation)
 deploy/        launchd/systemd unit templates for always-on watch/web + harvest schedule (#65)
