@@ -1,6 +1,7 @@
 # ADR-0008 — Transactional, sandboxed curator runs
 
 **Status:** Accepted · 2026-06-13
+**AMENDED (append-only) — [ADR-0041](0041-stratum-kind-first-layout.md) (Proposed, KB wiki schema 2) narrows the §4 allowlist:** `wiki/people/**` is a HUMAN-OWNED namespace CARVED OUT of the curator-writable allowlist — any add/modify/rename/delete under it in a curated diff FAILS the run (ADR-0041 D3.3/D4.1). The transaction, the sandbox, and the step ordering are UNCHANGED. **One further clause IS affected: §"Read-after-publish".** Its post-publish sync is `--ff-only` and "never clobbers a dirty/diverged owner tree", surfacing a stuck copy as an observable run-report signal — but a human editing `wiki/people/**` in Obsidian leaves the owner tree dirty BY DESIGN, so under schema 2 that signal would fire on the normal workflow rather than on an anomaly. RULE: the read-after-publish sync tolerates a working tree dirty ONLY under `wiki/people/**` (it proceeds, and the stale-worktree signal is raised only for dirt outside that subtree). A human is under no obligation to commit their notes for a curator run to publish cleanly. The CAS base stays `branch_commit`, unchanged. The prose below is retained verbatim for history.
 
 ## Context
 Inbox events are immutable, while consolidation changes shared wiki files and invokes an external

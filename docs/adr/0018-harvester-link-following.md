@@ -1,6 +1,7 @@
 # ADR-0018 — Harvester file-connector link-following
 
 **Status:** Accepted · 2026-06-20
+**AMENDED (append-only) — [ADR-0041](0041-stratum-kind-first-layout.md) (Proposed, KB wiki schema 2):** link-following itself is UNCHANGED — the one-hop rule, the strict link allowlist, the tolerant frontmatter strip, the fan-out cap counting ATTEMPTS, the never-drop rule, and the path-safety containment relative to the SOURCE FILE'S OWN DIRECTORY (which is a source-side property and has nothing to do with the Agora layout). What changes is the same widening recorded on [ADR-0017](0017-harvester-file-connector-mechanics.md): a `file:` connector may now read one IN-REPO path, `wiki/people/**`, and nothing else under `wiki/` or `raw/`. Sibling containment applies inside that subtree exactly as it does outside the repo. The prose below is retained verbatim for history.
 
 Supersedes the "links-not-followed" Phase-2 limitation recorded in
 [ADR-0017](0017-harvester-file-connector-mechanics.md) §2 (append-only — ADR-0017 is not rewritten).

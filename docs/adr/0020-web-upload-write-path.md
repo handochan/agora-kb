@@ -1,6 +1,7 @@
 # ADR-0020 — Web upload write-path: extract-to-inbox now, raw/ binary staging deferred
 
 **Status:** Accepted · 2026-06-21
+**AMENDED (append-only) — [ADR-0041](0041-stratum-kind-first-layout.md) (Proposed, KB wiki schema 2) gives this ADR's stated deferral a DESTINATION:** the original bytes land at `raw/_blob/<ab>/<sha256>.<ext>` (+ a `<file>.meta.yaml` sidecar), content-addressed and immutable, written ONLY by the deterministic APPLY pass and admitted ONLY by membership in `raw_writes` with matching bytes. **The ROUTING in this ADR is UNCHANGED** — faces still extract→inbox, and decision 3 (the curator remains the sole `raw/` writer) is kept verbatim. **The INBOX ITEM SHAPE is not, and it cannot be:** `Inbox.write` takes `text: str` plus an optional `raw_ref: str` and NO bytes, and `_materialize_raw_source` writes the event BODY — so an unchanged write path could never deliver a binary, and a destination without a transport is not a channel. ADR-0041 D4.2 adds an OPTIONAL ATTACHMENT to the inbox item, written beside the event in the writer's own append-only namespace with `raw_ref` naming its `raw/_blob/` destination; APPLY reads it at claim time. That is a `docs/DATA-MODEL.md` §1 amendment, recorded in ADR-0041. The prose below is retained verbatim for history.
 
 Depends on ADR-0003 (one core, many faces — a face writes only through `write`→inbox, never storage
 directly) and ADR-0002 (CQRS single-writer curator — only the curator writes `raw/`, the wiki, and
