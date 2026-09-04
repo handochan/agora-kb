@@ -56,11 +56,22 @@ from __future__ import annotations
 import datetime
 import posixpath
 import re
+from collections.abc import Mapping
 from pathlib import Path
+
+import yaml
 
 from agora_kb.core import frontmatter
 from agora_kb.core.frontmatter import FrontmatterError
-from agora_kb.core.layout import KIND_DIRECTORIES, RepoLayout
+from agora_kb.core.inbox import (
+    AttachmentError,
+    StagedAttachment,
+    attachment_sha256,
+    parse_attachments,
+    read_attachment,
+)
+from agora_kb.core.layout import KIND_DIRECTORIES, RepoLayout, attachment_basename
+from agora_kb.core.models import Attachment
 from agora_kb.core.pathsafe import is_safe_component
 
 # The strict PRODUCER body-region grammar + the initial-fill placeholder. These live in
@@ -315,6 +326,7 @@ def _sources_union(
     *,
     worktree: Path,
     raw_writes: dict[str, bytes],
+    attachments_dir: Path | None = None,
 ) -> list[str]:
     """Return the ordered, de-duplicated ``sources:`` list, MATERIALIZING each cited ``raw/`` (§2).
 
@@ -332,6 +344,13 @@ def _sources_union(
       a ``raw_ref`` nor a ``body`` (e.g. a hand-authored unit-test provenance fixture) keeps citing
       the path but skips the file write, preserving today's behavior.
 
+    A tuple may ALSO carry ``attachments`` — the captured artefact's original bytes, staged beside
+    the event in ``attachments_dir`` (ADR-0041 D4.2). Each one is materialized into
+    ``raw/_blob/<ab>/<sha256>.<ext>`` with its sidecar (:func:`_materialize_attachments`) and cited
+    BESIDE the text evidence, in that order: the extracted text and the bytes it was extracted from
+    are two artefacts of one capture, and a note that cites only one of them loses half its
+    provenance. The SIDECAR is never cited (lint L1-8b).
+
     Every engine-WRITTEN ``raw/`` ref (and its exact on-disk content) is recorded in ``raw_writes``
     so the worker's final-diff gate can admit ONLY these exact paths-with-content — a brain that
     overwrites or plants a ``raw/`` file during PASS 2 is then NOT in ``raw_writes`` (a new path) or
@@ -343,18 +362,30 @@ def _sources_union(
     sources: list[str] = []
     seen: set[str] = set()
     for tup in provenance:
+        ref: str | None
         raw_ref = tup.get("raw_ref")
         if isinstance(raw_ref, str) and raw_ref:
             ref = raw_ref
         else:
             event_id = tup.get("event_id")
-            if not isinstance(event_id, str) or not event_id:
-                continue
-            ref = f"raw/{domain}/{event_id}.md" if domain else f"raw/{event_id}.md"
-            _materialize_raw_source(worktree, ref, tup.get("body"), raw_writes=raw_writes)
-        if ref not in seen:
+            if isinstance(event_id, str) and event_id:
+                ref = f"raw/{domain}/{event_id}.md" if domain else f"raw/{event_id}.md"
+                _materialize_raw_source(worktree, ref, tup.get("body"), raw_writes=raw_writes)
+            else:
+                # A hand-authored provenance fixture with neither a raw_ref nor an event_id cites
+                # no text artefact. Its ATTACHMENTS are still materialized below: dropping bytes
+                # because the TEXT half of the same tuple is unaddressable would lose the artefact
+                # silently, which is the one outcome the capture channel exists to prevent.
+                ref = None
+        if ref is not None and ref not in seen:
             seen.add(ref)
             sources.append(ref)
+        for blob_ref in _materialize_attachments(
+            tup, worktree=worktree, attachments_dir=attachments_dir, raw_writes=raw_writes
+        ):
+            if blob_ref not in seen:
+                seen.add(blob_ref)
+                sources.append(blob_ref)
     return sources
 
 
@@ -411,6 +442,199 @@ def _materialize_raw_source(
     data = body.encode("utf-8")
     path.write_bytes(data)
     raw_writes[ref] = data
+
+
+# --- raw/_blob/: the ORIGINAL BYTES of a captured artefact (ADR-0041 D1.4 / D4.2) ---------------
+
+#: The reserved ``raw/`` prefix the content-addressed originals live under (ADR-0041 D1.4). A
+#: literal, not a token, so nothing model-supplied can ever reach this path segment.
+_BLOB_PREFIX = "raw/_blob"
+
+#: The ``.meta.yaml`` sidecar suffix. It is appended to the FULL blob filename (``<sha256>.<ext>``),
+#: never substituted for its extension — that is what keeps lint L1-8b (a pure ``endswith``
+#: sidecar test) working unmodified while ``.yaml`` stays a legal artefact extension (D1.4).
+_SIDECAR_SUFFIX = ".meta.yaml"
+
+
+def _blob_ref(record: Attachment) -> str:
+    """``raw/_blob/<ab>/<sha256>.<ext>`` for one attachment — the ONE composition of that path.
+
+    ``<ab>`` is the first two hex characters of the digest (a fan-out shard, ADR-0041 D1.4). Both
+    halves of the basename are re-validated by :func:`~agora_kb.core.layout.attachment_basename`, so
+    a record that reached here from a hand-edited spool file still cannot compose a path segment.
+    """
+    return f"{_BLOB_PREFIX}/{record.sha256[:2]}/{attachment_basename(record.sha256, record.ext)}"
+
+
+def _materialize_attachments(
+    tup: Mapping[str, object],
+    *,
+    worktree: Path,
+    attachments_dir: Path | None,
+    raw_writes: dict[str, bytes],
+) -> list[str]:
+    """Materialize one provenance tuple's attachments into ``raw/_blob/``; return their refs.
+
+    APPLY — the deterministic engine, and the sole writer of ``raw/`` (ADR-0020 decision 3) — is
+    the ONLY place bytes cross from the per-writer staging area into the canonical tree. Fail-loud
+    throughout: a malformed record, a missing staged file, or bytes that do not hash to the digest
+    naming them all raise :class:`ApplyError`, which the worker turns into a clean FAILED run
+    (the event returns to the inbox with its bytes). The alternative — publishing a note that cites
+    a blob nobody wrote — would fail lint L1-8 at best and silently drop the artefact at worst.
+    """
+    try:
+        records = parse_attachments(tup)
+    except AttachmentError as exc:
+        raise ApplyError(f"BLOB: unreadable attachment record on provenance tuple — {exc}") from exc
+    return [
+        _materialize_one_blob(
+            record,
+            tup,
+            worktree=worktree,
+            attachments_dir=attachments_dir,
+            raw_writes=raw_writes,
+        )
+        for record in records
+    ]
+
+
+def _materialize_one_blob(
+    record: Attachment,
+    tup: Mapping[str, object],
+    *,
+    worktree: Path,
+    attachments_dir: Path | None,
+    raw_writes: dict[str, bytes],
+) -> str:
+    """Write ONE attachment's bytes + sidecar into the worktree and return the blob's ``sources:``
+    ref.
+
+    **Immutable and content-addressed** (ADR-0041 D1.4). A blob already present at this content
+    address is RE-CITED and never rewritten: identical bytes are identical bytes, so a second event
+    carrying the same artefact adds a citation and no write. Its digest is re-checked all the same —
+    the note is about to cite it as evidence, and a file whose name does not hash its own content is
+    not evidence.
+
+    Both the blob AND its sidecar are recorded in ``raw_writes``, because both are engine-written
+    files under ``raw/`` and the final-diff gate admits nothing else there. Recording the bytes of a
+    file this run merely RE-cited follows :func:`_materialize_raw_source`'s rule, for the same
+    reason: a PASS-2 overwrite then changes them and fails the gate.
+
+    Those recorded bytes stay resident for the whole run (the gate compares them after PASS 2), so
+    a run's peak is bounded by ``max_candidates_per_run`` x the per-attachment cap. That is the
+    price of the gate's byte-equality contract, and it is paid deliberately: a digest-based
+    comparison for ``raw/_blob/`` paths alone would make the ONE check that distinguishes an
+    engine-written file from a planted one depend on a property a planter can also satisfy.
+
+    The gate's AUTHORSHIP check is untouched by any of this. ``hash(bytes) == basename`` is an
+    INTEGRITY property a brain can compute for bytes it invents; membership in ``raw_writes`` is
+    the statement that the ENGINE wrote the path this run. A planted ``raw/_blob/`` file with a
+    correct self-hash is still rejected, and content-addressing must never be offered as a reason
+    to relax that (D1.4, normative).
+    """
+    ref = _blob_ref(record)
+    sidecar_ref = f"{ref}{_SIDECAR_SUFFIX}"
+    path = _contained(worktree, worktree / ref)
+    sidecar = _contained(worktree, worktree / sidecar_ref)
+
+    if path.exists():
+        data = path.read_bytes()
+        actual = attachment_sha256(data)
+        if actual != record.sha256:
+            raise ApplyError(
+                f"BLOB: {ref!r} already exists but its bytes hash to {actual} — a "
+                f"content-addressed artefact whose content is not what its name says cannot be "
+                f"cited as evidence"
+            )
+        raw_writes[ref] = data
+    else:
+        data = _read_staged_attachment(record, attachments_dir)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # write_BYTES: the artefact is opaque (a PDF, an image, non-UTF-8 with NULs in it) and the
+        # final-diff gate compares RAW bytes, so text mode's newline translation would both corrupt
+        # the file and make the engine's own write fail its own admission check (#85).
+        path.write_bytes(data)
+        raw_writes[ref] = data
+
+    if sidecar.exists():
+        # Never rewritten, for the same immutability reason as the blob: the sidecar records the
+        # FIRST capture of these bytes, and a later event carrying the same artefact does not make
+        # that record wrong.
+        raw_writes[sidecar_ref] = sidecar.read_bytes()
+    else:
+        sidecar_bytes = _render_blob_sidecar(record, tup, size=len(data)).encode("utf-8")
+        sidecar.parent.mkdir(parents=True, exist_ok=True)
+        sidecar.write_bytes(sidecar_bytes)
+        raw_writes[sidecar_ref] = sidecar_bytes
+    return ref
+
+
+def _read_staged_attachment(record: Attachment, attachments_dir: Path | None) -> bytes:
+    """Read one staged attachment's bytes, verified against the digest that names them.
+
+    ``attachments_dir`` is ``<processing>/<run-id>/events/_attach/`` — where the bytes travelled to
+    with their event. ``None`` means the caller supplied no staging area at all (a unit-test APPLY
+    invoked directly), which for a tuple that DOES declare attachments is a caller bug, not a
+    tolerable absence: cite-without-materialize would publish a dangling citation.
+    """
+    if attachments_dir is None:
+        raise ApplyError(
+            f"BLOB: attachment {record.sha256}.{record.ext} was declared but APPLY was given no "
+            f"staging directory to read its bytes from"
+        )
+    staged = StagedAttachment(
+        record=record, path=attachments_dir / attachment_basename(record.sha256, record.ext)
+    )
+    try:
+        return read_attachment(staged)
+    except (OSError, AttachmentError) as exc:
+        raise ApplyError(f"BLOB: cannot read staged attachment {staged.path} — {exc}") from exc
+
+
+def _render_blob_sidecar(record: Attachment, tup: Mapping[str, object], *, size: int) -> str:
+    """Render the ``<blob>.meta.yaml`` capture sidecar — a CLOSED key set (DATA-MODEL §2).
+
+    ``sha256``, ``ext``, ``media_type``, ``bytes``, ``filename``, ``captured_at``, ``writer``,
+    ``source``, ``event_id`` — the capture FACTS, and never the extracted text: that lives in the
+    event body and, after curation, in the note. Duplicating it here would create a second copy of
+    the knowledge that nothing keeps in step with the first.
+
+    ``bytes`` is the length of the bytes actually written, not the record's declared size, so the
+    sidecar can never disagree with the file beside it. An absent optional (``media_type``,
+    ``filename``) and an absent provenance field are OMITTED rather than emitted empty — the key set
+    is closed against ADDITIONS; it does not oblige every key to be present.
+    """
+    doc: dict[str, object] = {"sha256": record.sha256, "ext": record.ext}
+    if record.media_type is not None:
+        doc["media_type"] = record.media_type
+    doc["bytes"] = size
+    if record.filename is not None:
+        doc["filename"] = record.filename
+    captured_at = _blob_timestamp(tup.get("created"))
+    if captured_at is not None:
+        doc["captured_at"] = captured_at
+    for key in ("writer", "source", "event_id"):
+        value = tup.get(key)
+        if isinstance(value, str) and value:
+            doc[key] = value
+    return yaml.safe_dump(doc, sort_keys=False, allow_unicode=True, default_flow_style=False)
+
+
+def _blob_timestamp(value: object) -> str | None:
+    """The event's ``created`` as the sidecar's ``captured_at`` string, or ``None``.
+
+    ``created`` is written as a quoted ``YYYY-MM-DDTHH:MM:SSZ`` string (DATA-MODEL §1) and normally
+    round-trips as one, but a hand-edited event can leave it UNQUOTED, in which case
+    ``yaml.safe_load`` hands back a :class:`datetime.datetime`. Both are accepted and normalized to
+    the same spelling, so the sidecar's shape never depends on how the event happened to be quoted.
+    """
+    if isinstance(value, datetime.datetime):
+        return value.astimezone(datetime.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    if isinstance(value, datetime.date):
+        return value.isoformat()
+    if isinstance(value, str) and value:
+        return value
+    return None
 
 
 def _is_harvest_origin(provenance: list[dict[str, object]]) -> str | None:
@@ -868,6 +1092,7 @@ def apply_plan(
     run_date: str,
     provenance: dict[str, list[dict[str, object]]],
     confidence: dict[str, str] | None = None,
+    attachments_dir: Path | None = None,
 ) -> dict[str, bytes]:
     """Materialize a validated ``plan`` into the ``worktree`` deterministically (ADR-0011 §3).
 
@@ -876,6 +1101,14 @@ def apply_plan(
     into the curated diff. Any OTHER ``raw/`` change in the committed tree (a brain-planted file, or
     a PASS-2 overwrite of one of these — same path, different content) is therefore rejected, so the
     brain still never writes ``raw/``.
+
+    ``attachments_dir`` is where the claimed events' staged bytes live — ``<processing>/<run-id>/
+    events/_attach/`` (ADR-0041 D4.2). Every attachment a provenance tuple declares is materialized
+    into ``raw/_blob/<ab>/<sha256>.<ext>`` with its ``.meta.yaml`` sidecar, BOTH recorded in the
+    returned set and the BLOB (never the sidecar) cited beside the text evidence in ``sources:``.
+    ``None`` is for callers with no staging area — a direct unit-test APPLY — and is safe exactly
+    while no tuple declares an attachment; one that does raises :class:`ApplyError` rather than
+    publishing a citation to bytes that were never written.
 
     ``confidence`` maps ``candidate_id -> worst-case confidence`` (``high|medium|low``, ADR-0011
     §2 / DATA-MODEL §1). APPLY MIRRORS it onto the materialized note (it is NOT a plan field, so the
@@ -949,6 +1182,7 @@ def apply_plan(
                 provenance=prov,
                 confidence=conf,
                 raw_writes=raw_writes,
+                attachments_dir=attachments_dir,
             )
             if disp.domain and disp.basename:
                 created_concepts_by_subject.setdefault(disp.domain, set()).add(disp.basename)
@@ -963,6 +1197,7 @@ def apply_plan(
                 run_date=run_date,
                 provenance=prov,
                 raw_writes=raw_writes,
+                attachments_dir=attachments_dir,
             )
         elif disp.op == "MARK_CONTESTED":
             _apply_contested(
@@ -972,8 +1207,17 @@ def apply_plan(
                 run_date=run_date,
                 provenance=prov,
                 raw_writes=raw_writes,
+                attachments_dir=attachments_dir,
             )
         elif disp.op in ("DROP", "NOOP"):
+            # No note, therefore no `sources:`, therefore no provenance materialisation at all —
+            # neither the free-text `raw/<domain>/<event_id>.md` nor, since ADR-0041 D4.2, an
+            # attachment's `raw/_blob/` bytes. That parity is deliberate: `raw/` holds the evidence
+            # a published note CITES, and an uncited blob would be a file the final diff admits and
+            # lint L1-8 can never account for. The artefact is not destroyed — it drains to
+            # `_kb/processed/<date>/_attach/` with its event and is never pruned — but that spool is
+            # git-ignored, so a DROPped capture's bytes never enter the committed tree. Documented
+            # in DATA-MODEL §1/§2 and INGEST-CONTRACT §0.1 rule 2 rather than left to be discovered.
             continue
         else:  # pragma: no cover — §4.1 CLOSED-VOCAB makes this unreachable for a valid plan
             raise ApplyError(f"candidate {disp.candidate_id!r}: unknown op {disp.op!r}")
@@ -994,6 +1238,7 @@ def apply_plan(
             run_date=run_date,
             provenance=provenance.get(disp.candidate_id, []),
             raw_writes=raw_writes,
+            attachments_dir=attachments_dir,
         )
 
     # Map + root-index maintenance for every subject that gained a concept this run. The map is
@@ -1017,6 +1262,7 @@ def _apply_create_concept(
     provenance: list[dict[str, object]],
     confidence: str,
     raw_writes: dict[str, bytes],
+    attachments_dir: Path | None,
 ) -> None:
     """Create ``wiki/concepts/<basename>.md`` with full D2 frontmatter + a body sentinel (D1/D2.2).
 
@@ -1034,7 +1280,13 @@ def _apply_create_concept(
     """
     if not disp.basename:
         raise ApplyError(f"candidate {disp.candidate_id!r}: CREATE_THEME requires a basename")
-    sources = _sources_union(disp.domain, provenance, worktree=worktree, raw_writes=raw_writes)
+    sources = _sources_union(
+        disp.domain,
+        provenance,
+        worktree=worktree,
+        raw_writes=raw_writes,
+        attachments_dir=attachments_dir,
+    )
     origin = _is_harvest_origin(provenance)
     fm = _concept_frontmatter(
         disp,
@@ -1064,6 +1316,7 @@ def _apply_append_journal(
     run_date: str,
     provenance: list[dict[str, object]],
     raw_writes: dict[str, bytes],
+    attachments_dir: Path | None,
 ) -> None:
     """Create-or-append the ONE journal of this ``run_date``, repo-wide (ADR-0041 D2.6).
 
@@ -1114,7 +1367,13 @@ def _apply_append_journal(
         section = f"{heading}\n\n{region}"
     else:
         section = ""
-    new_sources = _sources_union(disp.domain, provenance, worktree=worktree, raw_writes=raw_writes)
+    new_sources = _sources_union(
+        disp.domain,
+        provenance,
+        worktree=worktree,
+        raw_writes=raw_writes,
+        attachments_dir=attachments_dir,
+    )
 
     if path.is_file():
         # Append a new dated section, unioning the day's sources into frontmatter (keep prior).
@@ -1342,6 +1601,7 @@ def _apply_merge(
     run_date: str,
     provenance: list[dict[str, object]],
     raw_writes: dict[str, bytes],
+    attachments_dir: Path | None,
 ) -> None:
     """Union provenance into the target's ``sources:`` + append an augmentation sub-region."""
     if not disp.target_basename:
@@ -1358,7 +1618,11 @@ def _apply_merge(
     # `sources:` string derivable and lint L1-8 satisfiable.
     target_domain = _shard_key(fm, disp.domain)
     new_sources = _sources_union(
-        target_domain, provenance, worktree=worktree, raw_writes=raw_writes
+        target_domain,
+        provenance,
+        worktree=worktree,
+        raw_writes=raw_writes,
+        attachments_dir=attachments_dir,
     )
     merged = _str_list(fm.get("sources"))
     for s in new_sources:
@@ -1403,6 +1667,7 @@ def _apply_contested(
     run_date: str,
     provenance: list[dict[str, object]],
     raw_writes: dict[str, bytes],
+    attachments_dir: Path | None,
 ) -> None:
     """Set the §2.1 contested frontmatter + render the ``> [!contested]`` callout on the target."""
     if not disp.target_basename:
@@ -1422,7 +1687,11 @@ def _apply_contested(
 
     # Same schema-2 shard-key derivation as MERGE: the target's own `subjects:`, never its path.
     new_sources = _sources_union(
-        _shard_key(fm, disp.domain), provenance, worktree=worktree, raw_writes=raw_writes
+        _shard_key(fm, disp.domain),
+        provenance,
+        worktree=worktree,
+        raw_writes=raw_writes,
+        attachments_dir=attachments_dir,
     )
 
     # Union the new claim's provenance into sources (keep BOTH; contested needs >=2 sources, §2.1).

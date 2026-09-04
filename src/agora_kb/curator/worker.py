@@ -63,8 +63,8 @@ from typing import TYPE_CHECKING, Literal, Protocol
 from ..core import frontmatter
 from ..core.frontmatter import FrontmatterError
 from ..core.ids import new_event_id
-from ..core.inbox import Inbox, return_event_to_inbox
-from ..core.layout import RepoLayout
+from ..core.inbox import AttachmentError, Inbox, carry_attachments, return_event_to_inbox
+from ..core.layout import RepoLayout, attachment_dir
 from ..core.repo import GitError, Repo
 from ..core.sentinel import BODY_RESET_PLACEHOLDER, UNAUTHORED_REGION_BODIES, has_unauthored_region
 from ..core.sentinel import BODY_START_LINE_RE as _START_SENTINEL_RE
@@ -806,17 +806,32 @@ def _run_locked(
     # menu and the gate cannot drift apart. kb_schema.md §7.1 states this property to the model;
     # keep the three in step.
     live_now = scan_live_tree(layout, schema_version=schema_version)
-    bundle = build_bundle(
-        layout,
-        repo,
-        manifest,
-        related_k=related_k,
-        mergeable_paths={
-            n.rel_path
-            for n in live_now.notes
-            if _is_mergeable_note(n) and n.rel_path in live_now.curator_paths
-        },
-    )
+    try:
+        bundle = build_bundle(
+            layout,
+            repo,
+            manifest,
+            related_k=related_k,
+            mergeable_paths={
+                n.rel_path
+                for n in live_now.notes
+                if _is_mergeable_note(n) and n.rel_path in live_now.curator_paths
+            },
+        )
+    except AttachmentError as exc:
+        # A claimed event declares attachments in a shape this build cannot read (ADR-0041 D4.2).
+        # `parse_attachments` is deliberately fail-loud there — reading it as "no attachments"
+        # would drop the artefact and publish a note citing bytes nobody wrote — so the refusal
+        # surfaces HERE as the clean FAILED run every other integrity rejection produces, never as
+        # a traceback out of run() that strands the claimed batch in `_kb/processing/` (§4).
+        return _fail(
+            layout,
+            manifest,
+            state_store,
+            now=now,
+            reasons=[f"BUNDLE-ATTACH: {exc}"],
+            max_attempts=max_attempts,
+        )
 
     # #60 batch observability: the run's claim/bundle shape + the queue depth left after the claim
     # (one cheap dir count — the un-claimed FIFO remainder the next trigger will pick up). Captured
@@ -977,6 +992,12 @@ def _run_locked(
                 run_date=run_date,
                 provenance=bundle.provenance,
                 confidence=confidence,
+                # The claimed events' staged bytes, which travelled WITH them into the run
+                # (`_attach/` beside `events/`). APPLY is the only writer of `raw/_blob/`
+                # (ADR-0041 D4.2 / ADR-0020 decision 3), and this is the one seam by which
+                # original bytes reach it — the backend never sees the directory, let alone the
+                # bytes.
+                attachments_dir=attachment_dir(layout.processing_dir / manifest.run_id / "events"),
             )
         except ApplyError as exc:
             return _fail(
@@ -1622,7 +1643,12 @@ def _fail(
                 # failed/ beside the error record. A preserved event IS a terminal disposition, so
                 # it counts as one: `counts["failed"]` and `counters.failed` stay honest, and no
                 # counts KEY changes (the #123 strict-equality assertions hold).
-                os.replace(event_path, failed_dir / event_path.name)
+                dest = failed_dir / event_path.name
+                os.replace(event_path, dest)
+                # The event's staged bytes follow it into failed/ (ADR-0041 D4.2): a terminal
+                # failure is exactly where an operator needs the ORIGINAL artefact beside the event
+                # to work out what happened, and `processing/` is about to be rmtree'd.
+                carry_attachments(dest, source_dir=events_dir)
                 failed += 1
 
     bounded = _bounded_reasons(reasons)
@@ -1772,6 +1798,10 @@ def _preserve_one_event(event_path: Path, preserve_dir: Path) -> bool:
     so a preserved event is indistinguishable from the original an operator captured. Never raises —
     it runs on the failure/recovery paths, where an exception would strand the events after it in
     the disposal loop, turning a one-event problem into a whole-run one.
+
+    Its staged ATTACHMENT bytes are preserved with it (ADR-0041 D4.2). Without that the no-loss
+    floor would only be half a floor: the event survives naming an artefact whose only copy was
+    inside the ``processing/`` tree the caller ``rmtree``s a moment later.
     """
     try:
         preserve_dir.mkdir(parents=True, exist_ok=True)
@@ -1780,9 +1810,11 @@ def _preserve_one_event(event_path: Path, preserve_dir: Path) -> bool:
             # Already preserved under this run (a re-walked directory) — nothing to do, and
             # clobbering would overwrite an immutable event.
             return False
+        source_dir = event_path.parent
         os.replace(event_path, dest)
     except OSError:
         return False
+    carry_attachments(dest, source_dir=source_dir)
     return True
 
 
@@ -2725,6 +2757,22 @@ def _move_events_to_processed(layout: RepoLayout, manifest: RunManifest, run_dat
 
     A same-filesystem rename (``_kb/`` is one tree), so each event stays byte-for-byte immutable
     (DATA-MODEL §1). Idempotent: an already-moved event (a re-finalize after a crash) is skipped.
+
+    An event's staged attachment bytes follow it (:func:`~agora_kb.core.inbox.carry_attachments`):
+    they are part of the same delivery and are drained with it, so ``processing/<run-id>/`` is left
+    with nothing to clean up and ``processed/<date>/_attach/`` keeps the artefact recoverable beside
+    the event that named it. The carry is best-effort by contract and never raises: aborting a
+    drain half-way would leave events split across two directories, which is strictly worse than one
+    artefact that did not follow its event.
+
+    **The carried copy is not always redundant.** ``raw/_blob/`` holds the bytes only for a
+    candidate the run KEPT: ``apply_plan`` short-circuits ``DROP``/``NOOP`` before
+    ``_sources_union`` runs, so a dropped capture's artefact is never materialised (exactly as a
+    dropped free-text capture writes no ``raw/<domain>/<event_id>.md``). For those events
+    ``processed/<date>/_attach/`` is the ONLY remaining copy — recoverable and never pruned, but
+    inside the git-ignored ``_kb/`` spool, so it is not committed, pushed, or backed up by
+    ``agora sync``. Stated in DATA-MODEL §1 and INGEST-CONTRACT §0.1 too, so the capture
+    surfaces do not overstate their promise.
     """
     events_dir = layout.processing_dir / manifest.run_id / "events"
     if not events_dir.is_dir():
@@ -2736,6 +2784,7 @@ def _move_events_to_processed(layout: RepoLayout, manifest: RunManifest, run_dat
         if dest.exists():
             continue
         os.replace(event_path, dest)
+        carry_attachments(dest, source_dir=events_dir)
 
 
 def _commit_message(run_id: str, counts: dict[str, int]) -> str:

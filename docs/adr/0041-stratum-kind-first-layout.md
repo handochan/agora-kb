@@ -2,6 +2,8 @@
 
 **Status:** Proposed · 2026-09-04 · _authored as normative text so acceptance is a status flip, nothing else._
 
+**AMENDED (append-only) — three mechanical details of D1.4 and D4.2 are REVISED by the addendum at the end of this file** (*Addendum — as-built: the capture transport and the `raw/_blob/` sidecar (#153, landed 2026-09-04)*): the staging path is `_kb/inbox/<writer>/_attach/<sha256>.<ext>` with an `attachments:` list, **not** `<id>.blob` with `raw_ref`; the `raw/_blob/` sidecar has its own nine-key CAPTURE key set, **not** the five-key DATA-MODEL §2 re-ingest shape (which is unchanged for `raw/<domain>/` binaries); and `<ext>` is the D1.4 grammar with a `bin` fallback, deliberately **not** narrowed to the extractor's accepted set. Every normative property — APPLY as the sole `raw/` writer, `raw_writes` membership **with matching bytes** as the admission rule, content-addressing as an additional self-check and never a substitute for it — is untouched. The D1.4/D4.2 prose below is retained verbatim for history.
+
 Supersedes the layout, note-type, and folder-naming sections of [ADR-0010](0010-kb-wiki-schema.md)
 (KB wiki schema v1) and the "no new `type:` values" conclusion of
 [`STRATEGY-2026-08.md` §12](../STRATEGY-2026-08.md) (see the triage section below, which also
@@ -1110,3 +1112,105 @@ so.
 
 **Scope.** This addendum touches rule 2 only. Rules 1 and 3–7 are unchanged, and nothing here
 weakens the "source is never modified" property or rule 7's hard-failure-with-a-named-list contract.
+
+---
+
+## Addendum — as-built: the capture transport and the `raw/_blob/` sidecar (#153, landed 2026-09-04)
+
+D1.4 gave `raw/_blob/` a destination and D4.2 gave it a channel. Implementation took three of D4.2's
+and D1.4's mechanical details a different way, and this addendum records the shipped shapes so the
+code is not deviating from an unamended ADR. **Every normative property is untouched:** APPLY is
+still the only writer of `raw/`; admission is still membership in `raw_writes` **with matching
+bytes**, and content-addressing is still an additional self-check and never a substitute for that
+authorship check (D1.4's normative paragraph, verbatim); the inbox item is still immutable,
+append-only and per-writer-namespaced; the sidecar is still `<file>.meta.yaml` so lint L1-8b keeps
+working unmodified; `_blob`/`_pages` are still reserved domain names.
+
+**1. The staging path is content-addressed and shared, not one blob per event.** D4.2 says
+`_kb/inbox/<writer>/<id>.blob`, *"with `raw_ref` naming the `raw/_blob/<ab>/<sha256>.<ext>`
+destination"*. As built it is `_kb/inbox/<writer>/_attach/<sha256>.<ext>`, and the event names its
+bytes through a new **optional `attachments:` frontmatter list** (`{sha256, ext, filename,
+media_type, bytes}` per entry) rather than through `raw_ref`, which is untouched and keeps its
+existing meaning. Two reasons, both discovered by building it:
+
+- *One event may carry several artefacts, and several events may carry one.* `<id>.blob` can express
+  neither. Content-addressing gives both for free: two events uploading the same PDF name one staged
+  file and, later, one `raw/_blob/` blob with one citation each — which is also what makes D1.4's
+  re-cite rule (an existing digest is cited, never rewritten) reachable from the write side.
+- *`raw_ref` cannot name the destination without duplicating it.* The destination is a pure function
+  of the digest and the extension the record already carries (`raw/_blob/<sha[:2]>/<sha>.<ext>`), so
+  storing it as a second, caller-supplied string would let a hand-edited spool file point a
+  citation at a path the bytes do not hash to. APPLY composes the ref itself, from the record.
+
+The ordering D4.2 actually cares about — the bytes are written **before** the event that names
+them, inside one `Inbox.write` call, so a crash never leaves an event citing bytes that do not exist
+— is preserved exactly, and the rejected alternative (a staging area outside the inbox) stays
+rejected.
+
+**2. The `raw/_blob/` sidecar has its own closed key set, and the DATA-MODEL §2 key set is
+unaffected.** D1.4 says the sidecar carries *"the DATA-MODEL §2 shape (`source_url`, `ingested`,
+`ingested_by`, `sha256`, `mime`) unchanged"*, and the triage row repeats it. That was written on the
+assumption that a blob is a fetched document like every other `raw/` binary; it is not. The §2 shape
+describes a **re-ingest drift record** for a file with a `source_url` that can be fetched again. A
+captured artefact has no URL, was handed to us once, and is immutable by construction — for it the
+questions worth answering are *which bytes, how many, from whom, when, and under which event*. So
+the shipped sidecar is:
+
+```yaml
+sha256: <hex>          # == the basename: the integrity self-check
+ext: pdf
+media_type: application/pdf   # optional, normalised to a bare lowercase type/subtype
+bytes: 481920                 # the length actually written, never the record's claim
+filename: 2026-q3-report.pdf  # optional, DISPLAY only, sanitised
+captured_at: 2026-06-13T10:22:33Z
+writer: dochan
+source: web:dochan
+event_id: <inbox event id>
+```
+
+Closed against **additions**; an absent optional is omitted rather than emitted empty. It never
+carries the extracted text — that lives in the event body and, after curation, in the note, and a
+second copy nothing keeps in step is a liability. **`raw/<domain>/` binaries keep the five-key §2
+sidecar unchanged**; the two shapes are distinguished by which tree the file is in, and
+`docs/DATA-MODEL.md` §2 now says so explicitly. This supersedes the D1.4 sentence and the triage
+row's *"the sidecar key set are unchanged"* **for `raw/_blob/` only**.
+
+**3. `<ext>` is the D1.4 grammar, deliberately NOT narrowed to the extractor's accepted set.** D1.4
+says `<ext>` is *"drawn from the extractor's accepted extension set (ADR-0025's broadened list)"*.
+The path composer (`core/layout.attachment_ext_for`) enforces the grammar — exactly one component,
+`[a-z0-9]{1,16}`, never `meta`, falling back to `bin` for anything else — and consults no extractor
+registry. That is the shipped behaviour, and it is the correct one: `agora capture --file` exists
+precisely so that **an artefact nobody can extract today can be kept until somebody can**, and a
+composer restricted to the extractor's list would either refuse those files or rename every one of
+them to `bin`, throwing away the one piece of type information the operator had. The grammar is
+what carries the safety property (no `.`, no leading `_`, no dotfile, no `meta`, so
+`<sha256>.<ext>` and `<sha256>.<ext>.meta.yaml` stay structurally distinguishable and L1-8b keeps
+working); the extractor's list was never load-bearing for path safety. The extension is DISPLAY
+metadata attached to opaque bytes, and the operator's own gate for what a face will accept remains
+`web.extensions.allowed` (ADR-0025), one layer up.
+
+**4. What a `DROP` means for the bytes (no ADR change; recorded because it is easy to misread).**
+APPLY materialises a blob only where a note **cites** it, so a candidate the curator DROPs (or
+NOOPs) writes no note, no `sources:` entry, and no `raw/_blob/` file. The artefact is not destroyed
+— it drains to `_kb/processed/<date>/_attach/` with its event and is never pruned — but that spool
+is git-ignored, so a DROPped capture's bytes never enter the committed tree and `agora sync` never
+pushes them. This is the SAME rule a free-text capture has always followed (a DROPped `kb_remember`
+writes no `raw/<domain>/<event_id>.md`), and keeping the parity is deliberate: an uncited blob would
+be a file the final diff admits that lint L1-8 can never account for. Stated in DATA-MODEL §1/§2,
+INGEST-CONTRACT §0.1 and `agora capture`'s own output so the capture surfaces do not overstate what
+"kept" means.
+
+**5. `raw/_blob/` is pinned out of git's EOL translation.** `hash(bytes) == basename` is only true
+if git stores the bytes it was given. A CRLF artefact with no NUL in it (CSV, TXT, HTML, JSON) is
+classified TEXT by git and normalised to LF on commit under `core.autocrlf` — after which the
+committed blob no longer hashes to its own filename and every later re-cite of that digest fails
+`_materialize_one_blob`'s re-verification, permanently. `Repo.init` therefore seeds a
+`.gitattributes` carrying `raw/_blob/** -text -diff -merge`, appended rather than rewritten so a
+re-init keeps the operator's own rules and lands ours LAST (gitattributes resolves last match wins),
+and `Repo._git` pins `-c core.autocrlf=false` on every invocation (an argv `-c` outranks a
+repo-local `.git/config`, which the existing `GIT_CONFIG_GLOBAL/SYSTEM` neutralisation cannot
+reach). `core.eol` is deliberately NOT pinned: its default is `native`, so pinning it would change
+agora's own working-tree writes on Windows, and it applies only where the `text` attribute is set —
+which `raw/_blob/**` unsets. Repos created before this change have no such file; `agora doctor`
+answers with `git check-attr` (authoritative about ordering and the operator's own additions) and
+prints the one-line remedy.

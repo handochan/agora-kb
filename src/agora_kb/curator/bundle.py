@@ -28,7 +28,9 @@ RE-derives it from the body via :func:`agora_kb.core.content_sha256`, never trus
 ``content_sha256:`` field), collapsing identical content from different writers/sources into ONE
 candidate while UNIONing every distinct ``{event_id, source, writer, cwd, raw_ref, created, body}``
 tuple present in THIS run's manifest into ``provenance[]`` (the immutable event ``body`` is carried
-so deterministic APPLY can materialize the cited ``raw/`` source, ADR-0010 D3). The union is bounded
+so deterministic APPLY can materialize the cited ``raw/`` source, ADR-0010 D3; an event carrying
+original bytes adds an ``attachments`` list of METADATA records — filename, media type, size and
+digest — and never the bytes, ADR-0041 D4.2). The union is bounded
 to the manifest universe
 (§5 "Tier-2 union universe"), so the §4.1 coverage check stays exact: every manifest ``event_id``
 is reachable through exactly one candidate. Determinism is the contract — the same claimed events
@@ -44,6 +46,7 @@ from pathlib import Path
 
 from ..core import frontmatter
 from ..core.hashing import content_sha256
+from ..core.inbox import parse_attachments
 from ..core.layout import RepoLayout
 from ..core.repo import Repo
 from ..core.wiki import QueryResult, Wiki
@@ -271,11 +274,36 @@ def _read_events(layout: RepoLayout, manifest: RunManifest) -> list[_Event]:
     shape :func:`agora_kb.curator.apply_plan` materializes into ``sources:`` (§2): the immutable
     event BODY is threaded in so deterministic APPLY (the ENGINE, never the model) can materialize
     the cited ``raw/<domain>/<event_id>.md`` free-text capture from it (ADR-0010 D3).
+
+    An event that carries ATTACHMENTS (ADR-0041 D4.2) adds ONE key: ``attachments``, the list of
+    ``{sha256, ext, filename, media_type, bytes}`` records — **metadata, never bytes**. APPLY reads
+    the digest+extension to address the staged file and materialize ``raw/_blob/``; the brain, which
+    reads the same tuples out of ``candidates.json``, gets a TEXT summary of what was captured and
+    no way to reach the artefact itself (§1: the bundle is the model's whole world, and an opaque
+    binary has no business in a prompt). The key is OMITTED when the event has none, so every
+    bundle built from attachment-free events is byte-identical to before.
+
+    ``parse_attachments`` is FAIL-LOUD: an event whose ``attachments:`` block this build cannot
+    read raises rather than being read as "no attachments", which would publish a note that silently
+    dropped the artefact. The caller (:func:`agora_kb.curator.worker.run`) turns that into a clean
+    FAILED run.
     """
     events_dir = layout.processing_dir / manifest.run_id / "events"
     out: list[_Event] = []
     for event_id in manifest.event_ids:
         fm, body = frontmatter.parse((events_dir / f"{event_id}.md").read_text(encoding="utf-8"))
+        provenance: dict[str, object] = {
+            "event_id": event_id,
+            "source": fm.get("source"),
+            "writer": fm.get("writer"),
+            "cwd": fm.get("cwd"),
+            "raw_ref": fm.get("raw_ref"),
+            "created": fm.get("created"),
+            "body": body,
+        }
+        attachments = parse_attachments(fm)
+        if attachments:
+            provenance["attachments"] = [a.to_frontmatter() for a in attachments]
         out.append(
             _Event(
                 event_id=event_id,
@@ -284,15 +312,7 @@ def _read_events(layout: RepoLayout, manifest: RunManifest) -> list[_Event]:
                 domain=_opt_str(fm.get("domain")),
                 kind=str(fm.get("kind")) if isinstance(fm.get("kind"), str) else "capture",
                 confidence=_opt_str(fm.get("confidence")),
-                provenance={
-                    "event_id": event_id,
-                    "source": fm.get("source"),
-                    "writer": fm.get("writer"),
-                    "cwd": fm.get("cwd"),
-                    "raw_ref": fm.get("raw_ref"),
-                    "created": fm.get("created"),
-                    "body": body,
-                },
+                provenance=provenance,
             )
         )
     return out
