@@ -69,6 +69,7 @@ from agora_kb.config import (
     WebConfig,
     WebIdentityConfig,
     guard_repo_schema_version,
+    load_repo_config,
     load_web_config,
 )
 from agora_kb.core import Repo
@@ -472,9 +473,13 @@ def build_app(*, repo_path: Path, writer: str = "web", user: str = "local") -> F
         """Return ``{query, status, hits[...]}`` — ordered citations into ``wiki/`` (ADR-0012)."""
         return handlers.query(q)
 
-    @app.get("/api/notes", tags=["api"], summary="List every wiki note + domains.")
+    @app.get("/api/notes", tags=["api"], summary="List every wiki note + subjects.")
     def api_notes() -> dict[str, object]:
-        """Return ``{notes: [...], domains: [...]}`` — the browse listing (no body)."""
+        """Return ``{notes: [...], subjects: [...]}`` — the browse listing (no body).
+
+        Each row carries ``kind`` and ``subjects`` (ADR-0041 D2/D3.2); v1's ``type`` and scalar
+        ``domain`` are gone, not mirrored — see :meth:`AgoraHandlers.browse` for why.
+        """
         return handlers.browse()
 
     @app.get(
@@ -499,8 +504,8 @@ def build_app(*, repo_path: Path, writer: str = "web", user: str = "local") -> F
             str | None, Query(description="A note rel_path to ego-center the graph on (local).")
         ] = None,
         depth: Annotated[int, Query(description="Local ego-graph BFS depth (clamped 1..3).")] = 1,
-        domain: Annotated[
-            str | None, Query(description="Restrict the global graph to one domain.")
+        subject: Annotated[
+            str | None, Query(description="Restrict the global graph to one subject.")
         ] = None,
     ) -> dict[str, object]:
         """Return ``{nodes, edges, node_total, edge_total, truncated, center, depth}``.
@@ -515,7 +520,7 @@ def build_app(*, repo_path: Path, writer: str = "web", user: str = "local") -> F
         return handlers.graph(
             center=center,
             depth=depth,
-            domain=domain,
+            subject=subject,
             max_nodes=web_config.graph.max_nodes,
             max_depth=web_config.graph.max_depth,
         )
@@ -679,7 +684,7 @@ def build_app(*, repo_path: Path, writer: str = "web", user: str = "local") -> F
     # ============================================================================================
     @app.get("/", response_class=HTMLResponse, include_in_schema=False)
     def home(request: Request) -> _TemplateResponse:
-        """Home: search box, a status strip, and the domain/notes list (from ``browse()``)."""
+        """Home: search box, a status strip, and the subject/notes list (from ``browse()``)."""
         browse = handlers.browse()
         status = handlers.status()
         return templates.TemplateResponse(
@@ -717,37 +722,50 @@ def build_app(*, repo_path: Path, writer: str = "web", user: str = "local") -> F
         )
 
     @app.get("/graph", response_class=HTMLResponse, include_in_schema=False)
-    def graph_page(request: Request, domain: str | None = None) -> _TemplateResponse:
+    def graph_page(request: Request, subject: str | None = None) -> _TemplateResponse:
         """The interactive knowledge-graph page (a per-route force-graph canvas, ADR-0019 §7).
 
-        Builds the JSON ``api_src`` server-side (``/api/graph`` + an optional ``?domain=`` when a
-        non-empty domain is selected) and renders ``graph.html`` with the domain-filter chips. The
-        canvas fetches ``api_src`` client-side via ``graph.js``; this route adds no graph logic.
+        Builds the JSON ``api_src`` server-side (``/api/graph`` + an optional ``?subject=`` when a
+        non-empty subject is selected) and renders ``graph.html`` with the subject-filter chips.
+        The canvas fetches ``api_src`` client-side via ``graph.js``; this route adds no graph logic.
         A disabled graph feature 404s (ADR-0025), matching ``/api/graph``.
         """
         if not web_config.features.graph_enabled:
             raise HTTPException(status_code=404, detail="graph feature is disabled")
         api_src = "/api/graph"
-        active = (domain or "").strip() or None
+        active = (subject or "").strip() or None
         if active:
-            api_src = f"{api_src}?domain={urllib.parse.quote(active)}"
+            api_src = f"{api_src}?subject={urllib.parse.quote(active)}"
         return templates.TemplateResponse(
             request,
             "graph.html",
             {
-                "domains": handlers.browse()["domains"],
-                "active_domain": active,
+                "subjects": handlers.browse()["subjects"],
+                "active_subject": active,
                 "api_src": api_src,
             },
         )
 
     @app.get("/upload", response_class=HTMLResponse, include_in_schema=False)
     def upload_form(request: Request) -> _TemplateResponse:
-        """The multi-modal capture form (file | url | text, + domain/tags)."""
+        """The multi-modal capture form (file | url | text, + domain/tags).
+
+        The domain selector is the WRITE-side vocabulary and it is deliberately NOT the read side's
+        ``subjects`` facet: ``domain`` on this form reaches ``Inbox.write`` and survives schema 2
+        only as the ``raw/<domain>/`` SHARD KEY (ADR-0041 D2.2 leg 3), so its legal values are the
+        taxonomy's declared ``domains`` — not "the subjects some note happens to carry today".
+        Reading the taxonomy also lets a fresh KB offer its domains before any note exists, which
+        the old ``browse()``-derived list could not. A config error degrades to an empty list (the
+        field is optional — "let the curator decide" is the first option), never a 500 on a form.
+        """
+        try:
+            domains = list(load_repo_config(repo.layout).taxonomy.domains)
+        except Exception:  # noqa: BLE001 — an unreadable taxonomy must not break the capture form.
+            domains = []
         return templates.TemplateResponse(
             request,
             "upload.html",
-            {"browse": handlers.browse()},
+            {"domains": domains},
         )
 
     @app.post("/upload", response_class=HTMLResponse, include_in_schema=False)
@@ -1302,9 +1320,19 @@ def _rewrite_wiki_links(body: str, *, notes: list[dict[str, object]]) -> str:
     External links (scheme-bearing, anchors, non-``.md``) are returned verbatim. Operates on the
     RAW markdown so it composes with the later HTML-escaping render (the URL is what changes, never
     note prose).
+
+    ``wiki/people/**`` is OUTSIDE this identity space (ADR-0041 D3.3: *"a people note is addressed
+    by path, never by ``[[basename]]``"*), so a people row never SEEDS the resolver — it stays
+    browsable and readable at its own ``/note/<rel_path>``, it just cannot capture a link the
+    curator wrote to a note of the same name. The row's ``kind`` is the test, and it is exactly the
+    schema-gated one the rest of the read side uses: ``kind == "person"`` is derived from the
+    directory and only on schema 2, so a schema-1 repo owning an ordinary ``people`` DOMAIN is
+    untouched.
     """
     by_basename: dict[str, str] = {}
     for n in notes:
+        if n.get("kind") == "person":
+            continue
         base = n.get("basename")
         rel = n.get("rel_path")
         if isinstance(base, str) and isinstance(rel, str):

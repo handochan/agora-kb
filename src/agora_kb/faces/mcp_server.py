@@ -57,6 +57,7 @@ from typing import TYPE_CHECKING
 from agora_kb.config import guard_repo_schema_version, load_backend_registry, load_repo_config
 from agora_kb.core import Inbox, Repo, StateStore, Wiki, failed_event_count
 from agora_kb.core.inbox import assert_writable_repo_schema
+from agora_kb.core.layout import CLAIM_BEARING_KINDS
 from agora_kb.curator.constants import DEFAULT_BODY_BYTE_BOUND
 from agora_kb.curator.subprocess_backend import (
     RoutedBackend,
@@ -90,6 +91,13 @@ DEFAULT_SOURCE = "manual"
 # renders out of the box (the honest-truncation behaviour is unchanged).
 MAX_GRAPH_NODES = 10_000  # soft-cap default for the global graph; honest truncated flag (ADR-0025)
 MAX_GRAPH_DEPTH = 3  # clamp default for the local ego-graph depth (ADR-0025)
+
+# The residue bucket of :meth:`AgoraHandlers.health`'s kind census: a note whose DERIVED kind is
+# outside the ADR-0041 vocabulary — a schema-2 note under an unknown `wiki/<dir>/` or directly
+# under `wiki/` (the L1-22 population), or a schema-1 note with an unrecognised `type:`. It exists
+# so the census sums to `note_total`; the panel that shows a count must not quietly drop the very
+# notes the closed directory vocabulary was introduced to surface.
+UNKNOWN_KIND = "unknown"
 
 
 class AgoraHandlers:
@@ -164,19 +172,32 @@ class AgoraHandlers:
 
     # --- browse (read; web face, ADR-0003/0019) -------------------------------------------------
     def browse(self) -> dict[str, object]:
-        """List every wiki note for the browse face; return ``{notes: [...], domains: [...]}``.
+        """List every wiki note for the browse face; return ``{notes: [...], subjects: [...]}``.
 
         A thin shaping of :meth:`agora_kb.core.wiki.Wiki.list_notes` into JSON-serializable dicts —
-        one ``{rel_path, basename, type, title, status, tags, domain}`` per note, plus the sorted
-        unique non-``None`` ``domains``. ``title`` falls back to ``basename``; ``domain`` is the
-        ``wiki/<domain>/`` path segment (``None`` for ``index.md``). Notes are sorted by
-        ``rel_path`` for a deterministic listing. The body markdown is intentionally NOT included
-        here — that is the per-note :meth:`note` payload.
+        one ``{rel_path, basename, kind, title, status, tags, subjects}`` per note, plus the sorted
+        union of every subject any note declares. ``title`` falls back to ``basename``. Notes are
+        sorted by ``rel_path`` for a deterministic listing. The body markdown is intentionally NOT
+        included here — that is the per-note :meth:`note` payload.
+
+        **``domains`` became ``subjects`` and ``type`` became ``kind`` (ADR-0041 D2/D3.2), and the
+        old keys are GONE rather than mirrored.** The subject is now a LIST (0..n) read from
+        ``subjects:``, so a scalar ``domain`` could not carry it without silently picking one; and
+        ``type`` is retired as the kind authority, so echoing it would re-publish the axis this
+        wave flipped. Both values are derived per-schema by
+        :func:`~agora_kb.schema.notes.parse_all_notes`, so a schema-1 repo browses correctly too:
+        its single path domain arrives as a one-element ``subjects`` and its ``type:`` as the
+        mapped ``kind`` (D2.5). ``wiki/people/**`` IS listed — read is first class (D3.3).
         """
         rows = [self._note_summary(note) for note in self._wiki.list_notes()]
         rows.sort(key=lambda r: r["rel_path"])  # type: ignore[arg-type, return-value]
-        domains = sorted({d for r in rows if (d := r["domain"]) is not None})  # type: ignore[comparison-overlap]
-        return {"notes": rows, "domains": domains}
+        subject_values: set[str] = set()
+        for row in rows:
+            row_subjects = row["subjects"]
+            if isinstance(row_subjects, list):
+                subject_values.update(s for s in row_subjects if isinstance(s, str))
+        subjects = sorted(subject_values)
+        return {"notes": rows, "subjects": subjects}
 
     def note(self, rel_path: str) -> dict[str, object] | None:
         """Return one note's full read payload by ``rel_path``, or ``None`` if not tracked.
@@ -193,7 +214,10 @@ class AgoraHandlers:
         from agora_kb.schema.notes import body_link_basenames
 
         payload = self._note_summary(note)
-        payload.pop("type", None)  # the per-note shape carries the richer fields below instead
+        # ``kind`` is KEPT here (v1's ``type`` was popped, because it was already in
+        # ``frontmatter``): the schema-2 kind is DERIVED from the directory (ADR-0041 D2.1) and on
+        # a schema-1 repo it is derived from ``type:``, so it is genuinely not a duplicate of any
+        # frontmatter key the caller can read for itself.
         payload["frontmatter"] = note.frontmatter
         payload["body"] = note.body
         payload["links"] = body_link_basenames(note.body)
@@ -205,8 +229,14 @@ class AgoraHandlers:
 
         ``title`` ← ``frontmatter["title"]`` (else ``basename``); ``status`` ←
         ``frontmatter.status`` (may be ``None``); ``tags`` ← ``frontmatter.tags`` (``[]`` when
-        absent/non-list); ``domain`` ← the ``wiki/<domain>/`` path segment (``None`` for
-        ``index.md`` or any non-``wiki/`` path).
+        absent/non-list); ``kind`` ← the note's derived kind (the DIRECTORY on schema 2, the frozen
+        ``type:`` table on schema 1 — ADR-0041 D2.1/D2.5, ``None`` when neither yields one);
+        ``subjects`` ← the note's derived subjects as a plain list (``subjects:`` on schema 2, the
+        single path domain on schema 1 — D2.2; ``[]`` is legal and honest).
+
+        The two schema-2 fields are read straight off the :class:`~agora_kb.schema.notes.Note`
+        rather than re-derived from the path here: ADR-0041 D3.2 leaves exactly one place a
+        subject is recorded, and a face computing its own would be a second one.
         """
         fm = note.frontmatter  # type: ignore[attr-defined]
         raw_title = fm.get("title")
@@ -216,11 +246,11 @@ class AgoraHandlers:
         return {
             "rel_path": note.rel_path,  # type: ignore[attr-defined]
             "basename": note.basename,  # type: ignore[attr-defined]
-            "type": note.type,  # type: ignore[attr-defined]
+            "kind": note.kind,  # type: ignore[attr-defined]
             "title": title,
             "status": fm.get("status"),
             "tags": tags,
-            "domain": _wiki_domain(note.rel_path),  # type: ignore[attr-defined]
+            "subjects": list(note.subjects),  # type: ignore[attr-defined]
         }
 
     # --- meta -----------------------------------------------------------------------------------
@@ -288,14 +318,21 @@ class AgoraHandlers:
         """KB-health panel (DESIGN §5.3): note counts, status/tag distribution, lint signals.
 
         Counts are derived from :meth:`agora_kb.core.wiki.Wiki.list_notes` (the same core.wiki seam
-        :meth:`browse` uses) — themes vs dailies by the ``type`` field, status split over the frozen
-        vocabulary, and a tag-frequency map. ``broken_links`` and ``lint_findings`` come from the
+        :meth:`browse` uses) — a ``by_kind`` census over the ADR-0041 kind vocabulary plus an
+        :data:`UNKNOWN_KIND` residue bucket, so it is TOTAL (``sum(by_kind.values()) ==
+        note_total``) and an off-layout note is surfaced rather than silently dropped (with
+        ``concepts`` / ``journals`` lifted out as the two headline scalars that replace v1's
+        ``themes`` / ``dailies``), status split over the frozen vocabulary, and a tag-frequency
+        map. ``broken_links`` and ``lint_findings`` come from the
         deterministic :func:`agora_kb.schema.lint.lint` reused VERBATIM (called WITHOUT ``run_date``
         — dashboard mode, so no historical note is flagged as a future date), so this never
         reimplements a health check. ``orphans`` is a small read-time link-graph derivation (L2-1:
-        a theme nothing links TO — lint() emits no orphan finding, so it is NOT a lint signal).
-        ``unmanaged_notes`` counts the notes the curator did NOT write (issue #152): read, indexed
-        and linkable, but outside the producer lint's subject and never a MERGE/CONTEST target.
+        a claim-bearing note nothing links TO — lint() emits no orphan finding by default, so it is
+        NOT a lint signal). ``unmanaged_notes`` counts the notes the curator did NOT write
+        (issue #152): read, indexed and linkable, but outside the producer lint's subject and never
+        a MERGE/CONTEST target — ``wiki/people/**`` is excluded from it, because a human-owned note
+        is unmanaged BY DESIGN (D3.3) and counting it would turn the anomaly signal into noise;
+        the people population is reported instead as ``by_kind['person']``.
         ``contested`` counts notes whose frontmatter ``status == 'contested'``;
         ``last_consolidation`` is from :meth:`status`. This panel runs lint() + a full note scan,
         so it is the heavy one — refreshed on load + a manual button, not a poll.
@@ -303,12 +340,22 @@ class AgoraHandlers:
         from agora_kb.config import load_repo_config
         from agora_kb.curator.worker import is_curator_written
         from agora_kb.schema.lint import lint
-        from agora_kb.schema.notes import body_link_basenames, wikilinks
+        from agora_kb.schema.notes import SCHEMA2_KINDS, body_link_basenames, wikilinks
 
         notes = self._wiki.list_notes()
         note_total = len(notes)
-        themes = sum(1 for n in notes if n.type == "theme")
-        dailies = sum(1 for n in notes if n.type == "daily")
+        # The kind census is TOTAL over `notes`: `sum(by_kind.values()) == note_total`, always.
+        # A note whose derived kind is None — a schema-2 note under an unknown `wiki/<dir>/` or
+        # directly under `wiki/` (the L1-22 population), or a schema-1 note with an unrecognised
+        # `type:` — lands in `unknown` rather than being dropped. Dropping it made the panel
+        # under-report next to its own "Notes" total, and hid precisely the anomaly the closed
+        # directory vocabulary exists to catch.
+        by_kind = {kind: 0 for kind in sorted(SCHEMA2_KINDS)}
+        by_kind[UNKNOWN_KIND] = 0
+        for n in notes:
+            by_kind[n.kind if n.kind in by_kind else UNKNOWN_KIND] += 1
+        concepts = by_kind["concept"]
+        journals = by_kind["note"]
 
         by_status = {"active": 0, "stub": 0, "contested": 0, "deprecated": 0}
         tag_distribution: dict[str, int] = {}
@@ -333,20 +380,27 @@ class AgoraHandlers:
         # Two DISTINCT health signals (DESIGN §5.3), in opposite link directions:
         #  - broken_links: dangling OUTBOUND references — L1-2 findings (a link whose target note
         #    does not exist). A hard-gate signal, counted straight from lint().
-        #  - orphans: themes nothing links TO (L2-1) — read-time derived (lint() emits NO orphan
-        #    finding). A theme is an orphan when its basename is referenced by no other note's body
-        #    markdown link nor any frontmatter related:/children: [[ ]]; dailies and MOC/index roots
-        #    (type != "theme") are exempt.
+        #  - orphans: claim-bearing notes nothing links TO (L2-1) — read-time derived (lint() emits
+        #    NO orphan finding unless curator.lint.max_orphans is set). A note is an orphan when
+        #    its basename is referenced by no other note's body markdown link nor any frontmatter
+        #    related:/children: [[ ]]; journals, maps/index roots, entities and people are exempt.
         broken_links = sum(1 for f in result.findings if f.code == "L1-2")
         referenced: set[str] = set()
         for n in notes:
+            # Links OUT of a people note are UNGRADED (ADR-0041 D3.3), so they do not feed the
+            # reference universe — otherwise one human file linking a concept would silently
+            # suppress that concept's orphan count, giving a human-owned tree a vote on the signal
+            # that gates a curator run. This mirrors `schema.lint`'s L2-1 derivation exactly, which
+            # is the whole point: the dashboard and the gate must never disagree about the number.
+            if _is_ungraded_people_note(n):
+                continue
             referenced.update(body_link_basenames(n.body))
             for fkey in ("related", "children"):
                 fval = n.frontmatter.get(fkey)
                 for item in fval if isinstance(fval, list) else [fval]:
                     if isinstance(item, str):
                         referenced.update(wikilinks(item))
-        orphans = sum(1 for n in notes if n.type == "theme" and n.basename not in referenced)
+        orphans = sum(1 for n in notes if _is_orphan(n, referenced))
         # Issue #152: how many of those notes the curator does NOT own — no curator stamp, so they
         # are read, indexed and linkable but never graded by the producer lint and never a
         # MERGE/CONTEST target. The SAME predicate the curator classifies its live tree with, so the
@@ -354,12 +408,15 @@ class AgoraHandlers:
         # above may therefore belong to notes the curator will not act on — the dashboard reports
         # the whole tree honestly (it is a health panel, not the gate); this number is what tells an
         # operator why a finding is not being fixed by the next run.
-        unmanaged_notes = sum(1 for n in notes if not is_curator_written(n))
+        unmanaged_notes = sum(
+            1 for n in notes if not _is_ungraded_people_note(n) and not is_curator_written(n)
+        )
 
         return {
             "note_total": note_total,
-            "themes": themes,
-            "dailies": dailies,
+            "by_kind": by_kind,
+            "concepts": concepts,
+            "journals": journals,
             "by_status": by_status,
             "tag_distribution": tag_distribution,
             "orphans": orphans,
@@ -467,14 +524,30 @@ class AgoraHandlers:
         the curated tip to mark the pack FRESH (``curated_sha`` == the live tip) or STALE. Unlike
         the cheap :meth:`status` gold row (meta-only, no git), this panel may do one ``git
         rev-parse``. Tolerant: an absent pack → ``present=False``; a git failure →
-        ``fresh=None`` (unknown) rather than crashing the read-only panel. ``bronze`` carries the
+        ``fresh=None`` (unknown) rather than crashing the read-only panel. A pack whose sidecar
+        declares a different :data:`~agora_kb.core.gold.GOLD_SCHEMA_VERSION` is also
+        ``present=False`` — this build will not serve it — but carries ``stale_schema`` so the
+        panel can say WHY instead of implying nothing was ever built. ``bronze`` carries the
         cheap tier context (inbox backlog already in :meth:`status`; silver lives in the KB-health
         panel)."""
-        from agora_kb.core.gold import DEFAULT_PACK, read_meta
+        from agora_kb.core.gold import (
+            DEFAULT_PACK,
+            GOLD_SCHEMA_VERSION,
+            read_meta,
+            read_meta_schema_version,
+        )
 
         base = self.status()
         meta = read_meta(self._repo.layout, DEFAULT_PACK)
         gold: dict[str, object] = {"present": meta is not None, "pack": DEFAULT_PACK}
+        if meta is None:
+            # `present: false` is the right answer for a pack this build will not serve, but on its
+            # own it says "nothing was ever built" — misleading for the one case where a pack file
+            # plainly exists. `stale_schema` names the version that IS on disk, so the panel and
+            # :meth:`gold_pack`'s refusal tell the operator the same story.
+            declared = read_meta_schema_version(self._repo.layout, DEFAULT_PACK)
+            if declared is not None and declared != GOLD_SCHEMA_VERSION:
+                gold["stale_schema"] = declared
         if meta is not None:
             try:
                 commit: str | None = self._repo.branch_commit()
@@ -519,12 +592,16 @@ class AgoraHandlers:
           (``None`` if the sidecar is absent/corrupt — the pack bytes are the contract, the meta is
           advisory).
         - ``not_built``: no built pack file — ``note`` says how to build one and ``packs`` lists
-          the packs that DO exist.
+          the packs that DO exist. A pack whose sidecar declares a DIFFERENT
+          :data:`~agora_kb.core.gold.GOLD_SCHEMA_VERSION` reports the same status, carries the
+          declared version as ``stale_schema``, and is NOT served: its bytes were selected under
+          eligibility rules this build has invalidated. A corrupt (version-less) sidecar is a
+          different case and still serves — see the note on ``meta`` above.
         - ``invalid_name``: ``pack`` is not a safe single path component (the same
           :func:`~agora_kb.core.layout.safe_path_component` traversal guard the layout uses), so
           nothing outside ``_kb/gold/`` is ever read.
         """
-        from agora_kb.core.gold import read_meta
+        from agora_kb.core.gold import GOLD_SCHEMA_VERSION, read_meta, read_meta_schema_version
         from agora_kb.core.layout import InvalidWriterError
 
         try:
@@ -556,6 +633,33 @@ class AgoraHandlers:
                     "(ADR-0027)."
                 ),
             }
+        # A sidecar declaring a DIFFERENT gold schema means these bytes were assembled under a
+        # different eligibility rule, which is the one thing a GOLD_SCHEMA_VERSION bump exists to
+        # invalidate (1 → 2 moved eligibility to the kind axis and added the `wiki/people/**` and
+        # `derived: true` exclusions). Serving them anyway made the bump blind on the surface it
+        # was meant to protect: `gold_status` reported `present: false` off the same mismatch while
+        # `kb_context` kept serving the superseded selection, so the operator's panel and the
+        # agents' standing context disagreed. `_kb/` is git-ignored, so a pack built on the
+        # previous branch survives a checkout and lands exactly here.
+        #
+        # The refusal is keyed on the version FIELD specifically, never on "no usable meta": a
+        # CORRUPT sidecar still serves its bytes (the pack bytes are the contract, the meta is
+        # advisory — `test_handler_tolerates_corrupt_meta_sidecar` pins that), and
+        # `read_meta_schema_version` returns None for it precisely so the two stay separable.
+        declared = read_meta_schema_version(self._repo.layout, pack)
+        if declared is not None and declared != GOLD_SCHEMA_VERSION:
+            return {
+                "status": "not_built",
+                "pack": pack,
+                "packs": self._built_packs(),
+                "stale_schema": declared,
+                "note": (
+                    f"gold pack {pack!r} was built by an older gold schema "
+                    f"(v{declared}, this build assembles v{GOLD_SCHEMA_VERSION}) and its contents "
+                    "no longer match the current eligibility rules: run 'agora gold build' — or "
+                    "let the next curator run rebuild it — then retry (ADR-0027 / ADR-0041 D3.3)."
+                ),
+            }
         meta = read_meta(self._repo.layout, pack)
         meta_row: dict[str, object] | None = None
         if meta is not None:
@@ -584,7 +688,7 @@ class AgoraHandlers:
         *,
         center: str | None = None,
         depth: int = 1,
-        domain: str | None = None,
+        subject: str | None = None,
         max_nodes: int | None = None,
         max_depth: int | None = None,
     ) -> dict[str, object]:
@@ -597,17 +701,21 @@ class AgoraHandlers:
         rendering (force-graph layout) is the web layer's job, never this face's.
 
         **Nodes.** One per note via :meth:`_note_summary` (reused verbatim, NOT duplicated) for
-        ``title`` / ``domain`` / ``status`` / ``type``, with ``id == rel_path`` — the canonical
+        ``title`` / ``subjects`` / ``status`` / ``kind``, with ``id == rel_path`` — the canonical
         unique identity, which is exactly what ``/note/<id>`` navigates to — plus an ``orphan``
-        flag.
+        flag. ``kind`` and ``subjects`` replace v1's ``type`` and ``domain`` (ADR-0041 D2/D3.2);
+        the graph viz colours by the FIRST subject, which is the web layer's presentation choice
+        and not a claim that a note has only one.
 
-        **Orphan.** Reuses :meth:`health`'s EXACT derivation: a referenced set is built over the
-        FULL note set = the union of :func:`agora_kb.schema.notes.body_link_basenames` of each body
-        plus, for ``related`` / ``children``, the :func:`agora_kb.schema.notes.wikilinks` of each
-        str item (list-or-scalar tolerant, exactly as ``health()`` iterates). A node is an orphan
-        iff ``type == "theme"`` and its basename is referenced by nothing; a non-theme is never an
-        orphan. Orphan is a GLOBAL property, so it is computed over every note regardless of the
-        ``center`` / ``domain`` filter (so the count matches ``health()["orphans"]``).
+        **Orphan.** Reuses :meth:`health`'s EXACT derivation, through the SHARED
+        :func:`_is_orphan`: a referenced set is built over the FULL note set — minus the ungraded
+        ``wiki/people/**`` sources (D3.3) — as the union of
+        :func:`agora_kb.schema.notes.body_link_basenames` of each body plus, for ``related`` /
+        ``children``, the :func:`agora_kb.schema.notes.wikilinks` of each str item (list-or-scalar
+        tolerant, exactly as ``health()`` iterates). A node is an orphan iff its kind is in
+        :data:`ORPHAN_KINDS` and its basename is referenced by nothing. Orphan is a GLOBAL
+        property, so it is computed over every note regardless of the ``center`` / ``subject``
+        filter (so the count matches ``health()["orphans"]``).
 
         **Edges.** Directed, deduped, no self-loops, both endpoints real nodes. A ``by_basename``
         map (basename → rel_path, ``setdefault`` over notes sorted by ``rel_path`` for determinism)
@@ -615,16 +723,17 @@ class AgoraHandlers:
         rel_path; an unresolved (dangling) basename is NOT an edge, and self-loops are dropped.
         Emitted as ``{"source", "target"}``, sorted by ``(source, target)``.
 
-        **Scope.** GLOBAL (``center is None``): all notes, optionally filtered to one ``domain``
-        (kept iff ``_wiki_domain(rel_path) == domain``); ``edge_total`` / ``node_total`` are the
+        **Scope.** GLOBAL (``center is None``): all notes, optionally filtered to one ``subject``
+        (kept iff that subject is in the note's ``subjects``, which is a MEMBERSHIP test now that a
+        note may declare 0..n of them — D2.2); ``edge_total`` / ``node_total`` are the
         kept counts BEFORE the cap. If the kept node count exceeds :data:`MAX_GRAPH_NODES` the kept
         set is truncated to the first ``MAX_GRAPH_NODES`` by sorted rel_path, edges are recomputed
         on the survivors, and ``truncated`` is ``True`` — but ``node_total`` still reports the true
         pre-cap count (no silent truncation). LOCAL (``center`` is a rel_path): ``depth`` is clamped
         to ``[1, MAX_GRAPH_DEPTH]``; an unknown center returns an empty graph with ``center=None``;
         otherwise a BFS over the UNDIRECTED adjacency of the global edge set (both directions) from
-        the center out to ``depth`` hops yields the reached notes (``domain`` is ignored for local),
-        with edges induced on that reached set and ``truncated`` always ``False``.
+        the center out to ``depth`` hops yields the reached notes (``subject`` is ignored for
+        local), with edges induced on that reached set and ``truncated`` always ``False``.
 
         Returns ``{nodes, edges, node_total, edge_total, truncated, center, depth}`` — ``center``
         echoes the resolved center rel_path (``None`` for global or an unknown requested center) and
@@ -641,9 +750,14 @@ class AgoraHandlers:
         notes = self._wiki.list_notes()
 
         # Orphan derivation — reused VERBATIM from health() (a GLOBAL property over every note,
-        # computed before any center/domain filtering so the count matches health()["orphans"]).
+        # computed before any center/subject filtering so the count matches health()["orphans"]).
+        # The `wiki/people/**` source skip is part of that "verbatim": drop it here and a human
+        # note linking a concept would un-orphan it in the graph while lint and the dashboard still
+        # count it — the same number disagreeing with itself across two panels.
         referenced: set[str] = set()
         for n in notes:
+            if _is_ungraded_people_note(n):
+                continue
             referenced.update(body_link_basenames(n.body))
             for fkey in ("related", "children"):
                 fval = n.frontmatter.get(fkey)
@@ -652,10 +766,18 @@ class AgoraHandlers:
                         referenced.update(wikilinks(item))
 
         # Stable basename → rel_path resolver (setdefault over notes sorted by rel_path so a
-        # duplicate basename deterministically resolves to the first path).
+        # duplicate basename deterministically resolves to the first path). `wiki/people/**` is
+        # OUTSIDE this identity space (D3.3: "a people note is addressed by path, never by
+        # [[basename]]") — people notes stay NODES and stay readable by path, they are just never
+        # what a link RESOLVES to. Without the skip a human note captures every edge drawn to a
+        # curated note of the same name, and `wiki/people/...` sorts BEFORE `wiki/summaries/...`,
+        # so it would win the setdefault for every summary basename. lint's graded `by_basename`
+        # already drops `people_paths`; this makes the face's identity space equal to it.
         sorted_notes = sorted(notes, key=lambda n: n.rel_path)
         by_basename: dict[str, str] = {}
         for n in sorted_notes:
+            if _is_ungraded_people_note(n):
+                continue
             by_basename.setdefault(n.basename, n.rel_path)
 
         def _node(n: object) -> dict[str, object]:
@@ -663,12 +785,10 @@ class AgoraHandlers:
             return {
                 "id": summary["rel_path"],
                 "title": summary["title"],
-                "domain": summary["domain"],
+                "subjects": summary["subjects"],
                 "status": summary["status"],
-                "type": summary["type"],
-                "orphan": (
-                    n.type == "theme" and n.basename not in referenced  # type: ignore[attr-defined]
-                ),
+                "kind": summary["kind"],
+                "orphan": _is_orphan(n, referenced),
             }
 
         # The full directed, deduped, self-loop-free edge set over every real node — the basis for
@@ -693,11 +813,11 @@ class AgoraHandlers:
             return [{"source": s, "target": t} for (s, t) in kept]
 
         if center is None:
-            # GLOBAL scope — all notes, optionally filtered to one domain.
-            if domain is None:
+            # GLOBAL scope — all notes, optionally filtered to one subject.
+            if subject is None:
                 kept_notes = sorted_notes
             else:
-                kept_notes = [n for n in sorted_notes if _wiki_domain(n.rel_path) == domain]
+                kept_notes = [n for n in sorted_notes if subject in n.subjects]
             kept_ids = {n.rel_path for n in kept_notes}
             node_total = len(kept_notes)
             edge_total = len(_induced_edges(kept_ids))
@@ -986,17 +1106,53 @@ class AgoraHandlers:
         )
 
 
-def _wiki_domain(rel_path: str) -> str | None:
-    """Return the ``<domain>`` segment of a ``wiki/<domain>/...`` note path, else ``None``.
+#: The kinds the L2-1 orphan signal is derived over — the claim-bearing tiers (ADR-0041 D2.5).
+#:
+#: One schema-agnostic predicate replaces the v1 ``type == "theme"`` test, and it is EQUIVALENT on
+#: schema 1 rather than merely similar: :attr:`Note.kind <agora_kb.schema.notes.Note.kind>` is
+#: derived on both schemas, ``type: theme`` maps to ``concept`` (D2.5), and schema 1 has no
+#: ``summary`` antecedent — so on a v1 repo this set matches exactly the v1 themes. It is the
+#: read-side twin of ``schema.lint._V2_SOURCED_KINDS`` and MUST stay equal to it: lint's L2-1
+#: warning (``curator.lint.max_orphans``, ADR-0022) gates a curator run while this number is shown
+#: on the dashboard, and an operator cannot act on two different answers to one question.
+#: ``entity`` and ``person`` are exempt by construction — an entity may not be a map child (D1.3)
+#: and the curator may not link into ``people/`` at all (D3.3), so both are orphans by design and
+#: counting them would make the signal noise.
+#: It IS :data:`~agora_kb.core.layout.CLAIM_BEARING_KINDS` (the same object, not a copy of its
+#: members), so "MUST stay equal" above is now structural rather than a promise a future edit can
+#: quietly break;
+#: ``tests/core/test_layout.py::test_the_claim_bearing_kind_set_is_one_object_in_all_three_modules``
+#: pins the three-way equality as well.
+ORPHAN_KINDS: frozenset[str] = CLAIM_BEARING_KINDS
 
-    ``index.md`` (and any path not under ``wiki/<domain>/``) has no domain. POSIX-split on ``/``:
-    a path is in a domain iff it is ``wiki/<domain>/<...>`` (at least three segments under
-    ``wiki``).
+
+def _is_orphan(note: object, referenced: set[str]) -> bool:
+    """True iff ``note`` is a claim-bearing note whose basename nothing references (L2-1).
+
+    Shared by :meth:`AgoraHandlers.health` (the count) and :meth:`AgoraHandlers.graph` (the
+    per-node flag) so the dashboard's number and the graph's highlighting can never disagree. A
+    ``person`` note is excluded by :data:`ORPHAN_KINDS` alone — no extra path test is needed, and
+    adding one would make this DISAGREE with lint on a schema-1 repo that happens to have a
+    ``wiki/people/`` directory (there, ``skip_people`` is ``False``).
     """
-    parts = rel_path.split("/")
-    if len(parts) >= 3 and parts[0] == "wiki":
-        return parts[1]
-    return None
+    return (
+        note.kind in ORPHAN_KINDS  # type: ignore[attr-defined]
+        and note.basename not in referenced  # type: ignore[attr-defined]
+    )
+
+
+def _is_ungraded_people_note(note: object) -> bool:
+    """True iff ``note`` is a schema-2 ``wiki/people/**`` note — ungraded, human-owned (D3.3).
+
+    A thin alias for :func:`agora_kb.schema.notes.is_ungraded_people_note`, kept as this module's
+    local name because it reads at three call sites here. The schema test is not decoration:
+    ``schema.lint`` computes its people exclusion as ``skip_people = version >= 2``, so an
+    unconditional path test would diverge from the gate on a schema-1 repo that merely owns a
+    ``people`` DOMAIN. One question, one answer — and now literally one function.
+    """
+    from agora_kb.schema.notes import is_ungraded_people_note
+
+    return is_ungraded_people_note(note)  # type: ignore[arg-type]
 
 
 def _parse_ops(value: str) -> dict[str, int]:
@@ -1108,6 +1264,13 @@ def build_server(*, repo_path: Path, writer: str = DEFAULT_WRITER) -> FastMCP:
         re-querying erases vocabulary mismatch. ``path`` is a kb_query hit's ``path`` or a
         kb_neighbors node ``id``. An unknown or out-of-repo path returns
         ``{error: "not_found", ...}`` — never file contents outside the wiki.
+
+        Reads are FIRST CLASS over the whole tree, ``wiki/people/**`` included (ADR-0041 D3.3): a
+        human-owned note is indexed, readable and navigable here. That is deliberately WIDER than
+        the standing-context channel — ``kb_context`` serves gold packs, which exclude ``people/``
+        by construction — because a pull-shaped, agent-initiated read is a different risk from a
+        push-shaped pack assembled without a prompt. ADR-0027 §8's scope names the read tools as an
+        emission path whose control is distinct and still undesigned (residual R1).
         """
         payload = handlers.note(path)
         if payload is None:
@@ -1117,7 +1280,7 @@ def build_server(*, repo_path: Path, writer: str = DEFAULT_WRITER) -> FastMCP:
                 "note": (
                     f"no tracked note at path={path!r}: pass a `path` exactly as returned by a "
                     "kb_query hit or a kb_neighbors node id (e.g. "
-                    "'wiki/<domain>/themes/<name>.md')."
+                    "'wiki/concepts/<name>.md')."
                 ),
             }
         return payload
@@ -1155,6 +1318,11 @@ def build_server(*, repo_path: Path, writer: str = DEFAULT_WRITER) -> FastMCP:
         Returns ``status: "not_built"`` with build guidance (and the packs that DO exist) when the
         pack has not been built yet. A ``scopes`` parameter is reserved as a future additive
         extension (federation, reserved ADR-0030) and is not accepted in v0.1.
+
+        ``wiki/people/**`` is absent from every pack BY CONSTRUCTION, not by a filter here: this
+        channel serves built pack bytes and the assembler drops human-owned notes from the
+        population before scoring (ADR-0041 D3.3 day-1 exclusion, ``core.gold``). Nothing in this
+        face can re-admit them, which is the point of serving the artifact rather than assembling.
         """
         return handlers.gold_pack(pack)
 

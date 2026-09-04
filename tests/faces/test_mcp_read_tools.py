@@ -14,17 +14,19 @@ from pathlib import Path
 
 from fastmcp import Client
 
-from agora_kb.core import Repo
 from agora_kb.faces import mcp_server
 from agora_kb.faces.mcp_server import build_server
-from tests.faces.test_mcp_server_graph import _write_wiki_notes
+from tests.faces.test_mcp_server_graph import _init_repo, _write_wiki_notes
 
-_CENTER = "wiki/ai-tech/themes/curator-concurrency.md"
+_CENTER = "wiki/concepts/curator-concurrency.md"
+_INBOX = "wiki/concepts/inbox-design.md"
+_MAP = "wiki/maps/ai-tech.md"
 
 
 def _server(tmp_path: Path):
-    repo = Repo.resolve(tmp_path)
-    repo.init()
+    # `_init_repo` (shared with the graph tests) is what declares KB wiki schema 2 in
+    # `_meta/taxonomy.yaml` — the corpus below is kind-first, so it must be read as such.
+    _init_repo(tmp_path)
     _write_wiki_notes(tmp_path)
     return build_server(repo_path=tmp_path, writer="local")
 
@@ -46,10 +48,11 @@ def test_kb_read_returns_note_payload(tmp_path: Path) -> None:
     assert set(data) == {
         "rel_path",
         "basename",
+        "kind",
         "title",
         "status",
         "tags",
-        "domain",
+        "subjects",
         "frontmatter",
         "body",
         "links",
@@ -58,7 +61,8 @@ def test_kb_read_returns_note_payload(tmp_path: Path) -> None:
     assert data["basename"] == "curator-concurrency"
     assert data["title"] == "Curator Concurrency Model"  # frontmatter title wins over basename
     assert data["status"] == "active"
-    assert data["domain"] == "ai-tech"
+    assert data["kind"] == "concept"
+    assert data["subjects"] == ["ai-tech"]
     # Body stays RAW markdown (rendering is the consumer's job), with its H1 intact.
     assert data["body"].startswith("# Curator Concurrency")
     assert isinstance(data["frontmatter"], dict)
@@ -71,12 +75,37 @@ def test_kb_read_not_found_and_traversal_safe(tmp_path: Path) -> None:
     """An unknown path AND an escape path both yield the clear not-found shape, never contents."""
     server = _server(tmp_path)
 
-    for path in ("wiki/ai-tech/themes/nope.md", "../../etc/passwd"):
+    for path in ("wiki/concepts/nope.md", "../../etc/passwd"):
         data = _call(server, "kb_read", {"path": path})
         assert data["error"] == "not_found"
         assert data["path"] == path
         assert "kb_query" in data["note"]  # actionable: points back to the hit source
         assert "body" not in data
+
+
+def test_kb_read_serves_a_people_note(tmp_path: Path) -> None:
+    """ADR-0041 D3.3: read is FIRST CLASS over ``wiki/people/**`` — kb_read opens one on demand.
+
+    This is deliberately WIDER than the push surface: the same content is excluded from gold packs
+    and therefore from ``kb_context`` (D3.3 day-1 exclusion), because a pull-shaped, agent-initiated
+    read of a note a human filed in a shared repo is a different risk from a standing pack assembled
+    without a prompt. ADR-0027 §8's scope names the read tools as an emission path whose control is
+    distinct and still undesigned (residual R1) — so this test pins the CURRENT, decided behaviour,
+    not an accident.
+    """
+    _init_repo(tmp_path)
+    _write_wiki_notes(tmp_path)
+    people = tmp_path / "wiki" / "people" / "hando"
+    people.mkdir(parents=True, exist_ok=True)
+    (people / "desk.md").write_text(
+        "---\ntitle: Desk\nstatus: active\n---\n# Desk\n\nMy own notes.\n", encoding="utf-8"
+    )
+    server = build_server(repo_path=tmp_path, writer="local")
+
+    data = _call(server, "kb_read", {"path": "wiki/people/hando/desk.md"})
+    assert data["kind"] == "person"  # DERIVED from the directory; the note declares no kind
+    assert data["body"].startswith("# Desk")
+    assert data["subjects"] == []
 
 
 # --- kb_neighbors -------------------------------------------------------------------------------
@@ -91,16 +120,16 @@ def test_kb_neighbors_depth1_returns_ego_graph(tmp_path: Path) -> None:
     # 1 hop from curator-concurrency: the MOC links TO it, and it links to inbox-design.
     assert ids == {
         _CENTER,
-        "wiki/ai-tech/ai-tech-moc.md",
-        "wiki/ai-tech/themes/inbox-design.md",
+        _MAP,
+        _INBOX,
     }
     assert data["node_total"] == 3
     # Induced directed edges among the reached set (moc→cc, moc→inbox, cc→inbox).
     edges = {(e["source"], e["target"]) for e in data["edges"]}
     assert edges == {
-        ("wiki/ai-tech/ai-tech-moc.md", _CENTER),
-        ("wiki/ai-tech/ai-tech-moc.md", "wiki/ai-tech/themes/inbox-design.md"),
-        (_CENTER, "wiki/ai-tech/themes/inbox-design.md"),
+        (_MAP, _CENTER),
+        (_MAP, _INBOX),
+        (_CENTER, _INBOX),
     }
     # Every node carries the id (rel_path — feeds kb_read) + title label.
     for node in data["nodes"]:
@@ -121,7 +150,7 @@ def test_kb_neighbors_depth_is_clamped_by_existing_cap(tmp_path: Path) -> None:
 
 def test_kb_neighbors_unknown_path_returns_empty_graph_with_note(tmp_path: Path) -> None:
     """An unknown center is SAFE: empty graph, center=null, plus the actionable not-found note."""
-    data = _call(_server(tmp_path), "kb_neighbors", {"path": "wiki/ai-tech/themes/ghost.md"})
+    data = _call(_server(tmp_path), "kb_neighbors", {"path": "wiki/concepts/ghost.md"})
 
     assert data["center"] is None
     assert data["nodes"] == []

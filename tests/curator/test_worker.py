@@ -463,29 +463,20 @@ def test_finalize_rebuilds_gold_pack_after_publish(tmp_path: Path) -> None:
     meta = read_meta(layout)
     assert meta is not None
     assert meta.curated_sha == report.published_commit
-    # The pack is BUILT, FRESH and sentinel-wrapped. Its SELECTION is asserted separately, as a
-    # STRICT xfail, by the test below — see it for why the split exists.
+    # The pack is BUILT, FRESH and sentinel-wrapped. Its SELECTION is asserted separately by the
+    # test below — see it for why the split exists.
     assert "agora:pack" in pack_path.read_text(encoding="utf-8")
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "W2.3: core/gold.py still selects by the schema-1 predicates (`type: theme` and the "
-        "shared `_is_moc_path`), so a schema-2 repo assembles an EMPTY gold pack — `_kb/gold/`, "
-        "`kb_context` and GET /api/gold/{pack} return nothing on every repo this build writes. "
-        "ADR-0041 D5 moves those predicates in wave W2.3 as ONE shared edit with core/wiki.py; "
-        "this flips to passing there. STRICT so W2.3 is told out loud when it lands, rather than "
-        "the regression being described in a comment nobody is failed by."
-    ),
-)
 def test_the_gold_pack_contains_the_published_concept(tmp_path: Path) -> None:
     """The product claim the pack exists to make: a curated note is IN it.
 
     Split out of the test above rather than weakened into it. A pack that is built, fresh and
     correctly stamped but EMPTY satisfies every structural assertion while delivering nothing, so
-    the selection needs an assertion of its own — and a strict xfail is the shape that both keeps
-    the suite green today and fails the day the read side is fixed without this being revisited.
+    the selection needs an assertion of its own. It was a STRICT xfail while `core/gold.py` still
+    selected by the schema-1 predicates (`type: theme` + the v1 `<domain>-moc.md` seed) and a
+    schema-2 repo therefore assembled an EMPTY pack; wave W2.3 moved both to the kind axis
+    (ADR-0041 D5, `gold.GOLD_KINDS` + the shared map predicate) and the xfail came off here.
     """
     repo = _init_repo(tmp_path)
     layout = repo.layout

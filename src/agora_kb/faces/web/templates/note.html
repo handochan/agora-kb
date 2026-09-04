@@ -9,7 +9,8 @@
       <p class="muted mono">
         {{ note.rel_path }}
         {% if note.status %}<span class="badge-status">{{ note.status }}</span>{% endif %}
-        {% if note.domain %}· {{ note.domain }}{% endif %}
+        {% if note.kind %}· {{ note.kind }}{% endif %}
+        {% if note.subjects %}· {{ note.subjects | join(", ") }}{% endif %}
       </p>
       {% if note.tags %}
         <div class="tags">

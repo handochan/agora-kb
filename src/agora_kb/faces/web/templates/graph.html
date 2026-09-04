@@ -5,12 +5,15 @@
 <p class="muted">Each node is a note; arrows are intra-wiki links. Click a node to open it. Drag to
   pan, scroll to zoom.</p>
 
-{# Domain-filter chips: an "All" link plus one /graph?domain=<d> per domain, marking the active.
-   Values are URL-encoded in the href and autoescaped as text — untrusted domain strings stay safe. #}
-<nav class="graph-filters" aria-label="Domain filter">
-  <a href="/graph"{% if not active_domain %} class="active"{% endif %}>All</a>
-  {% for d in domains %}
-    <a href="/graph?domain={{ d | urlencode }}"{% if d == active_domain %} class="active"{% endif %}>{{ d }}</a>
+{# Subject-filter chips: an "All" link plus one /graph?subject=<s> per declared subject, marking
+   the active one. A note may declare 0..n subjects (ADR-0041 D2.2), so a chip selects every note
+   whose `subjects:` CONTAINS it — the same note can appear under two chips, and a subjectless note
+   under none. Values are URL-encoded in the href and autoescaped as text — untrusted subject
+   strings stay safe. #}
+<nav class="graph-filters" aria-label="Subject filter">
+  <a href="/graph"{% if not active_subject %} class="active"{% endif %}>All</a>
+  {% for s in subjects %}
+    <a href="/graph?subject={{ s | urlencode }}"{% if s == active_subject %} class="active"{% endif %}>{{ s }}</a>
   {% endfor %}
 </nav>
 

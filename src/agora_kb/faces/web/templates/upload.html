@@ -39,7 +39,7 @@
     <label for="domain">Domain (optional)</label>
     <select id="domain" name="domain">
       <option value="">(let the curator decide)</option>
-      {% for domain in browse.domains %}
+      {% for domain in domains %}
         <option value="{{ domain }}">{{ domain }}</option>
       {% endfor %}
     </select>

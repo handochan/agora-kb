@@ -1044,3 +1044,19 @@ are never force-re-emitted by this change, and no command silently upgrades one.
 - **R5 — The thin-page half of #146 is still open.** It is a `strict=True` xfail. The entity-child
   exclusion (D1.3/OD-2) is a *containment* measure for it, not a fix; a content/length prior is the
   fix, and it is not in this ADR.
+- **R6 — The ranking oracle's `people/` test is schema-UNCONDITIONAL, and on a schema-1 repo owning
+  a literal `people` domain that is a behaviour change.** D3.3's people exclusion has two faces. The
+  GRADING face — lint's `skip_people`, the dashboard's orphan count, gold eligibility — is version-
+  gated through `schema.notes.is_ungraded_people_note`, because those callers already hold a parsed
+  `schema_version` and must agree with `lint()` exactly. The RANKING face is not: `core/wiki.py`'s
+  `_is_people_path` is a pure path test, like every other predicate in that module, because D5's
+  rule is that the oracle reads no config file (the same rule that makes the subject scope a
+  frontmatter read rather than a `repo.yaml` read). The consequence, stated rather than left to be
+  discovered: in a **schema-1** repo that happens to have a `wiki/people/` **domain**, those notes
+  silently leave the `[[basename]]` identity space and stop contributing in-degree, where the
+  pre-flip tree counted them. It is the same pathological directory-name overlap `_path_kind`
+  already accepts for `maps`/`concepts`, it is invisible on every repo that does not use that
+  domain name, and lint/gold/dashboard are unaffected. **Accepted, not fixed**: version-gating the
+  oracle would put a config read on the query hot path and give one repo two rankings depending on
+  a `_meta/kb.yaml` field, which is a worse trade than one path-name collision. Reconsider if a
+  real schema-1 repo is ever found with that domain; migrating it to schema 2 removes the case.

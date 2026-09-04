@@ -2146,10 +2146,12 @@ def _cmd_eval(args: argparse.Namespace) -> int:
     """``agora eval``: snapshot what the deterministic ranker returns for a query file (#44).
 
     Model-free, network-free, server-free — it constructs a :class:`Wiki` over the repo on disk and
-    calls :meth:`Wiki.query`, which is the whole point: the Stratum layout flip moves every note's
-    path, and ``core.wiki._is_moc_path`` seeds the structural score from the path, so a baseline
-    recorded BEFORE the flip is the only way to attribute a ranking change to it. The record is
-    keyed on note BASENAMES, so it stays comparable across the move.
+    calls :meth:`Wiki.query`, which is the whole point: ``core.wiki._is_map_path`` seeds the
+    structural score from the PATH (``wiki/maps/…`` since ADR-0041 D5, ``wiki/<d>/<d>-moc.md``
+    before it), so a layout move changes ranking and a recorded baseline is the only way to
+    attribute the change to it. The record is keyed on note BASENAMES, so it stays comparable
+    across such a move — which is how ``tests/rank_golden`` compares its frozen pre-flip
+    ``golden_v1*`` record against the live ``golden_v2*`` one.
 
     Exit code is the CI gate: ``1`` when any query's ``status`` differs from its declared
     ``expect`` (or the query file is unusable), ``0`` otherwise. Nothing is written unless ``--out``
