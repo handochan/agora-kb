@@ -98,3 +98,9 @@ select = ["E", "F", "I", "UP", "B"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# `live` marks a suite that drives a REAL local model (Ollama) end to end: minutes per test, and
+# non-deterministic where a real brain's judgment is the thing under test. Deselected by default so
+# `uv run pytest` stays the fast, deterministic gate on every machine — including the maintainer's,
+# where the pinned brain IS installed. Opt in with `AGORA_LIVE_E2E=1 uv run pytest -m live`.
+markers = ["live: needs a running local model (opt in with AGORA_LIVE_E2E=1; slow)"]
+addopts = "-m 'not live'"
