@@ -30,6 +30,7 @@ from pathlib import Path
 import pytest
 import yaml
 
+from agora_kb.config import MAX_SUPPORTED_KB_SCHEMA_VERSION
 from agora_kb.core.frontmatter import parse
 from agora_kb.core.layout import RepoLayout
 from agora_kb.core.rank_snapshot import QuerySpec, load_queries
@@ -44,7 +45,7 @@ QUERIES_YAML = Path(__file__).resolve().parents[1] / "rank_golden" / "queries.ya
 @pytest.fixture(scope="module")
 def built(tmp_path_factory: pytest.TempPathFactory) -> RepoLayout:
     root = tmp_path_factory.mktemp("rank-golden") / "personal"
-    build_kb(root, CORPUS, domains=DOMAINS)
+    build_kb(root, CORPUS, schema_version=1, domains=DOMAINS)
     return RepoLayout(root)
 
 
@@ -107,8 +108,8 @@ def test_non_stub_theme_sources_resolve_to_real_raw_artifacts(built: RepoLayout)
 
 def test_two_builds_are_byte_identical(tmp_path: Path) -> None:
     """No wall clock, no ordering wobble — a golden recorded twice must record the same bytes."""
-    a = build_kb(tmp_path / "a", CORPUS, domains=DOMAINS)
-    b = build_kb(tmp_path / "b", CORPUS, domains=DOMAINS)
+    a = build_kb(tmp_path / "a", CORPUS, schema_version=1, domains=DOMAINS)
+    b = build_kb(tmp_path / "b", CORPUS, schema_version=1, domains=DOMAINS)
     rel_a = sorted(p.relative_to(a).as_posix() for p in a.rglob("*") if p.is_file())
     rel_b = sorted(p.relative_to(b).as_posix() for p in b.rglob("*") if p.is_file())
     assert rel_a == rel_b
@@ -123,12 +124,22 @@ def test_two_builds_are_byte_identical(tmp_path: Path) -> None:
 #: ``test_corpus_lints_clean_with_zero_errors`` already runs L1-17 over them.
 _BUILDER_AUTHORED = ("index.md", "wiki/", "raw/")
 
-#: Digest of the v1 tree the builder writes for :data:`CORPUS`, recorded against the PRE-Stratum
-#: builder (commit ``cb5a141``) and unchanged by the schema-2 work. This is the byte-identity claim
+#: Digest of the v1 tree the builder writes for :data:`CORPUS`. This is the byte-identity claim
 #: wave W2.1 makes: schema-1 repos keep exactly today's bytes. If it goes red, either the v1 layout
-#: moved (a bug — the golden was recorded over it) or the corpus changed (then re-record, and
-#: re-record ``tests/rank_golden/golden_v1*.json`` with it).
-_V1_TREE_DIGEST = "19a60061c19fd8eb798227a320288f17fdee2a8b1b3facfa341502335c38fbc6"
+#: moved (a bug — the golden was recorded over it) or something the builder DERIVES from production
+#: code moved (then re-record here, and re-record ``tests/rank_golden/golden_v1*.json`` if the
+#: goldens move with it).
+#:
+#: RE-RECORDED ONCE, deliberately, for ADR-0041 D4.4 (the pathsafe slugger swap). The pre-swap
+#: value was ``19a60061c19fd8eb798227a320288f17fdee2a8b1b3facfa341502335c38fbc6``. ``build_kb``
+#: derives a husk's basename through the PRODUCTION slugger on purpose (see ``kb_builder.slugify``
+#: — "if the production slugger ever changes, this fixture changes with it"), so widening the slug
+#: charset renames exactly the three Korean-titled husks: ``note-<sha8>`` → ``미수금-정산-메모``
+#: and friends. Nothing about the v1 LAYOUT moved — the same files in the same directories with the
+#: same bytes inside them — which is why this is a re-record rather than a bug. The gate-B goldens
+#: (``tests/rank_golden``) were re-run and are UNAFFECTED: the husks are husks, so they surface in
+#: no probe's hits.
+_V1_TREE_DIGEST = "f5653abb85287e18e7ab21a62c0ae285a1f8868e4ad692305c38bb814c277678"
 
 
 def _tree_digest(root: Path) -> str:
@@ -151,7 +162,7 @@ def test_the_v1_tree_is_byte_identical_to_the_pre_stratum_builder(tmp_path: Path
     — this is the record of what it produced, and the only honest way to reset it is to establish
     that the v1 layout was *meant* to move.
     """
-    root = build_kb(tmp_path / "v1", CORPUS, domains=DOMAINS)
+    root = build_kb(tmp_path / "v1", CORPUS, schema_version=1, domains=DOMAINS)
     assert _tree_digest(root) == _V1_TREE_DIGEST
 
 
@@ -394,13 +405,13 @@ def test_schema_2_only_kinds_are_rejected_by_a_v1_build(tmp_path: Path) -> None:
     """A ``summary`` under schema 1 has no directory — a loud refusal, not a silent misfile."""
     specs = [NoteSpec(kind="summary", domain="finance", title="S", body="B.", slug="s")]
     with pytest.raises(ValueError, match="only in KB wiki schema 2"):
-        build_kb(tmp_path / "v1-summary", specs)
+        build_kb(tmp_path / "v1-summary", specs, schema_version=1)
 
 
 def test_kb_identity_arguments_are_rejected_by_a_v1_build(tmp_path: Path) -> None:
     """``_meta/kb.yaml`` does not exist in v1: a silently-ignored kwarg is a fixture that lies."""
     with pytest.raises(ValueError, match="schema-2 only"):
-        build_kb(tmp_path / "v1-kb", CORPUS, domains=DOMAINS, kb_name="other")
+        build_kb(tmp_path / "v1-kb", CORPUS, schema_version=1, domains=DOMAINS, kb_name="other")
 
 
 def test_a_reserved_underscore_domain_is_a_build_error(tmp_path: Path) -> None:
@@ -413,6 +424,21 @@ def test_a_reserved_underscore_domain_is_a_build_error(tmp_path: Path) -> None:
 def test_an_unknown_schema_version_is_rejected(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="unknown schema_version"):
         build_kb(tmp_path / "v3", CORPUS, schema_version=3, domains=DOMAINS)
+
+
+def test_the_default_schema_version_is_the_one_this_build_writes(tmp_path: Path) -> None:
+    """A fixture that does not say which layout it means gets the one production produces.
+
+    Pinned against :data:`agora_kb.config.MAX_SUPPORTED_KB_SCHEMA_VERSION` rather than the literal
+    ``2`` so the next flip moves the default and this test together, and asserted on the TREE (a
+    ``wiki/concepts/`` directory exists, no ``wiki/finance/themes/`` does) rather than on the
+    signature, because the default only matters through the bytes it lays down.
+    """
+    root = build_kb(tmp_path / "default", _minimal(), domains=["finance"])
+    declared = yaml.safe_load((root / "_meta" / "taxonomy.yaml").read_text(encoding="utf-8"))
+    assert declared["schema_version"] == MAX_SUPPORTED_KB_SCHEMA_VERSION == 2
+    assert (root / "wiki" / "concepts").is_dir()
+    assert not (root / "wiki" / "finance").exists()
 
 
 # --- the builder fails loudly rather than emitting a repo that would fail lint ------------------
@@ -437,13 +463,26 @@ def test_alias_colliding_with_a_basename_is_a_build_error(tmp_path: Path) -> Non
         build_kb(tmp_path / "alias", _minimal(aliases=["one"]))
 
 
+def test_map_child_that_is_not_an_admitted_child_of_that_domain_is_a_build_error(
+    tmp_path: Path,
+) -> None:
+    """The DEFAULT (schema-2) refusal: D1.3 admits concept/summary/map children and nothing else."""
+    specs = [
+        *_minimal(),
+        NoteSpec(kind="moc", domain="finance", title="finance MOC", body="", children=["nope"]),
+    ]
+    with pytest.raises(ValueError, match="not an admitted child"):
+        build_kb(tmp_path / "map", specs)
+
+
 def test_moc_child_that_is_not_a_theme_of_that_domain_is_a_build_error(tmp_path: Path) -> None:
+    """The same refusal under the v1 layout, which words it in the v1 vocabulary ("theme")."""
     specs = [
         *_minimal(),
         NoteSpec(kind="moc", domain="finance", title="finance MOC", body="", children=["nope"]),
     ]
     with pytest.raises(ValueError, match="not a theme"):
-        build_kb(tmp_path / "moc", specs)
+        build_kb(tmp_path / "moc", specs, schema_version=1)
 
 
 # --- queries.yaml is the other half of the fixture, so it is checked against the corpus --------
@@ -533,11 +572,17 @@ def test_corpus_carries_the_shapes_the_golden_is_meant_to_cover() -> None:
     themes = [s for s in CORPUS if s.kind == "theme"]
     assert len(CORPUS) == 46
     assert len([s for s in CORPUS if s.kind == "daily"]) == 3
-    # #57 husks. Their basenames are DERIVED (no `slug=`), so this also asserts that the production
-    # slugger really does decline a purely-Korean title and hand over to the hash fallback.
+    # #57 husks. Their basenames are DERIVED (no `slug=`), so this also asserts what the production
+    # slugger does with a purely-Korean title. Since ADR-0041 D4.4 that is: NAME IT IN KOREAN. It
+    # used to be "decline, and hand over to the note-<sha8> floor", and the inversion is the point
+    # of the swap — the floor still exists (a seed with no admissible character at all reaches it,
+    # `tests/test_ollama_brain.py`), it is simply no longer where non-Latin knowledge lands.
     husks = [s for s in themes if s.slug is None]
     assert len(husks) == 3
-    assert all(s.basename().startswith("note-") for s in husks), [s.basename() for s in husks]
+    assert all(not s.basename().startswith("note-") for s in husks), [s.basename() for s in husks]
+    assert all(any("가" <= ch <= "힣" for ch in s.basename()) for s in husks), [
+        s.basename() for s in husks
+    ]
     assert len([s for s in themes if s.status == "stub"]) >= 6
     assert len([s for s in themes if s.status == "contested"]) == 1
     # Both halves of the ADR-0012 §8 table. `deprecated` (−0.15) is the ONLY negative term in the

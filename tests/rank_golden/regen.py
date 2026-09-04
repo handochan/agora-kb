@@ -58,7 +58,12 @@ GOLDEN_FM_OFF = HERE / "golden_v1_fm_off.json"
 def build_corpus(parent: Path) -> RepoLayout:
     """Materialize the golden corpus under ``parent/REPO_NAME`` and return its layout."""
     root = Path(parent) / REPO_NAME
-    build_kb(root, CORPUS, domains=DOMAINS)
+    # `schema_version=1` is EXPLICIT and load-bearing: gate B records what `Wiki.query` returned
+    # over the ADR-0010 v1 layout BEFORE the Stratum flip, so this corpus must stay v1 even though
+    # `build_kb` now defaults to the schema-2 layout the curator writes (ADR-0041). Inheriting the
+    # default here would silently re-record the baseline the flip is supposed to be measured
+    # against — which is the one failure mode a golden cannot survive.
+    build_kb(root, CORPUS, schema_version=1, domains=DOMAINS)
     return RepoLayout(root)
 
 

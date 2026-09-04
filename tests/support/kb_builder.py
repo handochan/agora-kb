@@ -80,9 +80,9 @@ from typing import Literal
 
 # The PRODUCTION slugger and the PRODUCTION canonical hash, imported rather than re-implemented.
 # A private-looking `_slugify` is reached into on purpose: a second slugger in the fixture would
-# drift from the one the curator/import paths actually use (#57 — the real one caps at 60 chars and
-# rejects a slug that fails `_SLUG_OK_RE`), and a fixture that claims to carry the "#57 shape" while
-# computing a different basename pins nothing about it.
+# drift from the one the curator/import paths actually use (#57 — the real one caps at 60 UTF-8
+# BYTES and returns "" rather than an unsafe component), and a fixture that claims to carry the
+# "#57 shape" while computing a different basename pins nothing about it.
 from agora_kb.adapters.ollama_brain import _slugify as _production_slugify
 from agora_kb.config import KbIdentity, write_kb_identity
 from agora_kb.core.frontmatter import render
@@ -143,16 +143,18 @@ _DAILY_DATE_RE = re.compile(r"\A\d{4}-\d{2}-\d{2}\Z")
 
 
 def slugify(text: str) -> str:
-    """Lowercase ASCII kebab slug — literally the slugger the CURATOR write path uses (#57).
+    """Path-component slug — literally the slugger the CURATOR write path uses (#57).
 
-    A thin re-export of :func:`agora_kb.adapters.ollama_brain._slugify` (collapse, trim, cap at 60,
-    reject anything ``_SLUG_OK_RE`` would not accept), NOT a look-alike: if the production slugger
-    ever changes, this fixture changes with it and the golden goes red, which is the only way the
-    "#57 shape" claim in :mod:`tests.rank_golden.corpus` can mean anything. The IMPORT path's
-    :func:`agora_kb.ingest.vault_import._slugify` is a looser variant (no 60-char cap, no
-    ``_SLUG_OK_RE`` gate); the two agree only on the un-slugifiable case this fixture exercises.
+    A thin re-export of :func:`agora_kb.adapters.ollama_brain._slugify` (ASCII-lowercase, the
+    ``core.pathsafe`` category allowlist, collapse, trim, cap at 60 UTF-8 bytes), NOT a look-alike:
+    if the production slugger ever changes, this fixture changes with it and the golden goes red,
+    which is the only way the "#57 shape" claim in :mod:`tests.rank_golden.corpus` can mean
+    anything. Since ADR-0041 D4.4 the IMPORT path's
+    :func:`agora_kb.ingest.vault_import._slugify` is an exact mirror rather than a looser variant,
+    so the two lanes now agree on every input, not only on the un-slugifiable one.
 
-    Returns ``""`` for text with no usable ASCII material (e.g. a purely Korean title); callers
+    Returns ``""`` only when NO admissible character survives (symbol junk, a Windows device
+    stem) — a purely Korean title now yields a Korean component (D4.4). When it is empty, callers
     fall back to :func:`hash_basename`, exactly as the real write path does.
     """
     return _production_slugify(text)
@@ -529,7 +531,7 @@ def build_kb(
     root: Path,
     notes: list[NoteSpec],
     *,
-    schema_version: int = 1,
+    schema_version: int = 2,
     domains: list[str] | None = None,
     kb_id: str = FIXTURE_KB_ID,
     kb_name: str = FIXTURE_KB_NAME,
@@ -549,9 +551,13 @@ def build_kb(
     deliberately left out is an orphan with no inbound link: a shape the ranker must be pinned
     against.
 
-    The DEFAULT is deliberately ``schema_version=1``, not 2: this builder's first job is still to
-    materialize the pre-flip corpus the gate-B golden was recorded over, and flipping the default
-    would silently re-record it.
+    The DEFAULT is ``schema_version=2`` — the version this build's curator WRITES (ADR-0041 D6).
+    It was 1 through wave W2.1, while schema 2 was opt-in and not yet curate-able; now that the
+    write path emits schema 2 and schema-1 repos are read-only, a fixture that does not say which
+    layout it means wants the one production produces. The two callers that genuinely mean the
+    PRE-FLIP record — :mod:`tests.rank_golden.test_golden` and :mod:`tests.rank_golden.regen`, the
+    gate-B baseline — say ``schema_version=1`` explicitly, which is the only way a default flip can
+    never silently re-record a golden.
 
     Raises :class:`ValueError` on a corpus that could not lint (duplicate basename, a map child that
     is not an admitted child of that domain, an unusable daily basename, a schema-2-only kind under

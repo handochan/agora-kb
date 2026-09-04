@@ -216,8 +216,12 @@ def test_build_kb_ignores_spec_order(tmp_path: Path) -> None:
     asserted nothing at all, which is what this test used to do under the name
     ``test_snapshot_is_invariant_to_note_creation_order``.
     """
-    forward = build_kb(tmp_path / "forward", CORPUS, domains=DOMAINS)
-    reverse = build_kb(tmp_path / "reverse", list(reversed(CORPUS)), domains=DOMAINS)
+    # `schema_version=1` explicitly: this module is the PRE-flip record (see `build_corpus` in
+    # `regen.py`), and `build_kb` now defaults to schema 2.
+    forward = build_kb(tmp_path / "forward", CORPUS, schema_version=1, domains=DOMAINS)
+    reverse = build_kb(
+        tmp_path / "reverse", list(reversed(CORPUS)), schema_version=1, domains=DOMAINS
+    )
 
     rel_f = sorted(p.relative_to(forward).as_posix() for p in forward.rglob("*") if p.is_file())
     rel_r = sorted(p.relative_to(reverse).as_posix() for p in reverse.rglob("*") if p.is_file())
