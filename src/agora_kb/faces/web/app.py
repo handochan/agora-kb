@@ -55,7 +55,7 @@ import os
 import re
 import urllib.parse
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated
+from typing import TYPE_CHECKING, Annotated, TypedDict
 
 from fastapi import FastAPI, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import HTMLResponse, PlainTextResponse, Response
@@ -73,8 +73,15 @@ from agora_kb.config import (
     load_repo_config,
     load_web_config,
 )
-from agora_kb.core import Repo
+from agora_kb.core import Inbox, Repo
 from agora_kb.core.hashing import content_sha256
+from agora_kb.core.inbox import (
+    AttachmentError,
+    AttachmentPayload,
+    AttachmentTooLargeError,
+    attachment_sha256,
+)
+from agora_kb.core.models import normalize_media_type, sanitize_attachment_filename
 from agora_kb.faces.mcp_server import AgoraHandlers
 from agora_kb.ingest.extractors import (
     ExtractorError,
@@ -115,6 +122,40 @@ _REMOTE_USER_MAX_LEN = 128
 
 
 # --- JSON API response models (the documented ADR-0019 §1 contract) -----------------------------
+class AttachmentReceipt(BaseModel):
+    """One attachment staged beside the inbox event this upload wrote (ADR-0041 D4.2).
+
+    The uploaded file's ORIGINAL bytes are no longer discarded after extraction (ADR-0020's
+    deferred half): they are staged, content-addressed, in the writer's own inbox namespace and
+    APPLY later materialises them as ``raw/_blob/<ab>/<sha256>.<ext>``. This receipt is what makes
+    that visible to the client at capture time — ``sha256`` is the content address the eventual
+    blob will be NAMED by, so an uploader can verify end to end that the bytes the server kept are
+    the bytes it sent, before any curator run has happened.
+    """
+
+    sha256: str
+    bytes: int
+    filename: str | None = None
+    media_type: str | None = None
+
+
+class _RememberReceipt(TypedDict):
+    """What the shared write seam returns — the inbox outcome plus the staged-bytes summary.
+
+    A ``TypedDict`` rather than a plain ``dict[str, object]``: both the single-upload route
+    (``UploadReceipt(**receipt, …)``) and the batch route (``FileReceipt(attachments=…)``) build a
+    response model out of it by name, and an untyped mapping makes every one of those keyword
+    arguments unverifiable — the reason the batch path carried a hand-written ``type: ignore`` on
+    the ``attachments`` key. It is a dict at runtime, so the Jinja receipt fragments
+    (``receipt.id``) are unaffected.
+    """
+
+    id: str
+    queued: bool
+    inbox_depth: int
+    attachments: list[AttachmentReceipt]
+
+
 class UploadReceipt(BaseModel):
     """The receipt returned by ``POST /api/upload`` — the inbox write outcome (DESIGN §2.2).
 
@@ -129,6 +170,7 @@ class UploadReceipt(BaseModel):
     queued: bool
     inbox_depth: int
     identity_source: str = "process"
+    attachments: list[AttachmentReceipt] = []
 
 
 class FileReceipt(BaseModel):
@@ -144,6 +186,7 @@ class FileReceipt(BaseModel):
     id: str | None = None
     queued: bool = False
     error: str | None = None
+    attachments: list[AttachmentReceipt] = []
 
 
 class BatchUploadReceipt(BaseModel):
@@ -430,6 +473,10 @@ def build_app(*, repo_path: Path, writer: str = "web", user: str = "local") -> F
     # against a repo this build only THINKS it understands.
     guard_repo_schema_version(repo.layout)
     handlers = AgoraHandlers(repo, writer=writer)
+    # The core write primitive, held beside the handlers: an upload now carries the file's original
+    # BYTES as well as the markdown extracted from them (ADR-0041 D4.2), and `kb_remember` — the
+    # handler's write method — stays text-only in this wave. See `_remember_markdown`.
+    inbox = Inbox(repo.layout)
     # ADR-0025: resolve the operator's web policy PER-REPO (invariant 5 / ADR-0006) — never a
     # module-global the browser could flip across repos. Threaded into the graph caps, the upload
     # limits, the allowed-extension gate, and the graph-feature flag below.
@@ -543,11 +590,14 @@ def build_app(*, repo_path: Path, writer: str = "web", user: str = "local") -> F
         """Extract one of (file | url | text) → markdown, then append it to the inbox.
 
         Exactly one input is used (precedence file > url > text). The extracted markdown gets a
-        deterministic provenance header (ADR-0020) and is written via :meth:`AgoraHandlers.remember`
+        deterministic provenance header (ADR-0020) and is appended to the inbox
         with ``source = web:<user>`` — the user is per-request when the operator configured
         ``web.identity.trusted_header`` (issue #67), else the process ``--user``. Returns the
-        ``{id, queued, inbox_depth, identity_source}`` receipt — the item is searchable only after
-        the next curator run (eventual consistency, DESIGN §2.2).
+        ``{id, queued, inbox_depth, identity_source, attachments}`` receipt — the item is
+        searchable only after the next curator run (eventual consistency, DESIGN §2.2). A FILE
+        upload's original bytes are kept as the event's attachment and each one's content address
+        (``sha256``) + size is listed in ``attachments`` (ADR-0041 D4.2); a url/text capture has
+        none.
 
         Errors map to HTTP: unsupported/empty input or an invalid identity-header value → 400, url
         capture disabled by the operator (``web.upload.url_enabled: false``) → 403, oversize → 413,
@@ -562,6 +612,7 @@ def build_app(*, repo_path: Path, writer: str = "web", user: str = "local") -> F
         )
         receipt = await _do_upload(
             handlers,
+            inbox=inbox,
             web_config=web_config,
             user=req_user,
             file=file,
@@ -586,9 +637,10 @@ def build_app(*, repo_path: Path, writer: str = "web", user: str = "local") -> F
     ) -> BatchUploadReceipt:
         """Capture multiple files in one batch → N independent inbox appends (ADR-0025).
 
-        Each file flows through the SAME per-file extract→provenance→:meth:`AgoraHandlers.remember`
-        path as :func:`_do_upload` (single-writer unchanged — the face only appends to the inbox,
-        ADR-0002/0020). BEST-EFFORT, not atomic: a bad file yields its own ``error`` receipt
+        Each file flows through the SAME per-file extract→provenance→inbox-append path as
+        :func:`_do_upload` (its original bytes attached to its own event, ADR-0041 D4.2;
+        single-writer unchanged — the face only appends to the inbox, ADR-0002/0020).
+        BEST-EFFORT, not atomic: a bad file yields its own ``error`` receipt
         while the good files still queue (the inbox is append-only per-event). Per-batch caps
         (``upload.max_files`` count, ``upload.total_bytes`` total) are enforced UP-FRONT and reject
         the whole batch with 413 before any write (count is known; the total is checked as each file
@@ -606,6 +658,7 @@ def build_app(*, repo_path: Path, writer: str = "web", user: str = "local") -> F
         )
         results = await _do_upload_batch(
             handlers,
+            inbox=inbox,
             web_config=web_config,
             user=req_user,
             files=files,
@@ -801,6 +854,7 @@ def build_app(*, repo_path: Path, writer: str = "web", user: str = "local") -> F
         if len(real_files) > 1:
             results = await _do_upload_batch(
                 handlers,
+                inbox=inbox,
                 web_config=web_config,
                 user=req_user,
                 files=real_files,
@@ -817,6 +871,7 @@ def build_app(*, repo_path: Path, writer: str = "web", user: str = "local") -> F
         try:
             receipt = await _do_upload(
                 handlers,
+                inbox=inbox,
                 web_config=web_config,
                 user=req_user,
                 file=single,
@@ -944,6 +999,7 @@ def _resolve_upload_user(
 async def _do_upload(
     handlers: AgoraHandlers,
     *,
+    inbox: Inbox,
     web_config: WebConfig,
     user: str,
     file: UploadFile | None,
@@ -951,7 +1007,7 @@ async def _do_upload(
     text: str | None,
     domain: str | None,
     tags: str | None,
-) -> dict[str, object]:
+) -> _RememberReceipt:
     """Extract → provenance-stamp → ``remember``; return the ``{id, queued, inbox_depth}`` receipt.
 
     Precedence: an uploaded ``file`` wins, then ``url``, then raw ``text``. The chosen input is
@@ -959,6 +1015,12 @@ async def _do_upload(
     :func:`extract`; ``text`` used verbatim), a deterministic provenance header is prepended
     (ADR-0020), and the result is appended to the inbox with ``source = web:<user>``. The per-file
     size limit + the allowed-extension gate come from the operator's :class:`WebConfig` (ADR-0025).
+
+    On the FILE branch the upload's original bytes ride along as the event's attachment (ADR-0041
+    D4.2): extraction is lossy and irreversible, so the artefact itself is kept rather than only
+    the markdown read out of it. The ``url``/``text`` branches attach nothing — a pasted body IS
+    the bytes, and a fetched page's bytes are the remote server's rendering at fetch time, not an
+    artefact the user handed us (a decision for the connector wave, not this one).
     Raises :class:`fastapi.HTTPException` for the documented error cases (no input/empty → 400,
     url capture disabled by the operator → 403, oversize → 413, blocked extension → 415, extractor
     failure — incl. an SSRF-blocked URL or a decompression-bomb archive → 422, missing dependency
@@ -968,9 +1030,11 @@ async def _do_upload(
     url_val = (url or "").strip() or None
     text_val = text if (text and text.strip()) else None
     max_bytes = web_config.upload.max_bytes
+    attachments: list[AttachmentPayload] = []
 
     if file is not None and file.filename:
         data = await file.read()
+        attachments.append((file.filename, file.content_type, data))
         markdown = _file_to_markdown(
             data,
             filename=file.filename,
@@ -1022,12 +1086,22 @@ async def _do_upload(
             detail="provide exactly one of: a file upload, a url, or text.",
         )
 
-    return _remember_markdown(handlers, markdown, user=user, domain=domain, tags=tags)
+    return _remember_markdown(
+        handlers,
+        inbox,
+        markdown,
+        user=user,
+        domain=domain,
+        tags=tags,
+        attachments=attachments,
+        max_attachment_bytes=max_bytes,
+    )
 
 
 async def _do_upload_batch(
     handlers: AgoraHandlers,
     *,
+    inbox: Inbox,
     web_config: WebConfig,
     user: str,
     files: list[UploadFile],
@@ -1041,7 +1115,8 @@ async def _do_upload_batch(
     (``upload.total_bytes``) — either overflow rejects the WHOLE batch with 413 before any inbox
     write (the count/total are batch-level policy, not per-file). Within the cap each file flows
     through the SAME per-file path as :func:`_do_upload` (size limit, extension gate, extract,
-    provenance, :meth:`AgoraHandlers.remember`); a per-file failure is captured as that file's own
+    provenance, the shared :func:`_remember_markdown` write seam — original bytes attached and all,
+    ADR-0041 D4.2); a per-file failure is captured as that file's own
     ``error`` :class:`FileReceipt` (BEST-EFFORT, not atomic — a bad file never blocks a good one,
     the inbox is append-only per-event, ADR-0002/0020). The shared ``domain``/``tags`` apply to
     every file; an invalid shared tag fails the whole batch up-front (it would fail every file).
@@ -1087,15 +1162,25 @@ async def _do_upload_batch(
                 allowed=web_config.extensions.allowed,
                 max_uncompressed_bytes=web_config.upload.max_uncompressed_bytes,
             )
-            receipt = _remember_markdown(handlers, markdown, user=user, domain=domain, tags=tags)
+            receipt = _remember_markdown(
+                handlers,
+                inbox,
+                markdown,
+                user=user,
+                domain=domain,
+                tags=tags,
+                attachments=[(filename, mime, data)],
+                max_attachment_bytes=web_config.upload.max_bytes,
+            )
         except HTTPException as exc:
             results.append(FileReceipt(filename=filename or "(unnamed)", error=str(exc.detail)))
             continue
         results.append(
             FileReceipt(
                 filename=filename or "(unnamed)",
-                id=str(receipt["id"]),
-                queued=bool(receipt["queued"]),
+                id=receipt["id"],
+                queued=receipt["queued"],
+                attachments=receipt["attachments"],
             )
         )
     return results
@@ -1162,27 +1247,66 @@ def _check_allowed_ext(filename: str, allowed: list[str] | None) -> None:
 
 def _remember_markdown(
     handlers: AgoraHandlers,
+    inbox: Inbox,
     markdown: str,
     *,
     user: str,
     domain: str | None,
     tags: str | None,
-) -> dict[str, object]:
-    """Append provenance-stamped ``markdown`` to the inbox; return the ``remember`` receipt.
+    attachments: Sequence[AttachmentPayload] = (),
+    max_attachment_bytes: int,
+) -> _RememberReceipt:
+    """Append provenance-stamped ``markdown`` (+ the original bytes) to the inbox; return a receipt.
 
     The single write seam shared by the single + batch paths: validates tags (kebab-case, 422),
-    normalizes the domain, and calls :meth:`AgoraHandlers.remember` with ``source = web:<user>``
-    (the only write path — the curator alone materializes ``raw/``, single-writer ADR-0002/0020).
+    normalizes the domain, and appends one immutable event with ``source = web:<user>`` (the only
+    write path — the curator alone materializes ``raw/``, single-writer ADR-0002/0020). Returns
+    ``{id, queued, inbox_depth, attachments}``.
+
+    ``attachments`` carries the uploaded file's ORIGINAL bytes, staged with the event inside the
+    writer's own inbox namespace (ADR-0041 D4.2) — ADR-0020's deferred half: the extracted markdown
+    is still the event BODY, and the bytes it was extracted from are no longer thrown away. The
+    per-file byte cap is the operator's ``upload.max_bytes``, passed explicitly rather than left to
+    :func:`~agora_kb.core.inbox.default_attachment_byte_cap` so one configured number governs both
+    halves of the same upload (:func:`_file_to_markdown` already refused an oversize file before
+    extraction; this is the same bound restated where the bytes are actually written).
+
+    **Why this calls :meth:`Inbox.write` rather than :meth:`AgoraHandlers.remember`.** ``remember``
+    is the ``kb_remember`` MCP tool's handler and that tool stays TEXT-ONLY in this wave — an agent
+    tool has no binary transport, so widening its signature would add a parameter no MCP client can
+    fill. The writer identity still comes from the handlers (``handlers.writer``, fixed by server
+    config, never by the request), so the tenant/namespace posture is unchanged; only the byte
+    payload takes the shorter route to the same core primitive ``remember`` itself calls.
     """
     parsed_tags = _parse_tags(tags)
     dom = (domain or "").strip() or None
     try:
-        return handlers.remember(
-            markdown,
+        receipt = inbox.write(
+            text=markdown,
+            writer=handlers.writer,
             source=f"web:{user}",
             domain=dom,
             tags=parsed_tags,
+            attachments=attachments or None,
+            max_attachment_bytes=max_attachment_bytes,
         )
+        return _RememberReceipt(
+            id=receipt.id,
+            queued=receipt.queued,
+            inbox_depth=receipt.inbox_depth,
+            attachments=_attachment_receipts(attachments),
+        )
+    except AttachmentTooLargeError as exc:
+        # The same 413 the face's own pre-check raises for an oversize upload — a byte-count
+        # refusal, not a malformed-input one. Unreachable while `_file_to_markdown` gates the same
+        # bound first; kept so the two limits can never disagree SILENTLY if one is later relaxed.
+        raise HTTPException(status_code=413, detail=str(exc)) from exc
+    except AttachmentError as exc:
+        # Integrity/containment refusals (ADR-0041 D4.2): the bytes did not land as their content
+        # address says they must. Nothing was queued — a capture is never half-delivered.
+        raise HTTPException(
+            status_code=422, detail=f"could not stage the uploaded bytes: {exc}"
+        ) from exc
     except ReadOnlySchemaVersionError as exc:
         # ADR-0041 D6, made EXPLICIT rather than incidental. `Inbox.write` refuses a capture into a
         # repo whose KB wiki schema this build will not write, and the refusal is a `ConfigError`
@@ -1211,6 +1335,35 @@ def _remember_markdown(
         # of the pydantic InboxItem deep in handlers.remember(). Tags are already pre-validated in
         # _parse_tags, so this is the belt to that pre-check's braces.
         raise HTTPException(status_code=422, detail=f"could not capture upload: {exc}") from exc
+
+
+def _attachment_receipts(attachments: Sequence[AttachmentPayload]) -> list[AttachmentReceipt]:
+    """Describe each staged payload for the receipt: content address, size, display metadata.
+
+    Computed from the SAME bytes handed to :meth:`Inbox.write` with the SAME hash function it
+    stages under (:func:`~agora_kb.core.inbox.attachment_sha256`), so the digest a client verifies
+    is the one the file is named by on disk — not a second, independently-derived number that could
+    drift. Deliberately not read back off the staged file: a receipt is a statement about what this
+    request delivered, and re-reading would answer a different question (what is on disk NOW).
+
+    The two DISPLAY fields go through the SAME normalisers the stored record does
+    (:func:`~agora_kb.core.models.sanitize_attachment_filename` /
+    :func:`~agora_kb.core.models.normalize_media_type`, applied by
+    :class:`~agora_kb.core.models.Attachment`'s own validators), so the receipt describes what was
+    PERSISTED rather than what was submitted. Echoing the request's raw strings back would make the
+    JSON API disagree with the event frontmatter and the eventual ``raw/_blob/`` sidecar about the
+    same file — and would report a name (``../../etc/passwd``) for an attachment that in fact
+    carries none.
+    """
+    return [
+        AttachmentReceipt(
+            sha256=attachment_sha256(data),
+            bytes=len(data),
+            filename=sanitize_attachment_filename(filename),
+            media_type=normalize_media_type(media_type),
+        )
+        for filename, media_type, data in attachments
+    ]
 
 
 def _extract(**kwargs: object):  # noqa: ANN201 - returns ExtractedDoc; thin wrapper

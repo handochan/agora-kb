@@ -8,6 +8,10 @@ A dependency-light :mod:`argparse` front-end over the core API. Subcommands:
   reading ``src`` without ever modifying it: by default ``src`` is a foreign Obsidian/markdown
   vault (ADR-0014 D5), and with ``--from-kb`` it is an existing schema-1 Agora repo, which the
   ADR-0041 D6 CONVERTER crosses to schema 2 — the only crossing there is.
+- ``agora capture --file PATH [--repo PATH] [--domain D] [--writer W] [--source S]`` — append ONE
+  file to the inbox: the extractor registry's text becomes the event body (a one-line stub when no
+  extractor claims the extension) and the file's ORIGINAL bytes ride along as the event's
+  attachment (ADR-0041 D4.2). The local, no-server twin of the web face's upload route.
 - ``agora status [--repo PATH]`` — print inbox depth + curator state (last run/commit, counters).
 - ``agora curate [--repo PATH] [--force]`` — recover any in-flight run, then execute ONE real
   consolidation run via :mod:`agora_kb.curator` ``worker`` against the configured ``adapters.yaml``
@@ -51,6 +55,7 @@ import argparse
 import functools
 import importlib
 import json
+import mimetypes
 import os
 import shutil
 import sys
@@ -71,6 +76,7 @@ from .config import (
     KbIdentity,
     RepoConfig,
     UnsupportedSchemaVersionError,
+    WebUploadConfig,
     guard_repo_schema_version,
     load_backend_registry,
     load_backup_policy,
@@ -80,6 +86,7 @@ from .config import (
     load_kb_identity,
     load_redact_policy,
     load_repo_config,
+    load_web_config,
     read_canonical_kb_schema_version,
     read_kb_schema_version,
     write_default_adapters_yaml,
@@ -96,8 +103,9 @@ from .core import (
     failed_event_count,
 )
 from .core.ids import new_ulid
-from .core.inbox import assert_writable_repo_schema
-from .core.repo import GitError
+from .core.inbox import assert_writable_repo_schema, attachment_sha256
+from .core.layout import attachment_ext_for
+from .core.repo import GITATTRIBUTES_NAME, GitError, blob_bytes_are_pinned
 from .core.state import CuratorState
 from .curator import evaluate
 from .curator.backends import _WORKTREE_TOKEN, BackendRegistry
@@ -249,6 +257,35 @@ def build_parser() -> argparse.ArgumentParser:
     # `dest` may already BE an Agora repo (import does not refuse one), and import writes
     # wiki/ + _meta/ and commits — so it must be guarded (#98).
     p_import.set_defaults(func=_cmd_import, schema_guard_attr="dest")
+
+    # capture — the local, no-server way to put ONE file into the inbox WITH its original bytes
+    # (ADR-0041 D4.2). The web face's upload route does the same thing over HTTP; this is the half
+    # that needs no browser, no `web` extra, and no running process — an operator with a PDF on
+    # disk and a shell.
+    p_capture = sub.add_parser(
+        "capture",
+        help="append one file to the inbox: extracted text as the event, original bytes attached",
+    )
+    p_capture.add_argument("--repo", default=".", help="repo root (default: .)")
+    p_capture.add_argument(
+        "--file", required=True, metavar="PATH", help="the file to capture (read, never modified)"
+    )
+    p_capture.add_argument(
+        "--domain",
+        default=None,
+        help="taxonomy domain for the capture (default: none — the curator decides)",
+    )
+    p_capture.add_argument(
+        "--writer",
+        default="local",
+        help="inbox writer namespace to append to (default: local)",
+    )
+    p_capture.add_argument(
+        "--source",
+        default="manual",
+        help="provenance source stamped on the event (default: manual; e.g. agent:<name>)",
+    )
+    p_capture.set_defaults(func=_cmd_capture)
 
     # status
     p_status = sub.add_parser("status", help="show inbox depth + curator state")
@@ -1009,6 +1046,166 @@ def _cmd_import_from_kb(args: argparse.Namespace, *, import_date: str) -> int:
         f"{MAX_SUPPORTED_KB_SCHEMA_VERSION} repo this build can curate — point 'agora curate' / "
         f"'agora serve' / 'agora web' at it once you have checked the report above",
         file=sys.stderr,
+    )
+    return 0
+
+
+def _capture_upload_policy(layout: RepoLayout) -> WebUploadConfig:
+    """The upload limits ``agora capture`` enforces — the REPO's numbers, not the defaults.
+
+    INGEST-CONTRACT §0.1 rule 3 is "one byte cap, one number": the ceiling is the operator's
+    ``web.upload.max_bytes`` (ADR-0025 / issue #66), the same value the web face threads into its
+    own upload path. Reading only :func:`~agora_kb.core.inbox.default_attachment_byte_cap` here
+    would give one repo two different per-file limits depending on which capture surface an
+    operator used — exactly the drift that function's own docstring says a second constant causes.
+
+    The WHOLE ``upload`` block is returned rather than the one field, because the byte cap is not
+    the only number with two surfaces: ``max_uncompressed_bytes`` is the decompression-bomb ceiling
+    for zip-based formats (docx/xlsx/pptx/epub, issue #53), and threading one but not the other
+    would leave an operator who LOWERED that cap with it lowered on the web face only. One
+    resolution, one policy object, both surfaces.
+
+    A repo whose ``web:`` block cannot be read (:class:`~agora_kb.config.ConfigError` — a malformed
+    ``_kb/repo.yaml``) falls back to the library defaults rather than refusing: an unreadable
+    OPERATOR POLICY file must not make a local capture impossible, and ``WebUploadConfig()`` is by
+    construction the same floor every other writer without configured policy in scope already uses
+    (:func:`~agora_kb.core.inbox.default_attachment_byte_cap` reads its ``max_bytes`` default).
+    """
+    try:
+        return load_web_config(layout).upload
+    except ConfigError:
+        return WebUploadConfig()
+
+
+def _cmd_capture(args: argparse.Namespace) -> int:
+    """``agora capture --file PATH`` — one inbox event carrying the file's text AND its bytes.
+
+    The local twin of the web face's upload route (ADR-0041 D4.2 / ADR-0020's deferred half). The
+    body is the text the existing extractor registry reads out of the file; the ORIGINAL bytes ride
+    along as the event's attachment, staged inside the writer's own inbox namespace, and APPLY
+    later materialises them as ``raw/_blob/<ab>/<sha256>.<ext>``. Extraction is lossy and
+    irreversible — a PDF is not recoverable from its text — so the artefact itself is what gets
+    kept; the text is how it becomes findable.
+
+    An extension the registry does not route (``.zip``, ``.png``, a raw log) is NOT a refusal: the
+    event body becomes a one-line stub naming the attachment and the bytes are stored anyway. That
+    is the whole point of a capture surface — an artefact nobody can extract today is exactly the
+    one worth keeping until somebody can. A MISSING optional dependency is the opposite case and
+    DOES refuse (``ExtractorUnavailable``, carrying its own install remedy): the format IS
+    supported, this install just cannot read it, and silently storing a stub instead would bury a
+    fixable environment problem under a capture that looks like it worked.
+
+    The per-file byte ceiling — and the zip-bomb ceiling handed to the extractor — are the REPO's
+    ``web.upload`` numbers (:func:`_capture_upload_policy`), the same ones the web face enforces on
+    an upload: INGEST-CONTRACT §0.1 rule 3.
+
+    **What "kept" means, exactly.** The bytes are durable in the inbox immediately and reach the
+    committed tree as ``raw/_blob/`` only if the curator KEEPS the candidate. A ``DROP`` (or a
+    ``NOOP``) writes no note, so there is no ``sources:`` list to cite the blob and APPLY
+    materialises nothing — the artefact then survives only in the git-ignored ``_kb/processed/``
+    spool, which is never pruned but is also never committed, pushed or backed up by
+    ``agora sync``. That is the same rule a free-text capture has always followed (a DROPped
+    ``kb_remember`` writes no ``raw/<domain>/<event_id>.md`` either); it is stated here because a
+    file the operator handed us reads as a stronger promise than a sentence typed into a tool.
+
+    Exit codes: ``0`` on a queued event; ``1`` for an unreadable/oversize file, a missing ingest
+    dependency, an extraction failure, an invalid writer/source/domain, or a repo whose KB wiki
+    schema this build will not write (ADR-0041 D6 — the refusal comes from ``Inbox.write`` itself,
+    like every other writer's).
+    """
+    from .ingest.extractors import ExtractorError, ExtractorUnavailable, extract
+
+    path = Path(args.file).expanduser()
+    try:
+        data = path.read_bytes()
+    except OSError as exc:
+        print(f"{_PROG} capture: cannot read {path}: {exc}", file=sys.stderr)
+        return 1
+    layout = RepoLayout(Path(args.repo))
+    policy = _capture_upload_policy(layout)
+    cap = policy.max_bytes
+    if len(data) > cap:
+        # Checked HERE, before extraction, for the same reason the web face checks before it:
+        # the refusal is about the artefact's size, and running an extractor over bytes that can
+        # never be stored is work whose only possible outcome is a different error message.
+        print(
+            f"{_PROG} capture: {path} is {len(data)} bytes, over the {cap}-byte per-file limit",
+            file=sys.stderr,
+        )
+        return 1
+
+    ext = attachment_ext_for(path.name)
+    try:
+        # Routed on the FILENAME alone — no `mime=` guess. `extract` treats a conflicting
+        # mime/extension pair as an ambiguity error, and a locally-guessed mime is exactly the kind
+        # of second opinion that manufactures one for a file the extension already routes fine.
+        # The bomb cap is the OPERATOR's, exactly as on the web face: a zip-based format captured
+        # locally must not be guarded by a different number than the same file uploaded (#53).
+        doc = extract(
+            data=data,
+            filename=path.name,
+            max_uncompressed_bytes=policy.max_uncompressed_bytes,
+        )
+    except ExtractorUnavailable as exc:
+        print(f"{_PROG} capture: {exc}", file=sys.stderr)
+        return 1
+    except ExtractorError as exc:
+        print(f"{_PROG} capture: could not extract {path.name}: {exc}", file=sys.stderr)
+        return 1
+    except ValueError:
+        doc = None  # no extractor claims this extension → the stub body below
+
+    sha = attachment_sha256(data)
+    # DISPLAY metadata for the attachment record (and, after APPLY, the `raw/_blob/` sidecar's
+    # `media_type:`) — never routing: the extractor already chose on the extension above, and a
+    # guess fed back into that choice is how a correctly-routed file becomes an "ambiguous upload".
+    # The extractor's own answer wins when it has one; `mimetypes` is the fallback for the stub
+    # path, where nothing else knows what the bytes are.
+    media_type = (doc.mime if doc is not None else None) or mimetypes.guess_type(path.name)[0]
+    body = doc.markdown if doc is not None and doc.markdown.strip() else None
+    if body is None:
+        # Also the empty-extraction case (a scanned PDF with no text layer): `Inbox.write` refuses
+        # an empty body, and a capture that fails because the file had no words in it would lose
+        # the file. The stub names the attachment so the curator — and a human reading the inbox —
+        # can see what arrived.
+        body = (
+            f"Captured file `{path.name}` ({len(data)} bytes, sha256 {sha}) — no extractable text; "
+            f"the original bytes are attached."
+        )
+    try:
+        receipt = Inbox(layout).write(
+            text=body,
+            writer=args.writer,
+            source=args.source,
+            domain=args.domain,
+            attachments=[(path.name, media_type, data)],
+            max_attachment_bytes=cap,
+        )
+    except UnsupportedSchemaVersionError as exc:
+        # ORDERED FIRST, as everywhere else: this family (and the `ReadOnlySchemaVersionError`
+        # write refusal) is a ConfigError, hence a ValueError, and it must not be rendered as a
+        # malformed-input complaint — it carries its own remedy (`agora import --from-kb`).
+        print(f"{_PROG}: {exc}", file=sys.stderr)
+        return 1
+    except ValueError as exc:
+        # One arm for every input verdict the core returns: an invalid writer
+        # (`InvalidWriterError`), an attachment refusal (`AttachmentError`), and the InboxItem
+        # model's own validation of `source`/`domain`/`target`. All are the operator's argument to
+        # fix, and all read as one line rather than a traceback.
+        print(f"{_PROG} capture: {exc}", file=sys.stderr)
+        return 1
+    except OSError as exc:
+        print(f"{_PROG} capture: could not write the inbox event: {exc}", file=sys.stderr)
+        return 1
+
+    staged = layout.inbox_attachment_path(args.writer, sha, ext)
+    print(f"repo: {layout.root}")
+    print(f"captured: {receipt.id} (queued={receipt.queued}, inbox depth={receipt.inbox_depth})")
+    print(f"body: {doc.extractor if doc is not None else 'stub'} ({len(body)} chars)")
+    print(f"attachment: {sha} ({len(data)} bytes) -> {rel_to_repo(layout, staged)}")
+    print(
+        "note: searchable after the next curator run (eventual consistency); a candidate the "
+        "curator DROPs keeps its bytes in the git-ignored _kb/ spool, not in git"
     )
     return 0
 
@@ -2418,6 +2615,21 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
     layout = RepoLayout(Path(args.repo))
     if Repo(layout).is_initialized():
         print(f"  repo {layout.root}: initialized")
+        # ADR-0041 D1.4: `raw/_blob/` bytes are named by their own sha256, so git must never
+        # translate their line endings. `repo init` seeds the rule; a repo created before that
+        # change has no `.gitattributes` and would silently rewrite a CRLF, NUL-free artefact
+        # (CSV/TXT/HTML/JSON) on commit under `core.autocrlf`. Reported, never repaired: doctor is
+        # diagnostic, and this is one line the operator can paste. It does NOT move the verdict —
+        # the argv pins on `Repo._git` already protect every write this engine makes; the file is
+        # what extends that to a hand-run `git add` in the same repo.
+        if blob_bytes_are_pinned(layout.root):
+            print(f"  {GITATTRIBUTES_NAME}: ok (raw/_blob/ pinned out of git EOL translation)")
+        else:
+            print(
+                f"  {GITATTRIBUTES_NAME}: missing the raw/_blob/ rule — run: "
+                f"printf 'raw/_blob/** -text -diff -merge\\n' >> "
+                f"{layout.root / GITATTRIBUTES_NAME}"
+            )
     else:
         print(f"  repo {layout.root}: not initialized (run 'agora repo init')")
 

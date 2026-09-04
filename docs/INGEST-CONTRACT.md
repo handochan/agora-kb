@@ -116,6 +116,59 @@ is silent data loss dressed as success. `agora doctor` keeps its diagnostic exem
 `agora import --from-kb <old-repo> <new-repo>`, a conversion into a NEW repo (ADR-0041 D6) — there is
 no in-place migrator, and the ADR decided there will not be one for this bump.
 
+### 0.1 CAPTURE SURFACES — what a writer may hand the inbox (ADR-0041 D4.2)
+
+Two surfaces put an **artefact** (a file, as opposed to typed text) into a repo. Every event they
+DO write has one shape, so INGEST sees exactly one kind of event either way — but they differ on
+which files they accept, and rule 1 below states the split rather than promising a parity the code
+does not have:
+
+| surface | writer / source | body | bytes |
+|---|---|---|---|
+| `POST /api/upload` · `/api/upload-batch` · `POST /upload` (web face) | `web` / `web:<user>` | the extractor's markdown + the ADR-0020 provenance header (a file no extractor claims is REFUSED `400`, not stubbed — rule 1) | the uploaded file's original bytes |
+| `agora capture --file PATH [--domain D] [--writer W] [--source S]` (CLI) | `--writer` (default `local`) / `--source` (default `manual`) | the extractor's markdown, or a one-line stub naming the attachment when no extractor claims the extension | the file's bytes |
+
+Rules the two surfaces obey — the contract INGEST may rely on:
+
+1. **The event body is TEXT, always — and the two surfaces differ on the file nobody can extract.**
+   Extraction is unchanged (`ingest/extractors/`, ADR-0025): the markdown read out of the file is
+   the body. No brain, bundle, or plan ever sees bytes (§1). Where an extraction yields *nothing*
+   (a scanned PDF with no text layer, an extension no extractor claims), the two surfaces part:
+   `agora capture` writes a **one-line stub body** naming the attachment and keeps the bytes, while
+   the web face **refuses** an extension no extractor claims with `400 unsupported or ambiguous
+   upload` and stages nothing at all. That is deliberate, not an oversight: a local shell command
+   is the operator saying "keep this", while an HTTP endpoint that silently accepted anything would
+   be an open blob store on a face reachable by a browser. An operator who wants the web face to
+   accept more formats widens `web.extensions.allowed` — or captures the file locally.
+2. **The original bytes ride along as `attachments:`**, staged inside the writer's own inbox
+   namespace at `_kb/inbox/<writer>/_attach/<sha256>.<ext>` and written *before* the event that
+   names them. This is ADR-0020's deferred half: extraction is lossy and irreversible, so the
+   artefact is kept rather than only the text read out of it. APPLY — and only APPLY — later
+   materialises them as `raw/_blob/<ab>/<sha256>.<ext>` (+ its `.meta.yaml` sidecar) and cites the
+   blob path, never the sidecar (L1-8b). The curator remains the sole writer of `raw/`.
+   **A blob is written only where a note cites it:** a candidate the curator `DROP`s (or `NOOP`s)
+   produces no note and therefore no `raw/_blob/` file — its bytes drain to
+   `_kb/processed/<date>/_attach/`, never pruned but git-ignored, so they do not reach the committed
+   tree or `agora sync`. The parity with a DROPped free-text capture (which writes no
+   `raw/<domain>/<event_id>.md` either) is the point; "kept" means kept *in the inbox lineage*,
+   and only a KEPT candidate puts the artefact in git.
+3. **One byte cap, one number.** The per-attachment ceiling is the repo's configured
+   `web.upload.max_bytes` (ADR-0025 / issue #66, default 25 MiB) — the web face resolves it per
+   repo in `build_app`, and `agora capture` resolves the SAME key off the same `_kb/repo.yaml`
+   (falling back to the library default only when that file cannot be read). Lowering the cap
+   therefore lowers it for both surfaces at once. Over-cap is refused per file, before extraction
+   and before any staging — a refused capture leaves no bytes behind.
+4. **Bytes are opaque and are never scanned.** Redaction and the §8 sentinel pass (ADR-0023 §5 /
+   ADR-0027) apply to the extracted TEXT on the paths that already run them; an attachment is
+   stored verbatim, because a redactor that rewrote a PDF would break the one property
+   `raw/_blob/` rests on — `hash(bytes) == basename`.
+5. **A capture is never half-delivered.** An attachment refusal (over cap, integrity, containment)
+   yields no event; the ADR-0041 D6 read-only refusal fires inside `Inbox.write` for both surfaces,
+   so nothing is staged for a repo whose schema this build will not write.
+
+`agora import` (the vault normalizer) is deliberately NOT a blob surface: it normalizes markdown
+that is already text. `kb_remember` stays text-only — MCP has no binary transport in this wave.
+
 ---
 ## 1. INPUT BUNDLE — `_kb/processing/<run-id>/bundle/` (git-ignored; never in the curated diff)
 

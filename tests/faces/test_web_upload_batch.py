@@ -12,6 +12,7 @@ co-existence check.
 
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 
 import pytest
@@ -84,6 +85,67 @@ def test_batch_all_success(tmp_path: Path) -> None:
     assert {r["filename"] for r in results} == {"a.md", "b.txt", "c.md"}
     # Three independent inbox events (append-only per-event).
     assert _depth(tmp_path) == before + 3
+
+
+def test_batch_stages_each_files_own_bytes(tmp_path: Path) -> None:
+    """Every file in a batch keeps ITS OWN bytes, staged under its own content address.
+
+    The batch path shares :func:`_remember_markdown` with the single-file route, so the ADR-0041
+    D4.2 attachment must arrive per FILE and never be shared, dropped, or attributed to the wrong
+    event — three files, three digests, three staged blobs, each cited by exactly one event.
+    """
+    _init_repo(tmp_path)
+    client = _client(tmp_path, user="alice")
+    payloads = {
+        "a.md": b"# Note A\n",
+        "b.txt": b"finding b\n",
+        "c.md": b"# Note C\n",
+    }
+
+    resp = client.post(
+        "/api/upload-batch",
+        files=[("files", (name, data, "text/plain")) for name, data in payloads.items()],
+    )
+
+    assert resp.status_code == 200, resp.text
+    results = {r["filename"]: r for r in resp.json()["results"]}
+    layout = Repo.resolve(tmp_path).layout
+    for name, data in payloads.items():
+        digest = hashlib.sha256(data).hexdigest()
+        assert results[name]["attachments"] == [
+            {
+                "sha256": digest,
+                "bytes": len(data),
+                "filename": name,
+                "media_type": "text/plain",
+            }
+        ]
+        ext = name.rsplit(".", 1)[1]
+        assert layout.inbox_attachment_path("web", digest, ext).read_bytes() == data
+    cited = [item["attachments"] for item in _inbox_items(tmp_path)]
+    assert sorted(entry[0]["sha256"] for entry in cited) == sorted(
+        hashlib.sha256(data).hexdigest() for data in payloads.values()
+    )
+
+
+def test_batch_per_file_oversize_stages_nothing_for_the_bad_file(tmp_path: Path) -> None:
+    """A per-file refusal leaves NO bytes behind — the good file's blob is the only one staged."""
+    _init_repo(tmp_path)
+    _write_repo_yaml(tmp_path, "web:\n  upload:\n    max_bytes: 10\n    total_bytes: 100000\n")
+    client = _client(tmp_path)
+
+    resp = client.post(
+        "/api/upload-batch",
+        files=[
+            ("files", ("small.md", b"ok\n", "text/markdown")),
+            ("files", ("big.md", b"x" * 50, "text/markdown")),
+        ],
+    )
+
+    assert resp.status_code == 200, resp.text
+    layout = Repo.resolve(tmp_path).layout
+    staged = sorted(p.name for p in layout.inbox_dir.glob("*/_attach/*"))
+    assert staged == [hashlib.sha256(b"ok\n").hexdigest() + ".md"]
 
 
 def test_batch_bad_shared_tag_rejects_whole_batch_up_front(tmp_path: Path) -> None:

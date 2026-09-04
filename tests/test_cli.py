@@ -8,6 +8,7 @@ not on PATH.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -27,7 +28,9 @@ from agora_kb import cli as cli_mod
 from agora_kb.adapters import cli_agent_brain, ollama_brain
 from agora_kb.cli import main
 from agora_kb.config import (
+    ConfigError,
     ReadOnlySchemaVersionError,
+    WebUploadConfig,
     load_backend_registry,
     load_kb_identity,
 )
@@ -630,6 +633,195 @@ def test_repo_without_subcommand_returns_2(capsys: pytest.CaptureFixture[str]) -
     rc = main(["repo"])
     assert rc == 2
     assert "subcommand" in capsys.readouterr().err
+
+
+# --- capture (the local file→inbox surface with the bytes attached; ADR-0041 D4.2) ---------------
+def _sole_inbox_event(layout: RepoLayout) -> tuple[dict[str, object], str]:
+    """The single pending event's parsed frontmatter + body (asserts there is exactly one)."""
+    from agora_kb.core import frontmatter
+
+    paths = sorted(layout.inbox_dir.glob("*/*.md"))
+    assert len(paths) == 1, f"expected exactly one inbox event, got {paths}"
+    return frontmatter.parse(paths[0].read_text(encoding="utf-8"))
+
+
+def test_capture_writes_the_event_and_stages_the_original_bytes(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The happy path: extracted text is the BODY, the file's own bytes are the ATTACHMENT.
+
+    The whole point of the surface (ADR-0020's deferred half): extraction is lossy, so the artefact
+    survives beside the text read out of it. The staged file must be byte-identical to the source
+    AND live at its own content address — that equality is what ``raw/_blob/``'s integrity story
+    rests on (ADR-0041 D1.4), and it has to be true from the very first hop.
+    """
+    src = tmp_path / "note.md"
+    payload = b"# Findings\n\nThe curator is the single writer.\n"
+    src.write_bytes(payload)
+    repo = tmp_path / "kb"
+
+    rc = main(["capture", "--repo", str(repo), "--file", str(src), "--domain", "ai-tech"])
+
+    assert rc == 0
+    layout = RepoLayout(repo)
+    fm, body = _sole_inbox_event(layout)
+    assert fm["writer"] == "local" and fm["source"] == "manual" and fm["domain"] == "ai-tech"
+    assert "single writer" in body
+    digest = hashlib.sha256(payload).hexdigest()
+    assert fm["attachments"] == [
+        {
+            "sha256": digest,
+            "ext": "md",
+            "filename": "note.md",
+            "media_type": "text/markdown",
+            "bytes": len(payload),
+        }
+    ]
+    staged = layout.inbox_attachment_path("local", digest, "md")
+    assert staged.read_bytes() == payload
+    out = capsys.readouterr().out
+    assert digest in out and "captured:" in out
+
+
+def test_capture_stubs_the_body_for_a_file_no_extractor_claims(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An unroutable extension is NOT a refusal — the bytes are the knowledge worth keeping.
+
+    A capture surface that only accepted what it could read would drop exactly the artefacts that
+    need an archive (a binary blob, a raw log, a format this build has no extractor for). The event
+    body degrades to a one-line stub NAMING the attachment so the curator and a human reading the
+    inbox can both see what arrived.
+    """
+    src = tmp_path / "capture.bin"
+    payload = bytes(range(256)) * 4
+    src.write_bytes(payload)
+    repo = tmp_path / "kb"
+
+    rc = main(["capture", "--repo", str(repo), "--file", str(src), "--writer", "cli"])
+
+    assert rc == 0
+    layout = RepoLayout(repo)
+    fm, body = _sole_inbox_event(layout)
+    assert body.strip().count("\n") == 0, "the stub body is ONE line"
+    assert "capture.bin" in body
+    digest = hashlib.sha256(payload).hexdigest()
+    attachments = fm["attachments"]
+    assert isinstance(attachments, list)
+    assert attachments[0]["sha256"] == digest and attachments[0]["ext"] == "bin"
+    assert layout.inbox_attachment_path("cli", digest, "bin").read_bytes() == payload
+    assert "body: stub" in capsys.readouterr().out
+
+
+def test_capture_refuses_a_schema_1_repo_and_stages_nothing(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """ADR-0041 D6 applies to the newest writer for free — it goes through ``Inbox.write``.
+
+    D6 puts the refusal at the ONE write primitive precisely so a face added later cannot forget
+    it. The test that matters is therefore not only the exit code but that NOTHING was staged: an
+    attachment written before a refused event would leave bytes in an inbox that can never drain.
+    """
+    repo = tmp_path / "kb"
+    (repo / "_meta").mkdir(parents=True)
+    (repo / "_meta" / "taxonomy.yaml").write_text(
+        "schema_version: 1\ndomains: [general]\nallowed_tags: []\n", encoding="utf-8"
+    )
+    src = tmp_path / "note.md"
+    src.write_text("# Nope\n", encoding="utf-8")
+
+    rc = main(["capture", "--repo", str(repo), "--file", str(src)])
+
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "READ-ONLY for this agora build" in err
+    assert "agora import --from-kb" in err
+    assert not (repo / "_kb" / "inbox").exists()
+
+
+def test_capture_refuses_a_file_over_the_attachment_cap(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The per-file byte cap is the web upload's cap — enforced BEFORE extraction and write."""
+    monkeypatch.setattr(cli_mod, "WebUploadConfig", lambda: WebUploadConfig(max_bytes=8))
+    monkeypatch.setattr(
+        cli_mod, "load_web_config", _raising_web_config
+    )  # the fallback branch: an unreadable `web:` block never blocks a local capture
+    src = tmp_path / "big.md"
+    src.write_text("x" * 64, encoding="utf-8")
+    repo = tmp_path / "kb"
+
+    rc = main(["capture", "--repo", str(repo), "--file", str(src)])
+
+    assert rc == 1
+    assert "over the 8-byte per-file limit" in capsys.readouterr().err
+    assert not (repo / "_kb").exists()
+
+
+def _raising_web_config(layout: object) -> object:
+    raise ConfigError("malformed web: block")
+
+
+def test_capture_enforces_the_repos_configured_upload_cap(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`agora capture` reads the OPERATOR's `web.upload.max_bytes`, not the library default.
+
+    INGEST-CONTRACT §0.1 rule 3 ("one byte cap, one number"): lowering the cap must lower it for
+    BOTH capture surfaces. Before the fix the CLI used `WebUploadConfig().max_bytes` — the pydantic
+    class default — so a repo configured at 8 bytes still accepted a 25 MiB file from the shell.
+    """
+    repo = tmp_path / "kb"
+    (repo / "_kb").mkdir(parents=True)
+    (repo / "_kb" / "repo.yaml").write_text("web:\n  upload:\n    max_bytes: 8\n", encoding="utf-8")
+    src = tmp_path / "big.md"
+    src.write_text("x" * 64, encoding="utf-8")
+
+    rc = main(["capture", "--repo", str(repo), "--file", str(src)])
+
+    assert rc == 1
+    assert "over the 8-byte per-file limit" in capsys.readouterr().err
+    assert not (repo / "_kb" / "inbox").exists()
+
+
+def test_capture_threads_the_operators_zip_bomb_cap_into_the_extractor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The decompression-bomb ceiling is ONE number for both capture surfaces, like the byte cap.
+
+    `web.upload.max_uncompressed_bytes` (issue #53) guards zip-based formats (docx/xlsx/pptx/epub).
+    The web face threads it into `extract()`; before this fix the CLI did not, so a locally
+    captured archive fell back to the extractor's own built-in default and an operator who LOWERED
+    the cap had not lowered it for `agora capture` — the same two-surfaces-one-number drift
+    INGEST-CONTRACT §0.1 rule 3 closes for `max_bytes`.
+    """
+    import agora_kb.ingest.extractors as extractors_mod
+
+    seen: dict[str, object] = {}
+    real = extractors_mod.extract
+
+    def _spy(**kwargs: object) -> object:
+        seen.update(kwargs)
+        return real(**kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(extractors_mod, "extract", _spy)
+    repo = tmp_path / "kb"
+    (repo / "_kb").mkdir(parents=True)
+    (repo / "_kb" / "repo.yaml").write_text(
+        "web:\n  upload:\n    max_uncompressed_bytes: 4096\n", encoding="utf-8"
+    )
+    src = tmp_path / "note.md"
+    src.write_text("# Findings\n\nThe curator is the single writer.\n", encoding="utf-8")
+
+    assert main(["capture", "--repo", str(repo), "--file", str(src)]) == 0
+    assert seen["max_uncompressed_bytes"] == 4096
+
+
+def test_capture_is_listed_in_the_top_level_help(capsys: pytest.CaptureFixture[str]) -> None:
+    """A capture surface nobody can find is not a surface (the #99 discoverability rule)."""
+    with pytest.raises(SystemExit):
+        main(["--help"])
+    assert "capture" in capsys.readouterr().out
 
 
 # --- status -------------------------------------------------------------------------------------
@@ -2303,6 +2495,38 @@ def test_doctor_reports_initialized_repo(
     rc = main(["doctor", "--repo", str(target)])
     assert rc in (0, 1)
     assert "initialized" in capsys.readouterr().out
+
+
+@requires_git
+def test_doctor_reports_a_repo_missing_the_raw_blob_gitattributes_rule(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A repo created before the seed keeps working; the operator is told, with the fix inline.
+
+    ADR-0041 D1.4: `raw/_blob/` files are named by their own sha256, so git must never translate
+    their line endings. `repo init` now seeds the rule; an older repo has no `.gitattributes` at
+    all. Reporting only — it never moves the verdict, because the argv pins on every engine git
+    call already protect what the curator writes; the file extends that to a hand-run `git add`.
+    """
+    target = tmp_path / "kb"
+    Repo.resolve(target).init()
+    assert "raw/_blob/ pinned out of git EOL translation" in _doctor_out(target, capsys)
+
+    # Removed from the INDEX as well as the working tree, which is what "created before the seed"
+    # actually means. Deleting only the file leaves the committed copy still answering for it —
+    # `git check-attr` says the bytes are pinned there because git really does still honour it, a
+    # truth a scan of the (now missing) file would have got backwards.
+    subprocess.run(["git", "rm", "--cached", "-q", ".gitattributes"], cwd=target, check=True)
+    (target / ".gitattributes").unlink()
+
+    out = _doctor_out(target, capsys)
+    assert ".gitattributes: missing the raw/_blob/ rule" in out
+    assert "raw/_blob/** -text -diff -merge" in out
+
+
+def _doctor_out(target: Path, capsys: pytest.CaptureFixture[str]) -> str:
+    main(["doctor", "--repo", str(target)])
+    return capsys.readouterr().out
 
 
 @requires_git

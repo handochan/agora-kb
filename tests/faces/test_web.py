@@ -11,6 +11,7 @@ the optional web stack (``faces.web`` is lazily imported).
 
 from __future__ import annotations
 
+import hashlib
 import subprocess
 import sys
 from pathlib import Path
@@ -377,6 +378,132 @@ def test_api_upload_oversize_file_is_413(tmp_path: Path) -> None:
     resp = client.post("/api/upload", files={"file": ("big.txt", big, "text/plain")})
     assert resp.status_code == 413, resp.text
     assert Inbox(Repo.resolve(tmp_path).layout).depth() == before
+
+
+# --- ADR-0041 D4.2: the upload keeps the original bytes, not just the text read out of them ------
+def test_api_upload_file_stages_the_original_bytes_as_an_attachment(tmp_path: Path) -> None:
+    """The uploaded file's bytes survive the capture, content-addressed beside the event.
+
+    ADR-0020 deferred the binary half of the upload write path; this is it. The markdown extracted
+    from the file is still the event BODY (nothing about the read path changes), but the bytes it
+    was extracted from are no longer discarded at the end of the request: they are staged in the
+    writer's own inbox namespace under their own sha256, which is the name APPLY will later
+    materialise them by in ``raw/_blob/``. The round trip asserted here — sent bytes → staged file
+    → identical bytes, at the digest the receipt names — is the whole integrity claim.
+    """
+    _init_repo(tmp_path)
+    client = _client(tmp_path, user="alice")
+    payload = b"# Upload\n\nKeep the original bytes.\n"
+
+    resp = client.post("/api/upload", files={"file": ("upload.md", payload, "text/markdown")})
+
+    assert resp.status_code == 200, resp.text
+    digest = hashlib.sha256(payload).hexdigest()
+    receipt = resp.json()
+    assert receipt["attachments"] == [
+        {
+            "sha256": digest,
+            "bytes": len(payload),
+            "filename": "upload.md",
+            "media_type": "text/markdown",
+        }
+    ]
+    item = _read_only_inbox_item(tmp_path)
+    assert item["attachments"] == [
+        {
+            "sha256": digest,
+            "ext": "md",
+            "filename": "upload.md",
+            "media_type": "text/markdown",
+            "bytes": len(payload),
+        }
+    ]
+    # The extracted markdown is still the body — the bytes ride BESIDE it, they do not replace it.
+    assert "Keep the original bytes." in str(item["body"])
+    layout = Repo.resolve(tmp_path).layout
+    staged = layout.inbox_attachment_path("web", digest, "md")
+    assert staged.read_bytes() == payload
+
+
+def test_the_receipt_describes_what_was_PERSISTED_not_what_was_submitted(tmp_path: Path) -> None:
+    """The receipt's display fields go through the same normalisers the stored record does.
+
+    ``filename``/``media_type`` are untrusted strings a browser handed us. The event record
+    sanitises the name and strips the media type's parameters (``Attachment``'s own validators), so
+    a receipt echoing the raw request back would make the JSON API, the event frontmatter and the
+    eventual ``raw/_blob/`` sidecar disagree about the same file — and would report a name for an
+    attachment that in fact carries none.
+    """
+    _init_repo(tmp_path)
+    client = _client(tmp_path, user="alice")
+    payload = b"# Upload\n\nNormalised metadata.\n"
+
+    resp = client.post(
+        "/api/upload",
+        files={"file": ("weird name (final).MD", payload, "text/markdown; charset=utf-8")},
+    )
+
+    assert resp.status_code == 200, resp.text
+    (receipt,) = resp.json()["attachments"]
+    (record,) = _read_only_inbox_item(tmp_path)["attachments"]  # type: ignore[misc]
+    assert receipt["filename"] == record["filename"] != "weird name (final).MD"
+    assert receipt["media_type"] == record["media_type"] == "text/markdown"
+    assert receipt["sha256"] == record["sha256"] == hashlib.sha256(payload).hexdigest()
+
+
+def test_api_upload_text_and_url_attach_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A pasted body IS its own bytes, and a fetched page is the remote server's rendering.
+
+    Only the FILE branch has an artefact the user handed us, so only it attaches one. Asserted so
+    that "every capture now writes a blob" can never become true by accident — every attachment is
+    a future ``raw/_blob/`` entry the curator must materialise and lint must find.
+    """
+    _init_repo(tmp_path)
+    from agora_kb.faces.web import app as web_app
+    from agora_kb.ingest.extractors import ExtractedDoc
+
+    client = _client(tmp_path, user="alice")
+    resp = client.post("/api/upload", data={"text": "A finding worth remembering."})
+    assert resp.status_code == 200
+    assert resp.json()["attachments"] == []
+
+    monkeypatch.setattr(
+        web_app,
+        "extract",
+        lambda **kwargs: ExtractedDoc(
+            markdown="# Fetched\n\nBody.",
+            source_url="https://example.com/post",
+            content_sha256="0" * 64,
+            extractor="url",
+        ),
+    )
+    resp = client.post("/api/upload", data={"url": "https://example.com/post"})
+    assert resp.status_code == 200
+    assert resp.json()["attachments"] == []
+    assert not list((Repo.resolve(tmp_path).layout.inbox_dir).glob("*/_attach/*"))
+
+
+def test_api_upload_over_cap_file_stages_no_bytes(tmp_path: Path) -> None:
+    """The cap refusal happens BEFORE anything is staged — no orphan bytes, no half-capture.
+
+    An attachment written for an event that was then refused would leave bytes in the inbox that no
+    event cites and no drain will ever move. The oversize path must therefore leave the writer's
+    namespace exactly as it found it.
+    """
+    _init_repo(tmp_path)
+    from agora_kb.faces.web.app import MAX_UPLOAD_BYTES
+
+    client = _client(tmp_path)
+    layout = Repo.resolve(tmp_path).layout
+    resp = client.post(
+        "/api/upload", files={"file": ("big.txt", b"x" * (MAX_UPLOAD_BYTES + 1), "text/plain")}
+    )
+
+    assert resp.status_code == 413, resp.text
+    assert Inbox(layout).depth() == 0
+    assert not list(layout.inbox_dir.glob("*/_attach/*"))
 
 
 # --- HTMX upload fragment -----------------------------------------------------------------------
