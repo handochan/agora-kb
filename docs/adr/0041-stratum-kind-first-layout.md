@@ -1,6 +1,8 @@
 # ADR-0041 — Stratum: the wiki axis flips (directory is the KIND, frontmatter carries the SUBJECT) — KB wiki schema 2
 
-**Status:** Proposed · 2026-09-04 · _authored as normative text so acceptance is a status flip, nothing else._
+**Status:** Accepted · 2026-09-05 (proposed 2026-09-04) · _authored as normative text so acceptance was a status flip, nothing else._
+
+**ACCEPTANCE RECORD (owner judgement, 2026-09-05).** The open sub-decisions were ratified as recommended, **OD-1 through OD-10** — note the count: the day-1 handoff said *OD-1..9* and OD-10 is real. OD-1..OD-9 were accepted as *already-shipped* (each recommendation is wired and test-locked on the branch this ADR ships with); **OD-10 was accepted as a deliberate deferral**, which means this ADR now records, normatively, that the curator lane keeps asserting a possibly-false subject through ADR-0022's catch-all floor, exactly as schema 1 did — the `subjects: []` PATH exists and is exercised, the PRODUCER does not, and closing it stays the three coupled changes OD-10 names. Two things are ratified as **known gaps, not as done**: D3.3's repo-internal `file:`-connector fence has no implementation (`harvester/` carries no `people` rule), and the `wiki/people/**` pull surface (`kb_query`/`kb_read`/`kb_neighbors`) stays open by design — residual risk R1. Both are tracked as issues rather than left implicit here: **#165** (the D3.3 connector fence) and **#166** (the R1 pull boundary, which ADR-0037 must answer for `role: reader` KBs before federation ships). Two ratified-but-deferred rows carry tickets too: **#167** for OD-6's cache-stem follow-up (the `#108` residual) and **#168** for OD-10's three coupled changes.
 
 **AMENDED (append-only) — three mechanical details of D1.4 and D4.2 are REVISED by the addendum at the end of this file** (*Addendum — as-built: the capture transport and the `raw/_blob/` sidecar (#153, landed 2026-09-04)*): the staging path is `_kb/inbox/<writer>/_attach/<sha256>.<ext>` with an `attachments:` list, **not** `<id>.blob` with `raw_ref`; the `raw/_blob/` sidecar has its own nine-key CAPTURE key set, **not** the five-key DATA-MODEL §2 re-ingest shape (which is unchanged for `raw/<domain>/` binaries); and `<ext>` is the D1.4 grammar with a `bin` fallback, deliberately **not** narrowed to the extractor's accepted set. Every normative property — APPLY as the sole `raw/` writer, `raw_writes` membership **with matching bytes** as the admission rule, content-addressing as an additional self-check and never a substitute for it — is untouched. The D1.4/D4.2 prose below is retained verbatim for history.
 
@@ -337,8 +339,8 @@ ever fused by the path:
    because nothing needs a domain to have a path.** Two sites implement this leg, not one — ADR-0022
    §A's own text says the floor *"unifies with the import lane, which already treats the first domain
    as its catch-all"*, so retiring one without the other leaves the two lanes disagreeing:
-   - `curator/plan.py` `normalize_plan`'s step-3 `domains[0]` fallback is removed from the
-     basename/path derivation;
+   - `adapters/ollama_brain.py` `normalize_plan`'s step-3 `domains[0]` fallback is removed from
+     the basename/path derivation;
    - `ingest/vault_import.py`'s catch-all (`moved_dest = f"wiki/{first_domain}/themes/{slug}.md"`,
      `vault_import.py:359`) becomes `wiki/concepts/<slug>.md`, recording the origin folder as a
      `subjects:` entry when it maps to a declared domain and `subjects: []` otherwise — the same rule
@@ -955,6 +957,8 @@ are never force-re-emitted by this change, and no command silently upgrades one.
 ---
 
 ## Open sub-decisions
+
+_Every row below was **ratified as written** on 2026-09-05 (see the acceptance record at the top of this file). The column is titled *Recommendation* because that is what it was when authored; as of acceptance it is the decision._
 
 | # | Question | Recommendation |
 |---|---|---|

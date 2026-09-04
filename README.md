@@ -25,7 +25,7 @@ read-only **dashboard** (KB health · curator · harvester), and a Prometheus `/
 search + no-loss capture, the derived `_kb/index` reader cache and `_kb/gold` context packs,
 `kb_read`/`kb_neighbors`/`kb_context`, bounded curator batches, `agora sync` push-only backup, and
 launchd/systemd units (ADR-0022/0024/0025/0027). In progress on top of that is **Stratum**
-(ADR-0041, Proposed): **KB wiki schema 2**, where the first directory under `wiki/` is the note's
+(ADR-0041, Accepted): **KB wiki schema 2**, where the first directory under `wiki/` is the note's
 *kind* and its *topic* moves into `subjects:` frontmatter — `agora repo init` now creates schema 2,
 and a repo on the old schema stays readable but refuses every write
 ([`docs/LIMITATIONS.md`](docs/LIMITATIONS.md) §6a). Phases 4–5

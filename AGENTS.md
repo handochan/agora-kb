@@ -144,9 +144,13 @@ accessors + inline ULID + `_meta/kb.yaml` identity + the writable-schema predica
 ranker seeding from `wiki/maps/` + reader cache v3 (`0c250aa`), gold/MCP/web on `kind` + `subjects`
 with `wiki/people/**` never leaving through a pack (`853d774`), and the pre/post-flip ranking
 goldens (`c1c3d9e`, `510d06c`, `9a5bab6`); and, in **wave W2.4**, `agora import` writing schema 2
-into a new destination plus the `--from-kb` D6 converter and the refusal surfaces around it. Still
-open: **W2.5** (`raw/_blob` capture — the destination and admission rule are decided but nothing
-writes it, because `Inbox.write` carries no bytes), the two empty tiers (`wiki/summaries/` and
+into a new destination plus the `--from-kb` D6 converter and the refusal surfaces around it, and in
+**wave W2.5** the `raw/_blob` capture end to end — inbox `_attach/` staging carries the original
+bytes with the event (`37dd56e`), APPLY materialises `raw/_blob/<ab>/<sha256>.<ext>` plus its
+sidecar under the bytes-mode gate so the brain never sees bytes (`d244e5e`), web uploads keep their
+original file and `agora capture --file` is the no-server capture (`7a30124`), with an opt-in
+live-brain e2e behind the `live` marker (`b3a5853`). Still open: the two empty tiers
+(`wiki/summaries/` and
 `wiki/entities/` have directories, frontmatter shapes and lint rules and NO producer — OD-7/OD-8;
 `ADR-0040` is unauthored), and the `wiki/people/` fences the ADR specifies but no code implements
 (the repo-internal `file:`-connector rule, and the undesigned pull-surface control for people
@@ -158,11 +162,11 @@ a conversion into a NEW repo implementing D6 rules 1-7, never an in-place migrat
 also lands the schema-2 vault importer — which refuses ANY already-initialized destination and
 re-targets pre-existing body markdown links — the `doctor`/`status` READ-ONLY line, doctor's
 `status: unhealthy`/exit-1 verdict on a schema-1 repo, and the web upload's per-file receipt error
-for a read-only repo). Still NOT shipped: the `raw/_blob` writer (W2.5 —
-`RepoLayout.blob_dir` resolves the path, `Inbox.write` carries no bytes), any producer for
-`wiki/summaries/` or `wiki/entities/` (OD-7/OD-8, ADR-0040 unauthored), and the `people/` egress
-fences (the repo-internal `file:`-connector rule and the pull-surface control, residual risk R1).
-ADR-0041 is **Proposed**, not Accepted — see its OD-1..OD-10 before changing anything it decides.
+for a read-only repo). Still NOT shipped: any producer for `wiki/summaries/` or `wiki/entities/`
+(OD-7/OD-8, ADR-0040 unauthored), and the `people/` egress fences (the repo-internal
+`file:`-connector rule and the pull-surface control, residual risk R1).
+ADR-0041 is **Accepted** (2026-09-05, OD-1..OD-10 ratified as recommended — OD-10 as a deliberate
+deferral) — read its acceptance record before changing anything it decides.
 
 Next is **Phase 4** (auth + multi-tenancy); the gating design debt is the authn/authz ADR (#69).
 See [`docs/ROADMAP.md`](docs/ROADMAP.md) and the GitHub Project "agora dev" board (the live

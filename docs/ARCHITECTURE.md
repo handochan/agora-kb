@@ -11,7 +11,7 @@ conceptual model; this doc maps it to modules and runtime processes.
 > dashboard, `/metrics`), `schema/`, `cli.py`, `config.py`. Only the `auth/` package below remains a
 > later-phase (Phase 4–5) stub, shown here for the full target map.
 >
-> **KB wiki schema 2 (ADR-0041, Proposed) is what this build writes.** The first path segment under
+> **KB wiki schema 2 (ADR-0041, Accepted) is what this build writes.** The first path segment under
 > `wiki/` is the note's **kind** (`concepts/` · `summaries/` · `notes/<yyyy>/<mm>/` · `maps/` ·
 > `entities/` · `people/`, root map at `index.md`) and the subject lives in `subjects:` frontmatter;
 > `raw/` is unmoved. `summaries/` and `entities/` ship EMPTY — the kinds, their directories and

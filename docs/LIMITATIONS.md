@@ -8,7 +8,7 @@
 > claim needed a run to prove it, the run is reproduced in §7.
 >
 > **§6a–§6c are newer than that commit** and were checked against the KB wiki schema 2 work on
-> `feat/stratum-unit2-schema2` (ADR-0041, Proposed) rather than against `a8906bf`.
+> `feat/stratum-unit2-schema2` (ADR-0041, Accepted) rather than against `a8906bf`.
 
 Related, and deliberately not duplicated here:
 

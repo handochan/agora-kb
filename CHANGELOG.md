@@ -27,15 +27,25 @@ build and a maintainer can reproduce it:
 
 ### Release status — read this before you trust the section below
 
-**`v0.1.0b1` has not been cut.** The version *string* is set and `agora --version` reports it, but
-no git tag exists yet, so `git checkout v0.1.0b1` will not resolve and there is no published
-artifact. Installing today means installing from `main`, which moves.
+**`v0.1.0b1` is tagged but not published.** *Corrected 2026-09-05: this section previously said "no
+git tag exists yet", which was wrong.* The annotated tag `v0.1.0b1` (commit `2987959`, 2026-08-24)
+exists locally **and on `origin`**, so `git checkout v0.1.0b1` resolves. What does **not** exist is
+a published artifact: `gh release list` is empty and PyPI has no `agora-kb` project. Installing
+today still means installing from `main`, which moves.
+
+**That tag is a KB schema-1 snapshot** — it predates Stratum (ADR-0041) entirely. Per the tag
+convention above (*tags are never moved or deleted*), it stays as it is: **schema 2 ships as
+`v0.1.0b2`, never as a re-issued `v0.1.0b1`** (owner judgement, 2026-09-05). One consequence has an
+ordering constraint attached: the PyPI name reservation (#102) must not upload `0.1.0b1`, because
+PyPI forbids re-uploading a filename and that would pin the first published artifact to the
+schema-1 snapshot.
 
 The `0.1.0b1` notes below are the prepared release notes, not a shipped release. Remaining gates
 (epic [#93](https://github.com/handochan/agora-kb/issues/93), Track A): PyPI name reservation
-(#102), repo metadata (description/topics, part of #106), and a clean-machine release smoke run by
-someone who is not the author (#107) — plus the `windows-latest` gate ruling that decides whether
-Windows ships in b1 or b2. Landed: [`SECURITY.md`](SECURITY.md) (#95),
+(#102, see the ordering constraint above), repo metadata (description/topics, part of #106), and a
+clean-machine release smoke run by someone who is not the author (#107 — which must be re-run
+against the schema-2 default, since the existing evidence is schema-1) — plus the `windows-latest`
+gate ruling that decides whether Windows ships in b1 or b2. Landed: [`SECURITY.md`](SECURITY.md) (#95),
 [`docs/GETTING-STARTED.md`](docs/GETTING-STARTED.md) (#104),
 [`docs/LIMITATIONS.md`](docs/LIMITATIONS.md) (#105), the README reconciliation (#106), the two
 `agora doctor` truthfulness fixes (#129), the frontmatter `body_status` invariant (#119) with its
