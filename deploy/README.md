@@ -260,6 +260,15 @@ of the unauthenticated premise, and it closes *browser-mediated* attacks only.
     (web-only, CI, a hub whose curation happens elsewhere). `--skip-probe` makes the verdict ignore
     brain reachability and performs no daemon or PATH lookups; every other check is unchanged.
   - The probe is bounded (3 s per distinct routed brain) and never *executes* a brain.
+  - **A repo on the OLD wiki layout also fails the verdict, and `--skip-probe` does not silence
+    it.** Since the KB wiki schema flip (ADR-0041 D6) this build reads schema 1 but refuses to
+    write it, so doctor prints `write: READ-ONLY — this build reads KB schema 1 …` and ends
+    `status: unhealthy` + **exit 1** on such a repo. Same principle as the brain probe: a KB that
+    can accept nothing new should not report healthy, and a gate that greened on one would hide a
+    frozen hub indefinitely. There is no skip flag, because the remedy is a one-time conversion
+    rather than a node property — `agora import --from-kb <old-repo> <new-repo>` (the source is
+    never modified), then point the units at the new repo. Full context:
+    [`../docs/LIMITATIONS.md`](../docs/LIMITATIONS.md) §6a.
 - **Recovering terminal failures — `agora requeue` (#99).** A brain that is *configured but
   unanswerable* (the Ollama daemon is down, the model was deleted, a typo in the `agora-cli-brain`
   argv) fails a **real** curator run on every tick. The triggers do not consult `last_run`

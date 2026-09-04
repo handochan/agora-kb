@@ -18,14 +18,28 @@ its header; the wall-clock ``generated_at`` / age lives ONLY in the ``meta.json`
 timestamp, never a wall clock (:meth:`Repo.commit_committer_datetime`).
 
 **Selection — a NEW deterministic gold-score contract; the frozen ADR-0012 §0 query contract is
-untouched** (ADR-0027 decision 4). *Eligibility:* a note enters a pack only if it is a ``theme``
-(the unit of atomic knowledge), ``status: active``, ungated (``confidence`` != ``low``), and NOT
-harvest-origin (``origin: harvest:*`` is DEFAULT-EXCLUDED — without this exclusion gold is a
-prompt-injection amplifier: attacker mail/message → harvest → curated summary → injected into every
-session). *Score:* ``0.35 ×`` structural centrality (reusing the ADR-0012 §5 ``d_moc`` / in-degree
-machinery — but query-independent: every MOC/index root seeds a full-graph BFS) ``+ 0.25 ×`` recency
+untouched** (ADR-0027 decision 4). *Eligibility:* a note enters a pack only if its KIND is one of
+:data:`GOLD_KINDS` (``concept`` / ``summary`` — the claim-bearing tiers; ADR-0041 D2.5 maps a
+schema-1 ``type: theme`` onto ``concept``, so a v1 repo's eligible population is unchanged),
+``status: active``, ungated (``confidence`` != ``low``), NOT ``derived: true`` (ADR-0041 D2.4 —
+proposal-plane output is not a curated claim), and NOT harvest-origin (``origin: harvest:*`` is
+DEFAULT-EXCLUDED — without this exclusion gold is a prompt-injection amplifier: attacker
+mail/message → harvest → curated summary → injected into every session). *Score:* ``0.35 ×``
+structural centrality (reusing the ADR-0012 §5 ``d_moc`` / in-degree machinery — but
+query-independent: every map/index root seeds a full-graph BFS) ``+ 0.25 ×`` recency
 exp-decay (half-life 30 d, commit-anchored) ``+ 0.20 ×`` status/confidence bucket ``+ 0.20 ×``
 provenance density ``min(1, len(sources)/5)``. Greedy fill to a CJK-aware token budget.
+
+**``wiki/people/**`` is EXCLUDED from every pack, and the exclusion is a POPULATION filter, not a
+score (ADR-0041 D3.3, day 1).** A human-owned note is dropped before centrality is computed, so it
+neither enters a pack nor influences one through its in-degree or its BFS edges. Two reasons it is
+the population and not merely the eligibility gate: a pack is assembled from *validator-gated*
+notes and ``lint()`` permanently excludes ``wiki/people/**`` from its graded population, so a
+people note is by construction not gated; and the outbound redaction boundary for a human-owned
+read corpus is undesigned, which makes any push-shaped emission of it an unreviewed egress. This is
+a **default, not a permanent rule** — lifting it requires that boundary design, not a config flag —
+and it is the control for the PUSH surface only: the MCP read tools (``kb_read`` / ``kb_neighbors``
+/ ``kb_query``) still serve people notes on demand (D3.3, residual R1).
 
 **The outbound sentinel + loop-break contract (ADR-0027 §8, the single normative spec every
 Agora→agent emission path cites).** Every pack is wrapped in ``agora:pack`` / ``agora:pack:end``
@@ -56,14 +70,17 @@ from typing import TYPE_CHECKING
 from .atomicio import atomic_write_text
 from .cjk import is_cjk as _is_cjk
 from .hashing import content_sha256
-from .wiki import STRUCT_ALPHA, STRUCT_BETA, _is_moc_path
+from .layout import CLAIM_BEARING_KINDS
+from .wiki import STRUCT_ALPHA, STRUCT_BETA, _is_map_path
 
 if TYPE_CHECKING:
     from agora_kb.core.layout import RepoLayout
     from agora_kb.core.repo import Repo
+    from agora_kb.schema.notes import Note
 
 __all__ = [
     "GOLD_SCHEMA_VERSION",
+    "GOLD_KINDS",
     "DEFAULT_PACK",
     "DEFAULT_BUDGET_TOKENS",
     "ESTIMATOR",
@@ -76,6 +93,7 @@ __all__ = [
     "estimate_tokens",
     "build_gold",
     "read_meta",
+    "read_meta_schema_version",
     "serialize_meta",
     "pack_fact_lines",
     "shingles",
@@ -88,7 +106,25 @@ __all__ = [
 # ``(curated_sha, spec_hash)`` freshness key and forces a rebuild (mirrors index_cache's
 # CACHE_SCHEMA_VERSION, ADR-0012 §2). ``schema_version`` of the in-repo schema contract is UNTOUCHED
 # — gold state is all git-ignored ``_kb/`` (ADR-0027 decision 9).
-GOLD_SCHEMA_VERSION = 1
+#
+# 1 → 2 (ADR-0041 D5/D3.3, wave W2.3): the ELIGIBILITY predicate moved from ``type: theme`` to
+# :data:`GOLD_KINDS`, ``derived: true`` and ``wiki/people/**`` became exclusions, and the ``d_moc``
+# seed moved from ``<domain>-moc.md`` to the shared map predicate. All four change which notes a
+# pack contains at an UNCHANGED ``(curated_sha, spec)``, which is exactly the state a freshness key
+# must invalidate — without the bump a pack built by the previous build would be served as fresh.
+GOLD_SCHEMA_VERSION = 2
+
+#: The kinds a pack may contain (ADR-0041 D2.5, the claim-bearing tiers). Deliberately written as
+#: ONE schema-agnostic predicate rather than the v1/v2 branch ``schema.lint._is_sourced_kind``
+#: carries: :attr:`Note.kind <agora_kb.schema.notes.Note.kind>` is derived for BOTH schemas, a
+#: schema-1 ``type: theme`` maps to ``concept``, and schema 1 has no ``summary`` antecedent at all
+#: — so on a v1 repo this set selects exactly the v1 themes and nothing else. ``entity`` is absent
+#: (no day-1 producer, OD-8, and an entity page is "registered, with gated filling" — the husk
+#: shape a standing context slot must not carry); ``map`` / ``index`` / ``note`` are navigation and
+#: journal tiers, not atomic claims; ``person`` is excluded by the D3.3 population filter above.
+#: It IS :data:`~agora_kb.core.layout.CLAIM_BEARING_KINDS` (the same object), so this set can never
+#: drift from ``schema.lint._V2_SOURCED_KINDS`` or ``faces.mcp_server.ORPHAN_KINDS``.
+GOLD_KINDS: frozenset[str] = CLAIM_BEARING_KINDS
 
 DEFAULT_PACK = "default"
 # ADR-0027 §S1 (A): a standing include stays cheap in every prompt; 4000 is one config line away
@@ -403,12 +439,17 @@ def _compute_centrality(
 ) -> tuple[dict[str, int], dict[str, int], int]:
     """Return ``(d_moc, indeg, max_indeg)`` over the whole note graph (query-independent).
 
-    ``notes`` is ``[(rel_path, basename, frontmatter, body)]``. Seeds: every ``<domain>-moc.md`` and
-    its direct children at ``d_moc=0``; root ``index.md`` and its direct children at ``d_moc=1``;
-    then multi-source BFS records MIN hop distance (unreached → :data:`_UNREACHED`). In-degree
-    counts resolved inbound links. This is the ADR-0012 §5 machinery, but seeded from EVERY
-    navigation root rather than a query — a note's centrality is a property of the graph, not a
-    question (ADR-0027 decision 4).
+    ``notes`` is ``[(rel_path, basename, frontmatter, body)]``. Seeds: every MAP and its direct
+    children at ``d_moc=0``; root ``index.md`` and its direct children at ``d_moc=1``; then
+    multi-source BFS records MIN hop distance (unreached → :data:`_UNREACHED`). In-degree counts
+    resolved inbound links. This is the ADR-0012 §5 machinery, but seeded from EVERY navigation
+    root rather than a query — a note's centrality is a property of the graph, not a question
+    (ADR-0027 decision 4).
+
+    The map predicate is :func:`agora_kb.core.wiki._is_map_path`, IMPORTED rather than restated:
+    ADR-0041 D5 moves it from ``wiki/<domain>/<domain>-moc.md`` to the ``wiki/maps/`` directory as
+    ONE shared edit with the query path, precisely so gold and ``Wiki.query`` can never seed
+    ``d_moc`` from two different definitions of what a map is.
     """
     by_basename = {b: (rel, fm, body) for rel, b, fm, body in notes}
     outlinks: dict[str, list[str]] = {b: _note_outlinks(body, fm) for rel, b, fm, body in notes}
@@ -424,7 +465,7 @@ def _compute_centrality(
     level0: set[str] = set()
     level1: set[str] = set()
     for rel, b, _fm, _body in notes:
-        if _is_moc_path(rel):
+        if _is_map_path(rel):
             level0.add(b)
             level0.update(t for t in outlinks[b] if t in by_basename)
     idx = by_basename.get("index")
@@ -460,8 +501,8 @@ class PackAssembler:
 
     Reader-class code — never the sandboxed model. Reads the wiki via the tolerant
     :func:`parse_all_notes` (the SAME scanner the browse face + lint build on), scores + orders +
-    budget-fills eligible theme notes, and renders the ``agora:pack`` span with assembly-time
-    sentinel neutralization. Construct over a :class:`Repo`; call :meth:`assemble`.
+    budget-fills the eligible :data:`GOLD_KINDS` notes, and renders the ``agora:pack`` span with
+    assembly-time sentinel neutralization. Construct over a :class:`Repo`; call :meth:`assemble`.
     """
 
     def __init__(self, repo: Repo) -> None:
@@ -473,20 +514,28 @@ class PackAssembler:
         the pack BODY never depends on it, preserving byte-identical rebuild). Raises
         :class:`agora_kb.core.repo.GitError` if the curated tip / committer instant cannot be read.
         """
-        from agora_kb.schema.notes import parse_all_notes
+        from agora_kb.schema.notes import is_ungraded_people_note, parse_all_notes
 
         spec = spec or PackSpec()
         curated_sha = self._repo.branch_commit()
         reference = self._repo.commit_committer_datetime(curated_sha)
 
-        parsed = [
-            (n.rel_path, n.basename, n.frontmatter, n.body) for n in parse_all_notes(self._layout)
-        ]
+        # The D3.3 people exclusion is applied HERE, at the population boundary, so it is
+        # structural: a human-owned note is not scored, not rendered, and — because the filter
+        # precedes _compute_centrality — contributes no in-degree and no BFS edge to any note that
+        # IS in the pack. An eligibility-only exclusion would still let `wiki/people/**` move the
+        # pack's contents through the graph. (:meth:`_eligible` re-checks it as a second layer.)
+        # `is_ungraded_people_note` — not a bare path test — because D3.3's tree exists only on
+        # schema 2; on a schema-1 repo `wiki/people/` is an ordinary DOMAIN that lint grades, so an
+        # unconditional exclusion would make gold answer differently from lint and the dashboard.
+        population = [n for n in parse_all_notes(self._layout) if not is_ungraded_people_note(n)]
+        parsed = [(n.rel_path, n.basename, n.frontmatter, n.body) for n in population]
         d_moc, indeg, max_indeg = _compute_centrality(parsed)
 
         scored: list[_Scored] = []
-        for rel, basename, fm, body in parsed:
-            if not self._eligible(fm):
+        for note in population:
+            rel, basename, fm, body = note.rel_path, note.basename, note.frontmatter, note.body
+            if not self._eligible(note):
                 continue
             struct = round(
                 _structural(d_moc.get(basename, _UNREACHED), indeg.get(basename, 0), max_indeg), 6
@@ -552,16 +601,45 @@ class PackAssembler:
 
     # --- internals ------------------------------------------------------------------------------
     @staticmethod
-    def _eligible(fm: dict[str, object]) -> bool:
-        """ADR-0027 decision 4 gate: theme, status=active, confidence!=low, not harvest-provenance.
+    def _eligible(note: Note) -> bool:
+        """ADR-0027 decision 4 gate, on the ADR-0041 kind axis.
 
-        ``contested``/``stub``/``deprecated`` are excluded by the status=active rule (ADR-0027
-        §S2 default-excludes ``contested`` from a standing context slot). ``confidence`` absent →
-        treated ``high`` (the non-gated APPLY default), so only an explicit ``low`` is excluded.
-        Harvest content is excluded by BOTH decision-4 clauses via :func:`_is_harvest_provenance`
-        (``origin: harvest:*`` OR harvest-only ``sources:``) — the anti-injection-amplifier posture.
+        ``kind ∈`` :data:`GOLD_KINDS`, not ``wiki/people/**``, not ``derived: true``,
+        ``status: active``, ``confidence != low``, and not harvest-provenance.
+
+        The kind is derived under the repo's own ``schema_version`` — from the DIRECTORY on
+        schema 2 (D2.1, with NO frontmatter fallback: see the comment below), from the frozen D2.5
+        ``type:`` table on schema 1 — so this ONE predicate is correct on both schemas and the
+        assembler never branches on a layout. ``contested``/``stub``/``deprecated`` are excluded by
+        the status=active rule (ADR-0027 §S2 default-excludes ``contested`` from a standing context
+        slot). ``confidence`` absent → treated ``high`` (the non-gated APPLY default), so only an
+        explicit ``low`` is excluded. Harvest content is excluded by BOTH decision-4 clauses via
+        :func:`_is_harvest_provenance` (``origin: harvest:*`` OR harvest-only ``sources:``) — the
+        anti-injection-amplifier posture. The ``wiki/people/**`` clause is the SECOND layer of the
+        D3.3 exclusion (:meth:`assemble` filters the population before scoring); it is restated
+        here so a future caller that scores a note directly cannot reopen the egress, and it is
+        the same schema-gated predicate the population filter uses.
         """
-        if _fm_str(fm.get("type")) != "theme":
+        from agora_kb.schema.notes import is_ungraded_people_note, path_kind
+
+        fm = note.frontmatter
+        # On schema 2 the kind is read off the PATH here, never off ``Note.kind``. The two agree
+        # everywhere except the one place that matters: ``_derive_kind`` falls back to the
+        # frontmatter ``kind:`` MIRROR whenever the path declares no kind — i.e. for every
+        # OFF-LAYOUT note (``wiki/scratch/x.md``, ``wiki/x.md``, a variant-cased
+        # ``wiki/People/x.md``), which is exactly the L1-22 population. ``assemble`` never runs
+        # lint, so that fallback let anyone who can drop a file into ``wiki/`` (a human, a synced
+        # vault, a teammate's push) put arbitrary prose into every agent's standing context just by
+        # declaring ``kind: concept`` under a directory the schema does not know — defeating the
+        # D3.1 closed-directory guarantee and, for a variant-cased ``people/``, the D3.3 exclusion.
+        # Schema 1 has no directory authority to read, so ``note.kind`` (the frozen D2.5 ``type:``
+        # table) stays the answer there and ``test_schema_1_repo_still_assembles`` is unaffected.
+        kind = path_kind(note.rel_path) if note.schema_version >= 2 else note.kind
+        if kind not in GOLD_KINDS:
+            return False
+        if is_ungraded_people_note(note):
+            return False
+        if note.derived:  # ADR-0041 D2.4: a derivation-plane note is not a curated claim.
             return False
         if (_fm_str(fm.get("status")) or "").strip().lower() != "active":
             return False
@@ -679,14 +757,13 @@ def serialize_meta(meta: PackMeta) -> str:
     return json.dumps(doc, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
 
 
-def read_meta(layout: RepoLayout, pack: str = DEFAULT_PACK) -> PackMeta | None:
-    """Read + structurally validate the sidecar at ``_kb/gold/<pack>.meta.json``; ``None`` on any
-    problem.
+def _read_meta_doc(layout: RepoLayout, pack: str) -> dict[str, object] | None:
+    """Return the sidecar's raw JSON object, or ``None`` when there is no readable object at all.
 
-    Never raises: an absent / unreadable / non-JSON / wrong-shape / schema-mismatched sidecar (or an
-    unsafe pack name) returns ``None`` so a status read degrades to "no pack" (mirrors
-    :func:`agora_kb.core.index_cache.read_payload`). The caller compares ``curated_sha`` against the
-    live curated tip to decide fresh vs stale.
+    Split out of :func:`read_meta` so that "absent / unreadable / not a JSON object" (a CORRUPT
+    sidecar) and "a JSON object declaring some OTHER ``schema_version``" (a sidecar written by a
+    different build) stay distinguishable — :func:`read_meta` collapses them both to ``None``,
+    which is right for a freshness read and wrong for a serve gate. Never raises.
     """
     from agora_kb.core.layout import InvalidWriterError
 
@@ -702,26 +779,105 @@ def read_meta(layout: RepoLayout, pack: str = DEFAULT_PACK) -> PackMeta | None:
         doc = json.loads(text)
     except (ValueError, RecursionError):
         return None
-    if not isinstance(doc, dict) or doc.get("schema_version") != GOLD_SCHEMA_VERSION:
+    return doc if isinstance(doc, dict) else None
+
+
+def read_meta_schema_version(layout: RepoLayout, pack: str = DEFAULT_PACK) -> int | None:
+    """Return the :data:`GOLD_SCHEMA_VERSION` the sidecar DECLARES, or ``None`` if it declares none.
+
+    The question :func:`read_meta` cannot answer, because it returns ``None`` for a corrupt sidecar
+    and for a version-mismatched one alike. A serve path needs the difference: a corrupt sidecar
+    says nothing about the PACK BYTES (which are the contract — the meta is advisory), while a
+    sidecar declaring an older version says the bytes beside it were assembled under a different
+    eligibility rule, and a :data:`GOLD_SCHEMA_VERSION` bump exists precisely to invalidate those.
+
+    ``None`` for an absent / unreadable / non-object / version-less / non-integer sidecar; a
+    ``bool`` is rejected too (``True`` is an ``int`` in Python and would read as version 1).
+    """
+    doc = _read_meta_doc(layout, pack)
+    if doc is None:
+        return None
+    version = doc.get("schema_version")
+    return version if isinstance(version, int) and not isinstance(version, bool) else None
+
+
+def _meta_str(doc: dict[str, object], key: str) -> str:
+    """Extract ``doc[key]`` as a ``str``; raises :class:`TypeError` on any other JSON shape."""
+    value = doc[key]
+    if not isinstance(value, str):
+        raise TypeError(f"{key} must be a str")
+    return value
+
+
+def _meta_int(doc: dict[str, object], key: str) -> int:
+    """Extract ``doc[key]`` as an ``int``; raises :class:`TypeError` on any other JSON shape.
+
+    ``bool`` is rejected too — it is an ``int`` subtype in Python and would otherwise pass silently.
+    """
+    value = doc[key]
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise TypeError(f"{key} must be an int")
+    return value
+
+
+def _meta_float(doc: dict[str, object], key: str) -> float:
+    """Extract ``doc[key]`` as a ``float``; a JSON int is accepted and widened, ``bool`` is not."""
+    value = doc[key]
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError(f"{key} must be a float")
+    return float(value)
+
+
+def _parse_pack_inputs(raw_inputs: object) -> tuple[PackInput, ...]:
+    """Parse the sidecar's ``inputs`` array into :class:`PackInput` rows.
+
+    Raises :class:`TypeError` on any shape other than a list of ``{path, content_sha256, score}``
+    objects — the caller's ``except`` turns that into the same ``None`` a corrupt sidecar always
+    produced.
+    """
+    if not isinstance(raw_inputs, list):
+        raise TypeError("inputs must be a list")
+    parsed: list[PackInput] = []
+    for item in raw_inputs:
+        if not isinstance(item, dict):
+            raise TypeError("each input must be an object")
+        parsed.append(
+            PackInput(
+                path=_meta_str(item, "path"),
+                content_sha256=_meta_str(item, "content_sha256"),
+                score=_meta_float(item, "score"),
+            )
+        )
+    return tuple(parsed)
+
+
+def read_meta(layout: RepoLayout, pack: str = DEFAULT_PACK) -> PackMeta | None:
+    """Read + structurally validate the sidecar at ``_kb/gold/<pack>.meta.json``; ``None`` on any
+    problem.
+
+    Never raises: an absent / unreadable / non-JSON / wrong-shape / schema-mismatched sidecar (or an
+    unsafe pack name) returns ``None`` so a status read degrades to "no pack" (mirrors
+    :func:`agora_kb.core.index_cache.read_payload`). The caller compares ``curated_sha`` against the
+    live curated tip to decide fresh vs stale. A caller that must tell a version mismatch from a
+    corrupt sidecar asks :func:`read_meta_schema_version` as well.
+    """
+    doc = _read_meta_doc(layout, pack)
+    if doc is None or doc.get("schema_version") != GOLD_SCHEMA_VERSION:
         return None
     try:
-        raw_inputs = doc["inputs"]
-        inputs = tuple(
-            PackInput(path=i["path"], content_sha256=i["content_sha256"], score=i["score"])
-            for i in raw_inputs
-        )
+        inputs = _parse_pack_inputs(doc["inputs"])
         return PackMeta(
-            schema_version=doc["schema_version"],
-            pack=doc["pack"],
-            curated_sha=doc["curated_sha"],
-            spec_hash=doc["spec_hash"],
-            generated_at=doc["generated_at"],
-            estimator=doc["estimator"],
-            note_count=doc["note_count"],
-            est_tokens=doc["est_tokens"],
-            budget_tokens=doc["budget_tokens"],
-            reference_instant=doc["reference_instant"],
-            harvest_derived_share=doc["harvest_derived_share"],
+            schema_version=_meta_int(doc, "schema_version"),
+            pack=_meta_str(doc, "pack"),
+            curated_sha=_meta_str(doc, "curated_sha"),
+            spec_hash=_meta_str(doc, "spec_hash"),
+            generated_at=_meta_str(doc, "generated_at"),
+            estimator=_meta_str(doc, "estimator"),
+            note_count=_meta_int(doc, "note_count"),
+            est_tokens=_meta_int(doc, "est_tokens"),
+            budget_tokens=_meta_int(doc, "budget_tokens"),
+            reference_instant=_meta_str(doc, "reference_instant"),
+            harvest_derived_share=_meta_float(doc, "harvest_derived_share"),
             inputs=inputs,
         )
     except (KeyError, TypeError, ValueError):

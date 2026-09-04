@@ -5,8 +5,9 @@ Mirrors ``tests/faces/test_web.py``'s fixtures (``_init_repo`` / ``_write_wiki_n
 ``_client``) over a :class:`fastapi.testclient.TestClient`. Covers the first-class JSON contract
 (shape + every
 corpus note present + an authored body link is an edge + id == rel_path), the local ego-graph
-(center echo + a 1-hop neighbour), the domain filter, the HTML graph page (loads the vendored
-force-graph + graph.js, carries the data-graph-src + domain chips), the vendored asset's MIT header,
+(center echo + a 1-hop neighbour), the subject filter, the HTML graph page (loads the vendored
+force-graph + graph.js, carries the data-graph-src + subject chips), the vendored asset's MIT
+header,
 graph.js's XSS/click wiring, the per-note Connections embed, the nav link, and XSS faithfulness (the
 JSON returns the raw title; escaping is graph.js's runtime job, asserted via its presence).
 
@@ -34,30 +35,38 @@ def _init_repo(tmp_path: Path) -> Repo:
 
 
 def _write_wiki_notes(tmp_path: Path) -> None:
-    """A small navigable corpus (index + MOC + two themes) under ``wiki/`` (mirrors test_web.py)."""
+    """A small navigable SCHEMA-2 corpus (index + map + two concepts), mirroring test_web.py.
+
+    ``_meta/taxonomy.yaml`` declares the schema so the read side derives ``kind``/``subjects``
+    under it (ADR-0041 D2.1/D2.2) rather than under the v1 path/``type:`` derivation.
+    """
+    (tmp_path / "_meta").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "_meta" / "taxonomy.yaml").write_text(
+        "schema_version: 2\ndomains: [ai-tech, general]\nallowed_tags: []\n", encoding="utf-8"
+    )
     (tmp_path / "index.md").write_text(
-        "---\ntype: index\nstatus: active\n---\n"
-        "# personal\n\n- [AI Tech MOC](wiki/ai-tech/ai-tech-moc.md)\n",
+        "---\nkind: index\nstatus: active\n---\n# personal\n\n- [AI Tech](wiki/maps/ai-tech.md)\n",
         encoding="utf-8",
     )
-    domain = tmp_path / "wiki" / "ai-tech"
-    domain.mkdir(parents=True, exist_ok=True)
-    (domain / "ai-tech-moc.md").write_text(
-        "---\nstatus: active\ntype: moc\n---\n# AI Tech\n\n"
-        "- [Curator concurrency](themes/curator-concurrency.md) — single-writer curator\n",
+    maps = tmp_path / "wiki" / "maps"
+    maps.mkdir(parents=True, exist_ok=True)
+    (maps / "ai-tech.md").write_text(
+        "---\nstatus: active\nkind: map\nsubjects: [ai-tech]\n---\n# AI Tech\n\n"
+        "- [Curator concurrency](../concepts/curator-concurrency.md) — single-writer curator\n",
         encoding="utf-8",
     )
-    themes = domain / "themes"
-    themes.mkdir(parents=True, exist_ok=True)
-    (themes / "curator-concurrency.md").write_text(
-        "---\nstatus: active\ntype: theme\ntags: [single-writer, concurrency]\n"
+    concepts = tmp_path / "wiki" / "concepts"
+    concepts.mkdir(parents=True, exist_ok=True)
+    (concepts / "curator-concurrency.md").write_text(
+        "---\nstatus: active\nkind: concept\nsubjects: [ai-tech]\n"
+        "tags: [single-writer, concurrency]\n"
         "title: Curator Concurrency Model\n---\n"
         "# Curator Concurrency\n\n"
         "The curator acquires a per-repo flock. See [Inbox design](inbox-design.md).\n",
         encoding="utf-8",
     )
-    (themes / "inbox-design.md").write_text(
-        "---\nstatus: active\ntype: theme\ntags: [inbox]\n---\n"
+    (concepts / "inbox-design.md").write_text(
+        "---\nstatus: active\nkind: concept\nsubjects: [ai-tech]\ntags: [inbox]\n---\n"
         "# Inbox Design\n\nThe inbox is append-only and per-writer namespaced.\n",
         encoding="utf-8",
     )
@@ -94,16 +103,16 @@ def test_api_graph_global_shape_and_edges(tmp_path: Path) -> None:
     # Every corpus note is a node, identified by rel_path.
     ids = {n["id"] for n in data["nodes"]}
     assert "index.md" in ids
-    assert "wiki/ai-tech/ai-tech-moc.md" in ids
-    assert "wiki/ai-tech/themes/curator-concurrency.md" in ids
-    assert "wiki/ai-tech/themes/inbox-design.md" in ids
+    assert "wiki/maps/ai-tech.md" in ids
+    assert "wiki/concepts/curator-concurrency.md" in ids
+    assert "wiki/concepts/inbox-design.md" in ids
 
     # An authored body link (curator-concurrency -> inbox-design) is a directed edge between the two
     # real nodes (both endpoints resolve to rel_path ids).
     edges = {(e["source"], e["target"]) for e in data["edges"]}
     assert (
-        "wiki/ai-tech/themes/curator-concurrency.md",
-        "wiki/ai-tech/themes/inbox-design.md",
+        "wiki/concepts/curator-concurrency.md",
+        "wiki/concepts/inbox-design.md",
     ) in edges
     # node id == rel_path (no separate identity scheme).
     for n in data["nodes"]:
@@ -117,7 +126,7 @@ def test_api_graph_local_center_and_neighbour(tmp_path: Path) -> None:
     _write_wiki_notes(tmp_path)
     client = _client(tmp_path)
 
-    center = "wiki/ai-tech/themes/curator-concurrency.md"
+    center = "wiki/concepts/curator-concurrency.md"
     resp = client.get("/api/graph", params={"center": center, "depth": 1})
     assert resp.status_code == 200
     data = resp.json()
@@ -127,20 +136,23 @@ def test_api_graph_local_center_and_neighbour(tmp_path: Path) -> None:
     # A 1-hop neighbour (the linked inbox-design note) is reached.
     ids = {n["id"] for n in data["nodes"]}
     assert center in ids
-    assert "wiki/ai-tech/themes/inbox-design.md" in ids
+    assert "wiki/concepts/inbox-design.md" in ids
 
 
-def test_api_graph_domain_filter(tmp_path: Path) -> None:
+def test_api_graph_subject_filter(tmp_path: Path) -> None:
     _init_repo(tmp_path)
     _write_wiki_notes(tmp_path)
     client = _client(tmp_path)
 
-    resp = client.get("/api/graph", params={"domain": "ai-tech"})
+    resp = client.get("/api/graph", params={"subject": "ai-tech"})
     assert resp.status_code == 200
     ids = {n["id"] for n in resp.json()["nodes"]}
-    # Only ai-tech notes survive the domain filter; the top-level index.md is excluded.
-    assert ids
-    assert all(i.startswith("wiki/ai-tech/") for i in ids)
+    # Only notes whose `subjects:` CONTAINS ai-tech survive; index.md (no subjects) is excluded.
+    assert ids == {
+        "wiki/maps/ai-tech.md",
+        "wiki/concepts/curator-concurrency.md",
+        "wiki/concepts/inbox-design.md",
+    }
     assert "index.md" not in ids
 
 
@@ -156,22 +168,22 @@ def test_graph_page_renders_with_assets_and_chips(tmp_path: Path) -> None:
     assert "/static/force-graph.min.js" in html
     assert "/static/graph.js" in html
     assert 'data-graph-src="/api/graph"' in html
-    # Domain-filter chips: the "All" link plus the ai-tech domain.
-    assert "/graph?domain=ai-tech" in html
+    # Subject-filter chips: the "All" link plus the ai-tech subject.
+    assert "/graph?subject=ai-tech" in html
     assert ">All<" in html
     assert ">ai-tech<" in html
 
 
-def test_graph_page_domain_active(tmp_path: Path) -> None:
+def test_graph_page_subject_active(tmp_path: Path) -> None:
     _init_repo(tmp_path)
     _write_wiki_notes(tmp_path)
     client = _client(tmp_path)
 
-    resp = client.get("/graph", params={"domain": "ai-tech"})
+    resp = client.get("/graph", params={"subject": "ai-tech"})
     assert resp.status_code == 200
     html = resp.text
-    # The server-built api_src carries the domain filter for the canvas to fetch.
-    assert 'data-graph-src="/api/graph?domain=ai-tech"' in html
+    # The server-built api_src carries the subject filter for the canvas to fetch.
+    assert 'data-graph-src="/api/graph?subject=ai-tech"' in html
 
 
 # --- vendored asset + graph.js wiring -----------------------------------------------------------
@@ -206,13 +218,13 @@ def test_note_page_embeds_local_graph(tmp_path: Path) -> None:
     _write_wiki_notes(tmp_path)
     client = _client(tmp_path)
 
-    resp = client.get("/note/wiki/ai-tech/themes/curator-concurrency.md")
+    resp = client.get("/note/wiki/concepts/curator-concurrency.md")
     assert resp.status_code == 200
     html = resp.text
     # The local-graph container is present; the query separator is the HTML entity &amp; (which the
     # browser decodes back to & for dataset), so assert on the center= part and depth, not the &.
     assert 'class="local-graph"' in html
-    assert "center=wiki/ai-tech/themes/curator-concurrency.md" in html
+    assert "center=wiki/concepts/curator-concurrency.md" in html
     assert "depth=1" in html
     # The note page loads the viz scripts.
     assert "/static/graph.js" in html
@@ -246,10 +258,10 @@ def test_api_graph_returns_raw_title_xss_faithful(tmp_path: Path) -> None:
     """A note titled with a `<script>` must come back RAW in the JSON (the data layer is faithful);
     the escaping is graph.js's runtime job (asserted via the escapeHtml presence test above)."""
     _init_repo(tmp_path)
-    domain = tmp_path / "wiki" / "general"
-    domain.mkdir(parents=True, exist_ok=True)
-    (domain / "evil.md").write_text(
-        "---\ntype: theme\nstatus: active\n"
+    concepts = tmp_path / "wiki" / "concepts"
+    concepts.mkdir(parents=True, exist_ok=True)
+    (concepts / "evil.md").write_text(
+        "---\nkind: concept\nstatus: active\n"
         'title: "<script>alert(1)</script>"\n---\n'
         "# Evil\n\nbody.\n",
         encoding="utf-8",

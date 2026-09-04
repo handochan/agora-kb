@@ -33,25 +33,29 @@
 </section>
 
 <section aria-label="Notes">
-  <h2>Notes by domain</h2>
+  <h2>Notes by subject</h2>
+  {# A note declares 0..n subjects (ADR-0041 D2.2), so this is a MEMBERSHIP grouping, not a
+     partition: a two-subject note is listed under both cards, and a note with none is listed
+     under "Unfiled" — which is an honest, no-loss answer, not a gap (D2.2: an empty subject list
+     asserts nothing and loses nothing). #}
   {% if browse.notes %}
     <div class="domains">
-      {% for domain in browse.domains %}
+      {% for subject in browse.subjects %}
         <div class="domain-card">
-          <h3>{{ domain }}</h3>
+          <h3>{{ subject }}</h3>
           <ul>
-            {% for note in browse.notes if note.domain == domain %}
+            {% for note in browse.notes if subject in note.subjects %}
               <li><a href="/note/{{ note.rel_path }}">{{ note.title }}</a></li>
             {% endfor %}
           </ul>
         </div>
       {% endfor %}
-      {% set rootless = browse.notes | selectattr("domain", "none") | list %}
-      {% if rootless %}
+      {% set unfiled = browse.notes | rejectattr("subjects") | list %}
+      {% if unfiled %}
         <div class="domain-card">
-          <h3>Top level</h3>
+          <h3>Unfiled</h3>
           <ul>
-            {% for note in rootless %}
+            {% for note in unfiled %}
               <li><a href="/note/{{ note.rel_path }}">{{ note.title }}</a></li>
             {% endfor %}
           </ul>

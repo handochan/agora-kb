@@ -24,7 +24,11 @@ read-only **dashboard** (KB health · curator · harvester), and a Prometheus `/
 (ADR-0019/0020/0021). Phases 3.5/3.6 then added the retrieval and deployability floor: Korean
 search + no-loss capture, the derived `_kb/index` reader cache and `_kb/gold` context packs,
 `kb_read`/`kb_neighbors`/`kb_context`, bounded curator batches, `agora sync` push-only backup, and
-launchd/systemd units (ADR-0022/0024/0025/0027). Phases 4–5
+launchd/systemd units (ADR-0022/0024/0025/0027). In progress on top of that is **Stratum**
+(ADR-0041, Accepted): **KB wiki schema 2**, where the first directory under `wiki/` is the note's
+*kind* and its *topic* moves into `subjects:` frontmatter — `agora repo init` now creates schema 2,
+and a repo on the old schema stays readable but refuses every write
+([`docs/LIMITATIONS.md`](docs/LIMITATIONS.md) §6a). Phases 4–5
 (multi-tenant, auth, governance) are still ahead — **this release has no authentication**; see
 [`docs/ROADMAP.md`](docs/ROADMAP.md). Package/distribution name: `agora-kb`.
 
@@ -71,7 +75,27 @@ pluggable — any headless CLI agent + any model (default: a local open-weight m
   - **read adapters** — *harvesters* that pull from other agents' memory systems → candidates
   - **write adapters** — the curator's *brain* (a headless CLI agent, swappable via config)
 - **Repo = tenant boundary.** Team repos and personal repos are equal citizens, hard-isolated,
-  with role- and (optionally) domain-level access control.
+  with role- and (optionally) subject-level access control.
+- **Directory is the kind; frontmatter carries the subject.** A repo is a plain folder you can open
+  in Obsidian:
+
+  ```
+  <repo>/
+    index.md                             the root map
+    wiki/concepts/<slug>.md              durable, atomic concept pages
+        summaries/<slug>.md              (ships empty — no producer yet)
+        notes/<yyyy>/<mm>/<date>.md      one dated journal per curator run date
+        maps/<slug>.md                   maps of content, one per subject
+        entities/<slug>.md               (ships empty — no producer yet)
+        people/<person>/**.md            yours — the curator never writes here
+    raw/<domain>/…                       immutable captured sources (unchanged, never moved)
+    _meta/{taxonomy.yaml,kb.yaml}        the closed vocabulary + this KB's identity
+    _kb/                                 git-ignored engine spool (inbox, state, caches, packs)
+  ```
+
+  Every note carries `kind:` (a mirror of its directory, which wins if they disagree) and
+  `subjects:` (0..n topics from the declared taxonomy — an empty list is legal, so nothing is ever
+  dropped for lack of a topic). ADR-0041.
 
 ## Quickstart (local, no cloud, no auth)
 
@@ -133,9 +157,17 @@ uv run agora repo init ~/my-kb --name my-kb --domain general
 #    reachability probe. Exits 1 if no brain is configured or reachable (#96).
 uv run agora doctor --repo ~/my-kb
 
-# 4. (optional) Import an existing Obsidian/markdown vault — non-destructive: the
-#    source is only READ; a new normalized Agora repo is written to the destination.
-uv run agora import ~/existing-vault ~/my-kb --domain general
+# 4. (optional) Import an existing Obsidian/markdown vault — non-destructive: the source is
+#    only READ, and a normalized schema-2 Agora repo is written to the destination. A
+#    destination that is ALREADY a knowledge base is refused, of either layout: the old one so
+#    two layouts never end up in one tree, the current one because the importer mints a fresh
+#    kb_id and rebuilds the root map. To ADD to a KB you have, capture through the inbox.
+uv run agora import ~/existing-vault ~/imported-kb --domain general
+
+# 4b. (only if you have a KB from an earlier Agora release) Convert it ONCE into a new repo.
+#     The old wiki layout is read-only to this build and there is no in-place upgrade; the
+#     source repo is never modified. See docs/LIMITATIONS.md §6a.
+uv run agora import --from-kb ~/old-kb ~/converted-kb
 
 # 5. Run the MCP server face over stdio (what an MCP client connects to)
 uv run agora serve --repo ~/my-kb
@@ -204,7 +236,7 @@ set `web.identity.trusted_header` (e.g. `X-Remote-User`) so each teammate's uplo
 proxy only (issue #67; snippets in `deploy/README.md`).
 
 **Gold context packs (ADR-0027).** Above the searchable wiki, Agora assembles a **gold** tier: a
-small, token-budgeted, byte-stable slice of your highest-value theme notes, meant to be injected at
+small, token-budgeted, byte-stable slice of your highest-value concept notes, meant to be injected at
 agent session start (the CLAUDE.md-style standing context every CLI agent wants). It is a *pure,
 deterministic function of (curated commit, pack spec)* — reader-class code assembles verbatim summary
 lines; no LLM runs, nothing writes the wiki. The curator rebuilds it after each consolidation (it is
@@ -225,7 +257,11 @@ standing consent; Agora never writes agent config dirs):
 
 Every pack is wrapped in an `<!-- agora:pack … -->` sentinel span that the harvester drops whole, so
 an injected pack round-trips to **zero** re-harvested facts, and harvest-origin notes are excluded
-from packs — gold can never become a prompt-injection amplifier (ADR-0027 §8). Agents without
+from packs — gold can never become a prompt-injection amplifier (ADR-0027 §8). Two further
+exclusions came with schema 2: your human-owned `wiki/people/**` notes and any note marked
+`derived: true` never leave through a pack. Note the scope — that is the *push* surface;
+`kb_query`/`kb_read` will still return a people note to an agent that asks
+([`docs/LIMITATIONS.md`](docs/LIMITATIONS.md) §6b). Agents without
 filesystem access consume the same pack over MCP — the **`kb_context`** tool (plus the
 `agora://gold/{pack}` resource and `gold_context` prompt) — and any HTTP client over
 **`GET /api/gold/{pack}`** on the web face; every channel serves the built pack **byte-identically**

@@ -6,7 +6,8 @@ scoring loop via the exact in-memory inverted index (the ADR-0012 §9 FTS5/ripgr
 accelerators are deferred to a load-avoiding reader — issue #28).
 
 The fixture is a git-initialized repo (``branch_commit()`` must resolve to key the cache) carrying
-the ADR-0012 §10 corpus PLUS a basename-derived-title note and an abutting-links note whose only
+the ADR-0012 §10 corpus in the KB wiki schema-2 kind-first layout (ADR-0041 D1: ``wiki/maps/`` +
+``wiki/concepts/``) PLUS a basename-derived-title note and an abutting-links note whose only
 lexical token is TOKENIZER-SYNTHESIZED — cases a raw-bytes accelerator would miss but the exact
 inverted index (fed the tokenizer output) returns, guarding against the parity class the adversarial
 review found in the deferred ripgrep prefilter.
@@ -30,11 +31,13 @@ from agora_kb.core.wiki import Wiki, build_cache
 
 WHEN = datetime(2026, 6, 12, 0, 0, 0, tzinfo=UTC)
 
-INDEX_MD = "# personal\n\n- [AI Tech MOC](wiki/ai-tech/ai-tech-moc.md)\n"
+INDEX_MD = "# personal\n\n- [AI Tech MOC](wiki/maps/ai-tech.md)\n"
+# KB wiki schema 2 (ADR-0041 D1/D5): the map is recognised by its DIRECTORY and its subject scope
+# by its `subjects:` frontmatter — never by the filename or a path segment.
 MOC = (
-    "---\nstatus: active\n---\n# AI Tech\n\n"
-    "- [Curator concurrency](themes/curator-concurrency.md) — single-writer curator serializes\n"
-    "- [Inbox design](themes/inbox-design.md) — append-only per-writer inbox\n"
+    "---\nstatus: active\nkind: map\nsubjects: [ai-tech]\n---\n# AI Tech\n\n"
+    "- [Curator concurrency](../concepts/curator-concurrency.md) — single-writer curator\n"
+    "- [Inbox design](../concepts/inbox-design.md) — append-only per-writer inbox\n"
 )
 CURATOR_CONCURRENCY = (
     "---\nstatus: active\ntags: [single-writer, concurrency]\n---\n# Curator Concurrency\n\n"
@@ -87,13 +90,14 @@ def _git(root: Path, *args: str) -> None:
 def _write_corpus(root: Path) -> None:
     root.mkdir(parents=True, exist_ok=True)
     (root / "index.md").write_text(INDEX_MD, encoding="utf-8")
-    themes = root / "wiki" / "ai-tech" / "themes"
-    themes.mkdir(parents=True, exist_ok=True)
-    (root / "wiki" / "ai-tech" / "ai-tech-moc.md").write_text(MOC, encoding="utf-8")
-    (themes / "curator-concurrency.md").write_text(CURATOR_CONCURRENCY, encoding="utf-8")
-    (themes / "inbox-design.md").write_text(INBOX_DESIGN, encoding="utf-8")
-    (themes / "zephyrquux-topic.md").write_text(BASENAME_TITLE_NOTE, encoding="utf-8")
-    (themes / "synth-token.md").write_text(SYNTH_TOKEN_NOTE, encoding="utf-8")
+    concepts = root / "wiki" / "concepts"
+    concepts.mkdir(parents=True, exist_ok=True)
+    (root / "wiki" / "maps").mkdir(parents=True, exist_ok=True)
+    (root / "wiki" / "maps" / "ai-tech.md").write_text(MOC, encoding="utf-8")
+    (concepts / "curator-concurrency.md").write_text(CURATOR_CONCURRENCY, encoding="utf-8")
+    (concepts / "inbox-design.md").write_text(INBOX_DESIGN, encoding="utf-8")
+    (concepts / "zephyrquux-topic.md").write_text(BASENAME_TITLE_NOTE, encoding="utf-8")
+    (concepts / "synth-token.md").write_text(SYNTH_TOKEN_NOTE, encoding="utf-8")
 
 
 def _repo(tmp_path: Path, *, name: str = "personal") -> Repo:
@@ -243,7 +247,7 @@ def test_stale_commit_falls_back_to_scan(tmp_path: Path) -> None:
     repo = _repo(tmp_path)
     build_cache(repo)
     # add + commit a NEW note without rebuilding the cache → curated_commit mismatch → scan.
-    new = repo.root / "wiki" / "ai-tech" / "themes" / "raftlog-note.md"
+    new = repo.root / "wiki" / "concepts" / "raftlog-note.md"
     new.write_text("---\nstatus: active\n---\n# Raftlog Note\n\nThe raftlog quorum detail.\n")
     _git(repo.root, "add", "-A")
     _git(repo.root, "commit", "-m", "add note")
@@ -270,7 +274,7 @@ def test_uncommitted_edit_self_corrects_via_source_digest(tmp_path: Path) -> Non
     build_cache(repo)  # cache stamped at the committed tip
     # Edit a note ON DISK without committing: the whole-cache commit gate still matches, but the
     # per-file source_digest differs → that ONE file is re-parsed, so the edit is reflected.
-    note = repo.root / "wiki" / "ai-tech" / "themes" / "inbox-design.md"
+    note = repo.root / "wiki" / "concepts" / "inbox-design.md"
     note.write_text(
         "---\nstatus: active\ntags: [inbox]\n---\n# Inbox Design\n\nNew snorquux term.\n"
     )
@@ -303,7 +307,7 @@ def test_corrupt_inner_note_reparses_not_crashes(tmp_path: Path) -> None:
     baseline = Wiki(repo.layout).query("curator concurrency control")  # same-repo uncached oracle
     build_cache(repo)
     path = repo.layout.index_notes_path()
-    target = "wiki/ai-tech/themes/curator-concurrency.md"  # the note the query hits
+    target = "wiki/concepts/curator-concurrency.md"  # the note the query hits
     pristine_text = path.read_text(encoding="utf-8")
     valid_note = json.loads(pristine_text)["notes"][target]["note"]
 
@@ -527,12 +531,12 @@ def test_unsafe_repo_dir_name_does_not_abort_a_curator_publish(tmp_path: Path) -
 
 # --- Korean corpus: cache parity + bigram determinism (issue #56, ADR-0012 addendum) -------------
 
-KO_INDEX_MD = "# personal\n\n- [기술 MOC](wiki/ai-tech/ai-tech-moc.md)\n"
+KO_INDEX_MD = "# personal\n\n- [기술 MOC](wiki/maps/ai-tech.md)\n"
 KO_MOC = (
-    "---\nstatus: active\n---\n# 에이전트 기술\n\n"
-    "- [큐레이터 동시성](themes/curator-concurrency.md) — 단일 작성자 큐레이터가 쓰기를 "
+    "---\nstatus: active\nkind: map\nsubjects: [ai-tech]\n---\n# 에이전트 기술\n\n"
+    "- [큐레이터 동시성](../concepts/curator-concurrency.md) — 단일 작성자 큐레이터가 쓰기를 "
     "직렬화한다\n"
-    "- [Memory Hub](themes/memory-hub.md) — 크로스 세션 지식 공유\n"
+    "- [Memory Hub](../concepts/memory-hub.md) — 크로스 세션 지식 공유\n"
 )
 KO_CURATOR = (
     "---\nstatus: active\ntags: [concurrency]\n"
@@ -551,11 +555,12 @@ KO_QUERIES = ["큐레이터 동시성", "큐레이터가", "메모리 허브", "
 def _write_ko_corpus(root: Path) -> None:
     root.mkdir(parents=True, exist_ok=True)
     (root / "index.md").write_text(KO_INDEX_MD, encoding="utf-8")
-    themes = root / "wiki" / "ai-tech" / "themes"
-    themes.mkdir(parents=True, exist_ok=True)
-    (root / "wiki" / "ai-tech" / "ai-tech-moc.md").write_text(KO_MOC, encoding="utf-8")
-    (themes / "curator-concurrency.md").write_text(KO_CURATOR, encoding="utf-8")
-    (themes / "memory-hub.md").write_text(KO_MEMORY_HUB, encoding="utf-8")
+    concepts = root / "wiki" / "concepts"
+    concepts.mkdir(parents=True, exist_ok=True)
+    (root / "wiki" / "maps").mkdir(parents=True, exist_ok=True)
+    (root / "wiki" / "maps" / "ai-tech.md").write_text(KO_MOC, encoding="utf-8")
+    (concepts / "curator-concurrency.md").write_text(KO_CURATOR, encoding="utf-8")
+    (concepts / "memory-hub.md").write_text(KO_MEMORY_HUB, encoding="utf-8")
 
 
 def _ko_repo(tmp_path: Path) -> Repo:
@@ -609,3 +614,36 @@ def test_v1_cache_is_invalidated_by_version_bump(tmp_path: Path) -> None:
     path.write_text(json.dumps(doc, ensure_ascii=False), encoding="utf-8")
     assert index_cache.read_payload(path) is None  # the version gate rejects the v1 cache
     assert Wiki(repo.layout).query("큐레이터 동시성") == baseline  # scan fallback, correct output
+
+
+def test_v2_cache_carrying_a_pre_stratum_map_verdict_is_invalidated(tmp_path: Path) -> None:
+    """The ADR-0041 D5 bump, pinned as the stale value it exists to reject (CACHE_SCHEMA_VERSION 3).
+
+    ``is_moc`` is PARSER-COMPUTED and serialized, so a v2 entry whose ``source_digest`` still
+    matches would keep a pre-flip map verdict forever — and the entry predates ``kind``/``subjects``
+    entirely. Both bump triggers in this module's own contract fire, and the fresh-repo argument
+    does not cover it: ``SUPPORTED_KB_SCHEMA_VERSIONS`` keeps 1, so a repo with a populated
+    ``_kb/index/`` written by an older build is reachable here.
+
+    The forgery is deliberately the WORST case the gate has to stop — every note flipped to
+    ``is_moc: true`` with ``kind``/``subjects`` stripped, i.e. a payload that would both re-seed the
+    whole corpus at ``d_moc = 0`` and ``KeyError`` in ``_note_from_dict``. Rejecting it WHOLE at the
+    version gate is what keeps the query byte-identical to the scan.
+    """
+    repo = _repo(tmp_path)
+    baseline = _results(repo.layout)  # uncached oracle
+    build_cache(repo)
+    path = repo.layout.index_notes_path()
+    doc = json.loads(path.read_text(encoding="utf-8"))
+    assert doc["cache_schema_version"] == 3, "the D5 flip must bump the cache schema to 3"
+    for entry in doc["notes"].values():
+        assert "kind" in entry["note"] and "subjects" in entry["note"]  # the new serialized shape
+        entry["note"]["is_moc"] = True  # the stale pre-flip verdict the bump exists to discard
+        del entry["note"]["kind"]
+        del entry["note"]["subjects"]
+    doc["cache_schema_version"] = 2
+    path.write_text(json.dumps(doc, ensure_ascii=False), encoding="utf-8")
+
+    assert index_cache.read_payload(path) is None  # rejected WHOLE, before any entry is read
+    for q in QUERIES:
+        assert Wiki(repo.layout).query(q) == baseline[q], f"stale v2 cache leaked into {q!r}"

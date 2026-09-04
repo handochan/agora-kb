@@ -36,6 +36,7 @@ from pathlib import Path
 from ..core import frontmatter
 from ..core.hashing import content_sha256
 from ..core.ids import is_valid_event_id
+from ..core.inbox import carry_attachments
 from ..core.layout import RepoLayout
 from ..core.state import CuratorState
 from .constants import DEFAULT_MAX_CANDIDATES_PER_RUN
@@ -109,7 +110,9 @@ def claim(
        (append-only + single-writer invariants unchanged).
     4. ATOMICALLY ``os.replace`` each selected file into ``processing/<run-id>/events/`` — a
        same-filesystem rename, so the event is byte-for-byte the inbox file (immutable, DATA-MODEL
-       §1). ``_kb/`` is one tree, so source and destination share a filesystem.
+       §1). ``_kb/`` is one tree, so source and destination share a filesystem. An event's staged
+       ATTACHMENT bytes are carried into ``events/_attach/`` with it (ADR-0041 D4.2), because APPLY
+       reads them from beside the claimed event.
     5. Write the manifest with ``phase='claimed'`` (DATA-MODEL §5) and return it.
 
     Returns ``None`` (a no-op) if the inbox is empty OR every event is dropped by tier-1 dedup —
@@ -139,7 +142,17 @@ def claim(
     for event_id, src in capped:
         # Same-filesystem rename: the event keeps its exact bytes (immutable; DATA-MODEL §1) and the
         # inbox entry disappears in one atomic step (claimed lifecycle, ADR-0008 step 1).
-        os.replace(src, events_dir / f"{event_id}.md")
+        dest = events_dir / f"{event_id}.md"
+        os.replace(src, dest)
+        # The event's STAGED ATTACHMENT bytes travel with it (ADR-0041 D4.2): APPLY reads them
+        # from `_attach/` beside the claimed event, so an event claimed without its bytes could
+        # only fail the run. Content-addressed staging means one file may serve several events, so
+        # a file still cited by an event LEFT in this writer's inbox is copied rather than moved
+        # (`carry_attachments`); only the last citation moves. Best-effort by contract — it never
+        # raises — because a claim that aborted half-way would leave events split across two
+        # directories, which is strictly worse than a run that fails loudly at APPLY on bytes that
+        # did not follow.
+        carry_attachments(dest, source_dir=src.parent)
         event_ids.append(event_id)
 
     manifest = RunManifest(

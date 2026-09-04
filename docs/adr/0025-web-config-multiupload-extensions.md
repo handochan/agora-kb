@@ -1,6 +1,7 @@
 # ADR-0025 — Web-face operator config, multi-upload, broadened extensions
 
 **Status:** Accepted · 2026-07-05 (Step-0 ratified, #36; shipped in PR #33) · Proposed 2026-06-24 · covers issue [#29]
+**AMENDED (append-only) — [ADR-0041](0041-stratum-kind-first-layout.md) (Proposed, KB wiki schema 2), ONE clause:** the upload/remember `domain` argument (`handlers.remember(markdown, source, domain, tags)`) keeps its meaning as an INBOX field and a `raw/` shard key, and becomes a **`subjects:` seed** rather than a wiki path segment. Everything else in this ADR — `web:` operator config, multi-upload + batch receipt, broadened extractor extensions, the SSRF guard, the zip-bomb cap, `web:<user>` identity — is layout-free and UNCHANGED. The prose below is retained verbatim for history.
 
 Extends [ADR-0019](0019-web-face-stack.md) (web-face stack: API-first FastAPI + server-rendered
 HTMX; §5 "charts are the single bolt-on"; §7 SPA-island triggers) and [ADR-0020](0020-web-upload-write-path.md)

@@ -4,6 +4,14 @@ A dependency-light :mod:`argparse` front-end over the core API. Subcommands:
 
 - ``agora repo init <path>`` — initialize a knowledge repo: ``Repo.init`` + emit the KB schema +
   taxonomy + a starter ``_kb/repo.yaml``, committed as one admin commit (the result lints clean).
+- ``agora import <src> <dest> [--from-kb]`` — write a NEW repo at ``dest`` in KB wiki schema 2,
+  reading ``src`` without ever modifying it: by default ``src`` is a foreign Obsidian/markdown
+  vault (ADR-0014 D5), and with ``--from-kb`` it is an existing schema-1 Agora repo, which the
+  ADR-0041 D6 CONVERTER crosses to schema 2 — the only crossing there is.
+- ``agora capture --file PATH [--repo PATH] [--domain D] [--writer W] [--source S]`` — append ONE
+  file to the inbox: the extractor registry's text becomes the event body (a one-line stub when no
+  extractor claims the extension) and the file's ORIGINAL bytes ride along as the event's
+  attachment (ADR-0041 D4.2). The local, no-server twin of the web face's upload route.
 - ``agora status [--repo PATH]`` — print inbox depth + curator state (last run/commit, counters).
 - ``agora curate [--repo PATH] [--force]`` — recover any in-flight run, then execute ONE real
   consolidation run via :mod:`agora_kb.curator` ``worker`` against the configured ``adapters.yaml``
@@ -18,6 +26,11 @@ A dependency-light :mod:`argparse` front-end over the core API. Subcommands:
 - ``agora sync [--repo PATH]`` — push-only git backup (issue #64): push the curated branch to the
   ``backup.remote`` configured in ``_kb/repo.yaml`` (fast-forward only, never ``--force``); with no
   remote configured it is a guided no-op. Pull/fetch/bidirectional is deferred to #46.
+- ``agora eval --queries FILE [--repo PATH] [--out JSON] [--fm on|off] [--limit N>=1]`` — run a
+  query file through the deterministic ADR-0012 ranker and snapshot what it returns (issue #44). No
+  model, no network, no server. Exits ``1`` when any query's status differs from its declared
+  ``expect``, so it gates CI; ``--out`` writes the full JSON golden record, keyed on note BASENAMES
+  so it stays comparable across a wiki-layout move.
 - ``agora serve [--repo PATH] [--writer W]`` — run the MCP stdio server face. The face is imported
   lazily so the rest of the CLI works even when an MCP transport dependency is missing.
 - ``agora web [--repo PATH] [--host H] [--port P] [--writer W] [--user U]`` — run the FastAPI + HTMX
@@ -42,6 +55,7 @@ import argparse
 import functools
 import importlib
 import json
+import mimetypes
 import os
 import shutil
 import sys
@@ -56,21 +70,28 @@ from pydantic import ValidationError
 
 from . import __version__
 from .config import (
+    MAX_SUPPORTED_KB_SCHEMA_VERSION,
     SUPPORTED_KB_SCHEMA_VERSIONS,
     ConfigError,
+    KbIdentity,
     RepoConfig,
     UnsupportedSchemaVersionError,
+    WebUploadConfig,
     guard_repo_schema_version,
     load_backend_registry,
     load_backup_policy,
     load_connector_specs,
     load_harvest_policy,
     load_index_policy,
+    load_kb_identity,
     load_redact_policy,
     load_repo_config,
+    load_web_config,
+    read_canonical_kb_schema_version,
     read_kb_schema_version,
     write_default_adapters_yaml,
     write_default_repo_config,
+    write_kb_identity,
 )
 from .core import (
     Inbox,
@@ -81,7 +102,10 @@ from .core import (
     atomic_write_text,
     failed_event_count,
 )
-from .core.repo import GitError
+from .core.ids import new_ulid
+from .core.inbox import assert_writable_repo_schema, attachment_sha256
+from .core.layout import attachment_ext_for
+from .core.repo import GITATTRIBUTES_NAME, GitError, blob_bytes_are_pinned
 from .core.state import CuratorState
 from .curator import evaluate
 from .curator.backends import _WORKTREE_TOKEN, BackendRegistry
@@ -108,10 +132,29 @@ from .curator.subprocess_backend import (
 )
 from .curator.worker import RunReport, recover, run
 from .schema import Taxonomy, emit_schema, lint
+from .schema.emit import materialize_kind_directories
 
 __all__ = ["main", "build_parser"]
 
 _PROG = "agora"
+
+
+def _positive_int(text: str) -> int:
+    """An argparse ``type=`` that rejects zero and negatives loudly.
+
+    ``agora eval --limit 0`` used to exit ``0`` while recording zero hits for every query:
+    :meth:`Wiki.query` slices ``eligible[: max(0, limit)]`` AFTER deciding ``status``, so the
+    statuses all still matched their ``expect`` and the only gate ``eval`` applies could not be
+    violated. A copied CI line with a typo would have produced a permanently green baseline that
+    pinned no ranking at all — the exact failure mode the snapshot exists to prevent.
+    """
+    try:
+        value = int(text)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"{text!r} is not an integer") from exc
+    if value < 1:
+        raise argparse.ArgumentTypeError(f"must be >= 1, got {value}")
+    return value
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -156,23 +199,52 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="TAG",
         help="an allowed taxonomy tag (repeatable; default: none)",
     )
+    p_repo_init.add_argument(
+        "--schema",
+        type=int,
+        choices=(1, 2),
+        default=None,
+        help=(
+            "KB wiki schema version to initialize (default: 2 for a NEW repo; a re-init KEEPS the "
+            "existing repo's version). 2 = the ADR-0041 kind-first layout (wiki/<kind>/, "
+            "subjects: in frontmatter, _meta/kb.yaml identity) and is what this build's curator "
+            "WRITES. 1 is READ-ONLY: query/status/browse/doctor keep working on a schema-1 repo, "
+            "but curate/watch/requeue and every inbox capture refuse. There is no in-place "
+            "migrator: cross with 'agora import --from-kb' (ADR-0041 D6)"
+        ),
+    )
     # Positional repo path — declared so the #98 guard covers a RE-init onto an existing repo.
     p_repo_init.set_defaults(func=_cmd_repo_init, schema_guard_attr="path")
     p_repo.set_defaults(func=_cmd_repo_missing)
 
-    # import — the opt-in Obsidian/markdown vault normalizer (ADR-0014 D5).
+    # import — TWO normalizers behind one verb, selected by `--from-kb`:
+    #   * the opt-in Obsidian/markdown VAULT normalizer (ADR-0014 D5), and
+    #   * the KB schema-1 → schema-2 CONVERTER (ADR-0041 D6), the ONLY crossing between the two
+    #     layouts.
+    # One verb rather than two because the CONTRACT is identical and it is the contract an operator
+    # has to trust: read SRC without ever modifying it, write a NEW repo at DEST, print a report,
+    # lint the result. Only the source GRAMMAR differs — a foreign vault vs. an Agora schema-1 repo.
     p_import = sub.add_parser(
-        "import", help="normalize an external Obsidian/markdown vault into a new Agora repo"
+        "import",
+        help="normalize a vault (or convert a schema-1 KB) into a new KB schema-2 Agora repo",
     )
-    p_import.add_argument("src", help="source vault to read (NEVER modified)")
-    p_import.add_argument("dest", help="destination repo to write (created)")
+    p_import.add_argument("src", help="source vault (or, with --from-kb, repo) to read")
+    p_import.add_argument("dest", help="destination repo to write (created; KB wiki schema 2)")
+    p_import.add_argument(
+        "--from-kb",
+        action="store_true",
+        help="SRC is an existing KB wiki schema-1 Agora repo, not a vault: convert it into a NEW "
+        "schema-2 repo (ADR-0041 D6 — the only crossing between the two schemas; there is no "
+        "in-place migrator). The source repo's own taxonomy is carried over, so --domain/--tag "
+        "do not apply and are refused with it",
+    )
     p_import.add_argument(
         "--domain",
         action="append",
         default=None,
         metavar="DOMAIN",
         help="a destination taxonomy domain (repeatable; the FIRST is the move target; "
-        "default: general)",
+        "default: general). Vault import only — not valid with --from-kb",
     )
     p_import.add_argument(
         "--tag",
@@ -180,11 +252,40 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="TAG",
         help="an allowed destination taxonomy tag (repeatable; source tags outside this set are "
-        "stripped + reported; default: none)",
+        "stripped + reported; default: none). Vault import only — not valid with --from-kb",
     )
     # `dest` may already BE an Agora repo (import does not refuse one), and import writes
     # wiki/ + _meta/ and commits — so it must be guarded (#98).
     p_import.set_defaults(func=_cmd_import, schema_guard_attr="dest")
+
+    # capture — the local, no-server way to put ONE file into the inbox WITH its original bytes
+    # (ADR-0041 D4.2). The web face's upload route does the same thing over HTTP; this is the half
+    # that needs no browser, no `web` extra, and no running process — an operator with a PDF on
+    # disk and a shell.
+    p_capture = sub.add_parser(
+        "capture",
+        help="append one file to the inbox: extracted text as the event, original bytes attached",
+    )
+    p_capture.add_argument("--repo", default=".", help="repo root (default: .)")
+    p_capture.add_argument(
+        "--file", required=True, metavar="PATH", help="the file to capture (read, never modified)"
+    )
+    p_capture.add_argument(
+        "--domain",
+        default=None,
+        help="taxonomy domain for the capture (default: none — the curator decides)",
+    )
+    p_capture.add_argument(
+        "--writer",
+        default="local",
+        help="inbox writer namespace to append to (default: local)",
+    )
+    p_capture.add_argument(
+        "--source",
+        default="manual",
+        help="provenance source stamped on the event (default: manual; e.g. agent:<name>)",
+    )
+    p_capture.set_defaults(func=_cmd_capture)
 
     # status
     p_status = sub.add_parser("status", help="show inbox depth + curator state")
@@ -312,6 +413,32 @@ def build_parser() -> argparse.ArgumentParser:
     p_gold_status.set_defaults(func=_cmd_gold_status)
     p_gold.set_defaults(func=_cmd_gold_missing)
 
+    # eval — the model-free deterministic ranking snapshot (issue #44). A flat command, not a
+    # group: it does ONE thing (run a query file, record what the ADR-0012 oracle returns) and a
+    # `build`/`status` split would imply state it deliberately keeps none of.
+    p_eval = sub.add_parser(
+        "eval",
+        help="run a query file through the deterministic ranker and snapshot the results (#44)",
+    )
+    p_eval.add_argument("--repo", default=".", help="repo root (default: .)")
+    p_eval.add_argument(
+        "--queries", required=True, help="query file (YAML or JSON list of {id, question, expect})"
+    )
+    p_eval.add_argument("--out", default=None, help="write the full JSON snapshot to this path")
+    p_eval.add_argument(
+        "--fm",
+        choices=("on", "off"),
+        default=None,
+        help="force the ADR-0012 §8 frontmatter boost on/off (default: the build's live mode)",
+    )
+    p_eval.add_argument(
+        "--limit",
+        type=_positive_int,
+        default=None,
+        help="max hits per query, >= 1 (default: the ADR's max_hits)",
+    )
+    p_eval.set_defaults(func=_cmd_eval)
+
     # sync — push-only git backup of the curated branch (issue #64).
     p_sync = sub.add_parser(
         "sync",
@@ -411,8 +538,10 @@ def _schema_version_guard(args: argparse.Namespace) -> int | None:
     A command whose repo argument is POSITIONAL declares which attribute holds it, with
     ``set_defaults(schema_guard_attr="...")``. That covers ``agora import <src> <dest>`` and
     ``agora repo init <path>``, which an earlier draft exempted on the premise that they "CREATE
-    the repo they name". That premise is FALSE and the exemption was a hole: neither command
-    refuses an ALREADY-INITIALIZED destination, and both are DIRECT writers of ``wiki/`` and
+    the repo they name". That premise was FALSE and the exemption was a hole: neither command
+    refused an ALREADY-INITIALIZED destination (``agora import`` does now —
+    :func:`~agora_kb.ingest.vault_import._assert_importable_destination` — but ``repo init`` is
+    idempotent by design and still does not), and both are DIRECT writers of ``wiki/`` and
     ``_meta/`` plus their own git commit — i.e. exactly the old-binary-writes-into-a-newer-repo
     damage this issue exists to prevent, on the flow the README quickstart documents. Creating a
     FRESH destination still passes silently, because :func:`read_kb_schema_version` yields the
@@ -450,6 +579,77 @@ def _schema_version_guard(args: argparse.Namespace) -> int | None:
     return None
 
 
+# --- the ADR-0041 D6 read-only posture, as the READ commands report it ---------------------------
+def _read_only_schema_version(layout: RepoLayout) -> int | None:
+    """The repo's declared KB schema when this build READS it but refuses to WRITE it, else None.
+
+    ``None`` in every other case: a directory that declares nothing determinable (an uninitialized
+    one, or an unparseable ``_meta/taxonomy.yaml``), a version this build cannot read at all (that
+    is :func:`_schema_version_guard`'s louder complaint, and every command exits on it), and the
+    writable version itself.
+
+    Reads ``_meta/taxonomy.yaml`` ALONE through
+    :func:`~agora_kb.config.read_canonical_kb_schema_version` — the SAME narrow read
+    :func:`~agora_kb.core.inbox.assert_writable_repo_schema` makes before it refuses a capture. That
+    is the whole point of not reusing the broader :func:`~agora_kb.config.read_kb_schema_version`
+    here: the broader reader falls back to the git-ignored ``_kb/repo.yaml`` mirror AND defaults a
+    bare directory to ``1``, so a read-only banner keyed on it would fire on every ``agora doctor``
+    run in a directory that is not a repo at all. A line about the write refusal must be true of
+    the write refusal, not of a lookalike.
+    """
+    try:
+        version = read_canonical_kb_schema_version(layout)
+    except (OSError, ValueError):
+        return None  # not this reporter's failure to render; the command itself surfaces it
+    if version is None or version == MAX_SUPPORTED_KB_SCHEMA_VERSION:
+        return None
+    if version not in SUPPORTED_KB_SCHEMA_VERSIONS:
+        return None
+    return version
+
+
+def _read_only_schema_note(root: Path, version: int) -> str:
+    """The ONE sentence every surface uses for "this build reads your repo but will not write it".
+
+    Shared rather than re-typed because it is the sentence an operator greps for and pastes into a
+    bug report: ``repo init --schema 1``, ``agora status`` and ``agora doctor`` must all say the
+    same thing about the same state, and the remedy — the single crossing that exists — must never
+    drift into implying an in-place migrator that ADR-0041 D6 deliberately does not provide.
+    """
+    return (
+        f"schema {version} is READ-ONLY for this agora build — query, status, browse and doctor "
+        f"work, but curate/watch/requeue and every inbox capture refuse. Convert once into a NEW "
+        f"repo with 'agora import --from-kb {root} <new-repo>'; there is no in-place migrator"
+    )
+
+
+# --- `repo init --schema 2` seeding (ADR-0041 D1/D1.2/D1.5) --------------------------------------
+def _seed_schema2_repo(layout: RepoLayout, *, name: str, kind: str) -> KbIdentity:
+    """Mint/read ``_meta/kb.yaml`` and materialize the kind tree; return the KB identity.
+
+    Called BEFORE ``Repo.init`` because the identity is what the root map needs: ``Repo.init``
+    seeds ``index.md`` (schema 1 or 2 by its ``schema_version`` argument) and the schema-2 seed
+    mirrors this ``kb_id`` into the note's ``kb:`` field, so the id must exist first. The root map
+    itself is deliberately NOT written here — one seed template, in ``core/repo.py``, beside the
+    schema-1 one it replaces, so the two cannot drift into different OKF postures.
+
+    Every step is guarded on absence, so a re-init never rewrites an existing repo's identity.
+
+    ``kb_id`` is minted here and NOWHERE else in the CLI: it is a ULID stamped once at repo
+    creation and never rewritten (ADR-0041 D1.5). ``declared_kind`` records ``--kind`` as ADVISORY
+    metadata; the ENFORCING repo kind stays in git-ignored ``_kb/repo.yaml``, which is what the
+    harvester scope lock reads — a git-tracked enforcing value would let an upstream author's
+    declaration unlock a downstream operator's personal-scope connectors.
+    """
+    layout.root.mkdir(parents=True, exist_ok=True)
+    identity = load_kb_identity(layout)
+    if identity is None:
+        identity = KbIdentity(kb_id=new_ulid(), name=name, declared_kind=kind)
+        write_kb_identity(layout, identity)
+    materialize_kind_directories(layout)
+    return identity
+
+
 # --- commands -----------------------------------------------------------------------------------
 def _cmd_repo_init(args: argparse.Namespace) -> int:
     """``agora repo init <path>``: init git + emit schema/taxonomy + repo.yaml in one admin commit.
@@ -463,6 +663,38 @@ def _cmd_repo_init(args: argparse.Namespace) -> int:
     IDEMPOTENT: re-running on an already-initialized repo re-emits the (idempotent) schema and the
     git-ignored ``_kb/repo.yaml`` without a new curated commit — there is nothing new to commit, so
     the existing HEAD is re-printed (matching ``Repo.init``'s own idempotency).
+
+    ``--schema`` selects the KB wiki schema (ADR-0041 D6). ``2`` — :data:`MAX_SUPPORTED_KB_SCHEMA_
+    VERSION`, the version this build's curator WRITES — is the default for a NEW repo: it mints
+    ``_meta/kb.yaml``, materializes the six ``wiki/<kind>/`` directories
+    (:func:`_seed_schema2_repo`), seeds the schema-2 root map (``Repo.init``), and emits the
+    schema-2 doc and templates. ``1`` is still buildable and byte-identical to every release before
+    ADR-0041, but it is READ-ONLY for this build — query/status/browse/doctor keep working while
+    ``curate``/``watch``/``requeue`` and every inbox capture refuse — so choosing it prints a note
+    saying exactly that.
+
+    **Idempotency is version-preserving, and both directions are refusals, not conversions.** ADR-
+    0041 D6 is explicit that "there is no in-place migrator" and that no command silently upgrades
+    an existing repo, so on an ALREADY-INITIALIZED repo this command resolves the schema from the
+    repo itself (:func:`~agora_kb.config.read_canonical_kb_schema_version`, the canonical
+    ``_meta/taxonomy.yaml`` read) rather than from the flag default. TWO refusals keep that
+    resolution from turning into a conversion, and both fire BEFORE anything is written, naming
+    ``agora import --from-kb`` as the only crossing:
+
+    * an explicit ``--schema`` that CONTRADICTS the repo's declared version — the half-migration it
+      would otherwise perform (a schema-2 ``_kb/repo.yaml`` mirror over a schema-1 canonical
+      taxonomy, plus a seeded kind tree) leaves a previously healthy repo permanently
+      ``L1-17``-broken with no rollback;
+    * a schema-1 TREE about to be seeded at 2 — either because its ``_meta/taxonomy.yaml`` was
+      hand-bumped to 2 (a DECLARATION running ahead of the tree) or because it declares nothing
+      determinable and the flipped default would run ahead of it. Both leave the same untracked
+      residue behind a failed lint gate, so the guard reads the tree's own witness
+      (``_meta/kb.yaml`` plus any existing KB content) rather than the declaration alone. An
+      initialized directory holding NO KB content is a first init and is adopted at the default.
+
+    The mirrored version travels INTO :func:`write_default_repo_config` for the same reason: a
+    re-init that resolved the version correctly but re-stamped the mirror from a flag default would
+    reintroduce the same drift from the other side.
     """
     now = datetime.now(UTC)
     repo = Repo.resolve(args.path)
@@ -473,15 +705,117 @@ def _cmd_repo_init(args: argparse.Namespace) -> int:
     name = args.name or layout.root.name
 
     already = repo.is_initialized()
-    repo.init(when=now)
+    requested = getattr(args, "schema", None)
+    # Keyed on the CANONICAL declaration only (ADR-0010 §5.1), which is why this reads through
+    # `read_canonical_kb_schema_version` and NOT the guard's `read_kb_schema_version`: the latter
+    # falls back to the git-ignored `_kb/repo.yaml` mirror when the canonical file omits the key,
+    # and the mirror is operator-local, untracked, and rewritten by this very command — it must
+    # never decide what gets seeded into a shared tree. A git repo with no `_meta/taxonomy.yaml`
+    # declares no schema, so adopting such a directory at either version is a first init, not a
+    # conversion.
+    declared = read_canonical_kb_schema_version(layout)
+    if declared is not None and requested is not None and requested != declared:
+        # BEFORE any write. A conversion is a re-import into a NEW repo, never an edit in place.
+        print(
+            f"{_PROG} repo init: {layout.root} is a schema-{declared} KB and --schema "
+            f"{requested} was requested; there is no in-place migrator (ADR-0041 D6). Convert it "
+            f"once into a NEW repo with "
+            f"'agora import --from-kb {layout.root} <new-repo>', or re-run without --schema to "
+            f"re-emit the existing schema-{declared} layout",
+            file=sys.stderr,
+        )
+        return 1
+    # The DEFAULT for a NEW repo is the version this build WRITES (ADR-0041 D6), never a literal:
+    # a repo initialized at anything less is read-only the moment it exists, which is not a default
+    # anyone would choose. A re-init still KEEPS `declared`, so flipping this default cannot
+    # convert an existing repo — that is the guard below, and the flag-contradiction refusal above.
+    schema_version = (
+        requested if requested is not None else (declared or MAX_SUPPORTED_KB_SCHEMA_VERSION)
+    )
+
+    # A repo can DECLARE a version its TREE was never built at: hand-bumping `_meta/taxonomy.yaml`
+    # to `schema_version: 2` is the first thing an operator reaches for when asking "how do I
+    # migrate?" (exactly the move ADR-0041 D6 answers with "you don't"). Resolving the version from
+    # that declaration is right; SEEDING the schema-2 skeleton into the schema-1 tree underneath it
+    # is the same half-migration the flag-contradiction refusal above exists to prevent — it drops
+    # `_meta/kb.yaml`, a v2 root map and six `wiki/<kind>/` directories as untracked residue and
+    # then fails the lint gate, on this run and on every re-run. `_meta/kb.yaml` is the tree's own
+    # witness of its version: `_seed_schema2_repo` mints it at creation and never rewrites it, so a
+    # genuine schema-2 repo always carries one. Refused BEFORE any write, like its sibling above.
+    # An UNDECLARED tree is the same hazard from the other side, and it is the one the flipped
+    # default creates: `read_canonical_kb_schema_version` returns `None` both for a directory that
+    # is merely git-initialized AND for one holding a schema-1 wiki whose `_meta/taxonomy.yaml` is
+    # missing or unparseable. Keying the refusal on the DECLARATION alone would adopt the second
+    # case at the default 2 — minting `_meta/kb.yaml` + the six kind directories over schema-1
+    # notes, while `Repo.init` early-returns and leaves the schema-1 `index.md` in place. The repo
+    # then DECLARES 2 (so D6 calls it writable) with schema-1 notes in `curator_paths`, failing the
+    # v2 lint gate on every run — and stickily, since `_meta/kb.yaml` now exists. So the guard
+    # keys on the TREE's own witness: an EMPTY initialized directory is a first init and is adopted
+    # at the default, while any pre-existing non-kind-first wiki content is refused. `--schema 1`
+    # stays available for the second case (no declaration means no contradiction refusal above,
+    # and schema 1 does not trip this guard) and re-emits the layout the tree is actually on.
+    has_kb_content = layout.index_file.is_file() or any(layout.wiki_dir.rglob("*.md"))
+    if (
+        requested is None
+        and already
+        and schema_version >= 2
+        and not layout.kb_meta_file.is_file()
+        and (declared is not None or has_kb_content)
+    ):
+        if declared is not None:
+            reason = (
+                f"declares KB schema {schema_version} but its tree was built at schema 1 (no "
+                f"{layout.kb_meta_file.name} identity file)"
+            )
+            remedy = "or restore the declaration in _meta/taxonomy.yaml to 'schema_version: 1'"
+        else:
+            reason = (
+                f"already holds KB content built at schema 1 (no {layout.kb_meta_file.name} "
+                f"identity file, and no schema_version declared in _meta/taxonomy.yaml)"
+            )
+            remedy = "or re-run with '--schema 1' to re-emit the existing schema-1 layout"
+        print(
+            f"{_PROG} repo init: {layout.root} {reason}; re-initializing would seed a "
+            f"schema-{schema_version} skeleton into a schema-1 repo. There is no in-place migrator "
+            f"(ADR-0041 D6): convert it once into a NEW repo with "
+            f"'agora import --from-kb {layout.root} <new-repo>', {remedy}",
+            file=sys.stderr,
+        )
+        return 1
+
+    # The `raw/` reserved-prefix namespace, rejected at the DECLARATION site (ADR-0041 D1.4): the
+    # taxonomy loader refuses such a domain on a schema-2 repo, so minting one here would create a
+    # repo the tool then refuses to load. Checked before any write, for every schema version.
+    reserved_domains = sorted(d for d in domains if d.startswith("_"))
+    if reserved_domains:
+        print(
+            f"{_PROG} repo init: domain(s) {reserved_domains} may not begin with '_' — that "
+            f"prefix is reserved inside raw/ for the content-addressed capture tree (raw/_blob/) "
+            f"and the long-document tier (raw/_pages/), which share the raw/<domain>/ namespace "
+            f"(ADR-0041 D1.4, lint L1-23)",
+            file=sys.stderr,
+        )
+        return 1
+
+    kb_id: str | None = None
+    if schema_version >= 2:
+        # BEFORE Repo.init, so the identity + kind tree land in the initial commit alongside the
+        # root map Repo.init seeds from the `kb_id` this returns (ADR-0041 D1.5: minted once, never
+        # rewritten — which is why it is minted before the first note that mirrors it).
+        kb_id = _seed_schema2_repo(layout, name=name, kind=args.kind).kb_id
+    repo.init(when=now, schema_version=schema_version, kb_id=kb_id)
     taxonomy = Taxonomy(
-        schema_version=1, taxonomy_policy="open", allowed_tags=tags, domains=domains
+        schema_version=schema_version, taxonomy_policy="open", allowed_tags=tags, domains=domains
     )
     # emit_schema + the starter repo.yaml are idempotent (existing curated files are left untouched;
     # _kb/repo.yaml is git-ignored), so a re-init produces no curated diff — only the first init's
     # admin commit advances the curated branch.
-    emit_schema(layout, taxonomy=taxonomy)
-    write_default_repo_config(layout, name=name, domains=domains, kind=args.kind)
+    emit_schema(layout, taxonomy=taxonomy, schema_version=schema_version)
+    # schema_version travels into the writer so the git-ignored _kb/repo.yaml MIRROR equals the
+    # canonical taxonomy value it was resolved from — L1-17 rejects any drift (ADR-0010 §5.1).
+    write_default_repo_config(
+        layout, name=name, domains=domains, kind=args.kind, schema_version=schema_version
+    )
     # Wire the OSS default brain so the fresh repo is IMMEDIATELY curate-able (idempotent +
     # non-destructive: an existing adapters.yaml is left untouched). adapters.yaml lives at the
     # repo root and is operator-facing registry config, not part of the curated admin commit.
@@ -505,6 +839,12 @@ def _cmd_repo_init(args: argparse.Namespace) -> int:
     # The adapters registry path is informational init output (the brain wiring), printed to stderr
     # so stdout stays the single machine-parseable admin-commit sha (the established init contract).
     print(f"adapters: {adapters_path}", file=sys.stderr)
+    if schema_version < MAX_SUPPORTED_KB_SCHEMA_VERSION:
+        # The inverse of the note this replaces: schema 2 is now the ordinary case and needs no
+        # announcement, while a repo re-emitted at the OLDER schema is READ-ONLY for this build and
+        # the operator must hear it here rather than discover it at the first refused capture
+        # (ADR-0041 D6).
+        print(f"note: {_read_only_schema_note(layout.root, schema_version)}", file=sys.stderr)
     print(sha)
     return 0
 
@@ -518,18 +858,41 @@ def _cmd_repo_missing(args: argparse.Namespace) -> int:
 def _cmd_import(args: argparse.Namespace) -> int:
     """``agora import <src> <dest>``: normalize an external vault into a new Agora repo (ADR-0014).
 
-    The opt-in Obsidian/markdown vault NORMALIZER. ``src`` is read NON-DESTRUCTIVELY; a normalized,
-    closer-to-ADR-0010-conformant repo is written to ``dest`` plus a human report. ``import_date``
-    is derived HERE from ``datetime.now(UTC)`` (the CLI boundary owns the wall clock) and injected
-    into :func:`~agora_kb.ingest.vault_import.import_vault`, which stays a pure function of its
-    inputs (ADR-0010 D1). Domains default to ``general`` (the first is the move target for
-    off-layout notes); tags default to none. Prints a concise digest — the counts, each note's
-    warnings, and the final lint summary — and exits non-zero ONLY on a HARD error (e.g. ``src``
-    missing), never on report warnings (a best-effort import with findings is a success; ADR-0014).
+    The opt-in Obsidian/markdown vault NORMALIZER, and — behind ``--from-kb`` — the ADR-0041 D6
+    schema-1 → schema-2 CONVERTER (:func:`_cmd_import_from_kb`). Both write KB wiki schema 2 into a
+    NEW ``dest`` and read ``src`` NON-DESTRUCTIVELY; only the source grammar differs.
+
+    On the vault path a normalized, ADR-0041-D2-conformant repo is written to ``dest`` plus a human
+    report. ``import_date`` is derived HERE from ``datetime.now(UTC)`` (the CLI boundary owns the
+    wall clock) and injected into :func:`~agora_kb.ingest.vault_import.import_vault`, which stays a
+    pure function of its inputs (ADR-0010 D1). Domains default to ``general`` (the first is the move
+    target for off-layout notes); tags default to none. Prints a concise digest — the counts, each
+    note's warnings, and the final lint summary — and exits non-zero ONLY on a HARD error, never on
+    report warnings (a best-effort import with findings is a success; ADR-0014). The hard errors
+    are ``src`` missing and a ``dest`` that is ALREADY a knowledge base — of either schema: both
+    modes write a NEW repo, so a destination that already declares one is refused rather than
+    written into (a schema-1 one names ``--from-kb`` as the crossing; a schema-2 one names the
+    inbox as the way to ADD to an existing KB).
+
+    ``--domain`` / ``--tag`` are refused WITH ``--from-kb`` (exit 2, the argparse usage code) rather
+    than ignored: the converter carries the SOURCE repo's own taxonomy across, so silently dropping
+    a declared domain would let an operator believe they had re-shaped a taxonomy that in fact
+    came over unchanged.
     """
-    from .ingest.vault_import import import_vault
+    from .ingest.vault_import import IMPORTER_SCHEMA_VERSION, import_vault
 
     import_date = datetime.now(UTC).strftime("%Y-%m-%d")
+    if args.from_kb:
+        if args.domain or args.tag:
+            print(
+                f"{_PROG} import: --domain/--tag are vault-import flags and do not apply to "
+                f"--from-kb, which carries the SOURCE repo's taxonomy across unchanged "
+                f"(ADR-0041 D6). Drop them, or drop --from-kb to import a vault",
+                file=sys.stderr,
+            )
+            return 2
+        return _cmd_import_from_kb(args, import_date=import_date)
+
     domains = list(args.domain) if args.domain else ["general"]
     tags = list(args.tag) if args.tag else []
 
@@ -549,9 +912,15 @@ def _cmd_import(args: argparse.Namespace) -> int:
     print(f"imported {s['notes']} note(s) from {args.src} -> {args.dest}")
     print(
         f"repaired_frontmatter={s['repaired_frontmatter']} moved={s['moved']} "
-        f"converted_links={s['converted_links']} unresolved_links={s['unresolved_links']} "
-        f"stripped_tags={s['stripped_tags']} themes_without_sources={s['themes_without_sources']}"
+        f"converted_links={s['converted_links']} retargeted_links={s['retargeted_links']} "
+        f"unresolved_links={s['unresolved_links']} stripped_tags={s['stripped_tags']} "
+        f"themes_without_sources={s['themes_without_sources']}"
     )
+    # The schema-2 navigation tier the importer SYNTHESIZES (ADR-0041 D5 / the importer's fix E) is
+    # reported separately because those notes are not in `report.notes` — they are the importer's
+    # own output, not a source note's fate, and an operator comparing "notes in my vault" against
+    # "notes in the repo" needs the difference named rather than discovered in a diff.
+    print(f"synthesized_maps={s['synthesized_maps']} synthesized_index={s['synthesized_index']}")
     for note in report.notes:
         if note.warnings or note.stripped_tags or note.unresolved_links:
             print(f"  {note.rel_path} ({note.type_inferred}):")
@@ -569,6 +938,275 @@ def _cmd_import(args: argparse.Namespace) -> int:
         print(f"lint: {len(lr.findings)} finding(s) still need hands:")
         for finding in lr.findings:
             print(f"  {finding.code} {finding.path}: {finding.message}")
+    # SAY IT OUT LOUD, still — but the branch is now DORMANT, not dead. The importer emits schema 2
+    # (ADR-0041 D6), so an imported repo is curate-able the moment it exists and needs no
+    # announcement. The guard survives against the NEXT bump: the day
+    # `MAX_SUPPORTED_KB_SCHEMA_VERSION` moves ahead of `IMPORTER_SCHEMA_VERSION`, `agora import`
+    # would silently start minting read-only repos again, and a `lint: clean` line over a repo the
+    # operator cannot curate is a true statement that leaves a false impression. Never an error
+    # exit: the import itself succeeded and is non-destructive.
+    if IMPORTER_SCHEMA_VERSION != MAX_SUPPORTED_KB_SCHEMA_VERSION:
+        print(
+            f"{_PROG} import: {args.dest} is a KB schema-{IMPORTER_SCHEMA_VERSION} repo, which "
+            f"this build can READ but not WRITE (it writes schema "
+            f"{MAX_SUPPORTED_KB_SCHEMA_VERSION}) — query/status/browse work, curate/remember are "
+            f"refused (ADR-0041 D6)",
+            file=sys.stderr,
+        )
+    return 0
+
+
+def _cmd_import_from_kb(args: argparse.Namespace, *, import_date: str) -> int:
+    """``agora import --from-kb <src> <dest>``: cross a schema-1 KB to schema 2 (ADR-0041 D6).
+
+    The ONE crossing between the two KB wiki schemas, and a CONVERTER rather than a migrator: it
+    reads the schema-1 repo at ``src`` — never modifying it, never opening a byte of it for
+    writing — and composes a NEW schema-2 repo at ``dest``.
+
+    ``import_date`` is the caller's single wall-clock read, injected so
+    :func:`~agora_kb.ingest.kb_convert.convert_kb` stays a pure function of its inputs (it pins the
+    destination's commit dates and is the fallback ``created``/``updated`` for a source note whose
+    own was unusable).
+
+    Prints the report D6 obliges the converter to produce: the counts, every ``(v1 → v2)`` basename
+    RENAME the flip introduced, every same-date daily MERGE with the dailies behind it, everything
+    in the source tree the conversion did NOT carry over, each note's warnings, and the
+    destination's v2 lint. Exits ``1`` on any refusal — a source that is not schema 1, a
+    destination nested inside the source (or the reverse), an occupied destination, a dateless
+    daily, and above all a rule-7 basename COLLISION, whose message carries the named list. In
+    every one of those cases nothing has been written: the converter decides the whole plan before
+    the first byte lands, which is why a collision is a clean re-runnable failure rather than a
+    half-converted tree — and why the closing ``<src> was NOT modified`` note is a fact rather than
+    a hope (a destination inside the source, which would have made it false, is refused outright).
+
+    Warnings are NOT a failure (same posture as the vault import): a converted note that needed a
+    guess is reported and the run still succeeds. Lint findings likewise — the destination is real
+    and the findings are the honest "what still needs hands" surface.
+    """
+    from .ingest.kb_convert import KbConvertError, convert_kb
+
+    try:
+        report = convert_kb(Path(args.src), Path(args.dest), import_date=import_date)
+    except (FileNotFoundError, NotADirectoryError, KbConvertError) as exc:
+        # The refusal messages are deliberately MULTI-LINE (rule 7 names every colliding basename),
+        # so they are printed verbatim rather than collapsed: the list IS the remedy.
+        print(f"{_PROG} import --from-kb: {exc}", file=sys.stderr)
+        return 1
+
+    s = report.summary
+    print(f"converted {s['notes']} note(s) from {args.src} -> {args.dest}")
+    print(f"kb_id: {report.kb_id}")
+    # `renamed_notes` and the `renamed basenames` list below are DIFFERENT quantities and are
+    # labelled apart for that reason: the count is per DESTINATION note (a merged journal counts
+    # once, however many dailies fed it), while the list is per basename PAIR (every contributing
+    # daily appears). Printed under one word they read as an arithmetic error in the report.
+    print(
+        f"source_notes={s['source_notes']} notes={s['notes']} renamed_notes={s['renamed']} "
+        f"merged_journals={s['merged_journals']} merged_sources={s['merged_sources']} "
+        f"subjects_assigned={s['subjects_assigned']} raw_files={s['raw_files']} "
+        f"asset_files={s['asset_files']} skipped_paths={s['skipped_paths']}"
+    )
+    if report.renames:
+        # The rename list is the operator's link-audit surface: a `[[basename]]` an OUTSIDE tool
+        # holds (an editor bookmark, another repo's note) is not rewritten by the conversion, so
+        # the pairs have to be enumerated rather than counted.
+        print(f"renamed basenames ({len(report.renames)}):")
+        for before, after in report.renames:
+            print(f"  {before} -> {after}")
+    if report.merges:
+        print(f"merges ({len(report.merges)}):")
+        for basename, sources in report.merges:
+            print(f"  {basename} <- {', '.join(sources)}")
+    if report.skipped:
+        # Nothing was destroyed (the source is untouched) and nothing was copied: D6 carries the
+        # D1 CANONICAL set, not an operator's `README.md` / `docs/` / `.obsidian/`. Saying so is
+        # the difference between a partial crossing and one that only READS as complete.
+        print(f"not carried over ({len(report.skipped)}) — still in {args.src}:")
+        for name in report.skipped:
+            print(f"  {name}")
+    for note in report.notes:
+        if note.warnings:
+            print(f"  {note.dest_path} ({note.kind}):")
+            for warning in note.warnings:
+                print(f"    - {warning}")
+
+    lr = report.lint
+    if lr.ok:
+        print("lint: clean")
+    else:
+        print(f"lint: {len(lr.findings)} finding(s) still need hands:")
+        for finding in lr.findings:
+            print(f"  {finding.code} {finding.path}: {finding.message}")
+    # The counterpart of the schema-1 note `repo init` prints: the operator has just been handed a
+    # SECOND repo and needs to know which of the two their faces should now point at, and that the
+    # first one is still intact (a converter that leaves any doubt about the source is a converter
+    # nobody runs on a real KB).
+    print(
+        f"note: {args.src} was NOT modified. {args.dest} is a KB schema-"
+        f"{MAX_SUPPORTED_KB_SCHEMA_VERSION} repo this build can curate — point 'agora curate' / "
+        f"'agora serve' / 'agora web' at it once you have checked the report above",
+        file=sys.stderr,
+    )
+    return 0
+
+
+def _capture_upload_policy(layout: RepoLayout) -> WebUploadConfig:
+    """The upload limits ``agora capture`` enforces — the REPO's numbers, not the defaults.
+
+    INGEST-CONTRACT §0.1 rule 3 is "one byte cap, one number": the ceiling is the operator's
+    ``web.upload.max_bytes`` (ADR-0025 / issue #66), the same value the web face threads into its
+    own upload path. Reading only :func:`~agora_kb.core.inbox.default_attachment_byte_cap` here
+    would give one repo two different per-file limits depending on which capture surface an
+    operator used — exactly the drift that function's own docstring says a second constant causes.
+
+    The WHOLE ``upload`` block is returned rather than the one field, because the byte cap is not
+    the only number with two surfaces: ``max_uncompressed_bytes`` is the decompression-bomb ceiling
+    for zip-based formats (docx/xlsx/pptx/epub, issue #53), and threading one but not the other
+    would leave an operator who LOWERED that cap with it lowered on the web face only. One
+    resolution, one policy object, both surfaces.
+
+    A repo whose ``web:`` block cannot be read (:class:`~agora_kb.config.ConfigError` — a malformed
+    ``_kb/repo.yaml``) falls back to the library defaults rather than refusing: an unreadable
+    OPERATOR POLICY file must not make a local capture impossible, and ``WebUploadConfig()`` is by
+    construction the same floor every other writer without configured policy in scope already uses
+    (:func:`~agora_kb.core.inbox.default_attachment_byte_cap` reads its ``max_bytes`` default).
+    """
+    try:
+        return load_web_config(layout).upload
+    except ConfigError:
+        return WebUploadConfig()
+
+
+def _cmd_capture(args: argparse.Namespace) -> int:
+    """``agora capture --file PATH`` — one inbox event carrying the file's text AND its bytes.
+
+    The local twin of the web face's upload route (ADR-0041 D4.2 / ADR-0020's deferred half). The
+    body is the text the existing extractor registry reads out of the file; the ORIGINAL bytes ride
+    along as the event's attachment, staged inside the writer's own inbox namespace, and APPLY
+    later materialises them as ``raw/_blob/<ab>/<sha256>.<ext>``. Extraction is lossy and
+    irreversible — a PDF is not recoverable from its text — so the artefact itself is what gets
+    kept; the text is how it becomes findable.
+
+    An extension the registry does not route (``.zip``, ``.png``, a raw log) is NOT a refusal: the
+    event body becomes a one-line stub naming the attachment and the bytes are stored anyway. That
+    is the whole point of a capture surface — an artefact nobody can extract today is exactly the
+    one worth keeping until somebody can. A MISSING optional dependency is the opposite case and
+    DOES refuse (``ExtractorUnavailable``, carrying its own install remedy): the format IS
+    supported, this install just cannot read it, and silently storing a stub instead would bury a
+    fixable environment problem under a capture that looks like it worked.
+
+    The per-file byte ceiling — and the zip-bomb ceiling handed to the extractor — are the REPO's
+    ``web.upload`` numbers (:func:`_capture_upload_policy`), the same ones the web face enforces on
+    an upload: INGEST-CONTRACT §0.1 rule 3.
+
+    **What "kept" means, exactly.** The bytes are durable in the inbox immediately and reach the
+    committed tree as ``raw/_blob/`` only if the curator KEEPS the candidate. A ``DROP`` (or a
+    ``NOOP``) writes no note, so there is no ``sources:`` list to cite the blob and APPLY
+    materialises nothing — the artefact then survives only in the git-ignored ``_kb/processed/``
+    spool, which is never pruned but is also never committed, pushed or backed up by
+    ``agora sync``. That is the same rule a free-text capture has always followed (a DROPped
+    ``kb_remember`` writes no ``raw/<domain>/<event_id>.md`` either); it is stated here because a
+    file the operator handed us reads as a stronger promise than a sentence typed into a tool.
+
+    Exit codes: ``0`` on a queued event; ``1`` for an unreadable/oversize file, a missing ingest
+    dependency, an extraction failure, an invalid writer/source/domain, or a repo whose KB wiki
+    schema this build will not write (ADR-0041 D6 — the refusal comes from ``Inbox.write`` itself,
+    like every other writer's).
+    """
+    from .ingest.extractors import ExtractorError, ExtractorUnavailable, extract
+
+    path = Path(args.file).expanduser()
+    try:
+        data = path.read_bytes()
+    except OSError as exc:
+        print(f"{_PROG} capture: cannot read {path}: {exc}", file=sys.stderr)
+        return 1
+    layout = RepoLayout(Path(args.repo))
+    policy = _capture_upload_policy(layout)
+    cap = policy.max_bytes
+    if len(data) > cap:
+        # Checked HERE, before extraction, for the same reason the web face checks before it:
+        # the refusal is about the artefact's size, and running an extractor over bytes that can
+        # never be stored is work whose only possible outcome is a different error message.
+        print(
+            f"{_PROG} capture: {path} is {len(data)} bytes, over the {cap}-byte per-file limit",
+            file=sys.stderr,
+        )
+        return 1
+
+    ext = attachment_ext_for(path.name)
+    try:
+        # Routed on the FILENAME alone — no `mime=` guess. `extract` treats a conflicting
+        # mime/extension pair as an ambiguity error, and a locally-guessed mime is exactly the kind
+        # of second opinion that manufactures one for a file the extension already routes fine.
+        # The bomb cap is the OPERATOR's, exactly as on the web face: a zip-based format captured
+        # locally must not be guarded by a different number than the same file uploaded (#53).
+        doc = extract(
+            data=data,
+            filename=path.name,
+            max_uncompressed_bytes=policy.max_uncompressed_bytes,
+        )
+    except ExtractorUnavailable as exc:
+        print(f"{_PROG} capture: {exc}", file=sys.stderr)
+        return 1
+    except ExtractorError as exc:
+        print(f"{_PROG} capture: could not extract {path.name}: {exc}", file=sys.stderr)
+        return 1
+    except ValueError:
+        doc = None  # no extractor claims this extension → the stub body below
+
+    sha = attachment_sha256(data)
+    # DISPLAY metadata for the attachment record (and, after APPLY, the `raw/_blob/` sidecar's
+    # `media_type:`) — never routing: the extractor already chose on the extension above, and a
+    # guess fed back into that choice is how a correctly-routed file becomes an "ambiguous upload".
+    # The extractor's own answer wins when it has one; `mimetypes` is the fallback for the stub
+    # path, where nothing else knows what the bytes are.
+    media_type = (doc.mime if doc is not None else None) or mimetypes.guess_type(path.name)[0]
+    body = doc.markdown if doc is not None and doc.markdown.strip() else None
+    if body is None:
+        # Also the empty-extraction case (a scanned PDF with no text layer): `Inbox.write` refuses
+        # an empty body, and a capture that fails because the file had no words in it would lose
+        # the file. The stub names the attachment so the curator — and a human reading the inbox —
+        # can see what arrived.
+        body = (
+            f"Captured file `{path.name}` ({len(data)} bytes, sha256 {sha}) — no extractable text; "
+            f"the original bytes are attached."
+        )
+    try:
+        receipt = Inbox(layout).write(
+            text=body,
+            writer=args.writer,
+            source=args.source,
+            domain=args.domain,
+            attachments=[(path.name, media_type, data)],
+            max_attachment_bytes=cap,
+        )
+    except UnsupportedSchemaVersionError as exc:
+        # ORDERED FIRST, as everywhere else: this family (and the `ReadOnlySchemaVersionError`
+        # write refusal) is a ConfigError, hence a ValueError, and it must not be rendered as a
+        # malformed-input complaint — it carries its own remedy (`agora import --from-kb`).
+        print(f"{_PROG}: {exc}", file=sys.stderr)
+        return 1
+    except ValueError as exc:
+        # One arm for every input verdict the core returns: an invalid writer
+        # (`InvalidWriterError`), an attachment refusal (`AttachmentError`), and the InboxItem
+        # model's own validation of `source`/`domain`/`target`. All are the operator's argument to
+        # fix, and all read as one line rather than a traceback.
+        print(f"{_PROG} capture: {exc}", file=sys.stderr)
+        return 1
+    except OSError as exc:
+        print(f"{_PROG} capture: could not write the inbox event: {exc}", file=sys.stderr)
+        return 1
+
+    staged = layout.inbox_attachment_path(args.writer, sha, ext)
+    print(f"repo: {layout.root}")
+    print(f"captured: {receipt.id} (queued={receipt.queued}, inbox depth={receipt.inbox_depth})")
+    print(f"body: {doc.extractor if doc is not None else 'stub'} ({len(body)} chars)")
+    print(f"attachment: {sha} ({len(data)} bytes) -> {rel_to_repo(layout, staged)}")
+    print(
+        "note: searchable after the next curator run (eventual consistency); a candidate the "
+        "curator DROPs keeps its bytes in the git-ignored _kb/ spool, not in git"
+    )
     return 0
 
 
@@ -609,6 +1247,17 @@ def _cmd_status(args: argparse.Namespace) -> int:
     print(f"last_attempt: {_fmt_dt(state.last_attempt)}")
     print(f"last_failure: {_fmt_last_failure(state, layout)}")
     print(f"failed_events: {failed_event_count(layout)}")
+    # ADR-0041 D6: a repo this build will not WRITE reports it here, because `agora status` is the
+    # command an operator runs when captures are "not arriving" — and on a schema-1 repo they never
+    # will, no matter how long they wait. The VALUE line keeps the `key: <machine-readable value>`
+    # grammar every other status line holds to (a `grep '^schema:'` answers "can this repo be
+    # written?"), and the REMEDY — which has no value slot — goes to stderr beside it, exactly as
+    # `repo init` places the same sentence. Printed ONLY when read-only: a writable repo has nothing
+    # to report and the absent line must not become noise on every run.
+    read_only = _read_only_schema_version(layout)
+    if read_only is not None:
+        print(f"schema: {read_only} (READ-ONLY — writes refuse)")
+        print(f"{_PROG} status: {_read_only_schema_note(layout.root, read_only)}", file=sys.stderr)
     # `agora status` deliberately does NOT advertise `agora requeue` (#99 §5.3): every line here is
     # `key: <machine-readable value>` and a remediation sentence has no value slot, but the real
     # reason is ordering — status has no CAUSE information, so it would send an operator to requeue
@@ -695,7 +1344,32 @@ def _cmd_curate(args: argparse.Namespace) -> int:
     """
     repo = Repo.resolve(args.repo)
     layout = repo.layout
-    cfg = load_repo_config(layout)
+    try:
+        cfg = load_repo_config(layout)
+        # ADR-0041 D6, one of the five exhaustive write-path call sites. BEFORE `recover()` and
+        # before any trigger evaluation: a schema-1 repo must not have its in-flight run finalized
+        # by a build that writes schema 2 either. `assert_supported_kb_schema_version` (membership
+        # in {1, 2}) has already passed inside the loader — this is the STRICTER equality check
+        # that separates "readable" from "writable". It reads the CANONICAL declaration rather than
+        # the `cfg` in hand, and deliberately: `load_repo_config` collapses "no taxonomy file at
+        # all" to the default `schema_version: 1`, which would answer `agora curate` in the wrong
+        # directory with a schema refusal instead of its ordinary "nothing was changed".
+        assert_writable_repo_schema(layout)
+    except UnsupportedSchemaVersionError as exc:
+        # ORDERED FIRST on purpose, exactly as in `_guard_schema_version`: this family (and its
+        # `ReadOnlySchemaVersionError` subclass — the write refusal `assert_writable_kb_schema_
+        # version` raises) is a ConfigError, hence a ValueError. Falling into the arm below would
+        # render "this KB is READ-ONLY for this agora build" as `invalid config:`, mislabelling a
+        # schema verdict as a malformed file and sending the operator to edit repo.yaml.
+        print(f"{_PROG}: {exc}", file=sys.stderr)
+        return 1
+    except ConfigError as exc:
+        # The write path's FIRST touch of the repo is the config load, and a refusal there (a
+        # malformed repo.yaml, a taxonomy the loader rejects) is an operator-fixable configuration
+        # problem — reported as the one-line refusal every other config-reading command prints
+        # (`agora harvest`, `doctor`, `index`), never as a Python traceback.
+        print(f"{_PROG} curate: invalid config: {exc}", file=sys.stderr)
+        return 1
     now = datetime.now(UTC)
 
     # ADR-0011 §9: finalize/return any in-flight run BEFORE deciding on a new one.
@@ -890,6 +1564,20 @@ def _cmd_requeue(args: argparse.Namespace) -> int:
     be moved; 2 from argparse for a missing/duplicated selector.
     """
     layout = RepoLayout(Path(args.repo))
+    # ADR-0041 D6, the third of the five exhaustive write-path call sites. Requeue puts events back
+    # into `_kb/inbox/`, so on a schema-1 repo it would refill a queue this build's curator refuses
+    # to drain — the same "silent data loss dressed as success" the `Inbox.write` refusal exists to
+    # prevent, reached by the one path that does NOT go through `Inbox.write` (it is a location-only
+    # `os.replace` of an already-immutable event, #99).
+    #
+    # Uses the shared `core.inbox` predicate, which reads only the canonical declaration: this
+    # command deliberately avoids `load_repo_config` (it "publishes nothing and must work when git
+    # is broken"), so it must not acquire a config dependency here either.
+    try:
+        assert_writable_repo_schema(layout)
+    except UnsupportedSchemaVersionError as exc:
+        print(f"{_PROG} requeue: {exc}", file=sys.stderr)
+        return 1
     selector = _requeue_selector(args)
     # A WARNING, never a guard (#99 §4.3): `failure_is_current` is True on 100% of legitimate
     # recoveries — `last_run` is the last successful PUBLISH and the canonical order is fix →
@@ -1128,6 +1816,17 @@ def _cmd_harvest(args: argparse.Namespace) -> int:
     reports what WOULD be harvested without writing anything (the noise-pollution preview);
     ``--connector NAME`` restricts the run to one connector. A malformed config or an unsupported
     connector type is a clean error (exit 1), as is any per-connector scan error.
+
+    **The ADR-0041 D6 write refusal reaches this command through the same one-line refusal every
+    other write path prints.** ``harvest`` is not on D6's exhaustive list of explicit call sites
+    because it writes through ``Inbox.write``, which carries the gate — but inheriting it there
+    means the refusal surfaces from *inside* :meth:`Harvester.run`, mid-scan, as an uncaught
+    :class:`~agora_kb.config.ReadOnlySchemaVersionError` traceback, which is not what an operator
+    of a read-only repo should see. Checking here instead moves the verdict BEFORE the scan, which
+    is also the privacy-correct place for it: a schema-1 repo can never accept the candidates, so
+    reading another agent's memory to build them is a side effect with no possible benefit.
+    Applied in ``--dry-run`` too — the preview describes writes this build would refuse, so
+    printing it would be a preview of a lie.
     """
     from .harvester import Harvester, build_connectors
     from .harvester.connectors import ConnectorError
@@ -1139,6 +1838,13 @@ def _cmd_harvest(args: argparse.Namespace) -> int:
         redact = load_redact_policy(layout)
         repo_name = load_repo_config(layout).name
         specs = load_connector_specs(layout.root / "adapters.yaml")
+        assert_writable_repo_schema(layout)
+    except UnsupportedSchemaVersionError as exc:
+        # ORDERED FIRST, exactly as in `_cmd_curate`: this family is a `ConfigError` (hence a
+        # `ValueError`), so the arm below would render "this KB is READ-ONLY for this agora build"
+        # as `invalid config —`, mislabelling a schema verdict as a malformed file.
+        print(f"{_PROG}: {exc}", file=sys.stderr)
+        return 1
     except ConfigError as exc:
         print(f"{_PROG} harvest: invalid config — {exc}", file=sys.stderr)
         return 1
@@ -1154,6 +1860,15 @@ def _cmd_harvest(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 1
+
+    # `--connector NAME` narrows BEFORE the build, not only inside `Harvester.run`: building is
+    # all-or-nothing (one connector that cannot be constructed raises out of `build_connectors`), so
+    # a targeted run must not be hostage to an unrelated connector's config. The unfiltered name
+    # list is kept for the "no connector named X" message below, which is still about the whole
+    # configured set.
+    configured_names = [s.name for s in specs]
+    if args.connector is not None and args.connector in configured_names:
+        specs = [s for s in specs if s.name == args.connector]
 
     try:
         connectors = build_connectors(specs, redact=redact)
@@ -1171,9 +1886,7 @@ def _cmd_harvest(args: argparse.Namespace) -> int:
     )
 
     if args.connector is not None and not report.connectors:
-        print(
-            f"harvest: no connector named {args.connector!r} (have: {[c.name for c in connectors]})"
-        )
+        print(f"harvest: no connector named {args.connector!r} (have: {configured_names})")
         return 1
 
     mode = " [dry-run]" if args.dry_run else ""
@@ -1339,6 +2052,17 @@ def _cmd_watch(args: argparse.Namespace) -> int:
     returns 1, so an external scheduler still sees the failure in the exit code.
     """
     repo = Repo.resolve(args.repo)
+    # ADR-0041 D6, PRE-FLIGHT. The per-tick assertion below is the authority (the repo can change
+    # version under a long-running scheduler), but a schema-1 repo is a permanent condition, and
+    # reporting it only through the #97 tick channel would TRUNCATE the message at
+    # `_TICK_DETAIL_CHARS` — cutting off the one remedy the refusal exists to deliver — and then
+    # back off politely forever over a state no amount of waiting fixes. Refusing here prints the
+    # message whole, once, and exits.
+    try:
+        assert_writable_repo_schema(repo.layout)
+    except UnsupportedSchemaVersionError as exc:
+        print(f"{_PROG} watch: {exc}", file=sys.stderr)
+        return 1
     interval = max(1, args.interval)
     # Python block-buffers stdout whenever it is not a TTY, and BOTH shipped units capture it to a
     # file/journal (deploy/systemd/agora-watch.service, deploy/launchd/com.agora.watch.plist) — so
@@ -1496,6 +2220,13 @@ def _watch_tick(repo: Repo) -> bool:
     # part of what may have changed. The raise lands in the loop's own guard (#97), so it surfaces
     # as one bounded tick error rather than a crash loop.
     guard_repo_schema_version(layout)
+    # ADR-0041 D6, the second of the five exhaustive write-path call sites, and it must be its OWN
+    # call rather than a consequence of the guard above: with SUPPORTED_KB_SCHEMA_VERSIONS widened
+    # to {1, 2} the guard PASSES for a schema-1 repo (by design — reads keep working), so `watch`
+    # would otherwise happily curate schema-2 paths into a schema-1 tree once a minute, forever.
+    # Re-asserted per tick for exactly the reason the guard is: the repo underneath a long-running
+    # scheduler can change version between ticks.
+    assert_writable_repo_schema(layout)
     now = datetime.now(UTC)
     stamp = _fmt_dt(now)
 
@@ -1771,6 +2502,71 @@ def _cmd_gold_missing(args: argparse.Namespace) -> int:
     return 2
 
 
+def _cmd_eval(args: argparse.Namespace) -> int:
+    """``agora eval``: snapshot what the deterministic ranker returns for a query file (#44).
+
+    Model-free, network-free, server-free — it constructs a :class:`Wiki` over the repo on disk and
+    calls :meth:`Wiki.query`, which is the whole point: ``core.wiki._is_map_path`` seeds the
+    structural score from the PATH (``wiki/maps/…`` since ADR-0041 D5, ``wiki/<d>/<d>-moc.md``
+    before it), so a layout move changes ranking and a recorded baseline is the only way to
+    attribute the change to it. The record is keyed on note BASENAMES, so it stays comparable
+    across such a move — which is how ``tests/rank_golden`` compares its frozen pre-flip
+    ``golden_v1*`` record against the live ``golden_v2*`` one.
+
+    Exit code is the CI gate: ``1`` when any query's ``status`` differs from its declared
+    ``expect`` (or the query file is unusable), ``0`` otherwise. Nothing is written unless ``--out``
+    is given.
+    """
+    from .core.rank_snapshot import QueryFileError, dumps, load_queries, snapshot
+    from .core.wiki import Wiki
+
+    layout = RepoLayout(Path(args.repo))
+    try:
+        queries = load_queries(args.queries)
+    except QueryFileError as exc:
+        print(f"{_PROG}: eval: {exc}", file=sys.stderr)
+        return 1
+
+    fm = None if args.fm is None else args.fm == "on"
+    record = snapshot(Wiki(layout), queries, fm=fm, limit=args.limit)
+    header = record["header"]
+    rows = record["queries"]
+
+    print(f"repo: {layout.root}")
+    print(
+        f"  queries={header['query_count']} notes={header['corpus_note_count']} "
+        f"fm={'on' if header['fm_enabled'] else 'off'} "
+        f"cache={'on' if header['index_cache_enabled'] else 'off'} "
+        f"cache_used={'yes' if header['index_cache_used'] else 'no'} limit={header['limit']}"
+    )
+    id_width = max([2, *(len(str(row["id"])) for row in rows)])
+    print(f"  {'ID':<{id_width}}  {'EXPECT':<9}  {'STATUS':<9}  {'TOP HIT':<28}  SCORE")
+    for row in rows:
+        top = row["hits"][0] if row["hits"] else None
+        note = top["note"] if top else "-"
+        score = f"{top['score']:.6f}" if top else "-"
+        print(
+            f"  {row['id']:<{id_width}}  {row['expect']:<9}  {row['status']:<9}  "
+            f"{note:<28}  {score}"
+        )
+
+    violations = [row for row in rows if row["status"] != row["expect"]]
+    for row in violations:
+        print(
+            f"  MISMATCH: {row['id']} expected {row['expect']}, got {row['status']}",
+            file=sys.stderr,
+        )
+
+    if args.out is not None:
+        out = Path(args.out)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_text(out, dumps(record), exclusive=False)
+        print(f"  wrote {out}")
+
+    print(f"  {len(rows)} queries, {len(violations)} violating expect")
+    return 1 if violations else 0
+
+
 # agora doctor's brain probe budget (#96 criterion 5). Deliberately SHORTER than the shim's own 10s
 # runtime default: 10s is the right budget for a real curate run, 3s for a yes/no reachability
 # question an operator is waiting on. 3.0 (the top of #96's 2-3s band) because a loopback daemon
@@ -1819,6 +2615,21 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
     layout = RepoLayout(Path(args.repo))
     if Repo(layout).is_initialized():
         print(f"  repo {layout.root}: initialized")
+        # ADR-0041 D1.4: `raw/_blob/` bytes are named by their own sha256, so git must never
+        # translate their line endings. `repo init` seeds the rule; a repo created before that
+        # change has no `.gitattributes` and would silently rewrite a CRLF, NUL-free artefact
+        # (CSV/TXT/HTML/JSON) on commit under `core.autocrlf`. Reported, never repaired: doctor is
+        # diagnostic, and this is one line the operator can paste. It does NOT move the verdict —
+        # the argv pins on `Repo._git` already protect every write this engine makes; the file is
+        # what extends that to a hand-run `git add` in the same repo.
+        if blob_bytes_are_pinned(layout.root):
+            print(f"  {GITATTRIBUTES_NAME}: ok (raw/_blob/ pinned out of git EOL translation)")
+        else:
+            print(
+                f"  {GITATTRIBUTES_NAME}: missing the raw/_blob/ rule — run: "
+                f"printf 'raw/_blob/** -text -diff -merge\\n' >> "
+                f"{layout.root / GITATTRIBUTES_NAME}"
+            )
     else:
         print(f"  repo {layout.root}: not initialized (run 'agora repo init')")
 
@@ -1863,6 +2674,11 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
     # ADR-0007: observability — the harvester policy + configured connectors with cursor state.
     # Reporting only; never affects the health verdict and never crashes on malformed config.
     _doctor_connectors(layout)
+
+    # Issue #152: observability — how much of `wiki/` the curator does NOT own. Reporting only;
+    # never affects the health verdict (a human note in the tree is not ill health) and never
+    # crashes on an unreadable note.
+    _doctor_notes(layout)
 
     # ADR-0012 §2 / issue #26: observability — the derived reader-cache state (present/fresh/stale).
     # Reporting only; never affects the health verdict and never crashes on malformed config.
@@ -1911,8 +2727,38 @@ def _doctor_schema(layout: RepoLayout) -> bool:
         return False
     if version in SUPPORTED_KB_SCHEMA_VERSIONS:
         print(f"  schema: repo={version} supported={supported}")
-        return True
+        return _doctor_writable_schema(layout)
     print(f"  schema: repo={version} supported={supported} (UNSUPPORTED — upgrade agora)")
+    return False
+
+
+def _doctor_writable_schema(layout: RepoLayout) -> bool:
+    """Print the ADR-0041 D6 WRITE verdict for a repo this build supports; False when read-only.
+
+    Support and writability are two different questions and #98's line only answered the first.
+    Since the flip, ``SUPPORTED_KB_SCHEMA_VERSIONS`` is ``{1, 2}`` *on purpose* — dropping 1 would
+    strand the owner's live KBs — so ``schema: repo=1 supported=[1, 2]`` is now a PASSING line over
+    a repo whose curator can never run again. Doctor is the command an operator reaches for when
+    ``agora curate`` refuses, so it is exactly where the second question has to be answered.
+
+    **It FAILS the verdict**, and that is a deliberate reading of what ``status: healthy`` claims:
+    the same judgement ``tests/test_cli.py`` already pins for an unrunnable curator — *"reporting
+    healthy for a repo that cannot curate is issue #96's opening complaint"*. Reads keep working
+    and the line says so, but a KB that can accept nothing new is not a healthy deployment, and a
+    ``launchd``/``systemd`` health check that greens on one would hide a frozen hub indefinitely.
+    The remedy is on the line, so the non-zero exit is actionable rather than merely noisy.
+
+    Keyed on :func:`_read_only_schema_version` — the CANONICAL declaration the write path itself
+    consults — so a directory that is not a repo (which the broader reader above defaults to ``1``)
+    stays silent here rather than being told its writes are refused.
+    """
+    version = _read_only_schema_version(layout)
+    if version is None:
+        return True
+    print(
+        f"  write: READ-ONLY — this build reads KB schema {version} and refuses to write it; "
+        f"convert with 'agora import --from-kb {layout.root} <new-repo>' (ADR-0041 D6)"
+    )
     return False
 
 
@@ -1923,9 +2769,14 @@ def _doctor_connectors(layout: RepoLayout) -> None:
     ``repo.yaml`` / ``adapters.yaml`` is noted (``agora harvest`` surfaces the real config error
     loudly). Shows whether harvesting is enabled, the ``scope_lock``, and for each connector its
     scope and cursor (last scan + the §6 ``proposed`` / ``accepted`` / ``rejected`` counters — the
-    latter two are curator-owned and remain 0 until that wiring lands, ADR-0017).
+    latter two are curator-owned and remain 0 until that wiring lands, ADR-0017). A ``session:``
+    connector also reports the EFFECTIVE transcript format (issue #147) — the parser actually
+    running, with an undeclared ``format:`` shown as the default it resolves to rather than as
+    blank, so "which grammar is reading my transcripts" is answerable without reading the code, and
+    a name this build has no reader for is marked as such rather than printed as if it were running.
     """
     from .harvester import CursorStore
+    from .harvester.session_sources import DEFAULT_SESSION_FORMAT, is_implemented_format
 
     try:
         policy = load_harvest_policy(layout)
@@ -1960,7 +2811,43 @@ def _doctor_connectors(layout: RepoLayout) -> None:
                 counters += f" redacted={{{breakdown}}}"
         except Exception as exc:  # noqa: BLE001 — a bad connector name must not crash doctor.
             counters = f"cursor unreadable ({exc})"
-        print(f"    {spec.name} (scope={spec.scope}): {counters}")
+        fields = f"scope={spec.scope}"
+        if spec.name.startswith("session:"):
+            fmt = spec.format or DEFAULT_SESSION_FORMAT
+            # Belt-and-braces: `load_connector_specs` already rejects a name this build cannot
+            # parse, so this branch should be unreachable — but a doctor line that names a parser
+            # must never name one that does not exist (a healthy verdict beside a connector that
+            # cannot build is exactly the report an operator acts on wrongly).
+            suffix = "" if is_implemented_format(fmt) else " — NO READER IN THIS BUILD"
+            fields += f", format={fmt}{suffix}"
+        print(f"    {spec.name} ({fields}): {counters}")
+
+
+def _doctor_notes(layout: RepoLayout) -> None:
+    """Print how many notes the curator owns vs does not (issue #152). Never crashes.
+
+    A note carrying no curator stamp was written by a human: since #152 it is READ (query, graph,
+    the index cache) but is not graded by the producer lint and can never be a MERGE/CONTEST target.
+    That used to be invisible — and before #152 it was worse than invisible, because one such note
+    failed every run. This is the line that says "N of your notes are outside the curator's reach",
+    so an operator can tell a quiet exclusion from a bug. Never moves the verdict: a human writing
+    in `wiki/` is a supported thing to do, not ill health.
+    """
+    from .curator.worker import is_curator_written
+    from .schema.notes import parse_all_notes
+
+    try:
+        notes = parse_all_notes(layout)  # TOLERANT: doctor is a read path (ADR-0014 D4)
+    except Exception as exc:  # noqa: BLE001 — doctor must never crash on an unreadable tree.
+        print(f"  notes: unreadable ({exc})")
+        return
+    unmanaged = sum(1 for n in notes if not is_curator_written(n))
+    detail = (
+        f"{unmanaged} out of schema (read + indexed, never curated)"
+        if unmanaged
+        else "none out of schema"
+    )
+    print(f"  notes: {len(notes)} total, {detail}")
 
 
 def _doctor_index(layout: RepoLayout) -> None:

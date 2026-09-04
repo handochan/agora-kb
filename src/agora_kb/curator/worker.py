@@ -51,6 +51,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 from collections.abc import Iterator
@@ -62,16 +63,20 @@ from typing import TYPE_CHECKING, Literal, Protocol
 from ..core import frontmatter
 from ..core.frontmatter import FrontmatterError
 from ..core.ids import new_event_id
-from ..core.inbox import Inbox, return_event_to_inbox
-from ..core.layout import RepoLayout
+from ..core.inbox import AttachmentError, Inbox, carry_attachments, return_event_to_inbox
+from ..core.layout import RepoLayout, attachment_dir
 from ..core.repo import GitError, Repo
 from ..core.sentinel import BODY_RESET_PLACEHOLDER, UNAUTHORED_REGION_BODIES, has_unauthored_region
 from ..core.sentinel import BODY_START_LINE_RE as _START_SENTINEL_RE
 from ..core.state import CuratorState, LastBatch, LastFailure, StateStore
 from ..schema.emit import Taxonomy
 from ..schema.lint import lint
-from ..schema.notes import Note, parse_all_notes
+from ..schema.notes import Note, is_people_path, parse_all_notes, path_kind
 from .apply import (
+    _MERGE_TARGET_KINDS,
+    ApplyError,
+    _contained,
+    _note_path,
     apply_plan,
     body_sentinels,
     region_sentinel_id,
@@ -96,16 +101,20 @@ if TYPE_CHECKING:
     from ..config import ConnectorSpec
 
 __all__ = [
+    "CURATOR_STAMP_KEYS",
     "AuthorRegion",
     "Backend",
     "FakeBackend",
     "HarvestCursorDelta",
+    "LiveTree",
     "RunFailure",
     "RunReport",
     "compute_harvest_cursor_deltas",
+    "is_curator_written",
     "iter_attempt_records",
     "run",
     "recover",
+    "scan_live_tree",
 ]
 
 # §4.2 AUTHOR-failure RESET placeholder (ADR-0011 §4.2): the blockquote derived from the plan
@@ -125,7 +134,7 @@ class AuthorRegion:
 
     The worker substitutes these deterministically into the PASS-2 AUTHOR prompt so the backend
     grounds its prose in the candidate's verbatim captured ``source_text`` and is OP-AWARE (a MERGE
-    region writes only the NEW claim, a CREATE writes the whole body, a daily writes the dated
+    region writes only the NEW claim, a CREATE writes the whole body, a journal writes the dated
     capture). Keyed by the run-scoped ``region_sentinel_id`` in the worker's context map; only THIS
     run's authored regions carry one (prior-run regions are not re-authored).
     """
@@ -212,18 +221,249 @@ class FakeBackend:
             path.write_text(text, encoding="utf-8")
 
 
-def _is_theme_note(note: Note) -> bool:
-    """True iff ``note`` lives at ``wiki/<domain>/themes/<basename>.md`` (a THEME note).
+def _is_mergeable_note(note: Note) -> bool:
+    """True iff ``note`` is one of the SOURCED kinds a MERGE/CONTEST may target (ADR-0041 D2.1).
 
-    Path-based, mirroring :func:`apply._resolve_target_path`'s ``theme_only`` semantics so the §4.1
-    BASENAME/PROVENANCE THEME-target check grades EXACTLY what APPLY will accept — robust to a wrong
-    or missing ``type:`` frontmatter value (the live tree's directory is authoritative).
-    MERGE/CONTEST may only target such a note; a MOC/index/daily basename must be rejected at the
-    PLAN gate rather than crash APPLY.
+    KIND-based, and the kind is the DIRECTORY: under KB wiki schema 2 the first segment under
+    ``wiki/`` IS the kind (D1/D2.1), so :attr:`~agora_kb.schema.notes.Note.kind` is derived from the
+    path by :func:`~agora_kb.schema.notes.parse_all_notes` and cannot be falsified by a brain
+    writing a ``kind:`` mirror it likes better. The admitted set is
+    :data:`~agora_kb.curator.apply._MERGE_TARGET_KINDS` — imported, never restated, so this gate
+    and :func:`apply._resolve_target_path`'s ``sourced_only`` filter grade EXACTLY the same
+    population. MERGE/CONTEST may only target such a note; a journal, a map, ``index.md`` or a
+    human-owned ``wiki/people/`` note must be rejected at the PLAN gate rather than crash APPLY.
+
+    This replaces the v1 four-segment ``wiki/<domain>/themes/<basename>.md`` path test. The
+    substitution is exact for the population that existed then — every v1 theme is a schema-2
+    concept (D2.5) — and additionally admits ``summary``, the second SOURCED kind, the day OD-7's
+    producer lands.
     """
-    parts = note.rel_path.split("/")
-    # wiki / <domain> / themes / <basename>.md  (exactly four POSIX segments)
-    return len(parts) == 4 and parts[0] == "wiki" and parts[2] == "themes"
+    return note.kind in _MERGE_TARGET_KINDS
+
+
+# --- the producer/consumer boundary inside wiki/ (issue #152, ADR-0014 D1/D4 addendum) ----------
+#
+# A human is ALLOWED to write in `wiki/` — nothing forbids it, and a schema-valid hand-written note
+# publishes untouched. What was NOT allowed was the consequence: the note was graded as CURATOR
+# OUTPUT (strict producer) although the curator never wrote it, so one Obsidian save (Properties
+# instead of the ADR-0010 §2 frontmatter, or no fence at all) hard-rejected EVERY subsequent run,
+# forever, because the offending file sits in the base commit. The fix is a classification BEFORE
+# the producer gate, not a softer gate: L1 severities stay frozen (kb_schema.md), the closed op
+# vocabulary is untouched, and no rule changes. See the ADR-0014 addendum for the rejected
+# alternatives (severity downgrade; git authorship).
+
+# The frontmatter keys the ENGINE — never the model, never Obsidian — materializes on a note it
+# wrote. `sources:` is written by APPLY's provenance union on every concept/journal (ADR-0011
+# §2: "the WORKER writes sources:, never the model"); `timestamp:` is the deterministic OKF
+# `<updated>T00:00:00Z` APPLY stamps on every note type it creates or re-renders and `_set_updated`
+# keeps in lock-step (ADR-0014 D2), including the seed `index.md` `repo init` writes. Presence of
+# EITHER is the curator's stamp. The union (not the intersection) is what makes the discriminator
+# total across every note kind and tolerant of a concept published before the OKF fields landed.
+CURATOR_STAMP_KEYS: frozenset[str] = frozenset({"sources", "timestamp"})
+
+# The same stamp, looked for TEXTUALLY, in a frontmatter block that does not parse. A malformed
+# block hides its keys from `frontmatter.parse`, and "malformed" is precisely where the two
+# populations must NOT be conflated: a broken CURATOR note is an integrity signal that still fails
+# the run, a broken HUMAN note is somebody's draft.
+_STAMP_LINE_RE = re.compile(r"^(?:sources|timestamp):")
+# How far into an unclosed block the textual scan looks. The scan is deliberately confined to the
+# FRONTMATTER REGION, never the body: a fenceless note whose PROSE happens to contain a line reading
+# `sources: …` must not be mistaken for a damaged curator note — that misfiling would resurrect the
+# permanent-failure bug this whole change exists to kill, for the one shape nobody would look at.
+_MAX_STAMP_SCAN_LINES = 40
+
+
+def _stamp_in_frontmatter_region(text: str) -> bool:
+    """Best-effort: does an UNPARSEABLE frontmatter block still visibly carry a curator stamp?
+
+    Only ever asked of a note whose frontmatter did NOT parse. Text that does not open with a
+    ``---`` fence has no frontmatter block at all and therefore cannot be something APPLY rendered
+    (:func:`agora_kb.core.frontmatter.render` always opens with one), so it is never stamped. For a
+    block that opens but is malformed or unclosed, the scan stops at the closing fence or after
+    :data:`_MAX_STAMP_SCAN_LINES` lines — bounding an unclosed fence to the region a real
+    frontmatter block could occupy.
+
+    The fence test tolerates a leading UTF-8 BOM and a stray CR (see below), and the discriminator
+    is deliberately TEXTUAL: a human ``Properties`` block that is YAML-invalid AND happens to carry
+    a line starting ``sources:`` / ``timestamp:`` is classified as a damaged PRODUCER artifact and
+    fails the run, naming the file. That is the conservative direction on purpose (a genuinely
+    damaged curator note must never be reclassified away as somebody's draft) and it is recorded as
+    a known residual in the ADR-0014 addendum.
+    """
+    lines = text.split("\n")
+    if not lines:
+        return False
+    # A leading UTF-8 BOM must not hide the fence. PowerShell `Set-Content`/`Out-File` and several
+    # Windows editors write UTF-8-with-BOM by default (epic #85), and `frontmatter.parse` rejects
+    # such a file — so WITHOUT this strip a BOM'd CURATOR note is silently demoted to "human",
+    # which drops it out of the producer lint scope where L1-16 (the rule that exists to catch
+    # exactly this damage) would never read it again. Stripping keeps it a damaged producer
+    # artifact: the run fails loudly and names the file, which is what the ADR-0014 addendum
+    # promises. A stray CR is stripped for the same "the fence is still a fence" reason.
+    if lines[0].lstrip("\ufeff").rstrip(" \t\r") != "---":
+        return False
+    for line in lines[1 : 1 + _MAX_STAMP_SCAN_LINES]:
+        if line.rstrip(" \t\r") == "---":
+            return False  # a closed block: the stamp was not in it
+        if _STAMP_LINE_RE.match(line):
+            return True
+    return False
+
+
+def is_curator_written(note: Note) -> bool:
+    """True iff ``note``'s frontmatter carries a curator stamp (:data:`CURATOR_STAMP_KEYS`).
+
+    The discriminator between a PRODUCER artifact (graded by the L1 gate, a legal MERGE/CONTEST
+    target) and a note a human wrote in ``wiki/`` (read, indexed, linkable — never graded, never
+    written to). Frontmatter-based ON PURPOSE: git authorship (the rejected alternative (c)) is
+    absent from a fresh clone and would misfile the legitimate case of a human hand-editing a
+    curator note, while this predicate is a pure function of the bytes in the tree.
+
+    Deliberately conservative in the one direction that matters: a human note that happens to carry
+    ``sources:``/``timestamp:`` is graded as producer output, i.e. exactly today's behaviour.
+    """
+    return any(key in note.frontmatter for key in CURATOR_STAMP_KEYS)
+
+
+def _is_structural_curator_path(rel_path: str) -> bool:
+    """True iff APPLY rewrites this path BY CONSTRUCTION, whoever last saved it (#152 follow-up).
+
+    The three structural notes the deterministic APPLY step opens without ever asking the plan gate
+    for permission: the root ``index.md`` (:func:`apply._update_index`), a subject MAP
+    ``wiki/maps/<subject>.md`` (:func:`apply._update_map`), and the run's JOURNAL
+    ``wiki/notes/<yyyy>/<mm>/<run_date>.md`` (:func:`apply._apply_append_journal`). Each of those
+    call sites does an UNGUARDED ``frontmatter.parse`` of the existing file.
+
+    KIND-keyed under KB wiki schema 2 (ADR-0041 D1/D2.1), which is what makes the predicate total:
+    v1 had to recognise the map by a FILENAME suffix (``<domain>-moc.md``) and the journal by a
+    ``daily/`` segment at a fixed depth, so a map or daily one directory deeper was invisible to it.
+    The kind is now the directory, so ``wiki/maps/**`` and ``wiki/notes/**`` cover every depth D1.1
+    permits — including the ``<yyyy>/<mm>`` shard, which the v1 four-segment test would have missed.
+
+    CONCEPT/SUMMARY notes are deliberately NOT here: a MERGE/CONTEST target must clear the PLAN
+    gate's ``theme_basenames`` (built from :attr:`LiveTree.curator_paths`) before APPLY ever opens
+    it, so a malformed human concept is already rejected as a clean plan error. These three have no
+    such gate — the curator owns them by construction — so a malformed one is an integrity signal,
+    not somebody's draft, and must FAIL the run (clean, named) instead of crashing APPLY mid-batch.
+
+    ``wiki/people/**`` is likewise NOT here, and that is the D3.3 guarantee in its strongest form:
+    the curator may never write it (:func:`~agora_kb.curator.constants.is_allowlisted_path` carves
+    it out), so APPLY never opens it, so a malformed people note is somebody's draft — never an
+    integrity signal that fails a run the tree has nothing to do with.
+    """
+    if rel_path == "index.md":
+        return True
+    return path_kind(rel_path) in ("map", "note")
+
+
+def _malformed_frontmatter(path: Path) -> tuple[str, str] | None:
+    """Return ``(raw_text, error message)`` if ``path``'s frontmatter does not parse, else ``None``.
+
+    Read tolerantly (``errors="replace"``) for the same reason
+    :func:`~agora_kb.schema.notes.parse_all_notes` is: a non-UTF-8 note in the live tree must not
+    raise :class:`UnicodeDecodeError` out of the classification (ADR-0014 D4).
+    """
+    text = path.read_text(encoding="utf-8", errors="replace")
+    try:
+        frontmatter.parse(text)
+    except FrontmatterError as exc:
+        return text, str(exc)
+    return None
+
+
+@dataclass(frozen=True)
+class LiveTree:
+    """The classified live-tree scan the run's registries and producer-lint scope are built from.
+
+    ``notes`` is the TOLERANT parse of every note (a malformed one degrades to empty frontmatter +
+    full body) — the read-path view, ADR-0014 D4. ``curator_paths`` are the notes carrying the
+    engine's stamp; ``human_paths`` are the rest, in deterministic path order.
+    ``malformed_curator`` is the first malformed note that still visibly carries the stamp, or sits
+    at a structural path APPLY rewrites unconditionally (:func:`_is_structural_curator_path`) — a
+    real integrity signal that must fail the run rather than be classified away.
+    """
+
+    notes: tuple[Note, ...]
+    curator_paths: frozenset[str]
+    human_paths: tuple[str, ...]
+    malformed_curator: str | None
+
+
+def scan_live_tree(layout: RepoLayout, *, schema_version: int | None = None) -> LiveTree:
+    """Parse the live tree once and split it into curator-produced vs human-written notes (#152).
+
+    Replaces the strict :func:`parse_all_notes` call that used to abort the run on the FIRST
+    unparseable note in the curated tree. The strictness is not dropped, it is SCOPED: a malformed
+    note that still carries a curator stamp — or sits at one of the structural paths APPLY rewrites
+    by construction (:func:`_is_structural_curator_path`) — is reported in ``malformed_curator``
+    (the caller fails the run exactly as before); a malformed note without one is a human draft and
+    joins ``human_paths``, which the caller warns about and otherwise leaves alone.
+
+    Only notes whose PARSED frontmatter has no stamp are re-read, so the extra IO is bounded by the
+    number of human notes (zero in a purely curated repo).
+
+    ``schema_version`` selects the KB wiki schema every :class:`~agora_kb.schema.notes.Note` is
+    DERIVED under — which decides ``kind`` (schema 2: the directory; schema 1: ``type:``) and hence
+    what :func:`_is_mergeable_note` admits. The production caller passes the repo's own version so
+    the derivation is one injected fact rather than a per-call filesystem re-resolution over a
+    WORKTREE that may not be the live repo. ``None`` (the default) keeps
+    :func:`~agora_kb.schema.notes.parse_all_notes`'s own resolution, which reads the scanned tree's
+    ``_meta/taxonomy.yaml`` — right for a caller that has no version in hand, and the reason this
+    is a keyword with a default rather than a required argument.
+    """
+    # TOLERANT: never aborts on somebody's draft (the strictness is re-scoped below).
+    notes = parse_all_notes(layout, schema_version=schema_version)
+    curator: list[str] = []
+    human: list[str] = []
+    malformed_curator: str | None = None
+    for note in notes:
+        if is_curator_written(note):
+            curator.append(note.rel_path)
+            continue
+        # No stamp in the PARSED frontmatter — either the note genuinely has none, or its block did
+        # not parse at all and the tolerant read handed us `{}`. Only the empty-frontmatter notes
+        # can be the latter, so only those are re-read.
+        if not note.frontmatter:
+            malformed = _malformed_frontmatter(layout.root / note.rel_path)
+            if malformed is not None:
+                text, message = malformed
+                # Stamped, OR at a path APPLY rewrites unconditionally. The second half is what
+                # keeps a fenceless `index.md` / subject map / journal out of APPLY's UNGUARDED
+                # `frontmatter.parse`: classified as a human draft it would sail past this gate and
+                # crash `run()` with a traceback, stranding the claimed batch in `_kb/processing/`
+                # while `agora status` reported `failed_events: 0` — strictly worse than the hard
+                # rejection #152 set out to remove. The curator owns those three by construction, so
+                # the clean named `_fail` IS the right answer for them.
+                if _stamp_in_frontmatter_region(text) or _is_structural_curator_path(note.rel_path):
+                    curator.append(note.rel_path)
+                    if malformed_curator is None:  # first in sorted scan order (fail-fast shape)
+                        malformed_curator = f"{note.rel_path}: {message}"
+                    continue
+        human.append(note.rel_path)
+    return LiveTree(
+        notes=tuple(notes),
+        curator_paths=frozenset(curator),
+        human_paths=tuple(human),
+        malformed_curator=malformed_curator,
+    )
+
+
+# How many out-of-scope note paths one warning line names before it summarizes the rest. The
+# warning is an operator signal, not an inventory: `agora doctor` prints the full count and the
+# notes are right there in the tree.
+_MAX_NAMED_HUMAN_NOTES = 5
+
+
+def _human_notes_warning(human_paths: tuple[str, ...]) -> str:
+    """Render the ONE operator-facing line naming the notes this run did not grade (#152)."""
+    named = ", ".join(human_paths[:_MAX_NAMED_HUMAN_NOTES])
+    if len(human_paths) > _MAX_NAMED_HUMAN_NOTES:
+        named += f", … and {len(human_paths) - _MAX_NAMED_HUMAN_NOTES} more"
+    return (
+        f"LIVE-TREE: {len(human_paths)} note(s) in the curated tree carry no curator stamp — "
+        f"left byte-identical, excluded from the plan registry and from the producer lint, still "
+        f"readable and indexed: {named}"
+    )
 
 
 def _read_notes(worktree: Path, needs_prose: dict[str, list[str]]) -> dict[str, str]:
@@ -491,6 +731,15 @@ def _run_locked(
     """The body of :func:`run`, executed UNDER the held curator lock (ADR-0011 §0)."""
     layout = repo.layout
     state = state_store.load()
+    # The ONE schema fact this run is graded under (ADR-0041 D6). Read from the taxonomy the caller
+    # loaded — `_meta/taxonomy.yaml` is the CANONICAL home (ADR-0010 §5.1), and lint already
+    # dispatches on this same value — so the note derivation (`kind`/`subjects`), the ruleset and
+    # the layout APPLY writes can never be resolved from three different places. The write refusal
+    # for a schema-1 repo is upstream of here, per D6's exhaustive call-site list (`agora curate`,
+    # `watch`, `requeue`, `kb_curate`, and `Inbox.write` itself); a run that reaches this point on a
+    # schema-1 repo is a caller that bypassed all five, and it still fails cleanly at the lint gate
+    # rather than publishing a two-layout tree.
+    schema_version = taxonomy.schema_version
 
     # ADR-0008 (read-after-publish, best-effort): a PRIOR run's post-publish sync may have failed
     # (owner working tree dirty/diverged), leaving HEAD behind the curated ref. Try a best-effort
@@ -540,7 +789,49 @@ def _run_locked(
     state_store.save(state)
 
     # ADR-0011 §1 / §5 tier-2: build the read-only bundle (candidates + provenance + related/).
-    bundle = build_bundle(layout, repo, manifest, related_k=related_k)
+    #
+    # `mergeable_paths` (#152): PASS 1 is instructed to pick its MERGE_INTO_THEME target out of the
+    # §1.1 `related/` hits, but since #152 a human-written note is NOT a legal target — naming one
+    # is a BASENAME plan error, and any plan error fails the WHOLE run. An unstamped note that
+    # lexically overlaps a candidate would otherwise sit at the top of that view on every run, so
+    # the engine would be failing runs over a menu it handed the model itself. Classified over the
+    # LIVE tree, the same files `build_bundle`'s `Wiki` reads (the worktree scan below is at
+    # `base_commit` and answers a different question: what this run is graded on).
+    #
+    # The set is the curator's own CONCEPTS (and, when OD-7's producer lands, SUMMARIES) — not
+    # merely its own notes: the plan gate accepts a MERGE/CONTEST target ONLY out of
+    # `theme_basenames` (plan.py checks 5 and 8), so a curator journal, map or `index.md` in the
+    # view is just as run-killing a pick as a human note. This mirrors the `theme_basenames`
+    # derivation below EXACTLY — same `_is_mergeable_note` over the same stamped-paths set — so the
+    # menu and the gate cannot drift apart. kb_schema.md §7.1 states this property to the model;
+    # keep the three in step.
+    live_now = scan_live_tree(layout, schema_version=schema_version)
+    try:
+        bundle = build_bundle(
+            layout,
+            repo,
+            manifest,
+            related_k=related_k,
+            mergeable_paths={
+                n.rel_path
+                for n in live_now.notes
+                if _is_mergeable_note(n) and n.rel_path in live_now.curator_paths
+            },
+        )
+    except AttachmentError as exc:
+        # A claimed event declares attachments in a shape this build cannot read (ADR-0041 D4.2).
+        # `parse_attachments` is deliberately fail-loud there — reading it as "no attachments"
+        # would drop the artefact and publish a note citing bytes nobody wrote — so the refusal
+        # surfaces HERE as the clean FAILED run every other integrity rejection produces, never as
+        # a traceback out of run() that strands the claimed batch in `_kb/processing/` (§4).
+        return _fail(
+            layout,
+            manifest,
+            state_store,
+            now=now,
+            reasons=[f"BUNDLE-ATTACH: {exc}"],
+            max_attempts=max_attempts,
+        )
 
     # #60 batch observability: the run's claim/bundle shape + the queue depth left after the claim
     # (one cheap dir count — the un-claimed FIFO remainder the next trigger will pick up). Captured
@@ -564,33 +855,57 @@ def _run_locked(
     # the committed worktree, so the §4.1 BASENAME/LINK checks grade against the real tree.
     with repo.worktree(at=base_commit) as wt:
         wt_layout = RepoLayout(wt)
-        # Parse the live tree ONCE and derive BOTH registries: the all-basenames set (CREATE
-        # uniqueness + LINK resolvability grade against this) and the THEME-only subset (MERGE/
-        # CONTEST targets grade against this, mirroring apply._resolve_target_path theme_only).
-        # strict=True: a malformed note in the live tree is integrity-critical here (the basename /
-        # theme registries grade the model's plan), so surface it loudly rather than silently
-        # building an incomplete registry. The browse read path uses the tolerant default instead.
-        # A malformed note in the LIVE tree is an operator problem, not a crash: `run()` catches
-        # only LockHeld, so this raise escaped as a traceback that left the claimed batch stranded
-        # in `_kb/processing/` while `agora status` still printed `failed_events: 0` and
-        # `agora doctor` still printed `status: healthy` — and each `agora watch` tick recovered,
-        # re-claimed and re-crashed. One hand-edited `wiki/` note (an Obsidian note with no
-        # frontmatter fence) is enough to trigger it. Keep strict=True — an incomplete registry
-        # would misgrade the model's plan — and turn the raise into the FAILED run the contract
-        # already promises, so #96's `last_failure` names the offending path.
-        try:
-            notes = parse_all_notes(wt_layout, strict=True)
-        except FrontmatterError as exc:
+        # Parse the live tree ONCE, CLASSIFY it (#152), and derive BOTH registries: the
+        # all-basenames set (CREATE uniqueness + LINK resolvability grade against this) and the
+        # THEME-only subset (MERGE/CONTEST targets grade against this, mirroring
+        # apply._resolve_target_path sourced_only).
+        #
+        # This used to be a strict parse_all_notes whose FrontmatterError failed the run. That was
+        # already an improvement on the traceback it replaced (a claimed batch stranded in
+        # `_kb/processing/` while `agora status` printed `failed_events: 0`), but it still had the
+        # wrong subject: opening the repo in Obsidian and saving ONE fenceless note failed EVERY
+        # subsequent run, forever, because the offending file sits in the base commit.
+        # `scan_live_tree` keeps the strictness where it is an integrity signal — a malformed note
+        # that still carries the curator's own stamp — and downgrades a human draft to a warning
+        # (#152, ADR-0014 D1/D4).
+        live_tree = scan_live_tree(wt_layout, schema_version=schema_version)
+        if live_tree.malformed_curator is not None:
             return _fail(
                 layout,
                 manifest,
                 state_store,
                 now=now,
-                reasons=[f"LIVE-TREE: unparseable note in the curated tree — {exc}"],
+                reasons=[
+                    f"LIVE-TREE: unparseable note in the curated tree — "
+                    f"{live_tree.malformed_curator}"
+                ],
                 max_attempts=max_attempts,
             )
-        live_basenames = {n.basename for n in notes}
-        theme_basenames = {n.basename for n in notes if _is_theme_note(n)}
+        notes = list(live_tree.notes)
+        # DELIBERATELY over ALL notes, human ones included. A human note is not a producer artifact,
+        # but its basename is still TAKEN: dropping it here would let a CREATE_THEME reuse that
+        # basename, and APPLY writes `wiki/concepts/<basename>.md` unconditionally — an Obsidian
+        # note saved under `wiki/concepts/` would be silently overwritten. The registry that must
+        # exclude human notes is the MERGE/CONTEST target set below, and it does.
+        #
+        # `wiki/people/**` is the ONE exclusion, and it is ADR-0041 D3.3's, not a softening of the
+        # rule above: people basenames do NOT join the global `[[basename]]` identity space at all
+        # (lint's L1-1 duplicate check and L1-15 alias/basename union exclude them too). Without
+        # this, a human file at `wiki/people/hando/agora.md` would make `CREATE_THEME
+        # basename=agora` a hard PLAN failure — a human-owned tree the curator may never write
+        # acquiring VETO power over curator naming, which is the exact inverse of what D3.3 grants
+        # it. The stated consequence: a people note is addressed by path, never by `[[basename]]`.
+        live_basenames = {n.basename for n in notes if not is_people_path(n.rel_path)}
+        theme_basenames = {
+            n.basename
+            for n in notes
+            if _is_mergeable_note(n) and n.rel_path in live_tree.curator_paths
+        }
+        # Carried to the report (seeded into `prose_warnings` at PASS 2) so a published run says out
+        # loud which notes it did not grade — the operator surface `agora doctor` mirrors.
+        live_tree_warnings: list[str] = (
+            [_human_notes_warning(live_tree.human_paths)] if live_tree.human_paths else []
+        )
 
         # ADR-0011 §0 / §4.3: append `_agora_scratch/` to the WORKTREE's own .gitignore BEFORE
         # invoking the backend, so the backend's PASS-1 plan.json + any model scratch are writable
@@ -636,6 +951,11 @@ def _run_locked(
             live_basenames=live_basenames,
             theme_basenames=theme_basenames,
             gated_candidate_ids=bundle.gated_candidate_ids,
+            # ADR-0041 D2.6: the day's single journal is basenamed by the run date and sharded by
+            # its year/month. Injected here — the curator already holds `run_date = run_id[:10]` —
+            # rather than parsed back out of `plan.run_id`, which is MODEL-supplied: deriving a
+            # curator-owned path segment from model output is the inversion D2.6 exists to forbid.
+            run_date=run_date,
         )
         if plan_errors:
             return _fail(
@@ -649,20 +969,62 @@ def _run_locked(
 
         # APPLY (deterministic, §3): the worker materializes ALL
         # structure/frontmatter/sources/links/
-        # MOC/index/sentinels. confidence is MIRRORED from the candidate worst-case (never a plan
+        # map/index/sentinels. confidence is MIRRORED from the candidate worst-case (never a plan
         # field) so the backend can never inflate it.
         confidence = {c.candidate_id: c.confidence for c in bundle.candidates if c.confidence}
-        # raw_writes is the EXACT {raw_ref: content} set the engine materialized this run (ADR-0010
+        # raw_writes is the EXACT {raw_ref: bytes} set the engine materialized this run (ADR-0010
         # D3). The final-diff gate admits ONLY these exact paths-with-content under raw/; any other
         # raw/ change (a brain-planted file, or a PASS-2 overwrite of an engine-written source) is
         # then rejected off-allowlist, so the brain still never writes raw/.
-        raw_writes = apply_plan(
-            plan,
-            worktree=wt,
-            run_date=run_date,
-            provenance=bundle.provenance,
-            confidence=confidence,
-        )
+        # A containment failure (`_contained` / `_resolve_target_path` raising ApplyError) is a
+        # tamper signal, not a crash: it must produce the same clean FAILED run + error.json every
+        # other integrity rejection does (ADR-0011 §4 "never an uncaught traceback out of run()"),
+        # not an escaping traceback. It is NO LONGER latent: the ASCII PATH/ALLOWLIST regex it used
+        # to be latent behind is gone (ADR-0041 D4.4 replaced it with `pathsafe.is_safe_component`
+        # plus the leading-`_` rejection), and APPLY now raises ApplyError on its own preconditions
+        # too — a map basename already taken by another note (`_assert_map_basename_free`) and a
+        # canonical source ref that is not a normalized path under `raw/`. Every one of those
+        # arrives here, as a clean FAILED run with the cause named in error.json.
+        try:
+            raw_writes = apply_plan(
+                plan,
+                worktree=wt,
+                run_date=run_date,
+                provenance=bundle.provenance,
+                confidence=confidence,
+                # The claimed events' staged bytes, which travelled WITH them into the run
+                # (`_attach/` beside `events/`). APPLY is the only writer of `raw/_blob/`
+                # (ADR-0041 D4.2 / ADR-0020 decision 3), and this is the one seam by which
+                # original bytes reach it — the backend never sees the directory, let alone the
+                # bytes.
+                attachments_dir=attachment_dir(layout.processing_dir / manifest.run_id / "events"),
+            )
+        except ApplyError as exc:
+            return _fail(
+                layout,
+                manifest,
+                state_store,
+                now=now,
+                reasons=[f"PATH/ALLOWLIST: {exc}"],
+                max_attempts=max_attempts,
+            )
+        except FrontmatterError as exc:
+            # DEFENCE IN DEPTH for the same contract (§4 "never an uncaught traceback out of
+            # run()"). APPLY re-opens existing notes with an UNGUARDED `frontmatter.parse` in four
+            # places — `_update_index`, `_update_map`, `_apply_append_journal`, and the
+            # `_apply_merge`/`_apply_contested` targets. `scan_live_tree`'s structural + stamp
+            # classification is what SHOULD keep a malformed note from ever reaching them, and the
+            # plan gate covers the merge targets; this catch is the belt to that pair of braces, so
+            # no live-tree note can ever escape `run()` as a traceback that strands the claimed
+            # batch in `_kb/processing/` with `agora status` reporting `failed_events: 0`.
+            return _fail(
+                layout,
+                manifest,
+                state_store,
+                now=now,
+                reasons=[f"APPLY-PARSE: unparseable note reached APPLY — {exc}"],
+                max_attempts=max_attempts,
+            )
 
         # The post-APPLY tree is structurally complete with empty body regions (prose_complete still
         # false). Persist phase=applied BEFORE PASS 2 so a crash recovers at the right §9 entry.
@@ -687,8 +1049,8 @@ def _run_locked(
         # production: a PASS-2 write to any OTHER `wiki/` note passed the §4.2 gate untested and
         # then passed §4.0 too, because the final-diff allowlist admits the whole `wiki/` prefix
         # (constants.ALLOWLIST_DIR_PREFIXES). Reproduced end-to-end: an adversarial backend rewrote
-        # an unrelated theme's body AND flipped its frontmatter `status`, and the run PUBLISHED
-        # with `failure=None`; deleting that note while scrubbing its MOC references published too,
+        # an unrelated concept's body AND flipped its frontmatter `status`, and the run PUBLISHED
+        # with `failure=None`; deleting that note while scrubbing its map references published too,
         # losing the note. `_agora_scratch/` is already excluded per-worktree (above), so backend
         # scratch can never enter this baseline.
         _git(wt, "add", "-A")
@@ -703,7 +1065,9 @@ def _run_locked(
         # Seeded, not appended later: an APPEND_DAILY that never flagged needs_prose contributes NO
         # region, so a plan made only of those has an empty `needs_prose` map and skips the whole
         # block below — the one shape that most needs the diagnostic (#131).
-        prose_warnings: list[str] = _plan_shape_warnings(plan)
+        # `live_tree_warnings` FIRST: a note the run refused to grade is context for everything
+        # below it, and it is the one warning a run with no prose at all still has to carry (#152).
+        prose_warnings: list[str] = [*live_tree_warnings, *_plan_shape_warnings(plan)]
         prose_counts: dict[str, int] = {}
         if needs_prose:
             base_state = {rel: (wt / rel).read_text(encoding="utf-8") for rel in needs_prose}
@@ -736,9 +1100,9 @@ def _run_locked(
             # baseline, so a write outside `needs_prose` reaches check 1 instead of being invisible.
             _git(wt, "add", "-A")
             pass2_diff = _parse_name_status_z(
-                _git(wt, "diff", "--cached", "--name-status", "-z", applied_tree).stdout
+                _git_bytes(wt, "diff", "--cached", "--name-status", "-z", applied_tree).stdout
             )
-            changed = sorted({rel for _status, rel in pass2_diff})
+            changed = sorted({rel for _status, rel, _old in pass2_diff})
             # The validator reads BOTH sides for `log.md` (and for any needs_prose note); supply
             # every changed path so an out-of-scope edit is graded on real bytes, never on a
             # defaulted empty string that would silently compare equal.
@@ -746,7 +1110,7 @@ def _run_locked(
             per_file_new = dict(new_state)
             for rel in changed:
                 if rel not in per_file_old:
-                    per_file_old[rel] = _blob_at(wt, applied_tree, rel)
+                    per_file_old[rel] = _blob_text_at(wt, applied_tree, rel)
                 if rel not in per_file_new:
                     per_file_new[rel] = _worktree_text(wt / rel)
             author_errors = validate_author_diff(
@@ -814,14 +1178,33 @@ def _run_locked(
             # new_state is now STALE for any cleared note (its last reader was the grading above).
             # Re-read from disk rather than trusting it if you add a reader below.
 
-        # §4.4 deterministic LINT of the full worktree — the SAME gate the dashboard runs. A lint
-        # failure is a structural failure: discard the whole diff, publish nothing (§4.4).
+        # §4.4 deterministic LINT — the SAME gate the dashboard runs, over the SAME worktree, with
+        # every rule and severity unchanged. What #152 narrows is the SUBJECT: the gate grades what
+        # the CURATOR PRODUCED, which is (a) every path THIS run added or modified — the run's own
+        # diff against base_commit, the same name-status view the final-diff gate reads — plus (b)
+        # every note carrying the curator's stamp from an earlier run. A note in neither set was
+        # written by a human; it is read (it still resolves links and feeds the orphan derivation)
+        # but never graded, so an Obsidian save can no longer hard-reject the run in perpetuity.
+        # A DELETED path is excluded: there is nothing left on disk to lint.
+        _git(wt, "add", "-A")
+        run_diff = _parse_name_status_z(
+            _git_bytes(wt, "diff", "--cached", "--name-status", "-z", base_commit).stdout
+        )
+        touched_this_run = {rel for status, rel, _old in run_diff if not status.startswith("D")}
+        producer_scope = set(live_tree.curator_paths) | touched_this_run
         lint_result = lint(
             wt_layout,
             taxonomy=taxonomy,
             run_date=run_date,
             run_id=run_id,
             max_orphans=max_orphans,
+            scope=producer_scope,
+            # Passed EXPLICITLY although `lint` would read the same value off `taxonomy`: this run
+            # already resolved the schema once (above) and every consumer of that fact must be
+            # visibly the same one. Under schema 2 the ruleset also excludes `wiki/people/**` from
+            # the graded population inside `lint()` itself (D3.3), which is what keeps a human's
+            # draft in a tree the curator may not write from hard-rejecting this run.
+            schema_version=schema_version,
         )
         if not lint_result.ok:
             # ERRORS ONLY, matching the gate's own predicate (``LintResult.ok`` is False iff an
@@ -968,9 +1351,9 @@ def _run_locked(
         published_commit=new_commit,
     )
 
-    # ADR-0008 (readers resolve a PUBLISHED commit): the CAS moved only the curated ref; the
-    # repo-owner's MAIN working copy is still parked at base_commit, so core.Wiki/kb_query (which
-    # read the on-disk tree) would not yet see the published theme. Fast-forward the working copy to
+    # ADR-0008 (readers resolve a PUBLISHED commit): the CAS moved only the curated ref; the repo-
+    # owner's MAIN working copy is still parked at base_commit, so core.Wiki/kb_query (which read
+    # the on-disk tree) would not yet see the published concept. Fast-forward the working copy to
     # the new tip AFTER state is saved + the manifest is finalized, so the read-after-publish
     # contract holds. GUARDED: a sync failure (e.g. an owner left the working tree dirty) must NOT
     # undo a durable publish — the diff is already in git and state is finalized; we keep
@@ -1017,6 +1400,10 @@ def _run_locked(
         # log.md, the commit subject and state.counters stay byte-identical, and only when the run
         # had prose to author — a run with no needs_prose keeps its small report shape.
         **prose_counts,
+        # #152: how many notes the run READ but did not GRADE (no curator stamp). Emitted ONLY when
+        # there are any, so a purely curated repo's report shape is byte-unchanged. `agora doctor`
+        # and the dashboard's health() derive the same number from the tree, outside a run.
+        **({"unmanaged_notes": len(live_tree.human_paths)} if live_tree.human_paths else {}),
     }
 
     return RunReport(
@@ -1256,7 +1643,12 @@ def _fail(
                 # failed/ beside the error record. A preserved event IS a terminal disposition, so
                 # it counts as one: `counts["failed"]` and `counters.failed` stay honest, and no
                 # counts KEY changes (the #123 strict-equality assertions hold).
-                os.replace(event_path, failed_dir / event_path.name)
+                dest = failed_dir / event_path.name
+                os.replace(event_path, dest)
+                # The event's staged bytes follow it into failed/ (ADR-0041 D4.2): a terminal
+                # failure is exactly where an operator needs the ORIGINAL artefact beside the event
+                # to work out what happened, and `processing/` is about to be rmtree'd.
+                carry_attachments(dest, source_dir=events_dir)
                 failed += 1
 
     bounded = _bounded_reasons(reasons)
@@ -1406,6 +1798,10 @@ def _preserve_one_event(event_path: Path, preserve_dir: Path) -> bool:
     so a preserved event is indistinguishable from the original an operator captured. Never raises —
     it runs on the failure/recovery paths, where an exception would strand the events after it in
     the disposal loop, turning a one-event problem into a whole-run one.
+
+    Its staged ATTACHMENT bytes are preserved with it (ADR-0041 D4.2). Without that the no-loss
+    floor would only be half a floor: the event survives naming an artefact whose only copy was
+    inside the ``processing/`` tree the caller ``rmtree``s a moment later.
     """
     try:
         preserve_dir.mkdir(parents=True, exist_ok=True)
@@ -1414,9 +1810,11 @@ def _preserve_one_event(event_path: Path, preserve_dir: Path) -> bool:
             # Already preserved under this run (a re-walked directory) — nothing to do, and
             # clobbering would overwrite an immutable event.
             return False
+        source_dir = event_path.parent
         os.replace(event_path, dest)
     except OSError:
         return False
+    carry_attachments(dest, source_dir=source_dir)
     return True
 
 
@@ -1589,7 +1987,7 @@ def _strip_region_stray_links(text: str, candidate_id: str, allowed: set[str]) -
 
 
 def _is_engine_written_raw(
-    path: str, status: str, worktree: Path, raw_writes: dict[str, str]
+    path: str, status: str, worktree: Path, raw_writes: dict[str, bytes]
 ) -> bool:
     """True iff ``path`` is EXACTLY an engine-written canonical ``raw/`` source (ADR-0010 D3).
 
@@ -1600,6 +1998,22 @@ def _is_engine_written_raw(
     * the file's current bytes equal what the engine wrote (``raw_writes[path]``) — a PASS-2
       OVERWRITE of an engine source (same path, forged content; appears as ``A``/``M`` in the cached
       diff vs ``base_commit``) has mismatched bytes → rejected.
+
+    The two are NOT interchangeable and the second NEVER subsumes the first. The membership test is
+    the AUTHORSHIP check ("the engine wrote this path this run"); the byte comparison is only an
+    ADDITIONAL self-check that the engine's own write survived PASS 2 intact (Stratum note §5). No
+    property computable from a file's own content — a content-addressed ``raw/_blob/<ab>/<sha256>``
+    basename that correctly hashes its own bytes, most of all — may ever be substituted for
+    membership: a brain can always compute that hash for bytes it invents, so "self-consistent" is
+    an integrity claim, never an authorship one. Hash-named plants stay rejected because they are
+    absent from ``raw_writes``, and that is the only reason they are rejected.
+
+    Comparison is on RAW BYTES (``read_bytes()``), not decoded text: ``raw/`` captures may be binary
+    or non-UTF-8, and decoding them as text raised :class:`UnicodeDecodeError` here (#85). Comparing
+    bytes obliges the writer to write bytes too — hence ``write_bytes`` in
+    ``_materialize_raw_source`` — which is a NEW obligation, not a fix for a prior false reject: the
+    old text/text pair's ``write_text`` newline translation was cancelled by ``read_text``'s
+    universal-newline decode on the read side, so it did not previously mismatch on LF-only bodies.
 
     This replaces the prior blanket ``raw/``-prefix admit, which waved through ANY ``raw/`` add or
     modify and so let a brain forge the immutable verification baseline during PASS 2 (the §4.2
@@ -1615,11 +2029,11 @@ def _is_engine_written_raw(
     full = worktree / path
     if not full.is_file() or full.is_symlink():
         return False
-    return full.read_text(encoding="utf-8") == raw_writes[path]
+    return full.read_bytes() == raw_writes[path]
 
 
 def _assert_final_diff_allowlisted(
-    worktree: Path, *, base_commit: str, raw_writes: dict[str, str]
+    worktree: Path, *, base_commit: str, raw_writes: dict[str, bytes]
 ) -> list[str]:
     """Assert the worktree's pending diff touches ONLY canonical-ALLOWLIST paths (ADR-0011 §4.0).
 
@@ -1639,12 +2053,42 @@ def _assert_final_diff_allowlisted(
     sorted for deterministic error records. This catches any out-of-allowlist file the backend
     physically wrote that the §4.1 PLAN gate (which only constrains plan-IMPLIED paths) cannot see.
     ``_kb/``, ``_meta/``, ``_templates/``, git internals, and hooks stay REJECTED.
+
+    A rename/copy's SOURCE path is graded too, not just its destination: ``git`` reports only the
+    NEW path in ``--name-status`` by default, so a PASS-2 rename of a protected file (a ``_kb/``
+    inbox entry, an engine ``raw/`` source, a schema symlink) INTO the allowlist would otherwise
+    read as an ordinary in-allowlist add with the deletion of the protected original invisible —
+    silently exfiltrating it into the curated tree. A rename out of a non-allowlisted prefix is
+    graded as though it were a delete of that protected path.
     """
     _git(worktree, "add", "-A")
-    out = _git(worktree, "diff", "--cached", "--name-status", "-z").stdout
+    out = _git_bytes(worktree, "diff", "--cached", "--name-status", "-z").stdout
 
     reasons: list[str] = []
-    for status, path in _parse_name_status_z(out):
+    for status, path, old_path in _parse_name_status_z(out):
+        old_has_surrogate = old_path is not None and _has_surrogate_escape(old_path)
+        if _has_surrogate_escape(path) or old_has_surrogate:
+            reasons.append(
+                f"FINAL-DIFF: {path!r} ({status}) is not valid UTF-8 — refusing to grade an "
+                f"unnameable path"
+            )
+            continue
+        # The rename/copy SOURCE: graded exactly as the destination would be, BEFORE the
+        # destination checks below, so an off-allowlist source is rejected even when the
+        # destination alone would look like an ordinary in-allowlist add.
+        if old_path is not None:
+            if old_path in SCHEMA_SYMLINKS:
+                reasons.append(
+                    f"FINAL-DIFF: schema symlink {old_path!r} was modified ({status}, rename "
+                    f"source) — immutable"
+                )
+                continue
+            if not is_allowlisted_path(old_path):
+                reasons.append(
+                    f"FINAL-DIFF: rename/copy source {old_path!r} ({status}) is outside the "
+                    f"canonical ALLOWLIST — treated as a delete of a protected path"
+                )
+                continue
         # §4.5: a NEW/MODIFIED schema symlink (or any change touching one) fails the run; an
         # unchanged pre-existing symlink never appears in the diff, so any appearance here is an
         # illegal mutation.
@@ -1689,17 +2133,34 @@ def _worktree_text(path: Path) -> str:
     return path.read_text(encoding="utf-8", errors="replace")
 
 
-def _blob_at(worktree: Path, tree: str, rel: str) -> str:
-    """``rel``'s text in ``tree``, or ``""`` when the path did not exist there (a PASS-2 ADD).
+def _blob_at(worktree: Path, tree: str, rel: str) -> bytes:
+    """``rel``'s RAW BYTES in ``tree``, or ``b""`` when the path did not exist there (a PASS-2 ADD).
 
-    Used to give :func:`agora_kb.curator.apply.validate_author_diff` the real base bytes for a path
-    outside ``needs_prose`` (whose text ``base_state`` never captured), so the ``log.md`` equality
-    check grades actual content instead of two defaulted empty strings.
+    Bytes, not text, because ``rel`` ranges over the FULL PASS-2 changed set — which includes
+    ``raw/``, where a capture may legitimately be binary or non-UTF-8. Decoding here made
+    ``git show`` raise :class:`UnicodeDecodeError` out of the PASS-2 collection loop, so a forged
+    BINARY ``raw/`` file crashed the run with a traceback instead of producing the ordinary #135
+    FINAL-DIFF TAMPER rejection. Callers that genuinely need text go through :func:`_blob_text_at`.
     """
     try:
-        return _git(worktree, "show", f"{tree}:{rel}").stdout
+        return _git_bytes(worktree, "show", f"{tree}:{rel}").stdout
     except RuntimeError:
-        return ""
+        return b""
+
+
+def _blob_text_at(worktree: Path, tree: str, rel: str) -> str:
+    """``rel``'s text in ``tree`` (lossy-decoded), or ``""`` when it did not exist there.
+
+    Used to give :func:`agora_kb.curator.apply.validate_author_diff` the real base content for a
+    path outside ``needs_prose`` (whose text ``base_state`` never captured), so the ``log.md``
+    equality check grades actual content instead of two defaulted empty strings.
+    ``errors="replace"`` MIRRORS :func:`_worktree_text`, the NEW side of that comparison, so both
+    are mangled identically and an UNCHANGED undecodable file still compares equal. The residual —
+    two DIFFERENT undecodable blobs collapsing to the same replaced string — can only make §4.2
+    under-report, and §4.2 merely degrades the prose pass; the enforcing gate for ``raw/`` is
+    :func:`_is_engine_written_raw`, which compares RAW BYTES and is unaffected.
+    """
+    return _blob_at(worktree, tree, rel).decode("utf-8", errors="replace")
 
 
 def _restore_out_of_scope(worktree: Path, tree: str, paths: list[str]) -> None:
@@ -1723,27 +2184,70 @@ def _restore_out_of_scope(worktree: Path, tree: str, paths: list[str]) -> None:
             (worktree / rel).unlink(missing_ok=True)
 
 
-def _parse_name_status_z(out: str) -> list[tuple[str, str]]:
-    """Parse ``git diff --name-status -z`` output into ``[(status, path), ...]`` (NUL-separated).
+def _parse_name_status_z(out: bytes) -> list[tuple[str, str, str | None]]:
+    """Parse ``git diff --name-status -z`` output into ``[(status, path, old_path), ...]``.
 
     ``-z`` separates every field by NUL: ``A\\0path\\0`` for simple statuses, and for
     renames/copies ``R<score>\\0old\\0new\\0`` (three NUL fields). We report the NEW path for a
-    rename/copy (the one that lands in the curated tree). Empty trailing tokens are ignored.
+    rename/copy (the one that lands in the curated tree) as ``path``, and the OLD path as the third
+    element (``None`` for a non-rename/copy status) so a caller can grade the SOURCE side too — a
+    rename out of a protected prefix is a delete of a protected file, which the new-path-only view
+    cannot see. Empty trailing tokens are ignored.
+
+    Takes RAW BYTES, split on the NUL byte BEFORE any decoding, and each field is then decoded with
+    ``errors="surrogateescape"`` (never raises, #85 / #135): a text-mode read here would (a) let a
+    non-UTF-8 byte raise :class:`UnicodeDecodeError` out of the integrity gate as an uncaught
+    traceback instead of a rejection, and (b) run ``-z``'s NUL-framed, otherwise-untouched byte
+    stream through universal-newline translation, silently rewriting an embedded ``\\r`` in a path
+    to ``\\n`` before the gate ever compares it. Splitting bytes on ``\\0`` first sidesteps both.
     """
-    tokens = [t for t in out.split("\0") if t != ""]
-    pairs: list[tuple[str, str]] = []
+    tokens = [t for t in out.split(b"\0") if t != b""]
+    decoded = [t.decode("utf-8", errors="surrogateescape") for t in tokens]
+    pairs: list[tuple[str, str, str | None]] = []
     i = 0
-    while i < len(tokens):
-        status = tokens[i]
-        if status[:1] in ("R", "C") and i + 2 < len(tokens):
-            pairs.append((status, tokens[i + 2]))  # new path
+    while i < len(decoded):
+        status = decoded[i]
+        if status[:1] in ("R", "C") and i + 2 < len(decoded):
+            pairs.append((status, decoded[i + 2], decoded[i + 1]))  # new path, old path
             i += 3
-        elif i + 1 < len(tokens):
-            pairs.append((status, tokens[i + 1]))
+        elif i + 1 < len(decoded):
+            pairs.append((status, decoded[i + 1], None))
             i += 2
         else:  # pragma: no cover — malformed/truncated git output
             break
     return pairs
+
+
+def _has_surrogate_escape(text: str) -> bool:
+    """True if ``text`` contains a lone surrogate — i.e. it round-tripped through
+    ``errors="surrogateescape"`` from bytes that are not valid UTF-8.
+
+    A path a legitimate git operation can ever produce is always valid UTF-8 (git stores/emits path
+    bytes verbatim and this codebase only ever writes UTF-8 paths); a surrogate here means the byte
+    stream held un-decodable bytes, which :func:`_parse_name_status_z` no longer raises on. Grading
+    it explicitly turns an unnameable path into a named FINAL-DIFF rejection rather than either a
+    traceback (the pre-surrogateescape behaviour) or a silent pass-through.
+    """
+    return any(0xD800 <= ord(ch) <= 0xDFFF for ch in text)
+
+
+def _git_bytes(worktree: Path, *args: str) -> subprocess.CompletedProcess[bytes]:
+    """Run a hermetic, no-shell ``git`` command in ``worktree``, capturing stdout as RAW BYTES.
+
+    The bytes-mode twin of :func:`_git`, for the one thing git can legitimately print that is not
+    text: the CONTENT of a blob. ``git show <tree>:<path>`` on a binary or non-UTF-8 ``raw/``
+    capture has no valid text decoding, and decoding it would raise
+    :class:`UnicodeDecodeError` out of the caller instead of letting the integrity gate reject the
+    file (#135). stderr is still decoded (UTF-8, replacing) purely to build the error message.
+    """
+    cmd = ["git", "-c", f"core.hooksPath={os.devnull}", *args]
+    cp = subprocess.run(  # noqa: S603 (argv list, no shell)
+        cmd, cwd=str(worktree), capture_output=True
+    )
+    if cp.returncode != 0:
+        stderr = cp.stderr.decode("utf-8", errors="replace").strip()
+        raise RuntimeError(f"git {' '.join(args)} failed (rc={cp.returncode}): {stderr}")
+    return cp
 
 
 def _git(worktree: Path, *args: str) -> subprocess.CompletedProcess[str]:
@@ -1752,13 +2256,41 @@ def _git(worktree: Path, *args: str) -> subprocess.CompletedProcess[str]:
     ``core.hooksPath=<devnull>`` neutralizes any host/repo hook so the deterministic gate can never
     execute planted code (ADR-0008 step 3). argv list, never a shell string. Raises on failure so a
     git error in the integrity gate surfaces rather than being silently treated as a clean diff.
+
+    stdout is decoded as UTF-8 EXPLICITLY, never with the host locale: git emits UTF-8 path bytes,
+    so a cp949 / latin-1 console would otherwise mis-decode the non-ASCII paths in
+    ``diff --cached --name-status -z`` and turn a legitimate engine write into a spurious
+    off-allowlist FINAL-DIFF rejection (#85). The ``-z`` name-status callers now go through
+    :func:`_git_bytes` + :func:`_parse_name_status_z` directly (bytes end-to-end, never raising on
+    an invalid path), so this function's remaining callers only ever see git's own ASCII output
+    (shas, ref names, ``add``/``checkout`` silence) — but ``errors="surrogateescape"`` (never
+    ``strict``) is still used rather than assumed, so a surprising non-UTF-8 byte in stderr (e.g. a
+    server-hook message) degrades to an unprintable-but-decoded string instead of raising
+    UnicodeDecodeError out of the integrity gate. Blob CONTENT never comes through here — see
+    :func:`_git_bytes`.
     """
     cmd = ["git", "-c", f"core.hooksPath={os.devnull}", *args]
     cp = subprocess.run(  # noqa: S603 (argv list, no shell)
-        cmd, cwd=str(worktree), capture_output=True, text=True
+        cmd,
+        cwd=str(worktree),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="surrogateescape",
     )
     if cp.returncode != 0:
-        raise RuntimeError(f"git {' '.join(args)} failed (rc={cp.returncode}): {cp.stderr.strip()}")
+        # ``cp.stderr`` was decoded with ``errors="surrogateescape"`` above, so a non-UTF-8 byte in
+        # git's stderr (e.g. a server-hook message this process does not control) can be present as
+        # a lone surrogate code point. Embedding it directly (rather than via ``!r``) would raise
+        # ``UnicodeEncodeError`` the moment an operator-facing print/log tries to encode this
+        # message under a strict stream — re-encode/decode through ``replace`` (U+FFFD) so the
+        # message is always printable (mirrors ``core.repo._printable``).
+        stderr = (
+            cp.stderr.strip()
+            .encode("utf-8", errors="surrogateescape")
+            .decode("utf-8", errors="replace")
+        )
+        raise RuntimeError(f"git {' '.join(args)} failed (rc={cp.returncode}): {stderr}")
     return cp
 
 
@@ -1801,9 +2333,10 @@ def _needs_prose_map(
     Each ``region_id`` is the run-scoped ``region_sentinel_id`` (``{run_id}--{candidate_id}``),
     computed via the SAME helper APPLY uses to PLACE the region so the two can never drift (the bare
     candidate_id is per-run and collides across runs). CREATE_THEME →
-    ``wiki/<domain>/themes/<basename>.md``; APPEND_DAILY →
-    ``wiki/<domain>/daily/<domain>-<run_date>.md`` (multiple dispositions can share one daily file,
-    so ids accumulate); MERGE_INTO_THEME → the target theme path resolved in the live tree.
+    ``wiki/concepts/<basename>.md``; APPEND_DAILY → ``wiki/notes/<yyyy>/<mm>/<run_date>.md`` (ONE
+    journal per run date, REPO-WIDE under ADR-0041 D2.6, so dispositions from several domains share
+    it and ids accumulate); MERGE_INTO_THEME → the target concept/summary path resolved in the live
+    tree.
     """
     needs: dict[str, list[str]] = {}
     sentinels: dict[str, set[str]] = {}
@@ -1817,7 +2350,7 @@ def _needs_prose_map(
         # The PERSISTED region id is RUN-SCOPED (region_sentinel_id), computed via the SAME shared
         # helper APPLY uses to PLACE the region, so the §4.2 sentinels set can never drift from the
         # ids on disk. The bare candidate_id is per-run and would collide across runs (a MERGE /
-        # cross-run daily append into a note holding a prior-run region).
+        # cross-run journal append into a note holding a prior-run region).
         sentinel_id = region_sentinel_id(plan.run_id, disp.candidate_id)
         needs.setdefault(rel, []).append(sentinel_id)
         sentinels.setdefault(rel, set()).add(sentinel_id)
@@ -1840,26 +2373,56 @@ def _needs_prose_map(
 def _disposition_note_rel_path(disp: Disposition, worktree: Path, run_date: str) -> str | None:
     """Return the repo-relative path the disposition authors prose into, or ``None`` if none.
 
-    For APPEND_DAILY the daily basename defaults to ``<domain>-<run_date>`` when the plan omits it —
-    MIRRORING :func:`agora_kb.curator.apply._apply_append_daily`, which derives daily basenames
-    worker-side (ADR-0011 §2/§3.1, daily basenames are not a model field). Without this default a
-    §4.1-valid APPEND_DAILY that omits ``basename`` (the normal case) would build no sentinel entry,
-    leaving APPLY's authored region unfilled and failing the §4.4 lint.
+    KB WIKI SCHEMA 2 (ADR-0041 D1): CREATE_THEME → ``wiki/concepts/<basename>.md``; APPEND_DAILY →
+    ``wiki/notes/<yyyy>/<mm>/<run_date>.md``; MERGE_INTO_THEME → the live-tree path of the target
+    concept/summary. Both composed paths come from :func:`agora_kb.curator.apply._note_path` — the
+    SAME composer APPLY writes through — so this funnel cannot name a file APPLY did not create.
+
+    The APPEND_DAILY *basename* is no longer read from the plan at all. v1 defaulted it to
+    ``<domain>-<run_date>`` because there was one daily per domain; D2.6 makes it ONE journal per
+    ``run_date``, repo-wide, basenamed by that date and sharded by its year/month — a deterministic
+    curator-owned fact, never a function of model output. The PLAN gate separately asserts
+    ``disp.basename == run_date`` (plan.py's PATH/ALLOWLIST check), so a model that names the
+    journal something else is rejected there rather than silently overridden here. The domain is
+    likewise no longer a precondition: a subject-less journal still has a path (D2.2 leg 1).
+
+    This is the SINGLE funnel every downstream ``needs_prose``/``sentinels`` write and read site
+    goes through (:func:`_needs_prose_map`, :func:`_strip_stray_links`, :func:`_degrade_prose`,
+    :func:`_clear_body_status`), so the containment check
+    (:func:`agora_kb.curator.apply._contained`, the same helper APPLY's own write sites use) is
+    applied HERE, once, rather than re-derived at each call site — matching
+    :func:`agora_kb.curator.apply._resolve_target_path`'s exact-name (not glob-pattern) lookup so a
+    ``target_basename`` containing a glob metacharacter cannot widen the search onto another note,
+    and its ``sourced_only`` KIND filter so a ``[[basename]]`` that resolves to a journal, a map or
+    a human-owned ``wiki/people/`` note yields no region here either.
     """
-    if disp.op == "CREATE_THEME" and disp.domain and disp.basename:
-        return f"wiki/{disp.domain}/themes/{disp.basename}.md"
-    if disp.op == "APPEND_DAILY" and disp.domain:
-        basename = disp.basename or f"{disp.domain}-{run_date}"
-        return f"wiki/{disp.domain}/daily/{basename}.md"
-    if disp.op == "MERGE_INTO_THEME" and disp.target_basename:
-        matches = sorted(
-            p
-            for p in (worktree / "wiki").rglob(f"{disp.target_basename}.md")
-            if p.is_file() and p.parent.name == "themes"
-        )
-        if matches:
-            return matches[0].relative_to(worktree).as_posix()
-    return None
+    try:
+        candidate: Path
+        if disp.op == "CREATE_THEME" and disp.basename:
+            candidate = _note_path(worktree, "concept", disp.basename)
+        elif disp.op == "APPEND_DAILY":
+            candidate = _note_path(worktree, "note", run_date, run_date=run_date)
+        elif disp.op == "MERGE_INTO_THEME" and disp.target_basename:
+            wanted = f"{disp.target_basename}.md"
+            matches = sorted(
+                p
+                for p in (worktree / "wiki").rglob("*.md")
+                if p.is_file()
+                and p.name == wanted
+                and path_kind(p.relative_to(worktree).as_posix()) in _MERGE_TARGET_KINDS
+            )
+            if not matches:
+                return None
+            candidate = _contained(worktree, matches[0])
+        else:
+            return None
+    except ApplyError:
+        # A basename plan.py's PATH/ALLOWLIST check would have rejected (a separator, a leading
+        # `_`, a Windows device stem), or a matched file reached through a symlinked directory.
+        # Kept fail-CLOSED (treated as "no note") so this funnel can never become the escape the
+        # ADR-0041 D4.4 charset widening is otherwise guarded against at the gate.
+        return None
+    return candidate.relative_to(worktree).as_posix()
 
 
 def _present_sentinel_ids(path: Path) -> set[str]:
@@ -1917,11 +2480,11 @@ def _clear_body_status(worktree: Path, needs_prose: dict[str, list[str]]) -> lis
     (unused by :func:`run` today — it exists so a test can call this directly and so a future
     counter is a one-line change).
 
-    CLEAR-ONLY: this never ADDS the key. APPLY owns placement, and an unauthored region with no
-    flag remains a legitimate state AT REST even though the curator no longer mints one: #131 made
-    region placement and the flag one decision in :func:`agora_kb.curator.apply._apply_append_daily`
+    CLEAR-ONLY: this never ADDS the key. APPLY owns placement, and an unauthored region with no flag
+    remains a legitimate state AT REST even though the curator no longer mints one: #131 made region
+    placement and the flag one decision in :func:`agora_kb.curator.apply._apply_append_journal`
     (before it, a ``needs_prose=False`` APPEND_DAILY placed an empty region that nothing would ever
-    author). The shape survives on disk in any daily whose APPEND_DAILY dispositions never flagged
+    author). The shape survives on disk in any journal whose APPEND_DAILY dispositions never flagged
     ``needs_prose`` — which the reference brain cannot emit, since ``ollama_brain.normalize_plan``
     forces the flag for this op — and in any hand-edited or imported note. Stamping a flag there
     would pin a ``pending`` this clear-only step could never retract: the flag would outlive every
@@ -1957,7 +2520,7 @@ def _plan_shape_warnings(plan: Plan) -> list[str]:
 
     APPEND_DAILY's body deliverable IS its dated section (schema §7.1: "yes (that section)"), and
     since #131 APPLY places that section only when the disposition flags ``needs_prose``. So a plan
-    that leaves the flag off publishes a daily recording the day's ``sources:`` and nothing
+    that leaves the flag off publishes a journal recording the day's ``sources:`` and nothing
     readable. That is UNDER-DELIVERY by the planner, not corruption by the engine — hence a warning
     and neither of the two louder options:
 
@@ -2194,6 +2757,22 @@ def _move_events_to_processed(layout: RepoLayout, manifest: RunManifest, run_dat
 
     A same-filesystem rename (``_kb/`` is one tree), so each event stays byte-for-byte immutable
     (DATA-MODEL §1). Idempotent: an already-moved event (a re-finalize after a crash) is skipped.
+
+    An event's staged attachment bytes follow it (:func:`~agora_kb.core.inbox.carry_attachments`):
+    they are part of the same delivery and are drained with it, so ``processing/<run-id>/`` is left
+    with nothing to clean up and ``processed/<date>/_attach/`` keeps the artefact recoverable beside
+    the event that named it. The carry is best-effort by contract and never raises: aborting a
+    drain half-way would leave events split across two directories, which is strictly worse than one
+    artefact that did not follow its event.
+
+    **The carried copy is not always redundant.** ``raw/_blob/`` holds the bytes only for a
+    candidate the run KEPT: ``apply_plan`` short-circuits ``DROP``/``NOOP`` before
+    ``_sources_union`` runs, so a dropped capture's artefact is never materialised (exactly as a
+    dropped free-text capture writes no ``raw/<domain>/<event_id>.md``). For those events
+    ``processed/<date>/_attach/`` is the ONLY remaining copy — recoverable and never pruned, but
+    inside the git-ignored ``_kb/`` spool, so it is not committed, pushed, or backed up by
+    ``agora sync``. Stated in DATA-MODEL §1 and INGEST-CONTRACT §0.1 too, so the capture
+    surfaces do not overstate their promise.
     """
     events_dir = layout.processing_dir / manifest.run_id / "events"
     if not events_dir.is_dir():
@@ -2205,6 +2784,7 @@ def _move_events_to_processed(layout: RepoLayout, manifest: RunManifest, run_dat
         if dest.exists():
             continue
         os.replace(event_path, dest)
+        carry_attachments(dest, source_dir=events_dir)
 
 
 def _commit_message(run_id: str, counts: dict[str, int]) -> str:

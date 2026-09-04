@@ -115,7 +115,8 @@ sources: []        # REQUIRED & non-empty UNLESS status == stub. Array of raw/ p
                    # MUST cite the source artifact itself, NEVER a .meta.yaml sidecar (§3.4, L1-8b).
                    # Every claim on the page traces to one of these (Karpathy provenance).
 related: []        # array of "[[basename]]" strings — typed-edge substitute (see §3)
-origin: claude-code | codex | qwen | gemini | opencode | hermes | web:<user> | harvest:<agent> | manual
+origin: claude-code | codex | qwen | gemini | opencode | hermes | manual
+                   #   | agent:<name> | web:<user> | harvest:<agent>
                    # PRESENT IFF any provenance source is harvest:<agent>; EXACT copy of the inbox
                    #   `source` enum (DATA-MODEL §1); loop-prevention (DATA-MODEL §7). Worker-set, §7.
 confidence: high | medium | low                        # mirrors inbox-item confidence (DATA-MODEL §1)
@@ -570,20 +571,29 @@ health:
 def lint_l1(worktree: Path, taxonomy: Taxonomy, run_date: str, run_id: str,
             review_mode: bool, base_taxonomy: Taxonomy) -> list[LintError]:
     notes = parse_all_notes(worktree)          # path -> Note; EXCLUDES schema doc + its symlinks (§1)
+    graded = curator_produced(notes)           # the SUBJECT of the gate: what the CURATOR wrote —
+                                               #   this run's diff ∪ notes carrying the engine's
+                                               #   `sources:`/`timestamp:` stamp (ADR-0014 D1
+                                               #   addendum). A human's hand-written wiki/ note is
+                                               #   READ (links resolve to it, its basename is
+                                               #   reserved) but never graded. Read-only surfaces
+                                               #   (dashboard, kb_status, doctor) pass graded=notes.
     errors: list[LintError] = []
-    by_basename = collect_basenames(notes)     # basename -> [paths]
+    by_basename = collect_basenames(graded)    # basename -> [paths]  (GRADED only: the curator
+                                               #   cannot fix a collision whose other half it may
+                                               #   not touch)
     for base, paths in by_basename.items():
         if len(paths) > 1: errors.append(DuplicateBasename(base, paths))          # L1-1
         if base == "index" and not is_root_index(paths[0]):                       # L1-13
             errors.append(SecondIndex(paths[0]))
-    name_space = set(by_basename)
-    for n in notes:                            # L1-15 alias/basename uniqueness
+    name_space = all_basenames(notes)          # EVERY basename on disk is reserved, graded or not
+    for n in graded:                           # L1-15 alias/basename uniqueness (graded aliases)
         for a in n.fm.aliases:
             if a in name_space: errors.append(AliasCollision(n.path, a))
             name_space.add(a)
-    known = set(by_basename) | all_aliases(notes)
+    known = all_basenames(notes) | all_aliases(notes)   # RESOLUTION spans the whole tree (§3.1)
     new_tags = set(taxonomy.allowed_tags) - set(base_taxonomy.allowed_tags)       # for L1-18 (evolution path only)
-    for n in notes:
+    for n in graded:
         if not is_utf8_lf_no_bom(n.path): errors.append(BadEncoding(n.path))      # L1-16
         # L1-2/L1-3 — body markdown links (ADR-0014 D3, path→basename) AND related:/children:
         # frontmatter [[basename]] entries
@@ -630,8 +640,11 @@ committing, the compare-and-swap of the curated ref) is done by deterministic wo
 You perform EXACTLY two acts:
 
 - **PASS 1 — PLAN.** You read a read-only bundle (this schema, the taxonomy, the dedup'd candidates, and a
-  pre-fetched `related/` view per candidate produced by the SAME `core.read` as QUERY) and emit ONE
-  closed-vocabulary JSON file `_agora_scratch/plan.json`. You write NO wiki files in PASS 1.
+  pre-fetched `related/` view per candidate produced by `core.read`'s deterministic, model-free
+  lexical oracle `query_lexical`, which by contract never gains a model tier; that view lists only
+  THEME notes the curator itself produced, so every hit in it is a legal `MERGE_INTO_THEME` /
+  `MARK_CONTESTED` target) and emit ONE closed-vocabulary JSON file `_agora_scratch/plan.json`.
+  You write NO wiki files in PASS 1.
 - **PASS 2 — AUTHOR.** After the worker has materialized all structure, you write ONLY note-body prose
   **between worker-placed sentinels** `<!-- agora:body:start id=<candidate_id> -->` …
   `<!-- agora:body:end id=<candidate_id> -->`. You touch nothing outside a sentinel pair.
@@ -792,8 +805,9 @@ SearchHit   = { repo, path, anchor, line, excerpt,
 - Frozen enums: `type ∈ {index, moc, theme, daily}`; `status ∈ {active, stub, contested, deprecated}`
   (`orphan` / `stale` are derived, NOT statuses; there is NO `canonical` / `verified` / `draft` / `stale`
   status); `confidence ∈ {high, medium, low}`; `body_status ∈ {pending}` (else the key is absent); and
-  `origin ∈ {claude-code, codex, qwen, gemini, opencode, hermes, web:<user>, harvest:<agent>, manual}` —
-  an exact copy of the inbox `source` enum (DATA-MODEL §1), with NO `upload` value.
+  `origin ∈ {claude-code, codex, qwen, gemini, opencode, hermes, manual, agent:<name>, web:<user>,
+  harvest:<agent>}` — an exact copy of the inbox `source` enum (DATA-MODEL §1), with NO `upload`
+  value. It tracks that enum: a form added there (`agent:<name>`, #147) is legal here the same day.
 - `summary` is REQUIRED on every note (a one-line precis); `body_status: pending` is present only while a
   note's body is not yet authored (§2.6).
 - `origin` is present **IFF** a provenance source is `harvest:<agent>`; it round-trips loop-prevention

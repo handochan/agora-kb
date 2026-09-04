@@ -842,7 +842,7 @@ def test_terminal_event_republishes_after_requeue(tmp_path: Path) -> None:
     assert failed_event_count(layout) == 0
     assert (layout.processed_dir / published.run_id[:10] / f"{event_id}.md").is_file()
     with repo.worktree(at=published.published_commit) as tree:
-        assert (tree / "wiki" / "ai-tech" / "themes" / "curator-concurrency.md").is_file()
+        assert (tree / "wiki" / "concepts" / "curator-concurrency.md").is_file()
 
 
 def test_default_requeue_spends_its_one_remaining_attempt_then_returns_terminal(

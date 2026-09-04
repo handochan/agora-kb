@@ -23,6 +23,7 @@ from pathlib import Path
 
 import pytest
 
+from agora_kb.config import KbIdentity, write_kb_identity
 from agora_kb.core import Repo, frontmatter
 from agora_kb.core.layout import RepoLayout
 from agora_kb.curator.apply import apply_plan
@@ -37,8 +38,13 @@ RUN_DATE = "2026-06-13"
 E1 = "2026-06-13T02-40-10.000Z--a1b2c3"
 E2 = "2026-06-13T02-41-00.000Z--d4e5f6"
 
+#: The fixture `_meta/kb.yaml` identity (ADR-0041 D1.5): APPLY stamps it into every note's `kb:`,
+#: so it is FIXED rather than minted — a per-run id would make these frontmatter assertions
+#: non-reproducible.
+KB_ID = "01J8ZQ3M4N5P6Q7R8S9T0V1W2X"
+
 TAXONOMY = Taxonomy(
-    schema_version=1,
+    schema_version=2,
     taxonomy_policy="open",
     allowed_tags=("curator", "concurrency", "architecture"),
     domains=("ai-tech", "economy", "general"),
@@ -46,9 +52,15 @@ TAXONOMY = Taxonomy(
 
 
 def _worktree(tmp_path: Path) -> Path:
-    """A repo worktree with the emitted schema + taxonomy and a populated raw/ for source refs."""
+    """A schema-2 worktree with the emitted schema + taxonomy and a populated raw/ for source refs.
+
+    `_meta/kb.yaml` is written through the production writer: APPLY refuses to write any note when
+    the identity file is missing (ADR-0041 D1.5), so a worktree without one is not a schema-2 repo.
+    """
     layout = RepoLayout(tmp_path)
-    emit_schema(layout, taxonomy=TAXONOMY)
+    layout.root.mkdir(parents=True, exist_ok=True)
+    write_kb_identity(layout, KbIdentity(kb_id=KB_ID, name="agora-fixture"))
+    emit_schema(layout, taxonomy=TAXONOMY, schema_version=2)
     for event in (E1, E2):
         raw = tmp_path / "raw" / "ai-tech" / f"{event}.md"
         raw.parent.mkdir(parents=True, exist_ok=True)
@@ -102,7 +114,8 @@ def _append_daily(**overrides: object) -> Disposition:
         "event_ids": (E2,),
         "op": "APPEND_DAILY",
         "domain": "ai-tech",
-        "basename": f"ai-tech-{RUN_DATE}",
+        # ADR-0041 D2.6: ONE journal per run_date, repo-wide, BASENAMED by that date.
+        "basename": RUN_DATE,
         "title": f"Daily {RUN_DATE}",
         "summary": "Daily consolidation.",
         "status": "active",
@@ -115,17 +128,18 @@ def _append_daily(**overrides: object) -> Disposition:
 
 
 def _apply_full_bundle(wt: Path) -> dict[str, dict[str, object]]:
-    """Apply a CREATE_THEME (+ its lazily-created MOC + root index) and an APPEND_DAILY.
+    """Apply a CREATE_THEME (+ its lazily-created MAP + root index) and an APPEND_DAILY.
 
-    Returns ``{note_kind: frontmatter}`` for the theme/daily/moc/index so a single APPLY exercises
-    every emitted note type. The CREATE_THEME triggers the lazy MOC + index creation (ADR-0010 §1).
+    Returns ``{note_kind: frontmatter}`` for the concept/journal/map/index so a single APPLY
+    exercises every emitted note kind. The CREATE_THEME triggers the lazy map + index creation
+    (ADR-0041 D1.3 — the map is created at the first concept of its subject).
     """
     plan = _plan(_create_theme(), _append_daily())
     prov = {**_provenance("c1", E1), **_provenance("d1", E2)}
     apply_plan(plan, worktree=wt, run_date=RUN_DATE, provenance=prov)
-    theme = wt / "wiki" / "ai-tech" / "themes" / "curator-concurrency.md"
-    daily = wt / "wiki" / "ai-tech" / "daily" / f"ai-tech-{RUN_DATE}.md"
-    moc = wt / "wiki" / "ai-tech" / "ai-tech-moc.md"
+    theme = wt / "wiki" / "concepts" / "curator-concurrency.md"
+    daily = wt / "wiki" / "notes" / "2026" / "06" / f"{RUN_DATE}.md"
+    moc = wt / "wiki" / "maps" / "ai-tech.md"
     index = wt / "index.md"
     return {
         "theme": frontmatter.parse(theme.read_text(encoding="utf-8"))[0],
@@ -159,8 +173,11 @@ E4 = "2026-06-20T02-41-00.000Z--cc22dd"
 def test_timestamp_re_derived_on_every_update_branch(tmp_path: Path) -> None:
     # The OKF invariant timestamp == <updated>T00:00:00Z must hold after a RE-TOUCH, not just at
     # CREATE: a stale timestamp (updated advances, timestamp frozen) breaks OKF "last meaningful
-    # change". Run 1 creates the bundle; run 2 (a LATER run_date) re-touches the daily (append),
-    # the merge target theme, the MOC and the root index via their UPDATE branches.
+    # change". Run 1 creates the bundle; run 2 (a LATER run_date) re-touches the merge target
+    # concept, the subject map and the root index via their UPDATE branches, and exercises the
+    # JOURNAL's append branch by writing TWO APPEND_DAILY dispositions into the one journal of that
+    # run date (ADR-0041 D2.6 — the journal is per run_date, repo-wide, so "append into an existing
+    # journal" is a within-run-date fact now, not a cross-run one).
     wt = _worktree(tmp_path)
 
     # Run 1 — create the theme (+ lazy MOC + index) and the daily.
@@ -172,8 +189,9 @@ def test_timestamp_re_derived_on_every_update_branch(tmp_path: Path) -> None:
         raw.parent.mkdir(parents=True, exist_ok=True)
         raw.write_text(f"raw capture {event}\n", encoding="utf-8")
 
-    # Run 2 — APPEND_DAILY re-touches the existing daily; MERGE_INTO_THEME re-touches the theme;
-    # both trigger the MOC + index re-render (a second theme keeps it on the create-or-update path).
+    # Run 2 — two APPEND_DAILY dispositions land in ONE journal (the second takes the append
+    # branch); MERGE_INTO_THEME re-touches the concept; a second concept keeps the map + index on
+    # the create-or-update path.
     merge = Disposition(
         candidate_id="m2",
         event_ids=(E4,),
@@ -186,7 +204,13 @@ def test_timestamp_re_derived_on_every_update_branch(tmp_path: Path) -> None:
         reason="Overlaps curator-concurrency.",
     )
     plan2 = _plan(
-        _append_daily(candidate_id="d2", event_ids=(E3,), basename=f"ai-tech-{RUN_DATE}"),
+        _append_daily(candidate_id="d2", event_ids=(E3,), basename=RUN_DATE_2),
+        _append_daily(
+            candidate_id="d3",
+            event_ids=(E4,),
+            basename=RUN_DATE_2,
+            summary="A second section in the same journal.",
+        ),
         merge,
         _create_theme(
             candidate_id="c2",
@@ -199,14 +223,15 @@ def test_timestamp_re_derived_on_every_update_branch(tmp_path: Path) -> None:
     )
     prov2 = {
         **_provenance("d2", E3),
+        **_provenance("d3", E4),
         **_provenance("m2", E4),
         **_provenance("c2", E4),
     }
     apply_plan(plan2, worktree=wt, run_date=RUN_DATE_2, provenance=prov2)
 
-    daily = wt / "wiki" / "ai-tech" / "daily" / f"ai-tech-{RUN_DATE}.md"
-    theme = wt / "wiki" / "ai-tech" / "themes" / "curator-concurrency.md"
-    moc = wt / "wiki" / "ai-tech" / "ai-tech-moc.md"
+    daily = wt / "wiki" / "notes" / "2026" / "06" / f"{RUN_DATE_2}.md"
+    theme = wt / "wiki" / "concepts" / "curator-concurrency.md"
+    moc = wt / "wiki" / "maps" / "ai-tech.md"
     index = wt / "index.md"
     re_touched = {
         "daily": frontmatter.parse(daily.read_text(encoding="utf-8"))[0],
@@ -226,7 +251,7 @@ def test_timestamp_re_derived_on_every_update_branch(tmp_path: Path) -> None:
 
 def test_okf_version_appears_only_on_bundle_root_index(tmp_path: Path) -> None:
     # OKF marks the BUNDLE ROOT with its version; per the OKF spec (ADR-0014 D2) okf_version lives
-    # on index.md alone — never on a theme/daily/moc.
+    # on index.md alone — never on a concept/journal/map.
     wt = _worktree(tmp_path)
     fms = _apply_full_bundle(wt)
     assert fms["index"]["okf_version"] == "0.1"
@@ -260,8 +285,11 @@ def test_fresh_repo_init_seed_index_is_okf_conformant(tmp_path: Path) -> None:
     # index.md is itself a conformant OKF bundle root the moment the repo is initialized.
     target = tmp_path / "kb"
     repo = Repo.resolve(target)
-    repo.init()
+    repo.init(schema_version=2, kb_id=KB_ID)
     fm, _ = frontmatter.parse(repo.layout.index_file.read_text(encoding="utf-8"))
+    # `type:` survives ONLY as the OKF mirror of `kind` (ADR-0041 D2.5 / OD-3), which is exactly
+    # what makes this test still about OKF conformance rather than about the retired authority.
+    assert fm["kind"] == "index"
     assert fm["type"] == "index"
     assert fm["okf_version"] == "0.1"
     assert fm["description"] == fm["summary"]
@@ -275,7 +303,7 @@ def test_fresh_repo_init_seed_index_is_okf_conformant(tmp_path: Path) -> None:
 
 def test_okf_augmented_notes_lint_clean(tmp_path: Path) -> None:
     # The additive OKF fields are OPTIONAL/unknown to lint (no new L1 rule, no required-field
-    # change): the full emitted bundle (theme + daily + lazily-created moc + index) lints CLEAN.
+    # change): the full emitted bundle (concept + journal + lazy map + index) lints CLEAN.
     wt = _worktree(tmp_path)
     _apply_full_bundle(wt)
     result = lint(RepoLayout(wt), taxonomy=TAXONOMY, run_date=RUN_DATE, run_id=RUN_ID)

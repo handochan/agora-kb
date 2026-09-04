@@ -27,15 +27,25 @@ build and a maintainer can reproduce it:
 
 ### Release status — read this before you trust the section below
 
-**`v0.1.0b1` has not been cut.** The version *string* is set and `agora --version` reports it, but
-no git tag exists yet, so `git checkout v0.1.0b1` will not resolve and there is no published
-artifact. Installing today means installing from `main`, which moves.
+**`v0.1.0b1` is tagged but not published.** *Corrected 2026-09-05: this section previously said "no
+git tag exists yet", which was wrong.* The annotated tag `v0.1.0b1` (commit `2987959`, 2026-08-24)
+exists locally **and on `origin`**, so `git checkout v0.1.0b1` resolves. What does **not** exist is
+a published artifact: `gh release list` is empty and PyPI has no `agora-kb` project. Installing
+today still means installing from `main`, which moves.
+
+**That tag is a KB schema-1 snapshot** — it predates Stratum (ADR-0041) entirely. Per the tag
+convention above (*tags are never moved or deleted*), it stays as it is: **schema 2 ships as
+`v0.1.0b2`, never as a re-issued `v0.1.0b1`** (owner judgement, 2026-09-05). One consequence has an
+ordering constraint attached: the PyPI name reservation (#102) must not upload `0.1.0b1`, because
+PyPI forbids re-uploading a filename and that would pin the first published artifact to the
+schema-1 snapshot.
 
 The `0.1.0b1` notes below are the prepared release notes, not a shipped release. Remaining gates
 (epic [#93](https://github.com/handochan/agora-kb/issues/93), Track A): PyPI name reservation
-(#102), repo metadata (description/topics, part of #106), and a clean-machine release smoke run by
-someone who is not the author (#107) — plus the `windows-latest` gate ruling that decides whether
-Windows ships in b1 or b2. Landed: [`SECURITY.md`](SECURITY.md) (#95),
+(#102, see the ordering constraint above), repo metadata (description/topics, part of #106), and a
+clean-machine release smoke run by someone who is not the author (#107 — which must be re-run
+against the schema-2 default, since the existing evidence is schema-1) — plus the `windows-latest`
+gate ruling that decides whether Windows ships in b1 or b2. Landed: [`SECURITY.md`](SECURITY.md) (#95),
 [`docs/GETTING-STARTED.md`](docs/GETTING-STARTED.md) (#104),
 [`docs/LIMITATIONS.md`](docs/LIMITATIONS.md) (#105), the README reconciliation (#106), the two
 `agora doctor` truthfulness fixes (#129), the frontmatter `body_status` invariant (#119) with its
@@ -249,18 +259,31 @@ against the code. The normative version lives in
    not shipped. The compensating control ADR-0013 promises for `allow_reduced_isolation` (forced
    review mode) is not implemented (#91).
    The real last line of defense is the deterministic FINAL-DIFF gate, not the kernel.
-9. **No schema migration command.** `agora repo upgrade` is #63, still open. The *read* side is
-   guarded as of #98 — a build that meets a repo whose `schema_version` it does not support
+9. **No IN-PLACE schema upgrade command.** `agora repo upgrade` is #63, still open. The *read* side
+   is guarded as of #98 — a build that meets a repo whose `schema_version` it does not support
    refuses every acting command with one line and exit 1, and `agora doctor` says so on its
    `schema:` line — so an old binary can no longer silently misread a newer repo and write on top
-   of that misreading. What is still missing is the other half: if the schema moves, there is no
-   command to move a repo with it. A repo initialized by this beta is expected to keep working —
-   the format is what is stable, not `main`.
+   of that misreading. What is still missing is the *in-place* half: no command upgrades a repo
+   where it stands, on its own history. Crossing a schema boundary is not impossible — item 12
+   names the conversion into a **new** repo (`agora import --from-kb`) that this build does ship —
+   it is upgrading a repo without moving it that #63 still owes. A repo initialized by this beta is
+   expected to keep working — the format is what is stable, not `main`.
 10. **No embeddings and no semantic search.** Deterministic BM25F ranking is the contract
     (ADR-0009/0012), not a gap waiting to be filled; ADR-0032 is reserved and evidence-triggered.
     If you want vector recall, Agora is the wrong tool today.
 11. **No contributor process yet.** `CONTRIBUTING.md` and `CODE_OF_CONDUCT.md` are deliberately
     post-beta; the beta's audience is dogfooders and evaluators, not contributors.
+12. **A KB created by an earlier build is read-only, and there is no in-place upgrade.** This build
+    writes **KB wiki schema 2** (the note's kind is the first directory under `wiki/`; the topic
+    lives in `subjects:` — ADR-0041). `agora repo init` creates schema 2 by default. A repo on the
+    old layout still **reads** — `query`, `status`, `browse`, the MCP read tools, the web read
+    routes — while every **write** path refuses with one message naming the crossing: `curate`,
+    `watch`, `requeue`, `harvest`, `kb_curate`, and `Inbox.write` itself, which covers `kb_remember`
+    and the web upload. `agora doctor` still runs on such a repo but fails the verdict
+    (`status: unhealthy`, exit 1), so a `doctor`-based health gate sees it. The one sanctioned
+    crossing is a conversion into a NEW repo — `agora import --from-kb <old-repo> <new-repo>` —
+    which never modifies the source; there is no `agora repo upgrade` (#63/#98) and no dual-layout
+    reader. Expanded in [`docs/LIMITATIONS.md`](docs/LIMITATIONS.md) §6a.
 
 <!-- No version-compare link definitions here on purpose: Keep a Changelog's footer links point at
      git tags, and this repo has none yet (see "Release status"). They get added with the first tag,

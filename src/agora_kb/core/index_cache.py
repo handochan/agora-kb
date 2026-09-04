@@ -61,7 +61,14 @@ __all__ = [
 # (see the module docstring).
 # 2: issue #56 (ADR-0012 addendum) — NFC + CJK-bigram tokenizer, and aliases/summary joined
 #    field_tokens; a v1 cache carries stale derived tokens, so the whole cache is invalidated.
-CACHE_SCHEMA_VERSION = 2
+# 3: issue #153 (ADR-0041 D5) — KB wiki schema 2 flips the wiki axis, and BOTH bump triggers fire.
+#    ``is_moc`` is PARSER-COMPUTED and serialized (``_parse_note`` sets it from the path predicate,
+#    which now reads ``wiki/maps/…`` instead of ``wiki/<domain>/<domain>-moc.md``), so a v2 entry
+#    whose ``source_digest`` still matches would carry a stale map verdict forever; and the
+#    serialized ``_Note`` shape GAINS ``kind`` + ``subjects``. The fresh-repo argument does not
+#    cover this: ``SUPPORTED_KB_SCHEMA_VERSIONS`` is ``{1, 2}``, so a schema-1 repo with a
+#    populated ``_kb/index/`` is reachable by a schema-2 build — exactly the stale-cache case.
+CACHE_SCHEMA_VERSION = 3
 
 
 def source_digest(text: str) -> str:

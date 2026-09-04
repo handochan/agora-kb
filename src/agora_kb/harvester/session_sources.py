@@ -15,6 +15,12 @@ envelope (both in :mod:`agora_kb.harvester.connectors`):
   per-project transcripts as JSONL under ``~/.claude/projects/**/*.jsonl``, one typed record per
   line. Codex/Gemini/Hermes analogues slot in behind the same Protocol without touching the
   orchestrator or the distiller.
+* :data:`SESSION_READERS` — the NAMED registry that makes that slot-in reachable from operator
+  config (issue #147). Until it existed the seam was real but unwired: ``build_connectors`` never
+  injected a reader, so every ``session:<agent>`` connector in the world was parsed as Claude Code
+  JSONL — the engine privileging ONE agent's transcript format, which is exactly what invariant #6
+  forbids. A connector now declares ``format:`` and the registry resolves the parser; the engine
+  reacts to that DECLARED format, never to the ``<agent>`` half of the connector key.
 
 **Role flattening (ADR-0023 §7 — injection safety).** A whole transcript is a much larger
 prompt-injection surface than a memory bullet; an embedded ``assistant``/``system`` turn may be
@@ -35,7 +41,7 @@ opt-in LLM digest for higher recall is an explicit future stage (ADR-0023 O1/C),
 from __future__ import annotations
 
 import json
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
@@ -43,6 +49,12 @@ __all__ = [
     "TurnRecord",
     "SessionReader",
     "ClaudeCodeJsonlReader",
+    "SessionFormatError",
+    "SESSION_READERS",
+    "implemented_session_formats",
+    "is_implemented_format",
+    "DEFAULT_SESSION_FORMAT",
+    "build_session_reader",
 ]
 
 # Tool-input keys checked, in order, for the ONE most-identifying scalar arg summarizing a tool_use.
@@ -182,3 +194,97 @@ class ClaudeCodeJsonlReader:
                         role="tool", text=summary, timestamp=timestamp, tool_name=name.strip()
                     )
             # thinking / tool_result / unknown blocks are intentionally dropped (v1 noise control).
+
+
+# --- the format registry (issue #147, invariant #6) ---------------------------------------------
+
+
+class SessionFormatError(ValueError):
+    """A ``session:`` connector declared a format this build cannot parse.
+
+    Raised by :func:`build_session_reader` for an unknown name *and* for a registered-but-unbuilt
+    placeholder. Both are FAIL-LOUD: silently falling back to the Claude Code parser would feed a
+    foreign transcript to the wrong grammar and yield a silent zero-fact harvest (or, worse,
+    garbage facts) with no signal that the format was never supported.
+    """
+
+
+def _unimplemented(fmt: str, hint: str) -> Callable[[], SessionReader]:
+    """Registry factory for a format whose SLOT exists but whose parser does not (yet).
+
+    The name is registered so the intent is documented in the ONE place a grammar is added, and a
+    contributor writing the parser only has to swap this factory for a class. It raises at BUILD
+    time (not mid-scan) so the failure is attributed to config, not to a transcript.
+
+    A slot is NOT part of the operator-facing vocabulary: :func:`is_implemented_format` marks it,
+    ``config._SESSION_FORMATS`` holds only the implemented names, and ``load_connector_specs``
+    therefore rejects a declared slot at CONFIG-LOAD time with "unknown format". That ordering is
+    load-bearing: reaching :func:`build_session_reader` with a slot name would raise inside
+    ``build_connectors``, which builds EVERY connector before ``agora harvest`` applies its
+    ``--connector`` filter — so one aspirational line in ``adapters.yaml`` would disable harvesting
+    for unrelated, healthy connectors, on a repo ``agora doctor`` had just called healthy.
+    """
+
+    def factory() -> SessionReader:
+        raise SessionFormatError(
+            f"session format {fmt!r} is a registered slot with no reader in this build ({hint}); "
+            f"implement a SessionReader for it and register it in SESSION_READERS"
+        )
+
+    factory.agora_unimplemented = True  # type: ignore[attr-defined]
+    return factory
+
+
+#: The default format when a ``session:`` connector declares none - today's behaviour, unchanged.
+DEFAULT_SESSION_FORMAT = "claude-code-jsonl"
+
+#: Transcript format name -> zero-arg factory returning a :class:`SessionReader`.
+#:
+#: The one place a new agent's transcript grammar is added. Keys are FORMAT names, deliberately not
+#: agent names: two agents that share a grammar share one entry, and one agent that changes grammar
+#: gets a second entry - neither of which the engine can express if it dispatches on WHO the agent
+#: is (invariant #6). Keep the IMPLEMENTED keys in sync with ``config._SESSION_FORMATS`` (the config
+#: seam holds the same names as plain strings so it never imports the harvester - the same split
+#: ``_SCOPE_VALUES`` already uses; a sync test asserts the two never drift). A registered SLOT with
+#: no parser (:func:`_unimplemented`) is deliberately NOT in that vocabulary - see
+#: :func:`is_implemented_format`.
+SESSION_READERS: dict[str, Callable[[], SessionReader]] = {
+    DEFAULT_SESSION_FORMAT: ClaudeCodeJsonlReader,
+    # Codex writes its own JSONL rollout files with a DIFFERENT record/payload shape than Claude
+    # Code's. Left a documented placeholder rather than a guessed parser: a reader written against
+    # an unverified grammar fails SILENTLY (zero facts on a real corpus) instead of loudly, which
+    # is a worse outcome than an explicit not-implemented error. NOT declarable in adapters.yaml
+    # until the parser exists (`is_implemented_format` / `config._SESSION_FORMATS`).
+    "codex-jsonl": _unimplemented("codex-jsonl", "Codex rollout JSONL"),
+}
+
+
+def is_implemented_format(fmt: str) -> bool:
+    """True iff ``fmt`` is registered AND this build actually carries its parser.
+
+    The SSOT for "can this name be declared in ``adapters.yaml``". Derived from the registry itself
+    (a placeholder factory is marked by :func:`_unimplemented`), so a slot becoming real is one
+    edit - swap the factory - and everything else follows.
+    """
+    factory = SESSION_READERS.get(fmt)
+    return factory is not None and not getattr(factory, "agora_unimplemented", False)
+
+
+def implemented_session_formats() -> tuple[str, ...]:
+    """The sorted format names an operator may declare today (see :func:`is_implemented_format`)."""
+    return tuple(sorted(name for name in SESSION_READERS if is_implemented_format(name)))
+
+
+def build_session_reader(fmt: str | None = None) -> SessionReader:
+    """Resolve a declared transcript format to a reader; ``None`` -> :data:`DEFAULT_SESSION_FORMAT`.
+
+    The single construction point for session readers, so the ``session:`` connector's own default
+    and the config-driven injection can never disagree about what "unset" means.
+    """
+    name = DEFAULT_SESSION_FORMAT if fmt is None else fmt
+    factory = SESSION_READERS.get(name)
+    if factory is None:
+        raise SessionFormatError(
+            f"unknown session format {name!r}; known formats are {sorted(SESSION_READERS)}"
+        )
+    return factory()

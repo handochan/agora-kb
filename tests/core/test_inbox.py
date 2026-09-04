@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from agora_kb.config import ReadOnlySchemaVersionError
 from agora_kb.core.frontmatter import parse
 from agora_kb.core.hashing import content_sha256
 from agora_kb.core.ids import is_valid_event_id
@@ -331,3 +332,92 @@ def test_failed_event_count_counts_the_nested_layout(tmp_path: Path) -> None:
 
     assert failed_event_count(layout) == 2
     assert list(layout.failed_dir.glob("*.md")) == []  # the non-recursive glob would say 0
+
+
+# --- ADR-0041 D6: the KB-schema write refusal, at the one write primitive ------------------------
+
+
+def _declare_schema(layout: RepoLayout, version: int | None, *, text: str | None = None) -> None:
+    """Write ``_meta/taxonomy.yaml`` declaring ``version`` (or ``text`` verbatim)."""
+    layout.meta_dir.mkdir(parents=True, exist_ok=True)
+    body = text if text is not None else f"schema_version: {version}\ndomains: [general]\n"
+    (layout.meta_dir / "taxonomy.yaml").write_text(body, encoding="utf-8")
+
+
+def test_a_capture_into_a_schema_1_repo_refuses_rather_than_queueing(tmp_path: Path) -> None:
+    """ADR-0041 D6: an inbox that can never drain is silent data loss dressed as success.
+
+    The curator of this build writes schema 2 — schema-2 paths and schema-2 frontmatter — so an
+    event accepted into a schema-1 repo could never be consolidated, and a re-import into a NEW
+    repo (the one crossing that exists) would orphan it. So the write REFUSES, loudly, naming
+    ``agora import --from-kb``, and leaves the inbox untouched.
+
+    The gate lives on ``Inbox.write`` and not on a face because with SUPPORTED_KB_SCHEMA_VERSIONS
+    widened to {1, 2} every entry-point guard PASSES for a schema-1 repo (reads must keep working),
+    so a construction-time guard structurally cannot let ``kb_query`` through while refusing
+    ``kb_remember`` on the same server object.
+    """
+    layout = RepoLayout(tmp_path)
+    _declare_schema(layout, 1)
+
+    with pytest.raises(ReadOnlySchemaVersionError) as exc:
+        Inbox(layout).write(text="remember this", writer="dochan", source="claude-code")
+
+    assert "agora import --from-kb" in str(exc.value)
+    assert Inbox(layout).depth() == 0
+    assert not layout.inbox_dir.exists()
+
+
+def test_a_capture_into_a_schema_2_repo_is_accepted(tmp_path: Path) -> None:
+    """The other side of the same predicate — the current schema is writable, unremarkably."""
+    layout = RepoLayout(tmp_path)
+    _declare_schema(layout, 2)
+
+    receipt = Inbox(layout).write(text="remember this", writer="dochan", source="claude-code")
+
+    assert receipt.queued is True
+    assert Inbox(layout).depth() == 1
+
+
+def test_a_directory_that_declares_no_schema_is_not_refused(tmp_path: Path) -> None:
+    """ "Declares nothing" is UNKNOWN, never "schema 1" — the gate must not fire on a bare dir.
+
+    ``read_canonical_kb_schema_version`` returns ``None`` when ``_meta/taxonomy.yaml`` is absent.
+    Treating that as 1 would turn "wrong cwd" into a confusing schema complaint, and would refuse
+    every capture into a repo that has not been initialized yet — a directory with no schema-1 tree
+    to corrupt and no curator that could drain it either way.
+    """
+    layout = RepoLayout(tmp_path)
+    assert not (layout.meta_dir / "taxonomy.yaml").exists()
+
+    assert Inbox(layout).write(text="a fact", writer="dochan", source="claude-code").queued is True
+
+
+def test_a_pre_98_taxonomy_with_no_schema_key_reads_as_schema_1_and_refuses(tmp_path: Path) -> None:
+    """A READABLE taxonomy with no ``schema_version`` key is a pre-#98 repo — i.e. schema 1.
+
+    The distinction that matters: the FILE's absence is "unknown", the KEY's absence is the
+    documented default of 1. Conflating them would let the oldest repos in existence — the ones
+    with the most to lose — write into a layout their tree is not in.
+    """
+    layout = RepoLayout(tmp_path)
+    _declare_schema(layout, None, text="domains: [general]\nallowed_tags: {}\n")
+
+    with pytest.raises(ReadOnlySchemaVersionError):
+        Inbox(layout).write(text="a fact", writer="dochan", source="claude-code")
+
+
+def test_the_git_ignored_repo_yaml_mirror_cannot_gate_the_write_path(tmp_path: Path) -> None:
+    """The CANONICAL declaration decides, never the operator-local mirror (ADR-0010 §5.1).
+
+    ``_kb/repo.yaml`` is git-IGNORED and rewritten by ``agora repo init`` itself; letting it gate
+    the write path would let one machine's untracked edit decide whether everybody's captures are
+    accepted. So a schema-2 canonical declaration is writable even when a stale local mirror still
+    says 1 — that DISAGREEMENT is lint L1-17's finding, not this gate's.
+    """
+    layout = RepoLayout(tmp_path)
+    _declare_schema(layout, 2)
+    layout.kb_dir.mkdir(parents=True, exist_ok=True)
+    (layout.kb_dir / "repo.yaml").write_text("schema_version: 1\n", encoding="utf-8")
+
+    assert Inbox(layout).write(text="a fact", writer="dochan", source="claude-code").queued is True

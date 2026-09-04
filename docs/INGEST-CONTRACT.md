@@ -23,6 +23,14 @@ repo's `AGENTS.md`/`SCHEMA.md` under an `INGEST` section.
   The deterministic schema LINT (§4.4) is the same code path as ADR-0010's L1/L2 ruleset; the
   `MARK_CONTESTED` convention (§2.1), frontmatter keys, `origin` enum, taxonomy gate, and naming rules are
   all defined there and merely *applied/validated* here.
+- **[ADR-0041](adr/0041-stratum-kind-first-layout.md) — Stratum / KB wiki schema 2** (Proposed):
+  **amends this document.** The op names and the integrity boundary are UNCHANGED — the plan-envelope
+  `schema_version` is not bumped — but every *structural effect* below is now a kind-first path
+  (`wiki/concepts/…`, `wiki/notes/<yyyy>/<mm>/…`, `wiki/maps/…`), §4.0's allowlist gains a
+  `wiki/people/` **exclusion**, and §4.1's PATH check composes the journal shard from an injected
+  `run_date` instead of parsing it out of a model-supplied basename. `raw/` is unmoved.
+  APPLY writes schema 2 and **only** schema 2; a schema-1 repo never reaches this contract, because
+  the write refusal (D6) fires one layer up — see §0 below.
 - Consistent with: [ADR-0002](adr/0002-cqrs-single-writer-curator.md) (single writer),
   [ADR-0005](adr/0005-fully-oss-bom.md) (OSS BOM / swappable backend),
   [ADR-0007](adr/0007-memory-harvester-safety.md) (candidate gating),
@@ -60,7 +68,8 @@ repo's `AGENTS.md`/`SCHEMA.md` under an `INGEST` section.
 ## 0. Where INGEST sits in the transactional loop (ADR-0008 step 5, expanded)
 
 ```
-acquire curator.lock (flock, non-blocking; if held → exit)                              ┐ deterministic
+assert the repo's KB wiki schema is WRITABLE (ADR-0041 D6) — else refuse before the lock ┐ deterministic
+acquire curator.lock (flock, non-blocking; if held → exit)                              │ deterministic
 claim FIFO snapshot inbox/ → processing/<run-id>/ ; write run.json (phase=claimed)      │
 dedup tier 1 (event_key) AUTHORITATIVELY at claim time, inside the lock            [§5] │
 dedup tier 2 (content_sha256, canonical-normalized) → candidate set, prov union   [§5] │
@@ -94,6 +103,72 @@ already valid). Structural integrity NEVER depends on the prose pass. The flat m
 drive recovery (§9): a crash at `applied` re-enters at PASS 2 (re-author prose, no re-PLAN); a `published`
 run is finalized without any backend call (ADR-0008 step 6).
 
+**The writable-schema gate (ADR-0041 D6) sits OUTSIDE this contract, deliberately.** It is asserted
+by the caller — `agora curate`, `agora watch` (per tick, because a repo can change version under a
+long-running scheduler), `agora requeue`, `agora harvest`, the `kb_curate` MCP handler, and
+`Inbox.write` itself — so a repo declaring a KB wiki schema this build will not write is refused
+*before* the lock, the claim, or any backend call. Membership in `SUPPORTED_KB_SCHEMA_VERSIONS`
+(`{1, 2}`) is the READ test; writability is the stricter equality with
+`MAX_SUPPORTED_KB_SCHEMA_VERSION`, raising `ReadOnlySchemaVersionError`. The refusal reaches
+`requeue` and `Inbox.write` for the same reason it reaches `curate`: an inbox that can never drain
+is silent data loss dressed as success. `agora doctor` keeps its diagnostic exemption, and it and
+`agora status` print a READ-ONLY line naming the remedy. That remedy is the same everywhere:
+`agora import --from-kb <old-repo> <new-repo>`, a conversion into a NEW repo (ADR-0041 D6) — there is
+no in-place migrator, and the ADR decided there will not be one for this bump.
+
+### 0.1 CAPTURE SURFACES — what a writer may hand the inbox (ADR-0041 D4.2)
+
+Two surfaces put an **artefact** (a file, as opposed to typed text) into a repo. Every event they
+DO write has one shape, so INGEST sees exactly one kind of event either way — but they differ on
+which files they accept, and rule 1 below states the split rather than promising a parity the code
+does not have:
+
+| surface | writer / source | body | bytes |
+|---|---|---|---|
+| `POST /api/upload` · `/api/upload-batch` · `POST /upload` (web face) | `web` / `web:<user>` | the extractor's markdown + the ADR-0020 provenance header (a file no extractor claims is REFUSED `400`, not stubbed — rule 1) | the uploaded file's original bytes |
+| `agora capture --file PATH [--domain D] [--writer W] [--source S]` (CLI) | `--writer` (default `local`) / `--source` (default `manual`) | the extractor's markdown, or a one-line stub naming the attachment when no extractor claims the extension | the file's bytes |
+
+Rules the two surfaces obey — the contract INGEST may rely on:
+
+1. **The event body is TEXT, always — and the two surfaces differ on the file nobody can extract.**
+   Extraction is unchanged (`ingest/extractors/`, ADR-0025): the markdown read out of the file is
+   the body. No brain, bundle, or plan ever sees bytes (§1). Where an extraction yields *nothing*
+   (a scanned PDF with no text layer, an extension no extractor claims), the two surfaces part:
+   `agora capture` writes a **one-line stub body** naming the attachment and keeps the bytes, while
+   the web face **refuses** an extension no extractor claims with `400 unsupported or ambiguous
+   upload` and stages nothing at all. That is deliberate, not an oversight: a local shell command
+   is the operator saying "keep this", while an HTTP endpoint that silently accepted anything would
+   be an open blob store on a face reachable by a browser. An operator who wants the web face to
+   accept more formats widens `web.extensions.allowed` — or captures the file locally.
+2. **The original bytes ride along as `attachments:`**, staged inside the writer's own inbox
+   namespace at `_kb/inbox/<writer>/_attach/<sha256>.<ext>` and written *before* the event that
+   names them. This is ADR-0020's deferred half: extraction is lossy and irreversible, so the
+   artefact is kept rather than only the text read out of it. APPLY — and only APPLY — later
+   materialises them as `raw/_blob/<ab>/<sha256>.<ext>` (+ its `.meta.yaml` sidecar) and cites the
+   blob path, never the sidecar (L1-8b). The curator remains the sole writer of `raw/`.
+   **A blob is written only where a note cites it:** a candidate the curator `DROP`s (or `NOOP`s)
+   produces no note and therefore no `raw/_blob/` file — its bytes drain to
+   `_kb/processed/<date>/_attach/`, never pruned but git-ignored, so they do not reach the committed
+   tree or `agora sync`. The parity with a DROPped free-text capture (which writes no
+   `raw/<domain>/<event_id>.md` either) is the point; "kept" means kept *in the inbox lineage*,
+   and only a KEPT candidate puts the artefact in git.
+3. **One byte cap, one number.** The per-attachment ceiling is the repo's configured
+   `web.upload.max_bytes` (ADR-0025 / issue #66, default 25 MiB) — the web face resolves it per
+   repo in `build_app`, and `agora capture` resolves the SAME key off the same `_kb/repo.yaml`
+   (falling back to the library default only when that file cannot be read). Lowering the cap
+   therefore lowers it for both surfaces at once. Over-cap is refused per file, before extraction
+   and before any staging — a refused capture leaves no bytes behind.
+4. **Bytes are opaque and are never scanned.** Redaction and the §8 sentinel pass (ADR-0023 §5 /
+   ADR-0027) apply to the extracted TEXT on the paths that already run them; an attachment is
+   stored verbatim, because a redactor that rewrote a PDF would break the one property
+   `raw/_blob/` rests on — `hash(bytes) == basename`.
+5. **A capture is never half-delivered.** An attachment refusal (over cap, integrity, containment)
+   yields no event; the ADR-0041 D6 read-only refusal fires inside `Inbox.write` for both surfaces,
+   so nothing is staged for a repo whose schema this build will not write.
+
+`agora import` (the vault normalizer) is deliberately NOT a blob surface: it normalizes markdown
+that is already text. `kb_remember` stays text-only — MCP has no binary transport in this wave.
+
 ---
 ## 1. INPUT BUNDLE — `_kb/processing/<run-id>/bundle/` (git-ignored; never in the curated diff)
 
@@ -108,10 +183,10 @@ processing/<run-id>/
   bundle/
     manifest.json          { run_id, base_commit, ordered event_ids[], phase:"plan"|"prose", schema_version }
     schema.md              read-only copy of the repo AGENTS.md/SCHEMA.md (the rules the model must obey; ADR-0010)
-    taxonomy.yaml          read-only copy of `_meta/taxonomy.yaml`: { allowed_tags: [kebab-case...], domains: [...], taxonomy_policy, schema_version: 1 } → model MAY NOT invent or expand (§6.1)
+    taxonomy.yaml          read-only copy of `_meta/taxonomy.yaml`: { allowed_tags: [kebab-case...], domains: [...], taxonomy_policy, schema_version } → model MAY NOT invent or expand (§6.1)
     candidates.json        ONE entry per dedup'd candidate (NOT per raw event); see below
     related/<cand-id>.json per-candidate top-k existing notes via core.read (the key move; §1.1)
-    wiki_index.json        root index.md outline + each touched <domain>-moc.md outline + existing basename registry (ADVISORY hint; §1.2)
+    wiki_index.json        root index.md outline + each touched wiki/maps/<subject>.md outline + existing basename registry (ADVISORY hint; §1.2)
 ```
 
 The live `wiki/` tree is present in the worktree (readable). `raw/` and `assets/` binaries are referenced by
@@ -146,13 +221,21 @@ Every manifest `event_id` is reachable through exactly one candidate's `provenan
 trusted to the model.
 
 ### 1.1 Pre-fetched related view (the move that makes a small Qwen reliable)
-For each candidate the worker runs the SAME deterministic `core.read` used by `kb_query`
-([ADR-0009](adr/0009-deterministic-query-contract.md)) over the current wiki and writes
+For each candidate the worker runs `core.read`'s deterministic, model-free lexical oracle
+`Wiki.query_lexical` ([ADR-0009](adr/0009-deterministic-query-contract.md),
+[ADR-0012 §0a](adr/0012-deterministic-query-ranking.md)) over the current wiki and writes
 `related/<cand-id>.json` = an ordered `QueryResult` (`status`, `hits[]` with
 repo/path/anchor/line/excerpt/match_reason/score, plus each hit's frontmatter `title,tags,sources`). The
 backend does mem0-style retrieve-then-decide with ZERO network and NO search tool, satisfying the sandbox
 invariant (ADR-0008) and the local-zero-cost goal. Top-k default `k=8` (tunable in `repo.yaml`). Bundle size
 is bounded (§1.3) so PASS 1 never silently overflows the local context window.
+
+The oracle — not `Wiki.query`, the READ face — is the pinned seam (issue #144). The two compute the
+same bytes today and share one implementation, but `query` is the method that may one day grow a
+ranking tier; the write path may not follow it there, because a mis-merge is permanent (no DELETE in
+the closed op vocabulary) while a bad read is transient. The view is additionally filtered to notes
+the CURATOR produced (ADR-0014 D1 addendum, #152): a human-written note is not a legal
+`MERGE_INTO_THEME` target, so it is never offered as one.
 
 ### 1.2 wiki_index.json is a rebuilt, advisory index
 `wiki_index.json` is regenerated **deterministically from the worktree markdown at `base_commit` on every
@@ -208,8 +291,8 @@ CREATE/MERGE/CONTEST (so every disposition maps to ≥1 event and coverage stays
 
 | op | meaning | structural effect (applied by deterministic code, §3) | needs prose? | allowed for gated candidate? |
 |---|---|---|---|---|
-| `CREATE_THEME` | new atomic concept page | create `wiki/<domain>/themes/<basename>.md` w/ frontmatter (title, status, summary, tags, aliases, sources, related, created, updated, origin?, confidence?); add `[[basename]]` to `<domain>-moc.md` + root index (per ADR-0014 D3, the MOC child bullet is a standard markdown link `[Title](themes/<basename>.md)` and the root index child bullet is `[Title](wiki/<domain>/<domain>-moc.md)`; frontmatter `related:`/`children:` stay `[[basename]]`); insert plan `links[]` | yes (body) | **NO** (may never originate) |
-| `APPEND_DAILY` | dated capture/briefing | create-or-append `wiki/<domain>/daily/<domain>-<YYYY-MM-DD>.md`; add a dated `## ` section (one per **`needs_prose`** disposition, §3.1) + `sources:` line. A disposition that does not flag `needs_prose` contributes provenance only — the `raw/` capture and the `sources:` union — and no section; the run reports that under-delivery on the non-fatal warnings channel rather than failing or coercing the flag (#131, ADR-0011 §3.1 addendum) | yes (the appended section only) | **NO** (originates content) |
+| `CREATE_THEME` | new atomic concept page | create `wiki/concepts/<basename>.md` (kind `concept`) w/ full schema-2 frontmatter (title, kind, kb, subjects, status, summary, tags, aliases, created, updated, derived, provenance, sources, related, origin?, confidence?); create-or-update `wiki/maps/<subject>.md` (created LAZILY at the first concept of that subject) + root `index.md` (per ADR-0014 D3, the map child bullet is a standard markdown link `[Title](../concepts/<basename>.md)` and the root index child bullet points at the map; frontmatter `related:`/`children:` stay `[[basename]]`); insert plan `links[]`. **The path no longer depends on the subject** — a disposition naming no domain still lands at `wiki/concepts/<basename>.md`, with `subjects: []` and no map | yes (body) | **NO** (may never originate) |
+| `APPEND_DAILY` | dated capture/briefing | create-or-append **the one journal of this run date**, `wiki/notes/<yyyy>/<mm>/<YYYY-MM-DD>.md` — both the shard and the basename are composed from the injected `run_date`, never parsed out of the model's basename; add a dated `## <run_date> · <domain>` section (one per **`needs_prose`** disposition, §3.1) + `sources:` line, unioning `subjects:` across the contributing dispositions. A disposition that does not flag `needs_prose` contributes provenance only — the `raw/` capture and the `sources:` union — and no section; the run reports that under-delivery on the non-fatal warnings channel rather than failing or coercing the flag (#131, ADR-0011 §3.1 addendum) | yes (the appended section only) | **NO** (originates content) |
 | `MERGE_INTO_THEME` | fold claim into existing theme | edit target theme: UNION this run's `event_ids` into `sources:` (never drop prior); insert plan `links[]`; place an augmentation sentinel sub-region | yes (only the augmented sub-region) | **YES** — corroborate only |
 | `MARK_CONTESTED` | contradiction | annotate target with the templated `> [!contested]` callout + `[[competing-note]]`; set frontmatter `status: contested` + `contested_by` + `contested_at`; record new claim's provenance; keep BOTH | no (callout is templated, §2.1) | **YES** — on contradiction |
 | `DROP` | discard (noise/redundant/uncertain) | NO wiki edit; record disposition + reason only | no | **YES** — default on doubt |
@@ -299,19 +382,31 @@ The worker (single writer, [ADR-0002](adr/0002-cqrs-single-writer-curator.md)) p
 mutation itself, so correctness is by construction, not by post-hoc rejection:
 - allocate/verify globally-unique basenames by re-scanning the FULL worktree tree at base_commit
   (authoritative, §1.2) + within-plan basenames; create files ONLY under the canonical ALLOWLIST (§4.0);
-- write frontmatter from the plan: `title, status, summary, tags, aliases, sources` (= unioned provenance
-  event_ids + source/writer), `related`, `created` (`YYYY-MM-DD == run_date`, set once), `updated`
-  (`YYYY-MM-DD == run_date` on every edit), `origin?` (harvest), `confidence?` (mirrors inbox; present on
-  harvested regions), `status: contested` + `contested_by?` + `contested_at?` (§2.1), `body_status: pending`
-  for notes needing prose;
+- compose every note path from its KIND, in one place (`RepoLayout.note_path_for`): `concept` →
+  `wiki/concepts/<basename>.md`, `note` → `wiki/notes/<yyyy>/<mm>/<run_date>.md`, `map` →
+  `wiki/maps/<subject>.md`, `index` → root `index.md`. The subject never appears in a path
+  (ADR-0041 D1/D3.2), and `person` is deliberately not composable — `wiki/people/**` is human-owned
+  and asking for a path into it is a caller bug, not a path (D3.3);
+- write frontmatter from the plan: the D2 common base `title, kind, kb, subjects, aliases, tags,
+  created, updated, status, summary, derived, provenance` — where `kind` mirrors the directory (the
+  directory wins if they ever disagree), `kb` is the `_meta/kb.yaml` ULID, and `subjects` is seeded
+  from the disposition's singular `domain` (`[]` when it names none) — plus `sources` (= unioned
+  provenance event_ids + source/writer), `related`, `origin?` (harvest), `confidence?` (mirrors
+  inbox; present on harvested regions), `status: contested` + `contested_by?` + `contested_at?`
+  (§2.1), `body_status: pending` for notes needing prose, and the ADR-0014 D2 OKF mirrors
+  (`type` ← `kind`, `description` ← `summary`, `timestamp`, `okf_version` on the root index only).
+  `created`/`updated` are `YYYY-MM-DD == run_date` (set once / on every edit). A repo with no
+  `_meta/kb.yaml` is REFUSED rather than written half-identified;
 - insert `[[basename]]` wikilinks and verify each resolves to a real (live-tree) or same-plan basename (else
   the plan is rejected at §4.1 check 7);
-- add MOC entries (`<domain>-moc.md`) and root `index.md` entries (per ADR-0014 D3, the child bullets in
-  MOC bodies are standard markdown links `[Title](themes/<basename>.md)` and in the root `index.md` body
-  are `[Title](wiki/<domain>/<domain>-moc.md)`; basename is recovered from the link path; frontmatter
-  `related:`/`children:` arrays remain `[[basename]]`);
-- render the templated `MARK_CONTESTED` callout + frontmatter (§2.1) byte-for-byte; create dated daily
-  sections (§3.1);
+- add map entries (`wiki/maps/<subject>.md`, created LAZILY at the first concept of that subject) and
+  root `index.md` entries (per ADR-0014 D3, the child bullets in map bodies are standard markdown
+  links `[Title](../concepts/<basename>.md)` and in the root `index.md` body are
+  `[Title](wiki/maps/<subject>.md)`; basename is recovered from the link path; frontmatter
+  `related:`/`children:` arrays remain `[[basename]]`). A map's `children:` may hold only
+  `concept`/`summary`/`map` kinds (L1-24); a journal or a people note never appears there;
+- render the templated `MARK_CONTESTED` callout + frontmatter (§2.1) byte-for-byte; create dated
+  journal sections (§3.1);
 - place body sentinels for notes flagged `needs_prose`:
   `<!-- agora:body:start id=<region-id> -->` … `<!-- agora:body:end id=<region-id> -->`
   (CREATE_THEME wraps the whole body; MERGE_INTO_THEME wraps only a NEW augmentation sub-region appended
@@ -328,15 +423,18 @@ After APPLY the worktree holds a structurally-complete, link-resolved, schema-va
 placeholder/empty body regions; `run.json.phase=applied`, `prose_complete=false`. The model never edits
 frontmatter, links, MOC, index, `log.md`, or assets.
 
-### 3.1 Multiple dispositions targeting ONE daily file (collision resolution)
-Daily basenames are exempt from global uniqueness, so multiple non-gated `APPEND_DAILY` dispositions in one
-run may target the same `<domain>-<YYYY-MM-DD>.md`. The worker writes ONE dated `## ` section per
-disposition, in **stable manifest-event order** (sort by the first event_id of each disposition), each
+### 3.1 Multiple dispositions targeting ONE journal file (collision resolution)
+Journal basenames are exempt from global uniqueness, and under schema 2 there is exactly **one journal
+per `run_date`, repo-wide** — so every non-gated `APPEND_DAILY` disposition in a run targets the same
+`wiki/notes/<yyyy>/<mm>/<YYYY-MM-DD>.md`, including dispositions from different domains (v1 fanned
+them out into one file per domain only because bare dates would have collided across domains). The
+worker writes ONE dated `## ` section per disposition, **domain-major** and then in stable
+manifest-event order within a domain (byte-identical to v1's order for the single-domain case), each
 wrapped in its own sentinel pair keyed by the per-run `candidate_id`. PASS 2 authors each section
 independently per its candidate_id. This is why the sentinel id derives from `candidate_id` (§3, §8.2)
-and never `basename` (which would collide for daily). The PERSISTED id, however, is the **run-scoped**
+and never `basename` (which would collide for the journal). The PERSISTED id, however, is the **run-scoped**
 `{run_id}--{candidate_id}` (`apply.region_sentinel_id`): the bare per-run `candidate_id` is unique only
-*within* a run, so a cross-run append into the SAME daily file would otherwise re-use `id=c1` and collide
+*within* a run, so a cross-run append into the SAME journal file would otherwise re-use `id=c1` and collide
 with a prior run's region in that file — prefixing the globally-unique `run_id` keeps every region id
 unique while distinct candidates in one run still differ.
 
@@ -344,10 +442,15 @@ unique while distinct candidates in one run still differ.
 ## 4. OUTPUT / SUCCESS-DETECTION CONTRACT (decide success WITHOUT trusting the model)
 
 ### 4.0 The ONE canonical allowlist (matches ADR-0008 §4 verbatim)
-`ALLOWLIST = { wiki/** , index.md , <domain>-moc.md , log.md , assets/** }` — defined once in code
-(`curator/constants.py`) and referenced by every check below and by the final-diff assertion. It is the union
-of ADR-0008 §4's `{wiki/, index.md, log.md, schema-approved content paths}` made explicit (`<domain>-moc.md`
-lives under `wiki/`; `assets/**` is the schema-approved binary path, DESIGN §5.2). **Worker-written vs
+`ALLOWLIST = { wiki/** , index.md , log.md , assets/** } MINUS { wiki/people/** }` — defined once in code
+(`curator/constants.py`: `ALLOWLIST_FILES` / `ALLOWLIST_DIR_PREFIXES` / `ALLOWLIST_DENY_PREFIXES`) and
+referenced by every check below and by the final-diff assertion. It is the union
+of ADR-0008 §4's `{wiki/, index.md, log.md, schema-approved content paths}` made explicit (maps live
+under `wiki/maps/`; `assets/**` is the schema-approved binary path, DESIGN §5.2), **minus the
+ADR-0041 D4.1 carve-out**: `wiki/people/**` sits under an allowed prefix but is never a legal curator
+write, so any add, modify, rename or delete under it fails the run. Expressing that as an exclusion
+inside the one predicate is the point — the PLAN check and the final-diff assertion both acquire it
+without either being edited. **Worker-written vs
 backend-reachable split:** `log.md` is WORKER-ONLY (always expected in the final diff, written in §4.3);
 `assets/**` binaries are placed by the upload/raw path (DESIGN §5.2), so a Phase-1 disposition only *links* an
 asset already present — the model never creates a new asset binary, and no op creates one. `_meta/` (incl. read-only
@@ -370,13 +473,34 @@ change to them fails the run. The schema doc (`AGENTS.md`/`SCHEMA.md`) and its s
    is unchanged, but a NON-gated basename op whose domain does not resolve is now floored to the first
    declared domain `domains[0]` *upstream* (in `ollama_brain.normalize_plan` step 3) instead of downgraded
    to DROP, so `domains[0]` — a taxonomy member by construction — passes this check; a gated candidate still
-   never reaches the floor (the §6 candidate gate forces DROP first).
+   never reaches the floor (the §6 candidate gate forces DROP first). **Schema 2 does not change this
+   check's shape** (ADR-0041 D2.2): it still grades the disposition's *singular* `domain` against
+   `domains`, because that field's surviving job is the `raw/<domain>/` shard key. The
+   `subjects ⊆ domains` property is asserted on the materialised note by lint (L1-5's successor), not
+   on the plan — one rule, one input, one verdict.
 5. **BASENAME** — each proposed `basename` is not in the live worktree tree at base_commit and is unique
-   within the plan (daily exempt); each `target_basename` exists in the live tree. (The bundle registry is
-   advisory; this check re-scans the tree, §1.2.)
+   within the plan (journal ops exempt); each `target_basename` exists in the live tree. (The bundle
+   registry is advisory; this check re-scans the tree, §1.2.) The `(daily exempt)` clause is **kept**
+   under schema 2 and is no longer load-bearing for *uniqueness* — a dated basename is unique by
+   construction now — only for **idempotent re-entry**: the second `agora curate` of the same day
+   names a basename that is by then already on disk, and retiring the exemption would make every
+   same-day re-run a hard BASENAME failure. The `live_basenames` input **excludes `wiki/people/**`**
+   (ADR-0041 D3.3), so a human's filename can never veto a curator basename.
 6. **PATH/ALLOWLIST** — every implied target path resolves under the canonical `ALLOWLIST` (§4.0); no `_kb/`,
-   `_templates/`, `raw/`, git internals, hooks, symlinks introduced/modified by the plan, or `..` escapes
-   (ADR-0008 §4; symlink scope per §4.5).
+   `_templates/`, `raw/`, `wiki/people/`, git internals, hooks, or `..` escapes (ADR-0008 §4). The
+   implied path is composed **kind-first** and, for the journal, its `<yyyy>/<mm>` shard is composed
+   from the injected `run_date` rather than parsed back out of a model-supplied basename — deriving a
+   curator-owned path segment from model output is exactly the inversion ADR-0041 D2.6 forbids. The
+   same injected fact settles the basename: an `APPEND_DAILY` whose `basename` is not that
+   `run_date` is rejected **here**, as a `PATH-ALLOWLIST` failure — that is the `check=` label an
+   operator sees on the rejected run, so the rule is documented under the check that raises it. Path
+   components are graded by `core.pathsafe.is_safe_component` (a closed Unicode-CATEGORY allowlist
+   that replaced the ASCII token regex — separators, controls, bidi overrides and the Windows-hostile
+   characters stay unreachable without being enumerated, and Windows reserved device stems are now
+   rejected too) **plus a leading-`_` rejection**, which is a precondition of that swap: pathsafe
+   allows `_`, so without it a component named `_blob`/`_pages` would be admissible. Symlinks are NOT
+   graded here — this check is a pure function over plan-implied path *names*, and a name cannot
+   disclose that it names a symlink; symlink rejection is the diff-scoped §4.5 FINAL-DIFF gate.
 7. **LINK RESOLVABILITY** — every `links[]` target resolves to an existing (live-tree) or same-plan basename.
 8. **PROVENANCE** — every `CREATE_THEME`/`APPEND_DAILY`/`MERGE_INTO_THEME` lists ≥1 `event_id`;
    `MERGE_INTO_THEME`/`MARK_CONTESTED` `target_basename` exists in the live tree.
@@ -453,9 +577,24 @@ additionally asserts `_agora_scratch/` produced ZERO tracked changes.
 ### 4.4 Deterministic schema LINT (model-free; the SAME code path as the dashboard)
 `lint(worktree)` is a pure function with ZERO model dependency, run after §4.2 and reused verbatim by the
 dashboard lint signals (DESIGN §5.3) and `kb_status`. It is the L1 ruleset specified in **ADR-0010** (KB wiki
-schema v1); the checks below are the subset this contract relies on. On the post-APPLY/post-AUTHOR tree it
-checks:
-1. **Frontmatter required-keys** present and well-typed on every theme/daily note: `title` (str), `status`
+schema v1) as amended by **ADR-0041** for schema 2; the checks below are the subset this contract relies on.
+
+**Which ruleset runs is a function of the repo's `schema_version` and nothing else.** On schema 2 the
+per-kind required-field tables key off `kind` (derived from the DIRECTORY, so a brain cannot pick its
+own rule set by lying in frontmatter) and the common base additionally requires `kb:`; the
+`type`-keyed predicates behind L1-7/L1-8/L1-8b/L1-10/L1-19 become `kind ∈ {concept, summary}`
+(`entity` is excluded — it may carry empty `sources:` while `status: stub`); L1-6's predicate widens
+from `type ∈ (moc, index)` to `kind ∈ (map, index)`; L1-5 reads `subjects:` instead of a path
+segment; L1-14 becomes the journal date/shard rule; and three rules are ADDED — **L1-22** (a `wiki/`
+segment-1 directory outside the closed kind set), **L1-23** (a taxonomy `domains` entry beginning
+with `_`) and **L1-24** (a map `children:` bullet whose child kind is not admitted). `wiki/people/**`
+is **permanently excluded from the graded population inside `lint()` itself**, not by a
+caller-supplied flag — every caller (the curator, the dashboard, `kb_status`, `/metrics`) must
+behave identically, or a read-only surface would report a red KB for a file the curator is forbidden
+to fix. People notes are still parsed and still enter the link-resolution universe.
+
+On the post-APPLY/post-AUTHOR tree it checks:
+1. **Frontmatter required-keys** present and well-typed on every claim-bearing/journal note: `title` (str), `status`
    (enum `active | stub | contested | deprecated`), `summary` (str), `tags` (list[str]), `aliases`
    (list[str], default `[]`), `sources` (list[str]; theme notes require non-empty UNLESS `status: stub`),
    `related` (list of `[[basename]]`), `created` (`YYYY-MM-DD == run_date`), `updated`
@@ -464,17 +603,21 @@ checks:
    provenance source is `harvest:<agent>`; `confidence` (`high | medium | low`) present on harvested
    regions. `orphan`/`stale` are DERIVED at read/dashboard time (link graph + `run_date`) and are NEVER
    persisted in frontmatter.
-2. **Taxonomy** — every note's `tags ⊆ _meta/taxonomy.yaml allowed_tags`; its domain ∈ `_meta/taxonomy.yaml domains`.
+2. **Taxonomy** — every note's `tags ⊆ _meta/taxonomy.yaml allowed_tags`; every entry of its
+   `subjects:` ∈ `_meta/taxonomy.yaml domains` (schema 1 read the same set out of the path domain).
 3. **Link resolution (L1-2)** — every graph edge resolves to a real basename (or alias) in the tree, across
    two forms: (a) **standard-markdown BODY links** `[Title](relative.md)` in note bodies, MOCs, and the
    index (the MOC/index child bullets), resolved path→basename via `body_link_basenames` (a body link whose
    resolved basename is unknown fails with `broken link [{basename}](…)`); and (b) frontmatter
    **`related:`/`children:` `[[basename]]`** arrays, resolved via `wikilinks` (an unresolved entry fails
    with `broken wikilink [[{basename}]]`). Both must resolve or the run is discarded. Per ADR-0014 D3,
-   body/MOC/index graph edges are standard markdown links, NOT `[[basename]]`; only frontmatter
-   `related:`/`children:` remain `[[basename]]`.
-4. **Orphans** — count notes not referenced by any MOC/index/other note; FAIL only if orphan count exceeds
-   `repo.yaml curator.lint.max_orphans` (default 0 for theme notes; daily exempt). A signal, not a per-note
+   body/map/index graph edges are standard markdown links, NOT `[[basename]]`; only frontmatter
+   `related:`/`children:` remain `[[basename]]`. A `[[ ]]` pointing into `wiki/people/**` does **not**
+   resolve (those basenames are outside the identity space, ADR-0041 D3.3) and is a broken link; the
+   curator may not author one anyway.
+4. **Orphans** — count notes not referenced by any map/index/other note; FAIL only if orphan count exceeds
+   `repo.yaml curator.lint.max_orphans` (absent ⇒ the check is skipped; the population is the claim-bearing kinds
+   `concept`/`summary` — journals, maps, `entity` and `person` are exempt). A signal, not a per-note
    hard error, so legitimate roots don't fail.
 5. **Contested shape** — any note with `status: contested` MUST have the §2.1 frontmatter+callout shape
    (non-empty `contested_by`, `contested_at` as `YYYY-MM-DD`, `≥2` `sources`, and the `^> \[!contested\]`

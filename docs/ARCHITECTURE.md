@@ -10,15 +10,30 @@ conceptual model; this doc maps it to modules and runtime processes.
 > + `ingest/extractors/` (url/pdf/office), `faces/mcp_server.py`, `faces/web/` (FastAPI JSON API + HTMX UI,
 > dashboard, `/metrics`), `schema/`, `cli.py`, `config.py`. Only the `auth/` package below remains a
 > later-phase (Phase 4–5) stub, shown here for the full target map.
+>
+> **KB wiki schema 2 (ADR-0041, Accepted) is what this build writes.** The first path segment under
+> `wiki/` is the note's **kind** (`concepts/` · `summaries/` · `notes/<yyyy>/<mm>/` · `maps/` ·
+> `entities/` · `people/`, root map at `index.md`) and the subject lives in `subjects:` frontmatter;
+> `raw/` is unmoved. `summaries/` and `entities/` ship EMPTY — the kinds, their directories and
+> their lint rules exist, but nothing produces a note in either one (ADR-0041 OD-7/OD-8).
+> `SUPPORTED_KB_SCHEMA_VERSIONS` is `{1, 2}`: a schema-1 repo still reads, every write path refuses.
 
 ```
 core/                 The single internal API. Everything else is a face or adapter over this.
   inbox.py            append-only write path: write(target, item) → _kb/inbox/<writer>/<id>.md
+                      (also hosts the ADR-0041 D6 writable-schema gate every writer inherits)
   wiki.py             deterministic retrieval: QueryResult with ordered SearchHit citations
   gold.py             GOLD context packs (ADR-0027, #37): deterministic PackAssembler — verbatim
-                      summary lines from validator-gated theme notes → _kb/gold/<pack>.md + meta
-                      sidecar; a pure fn of (curated commit, spec); commit-anchored gold-score +
-                      CJK-aware estimator + §8 outbound sentinel wrap/neutralization + loop shingle
+                      summary lines from validator-gated claim-bearing notes (GOLD_KINDS =
+                      concept|summary; wiki/people/** and derived:true excluded) → _kb/gold/<pack>.md
+                      + meta sidecar; a pure fn of (curated commit, spec); commit-anchored
+                      gold-score + CJK-aware estimator + §8 sentinel wrap/neutralization + shingle
+  layout.py           pure path resolution: the ADR-0041 KIND_DIRECTORIES vocabulary, the
+                      note_path_for(kind, basename, run_date) schema-2 composer, _meta/kb.yaml and
+                      the reserved raw/_blob + raw/_pages accessors
+  pathsafe.py         the closed Unicode-CATEGORY component/slug allowlist (replaced the ASCII
+                      plan-token regex; Windows device stems rejected, NFC, 180-byte cap)
+  ids.py              event ids + the inline ULID minted once as _meta/kb.yaml kb_id (OD-1)
   repo.py             Repo/tenant model: resolve repo, git ops (commit, push, PR), layout
   state.py            curator state (_kb/state.json): counters, event keys, published runs
 
@@ -84,12 +99,17 @@ auth/                 AuthN/AuthZ.
   policy.py           AuthZ: Forgejo delegation or OpenFGA; resolve token → repos+roles+domains
 
 schema/               KB wiki schema emitted into each knowledge repo.
-  emit.py             emit AGENTS.md + symlinks/templates into a repo
-  lint.py             validate a repo's KB schema / notes (deterministic L1 rules)
-  notes.py            note-type helpers (index/moc/theme/daily) + link resolution
-  templates/kb_schema.md   the AGENTS.md schema template
+  emit.py             emit AGENTS.md + symlinks/templates into a repo; the doc and the _templates/
+                      set are picked by the repo's schema_version (canonical: _meta/taxonomy.yaml)
+  lint.py             validate a repo's KB schema / notes (deterministic L1 rules), dispatched by
+                      schema_version; L1-22/23/24 are schema-2 only, wiki/people/** is never graded
+  notes.py            the kind/subjects reading layer — kind derived for BOTH schemas (schema 2:
+                      the wiki/<dir> segment; schema 1: type: mapped through the frozen D2.5 table)
+                      + link resolution
+  templates/kb_schema.md      the AGENTS.md schema template — KB wiki schema 1
+  templates/kb_schema_v2.md   the AGENTS.md schema template — KB wiki schema 2 (ADR-0041)
 
-cli.py                `agora` entry point: repo init · import · status · curate · harvest · index · gold · sync · watch · serve · web · doctor
+cli.py                `agora` entry point: repo init · import · status · curate · harvest · index · gold · eval · sync · watch · serve · web · doctor
 config.py             load config (adapters.yaml backends/routing + connectors, repo.yaml, triggers, harvest policy)
 ```
 
@@ -134,9 +154,13 @@ web upload (file/url/text) → ingest extractor → markdown          (ADR-0020)
   └─ core.write(target, item)                       (the inbox is the only write path — no face
                                                      writes raw/; the curator alone materializes it)
 ```
-Storing the verbatim original binary in `raw/` (+ the re-ingest-drift sha256 sidecar) is a
-curator-side staging step **deferred** past Phase 3 (ADR-0020); Phase 3 carries provenance in the
-capture body, not a separate raw/ write.
+Storing the verbatim original binary in `raw/` (+ the re-ingest-drift sha256 sidecar) is still a
+curator-side staging step **not yet built**. ADR-0041 D1.4/D4.2 named its destination
+(`raw/_blob/<ab>/<sha256>.<ext>` + `<file>.meta.yaml`, content-addressed, admitted only by
+membership in the APPLY `raw_writes` set with matching bytes) and `RepoLayout.blob_dir` resolves it,
+but no writer exists: `Inbox.write` still takes `text: str` + an optional `raw_ref: str` and carries
+no bytes, so the upload path still carries provenance in the capture body, not a separate `raw/`
+write.
 
 ### 3.3 Harvest — pull candidates
 ```
@@ -150,7 +174,10 @@ harvester (agora harvest) → for each connector (file: memory | session: transc
 
 ### 3.4 Consolidate (curator) — single writer
 ```
-trigger (cron/threshold/idle) → curator.worker.run(repo)
+trigger (cron/threshold/idle) → writable-schema gate → curator.worker.run(repo)
+  (the gate is CALLER-side, before the lock: agora curate / watch (re-asserted per tick) / requeue
+   and the kb_curate handler refuse a repo this build will not WRITE — reads are unaffected,
+   ADR-0041 D6)
   ├─ flock curator.lock (else exit)
   ├─ atomically claim FIFO items → _kb/processing/<run-id>/ + manifest
   ├─ event_key idempotency; content hash equivalence retains/merges provenance
@@ -167,7 +194,8 @@ trigger (cron/threshold/idle) → curator.worker.run(repo)
 ```
 agent/web → core.read(scope, question) -> QueryResult
   ├─ auth: filter to readable repos+domains            (auth/policy)
-  ├─ navigate: read <domain>-moc.md → follow [[links]] → grep synonyms   (core/wiki)
+  ├─ navigate: seed from wiki/maps/** + root index.md → follow links → grep synonyms  (core/wiki)
+  │   (a question token matching a map's declared `subjects:` narrows the seed set to those maps)
   └─ return ordered SearchHit{repo,path,anchor,excerpt,reason,score}
 ```
 
@@ -178,17 +206,23 @@ and may use only the returned hits; `not_found` is explicit and never synthesize
 ```
 web/dashboard → AgoraHandlers.{health,curator_status,harvester_status,gold_status}  (read-only panels)
    reads: inbox count, state.json, log.md, processed/failed, harvest cursors, deterministic lint(),
-   the gold-pack meta sidecar (ADR-0027 medallion panel, #37)
+   the gold-pack meta sidecar (ADR-0027 medallion panel, #37), and the canonical KB wiki schema
+   declaration — health() carries the ADR-0041 D6 WRITE verdict (`writable_schema`) beside `lint_ok`,
+   because a schema-1 repo lints clean while refusing every capture
    (HTMX-polled fragments; lint reused VERBATIM for KB-health signals — Phase 3c)
 
 GET /metrics  →  web/metrics.py            Prometheus exporter (separate surface — Phase 3d):
-   cheap per-scrape operational counters/gauges; NEVER runs lint on scrape; Grafana stays an
-   external (optional, AGPL) sidecar for time-series trends
+   cheap per-scrape operational counters/gauges; NEVER runs lint on scrape (the schema-writability
+   pair `agora_kb_schema_version` / `agora_kb_schema_writable` is one canonical-file read, not a
+   lint); Grafana stays an external (optional, AGPL) sidecar for time-series trends
 
-GET /api/graph → AgoraHandlers.graph(center,depth,domain)   (read-only graph data — ADR-0021):
+GET /api/graph → AgoraHandlers.graph(center,depth,subject)  (read-only graph data — ADR-0021):
    nodes = Wiki.list_notes; edges = body_link_basenames + frontmatter related/children; orphan flag
    reuses health()'s derivation. Global /graph page + per-note local ego-graph; the canvas is the
    vendored MIT force-graph (static/graph.js), the first firing of the ADR-0019 §7 per-route viz.
+   Per-node `kind` + `subjects` replace v1's `type` + scalar `domain`, and the filter chips are a
+   subjects facet (a union over the notes' `subjects:`), not a set of path segments — a visible
+   face-contract change shipped with the schema-2 flip (ADR-0041 D2/D3.2).
 ```
 
 ## 4. Deployment topology

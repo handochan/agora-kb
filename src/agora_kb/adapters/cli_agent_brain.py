@@ -37,12 +37,19 @@ The configured CLI MUST read its prompt from stdin and print ONLY its text answe
 from __future__ import annotations
 
 import argparse
+import os
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
 
-from agora_kb.adapters.ollama_brain import BrainError, detect_mode, run_author, run_plan
+from agora_kb.adapters.ollama_brain import (
+    BrainError,
+    detect_mode,
+    reconfigure_stdio_utf8,
+    run_author,
+    run_plan,
+)
 
 __all__ = ["CliAgentError", "KNOWN_CLI_AGENTS", "call_cli_agent", "main"]
 
@@ -95,7 +102,17 @@ def call_cli_agent(prompt: str, *, argv: list[str], timeout: float) -> str:
     (``.omc/``, ``.claude/`` …) into its cwd, which would otherwise pollute the worktree and trip
     the worker's FINAL-DIFF allowlist. The shim already read the bundle FOR the agent, so the agent
     needs no worktree access — it only generates text from the prompt on stdin.
+
+    ``env`` is the parent process env PLUS ``PYTHONIOENCODING=utf-8``/``PYTHONUTF8=1`` (#85):
+    pinning ``encoding="utf-8"`` below only fixes THIS process's end of the pipe — a Python-based
+    CLI agent child would still read/write stdio at its own locale-driven encoding without these
+    vars (mirrors :func:`agora_kb.curator.backends.with_utf8_child_env`). A non-Python agent
+    (``claude``/``codex``/``gemini`` and the like) is UTF-8-native and simply ignores env vars
+    naming a CPython behaviour it does not implement.
     """
+    env = dict(os.environ)
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONUTF8"] = "1"
     try:
         with tempfile.TemporaryDirectory(prefix="agora-cli-brain-") as scratch:
             proc = subprocess.run(  # noqa: S603 — argv is a config array, shell=False, no interp
@@ -103,9 +120,15 @@ def call_cli_agent(prompt: str, *, argv: list[str], timeout: float) -> str:
                 input=prompt,
                 capture_output=True,
                 text=True,
+                # Pinned, not left to the process locale (#85): `prompt` carries a Korean/non-ASCII
+                # candidate body into a CLI agent's stdin, and this shim's stdout carries plan
+                # JSON / authored prose back out — a non-UTF-8 locale host would otherwise
+                # mis-encode or mis-decode either direction. UTF-8 is what every CLI agent speaks.
+                encoding="utf-8",
                 timeout=timeout,
                 check=False,
                 cwd=scratch,
+                env=env,
             )
     except FileNotFoundError as exc:
         raise CliAgentError(f"CLI agent executable not found: {argv[0]!r} ({exc})") from exc
@@ -151,6 +174,7 @@ def main(argv: list[str] | None = None) -> int:
     to stdout (0), or a clear stderr message (1) the worker turns into a clean PLAN-parse failure;
     AUTHOR edits the worktree file in place (0), or returns 1 only on a TOTAL failure (no file).
     """
+    reconfigure_stdio_utf8()
     ns, cli_argv = _parse_args(argv)
     if not cli_argv:
         print(

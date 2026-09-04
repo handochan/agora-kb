@@ -35,6 +35,14 @@
       <tr><th>Built</th><td class="mono">{{ panel.gold.generated_at }}</td></tr>
     </tbody>
   </table>
+{% elif panel.gold.stale_schema %}
+  {# A pack file exists but was assembled by an older gold schema, so this build refuses to serve
+     it (the eligibility rules changed under it). Saying "none built" here would contradict the
+     file on disk AND the identical refusal `kb_context` returns. #}
+  <p class="empty">
+    Gold pack built by an older schema (v{{ panel.gold.stale_schema }}) — not served.
+    Rebuild with <code>agora gold build</code> or curate.
+  </p>
 {% else %}
   <p class="empty">No gold pack built yet (run <code>agora gold build</code> or curate).</p>
 {% endif %}

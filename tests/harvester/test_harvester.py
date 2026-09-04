@@ -31,6 +31,7 @@ from agora_kb.harvester.harvester import (
     build_connectors,
     check_scope,
 )
+from agora_kb.harvester.session_sources import DEFAULT_SESSION_FORMAT, ClaudeCodeJsonlReader
 
 FIXED = datetime(2026, 6, 20, 9, 0, 0, tzinfo=UTC)
 
@@ -440,3 +441,61 @@ def test_gold_loop_telemetry_silent_when_no_echo(tmp_path: Path) -> None:
     )
     report = Harvester(layout).run([conn], policy=policy, now=FIXED)
     assert not any("loop telemetry" in n for n in report.connectors[0].notes)
+
+
+# --- build_connectors: the reader injection (issue #147, invariant #6) ---------------------------
+
+
+def test_build_connectors_session_default_format_is_claude_code() -> None:
+    """A spec with no format keeps today's parser — an existing adapters.yaml is unaffected."""
+    specs = [ConnectorSpec(name="session:demo", scope="personal", path="/x/**/*.jsonl")]
+    conn = build_connectors(specs)[0]
+    assert isinstance(conn._reader, ClaudeCodeJsonlReader)  # type: ignore[attr-defined]
+
+
+def test_build_connectors_injects_the_declared_format() -> None:
+    """The DECLARED format selects the parser — never the <agent> half of the connector key.
+
+    `session:demo` is not an agent the engine has ever heard of, which is the point: the same
+    dispatch must work for an agent that does not exist yet.
+    """
+    specs = [
+        ConnectorSpec(
+            name="session:demo",
+            scope="personal",
+            path="/x/**/*.jsonl",
+            format=DEFAULT_SESSION_FORMAT,
+        )
+    ]
+    conn = build_connectors(specs)[0]
+    assert isinstance(conn._reader, ClaudeCodeJsonlReader)  # type: ignore[attr-defined]
+
+
+def test_build_connectors_unregistered_format_fails_loud_naming_the_connector() -> None:
+    specs = [
+        ConnectorSpec(
+            name="session:demo", scope="personal", path="/x/**/*.jsonl", format="not-a-format"
+        )
+    ]
+    with pytest.raises(ConnectorError) as exc:
+        build_connectors(specs)
+    assert "session:demo" in str(exc.value) and "not-a-format" in str(exc.value)
+
+
+def test_build_connectors_placeholder_format_fails_loud_not_silently_default() -> None:
+    """A registered-but-unimplemented format must error, never fall back to the default parser."""
+    specs = [
+        ConnectorSpec(
+            name="session:demo", scope="personal", path="/x/**/*.jsonl", format="codex-jsonl"
+        )
+    ]
+    with pytest.raises(ConnectorError) as exc:
+        build_connectors(specs)
+    assert "codex-jsonl" in str(exc.value)
+
+
+def test_build_connectors_file_type_ignores_format_machinery() -> None:
+    """The file: branch is untouched by #147 (config rejects a format there anyway)."""
+    specs = [ConnectorSpec(name="file:demo", scope="personal", path="/x/MEMORY.md")]
+    conn = build_connectors(specs)[0]
+    assert conn.name == "file:demo" and not hasattr(conn, "_reader")

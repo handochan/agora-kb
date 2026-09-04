@@ -3,7 +3,8 @@
 This shapes the core ``Wiki.list_notes`` link graph into JSON-serializable node/edge data for the
 web ``/graph`` viz — read-only, deterministic, thin-face (no canonical change). It reuses the SAME
 core.wiki seam and the SAME orphan derivation as :meth:`AgoraHandlers.health` (parity asserted
-below). The corpus mirrors the browse tests (index + MOC + two themes) on a real on-disk repo.
+below). Every corpus here is KB WIKI SCHEMA 2 (ADR-0041 D1: the first segment under ``wiki/`` IS
+the kind; the subject lives in ``subjects:``), mirroring the browse tests.
 """
 
 from __future__ import annotations
@@ -18,50 +19,60 @@ from agora_kb.faces.mcp_server import AgoraHandlers
 
 
 def _init_repo(tmp_path: Path) -> Repo:
+    """A git repo whose ``_meta/taxonomy.yaml`` declares KB wiki schema 2.
+
+    The taxonomy file is what :func:`agora_kb.schema.notes.resolve_schema_version` reads, and the
+    read side derives ``kind``/``subjects`` under the REPO's schema — so without it the same bytes
+    would be parsed under the v1 derivation and every ``kind`` would come back ``None``.
+    """
     repo = Repo.resolve(tmp_path)
     repo.init()
+    (tmp_path / "_meta").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "_meta" / "taxonomy.yaml").write_text(
+        "schema_version: 2\ndomains: [ai-tech, ops, a, b]\nallowed_tags: []\n", encoding="utf-8"
+    )
     return repo
 
 
 def _write_wiki_notes(tmp_path: Path) -> None:
-    """Place a small navigable corpus on disk (index + MOC + two themes) under ``wiki/``.
+    """Place a small navigable schema-2 corpus on disk (index + map + two concepts).
 
-    Edges: index → ai-tech-moc; moc → curator-concurrency + inbox-design; curator-concurrency →
+    Edges: index → the ai-tech map; map → curator-concurrency + inbox-design; curator-concurrency →
     inbox-design (a body link AND a frontmatter ``related:`` wikilink, so the related-array path is
-    exercised). Both themes are linked-to, so neither is an orphan.
+    exercised). Both concepts are linked-to, so neither is an orphan.
     """
     (tmp_path / "index.md").write_text(
-        "---\ntype: index\nstatus: active\n---\n"
-        "# personal\n\n- [AI Tech MOC](wiki/ai-tech/ai-tech-moc.md)\n",
+        "---\nkind: index\nstatus: active\n---\n# personal\n\n- [AI Tech](wiki/maps/ai-tech.md)\n",
         encoding="utf-8",
     )
-    domain = tmp_path / "wiki" / "ai-tech"
-    domain.mkdir(parents=True, exist_ok=True)
-    (domain / "ai-tech-moc.md").write_text(
-        "---\nstatus: active\ntype: moc\n---\n# AI Tech\n\n"
-        "- [Curator concurrency](themes/curator-concurrency.md) — single-writer curator\n"
-        "- [Inbox design](themes/inbox-design.md) — append-only inbox\n",
+    maps = tmp_path / "wiki" / "maps"
+    maps.mkdir(parents=True, exist_ok=True)
+    (maps / "ai-tech.md").write_text(
+        "---\nstatus: active\nkind: map\nsubjects: [ai-tech]\n---\n# AI Tech\n\n"
+        "- [Curator concurrency](../concepts/curator-concurrency.md) — single-writer curator\n"
+        "- [Inbox design](../concepts/inbox-design.md) — append-only inbox\n",
         encoding="utf-8",
     )
-    themes = domain / "themes"
-    themes.mkdir(parents=True, exist_ok=True)
-    (themes / "curator-concurrency.md").write_text(
-        "---\nstatus: active\ntype: theme\ntags: [single-writer, concurrency]\n"
+    concepts = tmp_path / "wiki" / "concepts"
+    concepts.mkdir(parents=True, exist_ok=True)
+    (concepts / "curator-concurrency.md").write_text(
+        "---\nstatus: active\nkind: concept\nsubjects: [ai-tech]\n"
+        "tags: [single-writer, concurrency]\n"
         'title: Curator Concurrency Model\nrelated: ["[[inbox-design]]"]\n---\n'
         "# Curator Concurrency\n\n"
         "The curator acquires a per-repo flock. See [Inbox design](inbox-design.md).\n",
         encoding="utf-8",
     )
-    (themes / "inbox-design.md").write_text(
-        "---\nstatus: active\ntype: theme\ntags: [inbox, append-only]\n---\n"
-        "# Inbox Design\n\nThe inbox is append-only and per-writer namespaced.\n",
+    (concepts / "inbox-design.md").write_text(
+        "---\nstatus: active\nkind: concept\nsubjects: [ai-tech]\ntags: [inbox, append-only]\n"
+        "---\n# Inbox Design\n\nThe inbox is append-only and per-writer namespaced.\n",
         encoding="utf-8",
     )
 
 
-_CC = "wiki/ai-tech/themes/curator-concurrency.md"
-_INBOX = "wiki/ai-tech/themes/inbox-design.md"
-_MOC = "wiki/ai-tech/ai-tech-moc.md"
+_CC = "wiki/concepts/curator-concurrency.md"
+_INBOX = "wiki/concepts/inbox-design.md"
+_MAP = "wiki/maps/ai-tech.md"
 
 
 # --- global -------------------------------------------------------------------------------------
@@ -85,23 +96,23 @@ def test_graph_global_nodes_and_edges(tmp_path: Path) -> None:
 
     # Every note is a node with id == rel_path and the documented summary fields.
     node_ids = {n["id"] for n in result["nodes"]}
-    assert node_ids == {"index.md", _MOC, _CC, _INBOX}
+    assert node_ids == {"index.md", _MAP, _CC, _INBOX}
     for node in result["nodes"]:
-        assert set(node) == {"id", "title", "domain", "status", "type", "orphan"}
+        assert set(node) == {"id", "title", "subjects", "status", "kind", "orphan"}
     cc = next(n for n in result["nodes"] if n["id"] == _CC)
     assert cc["title"] == "Curator Concurrency Model"  # frontmatter title wins
-    assert cc["domain"] == "ai-tech"
+    assert cc["subjects"] == ["ai-tech"]
     assert cc["status"] == "active"
-    assert cc["type"] == "theme"
+    assert cc["kind"] == "concept"
 
     edges = {(e["source"], e["target"]) for e in result["edges"]}
     # An authored body link [Inbox design](inbox-design.md) => edge curator-concurrency -> inbox.
     assert (_CC, _INBOX) in edges
     # A frontmatter related: ["[[inbox-design]]"] is also that same edge (dedup keeps one).
     # The index/MOC child bullets resolve to their targets too.
-    assert ("index.md", _MOC) in edges
-    assert (_MOC, _CC) in edges
-    assert (_MOC, _INBOX) in edges
+    assert ("index.md", _MAP) in edges
+    assert (_MAP, _CC) in edges
+    assert (_MAP, _INBOX) in edges
     assert result["node_total"] == 4
     assert result["edge_total"] == len(result["edges"])
 
@@ -115,87 +126,141 @@ def test_graph_global_nodes_and_edges(tmp_path: Path) -> None:
 
 def test_graph_related_frontmatter_yields_edge(tmp_path: Path) -> None:
     repo = _init_repo(tmp_path)
-    # A theme whose ONLY link to another note is a frontmatter related: [[ ]] entry.
-    domain = tmp_path / "wiki" / "ai-tech"
-    themes = domain / "themes"
-    themes.mkdir(parents=True, exist_ok=True)
-    (themes / "alpha.md").write_text(
-        "---\nstatus: active\ntype: theme\nrelated: ["
+    # A concept whose ONLY link to another note is a frontmatter related: [[ ]] entry.
+    concepts = tmp_path / "wiki" / "concepts"
+    concepts.mkdir(parents=True, exist_ok=True)
+    (concepts / "alpha.md").write_text(
+        "---\nstatus: active\nkind: concept\nrelated: ["
         '"[[beta]]"]\n---\n# Alpha\n\nProse with no body link.\n',
         encoding="utf-8",
     )
-    (themes / "beta.md").write_text(
-        "---\nstatus: active\ntype: theme\n---\n# Beta\n\nLeaf.\n",
+    (concepts / "beta.md").write_text(
+        "---\nstatus: active\nkind: concept\n---\n# Beta\n\nLeaf.\n",
         encoding="utf-8",
     )
     handlers = AgoraHandlers(repo, writer="local")
 
     edges = {(e["source"], e["target"]) for e in handlers.graph()["edges"]}
-    assert ("wiki/ai-tech/themes/alpha.md", "wiki/ai-tech/themes/beta.md") in edges
+    assert ("wiki/concepts/alpha.md", "wiki/concepts/beta.md") in edges
+
+
+def test_a_people_note_never_captures_a_curated_basename(tmp_path: Path) -> None:
+    """ADR-0041 D3.3: ``wiki/people/**`` is outside the ``[[basename]]`` identity space.
+
+    The face's basename resolver is ``setdefault`` over rel_path-sorted notes, and
+    ``wiki/people/...`` sorts BEFORE ``wiki/summaries/...`` — so without the exclusion a human note
+    wins the resolver for every summary basename and silently REDIRECTS an edge the curator wrote
+    at an explicit path. The same edge set is what ``kb_neighbors`` serves to agents.
+
+    The collision is legal by construction (D3.3 keeps people out of L1-1's duplicate check), so
+    this is not a "don't do that" case; it is the case the exclusion exists for.
+    """
+    repo = _init_repo(tmp_path)
+    _write_wiki_notes(tmp_path)
+    summaries = tmp_path / "wiki" / "summaries"
+    summaries.mkdir(parents=True, exist_ok=True)
+    (summaries / "dup.md").write_text(
+        "---\nstatus: active\nkind: summary\nsubjects: [ai-tech]\n---\n# Dup\n\nCurated.\n",
+        encoding="utf-8",
+    )
+    people = tmp_path / "wiki" / "people" / "hando"
+    people.mkdir(parents=True, exist_ok=True)
+    (people / "dup.md").write_text(
+        "---\nstatus: active\n---\n# Dup\n\nHuman-owned, same basename.\n", encoding="utf-8"
+    )
+    (tmp_path / "wiki" / "concepts" / "src.md").write_text(
+        "---\nstatus: active\nkind: concept\n---\n# Src\n\nSee [Dup](../summaries/dup.md).\n",
+        encoding="utf-8",
+    )
+    handlers = AgoraHandlers(repo, writer="local")
+
+    graph = handlers.graph()
+    edges = {(e["source"], e["target"]) for e in graph["edges"]}
+    assert ("wiki/concepts/src.md", "wiki/summaries/dup.md") in edges
+    assert ("wiki/concepts/src.md", "wiki/people/hando/dup.md") not in edges
+    # Read stays first class: the people note is still a NODE, addressable by its own path.
+    assert "wiki/people/hando/dup.md" in {n["id"] for n in graph["nodes"]}
 
 
 # --- orphan -------------------------------------------------------------------------------------
 def test_graph_orphan_flag_and_health_parity(tmp_path: Path) -> None:
     repo = _init_repo(tmp_path)
     _write_wiki_notes(tmp_path)
-    # Add an UNLINKED theme — nothing references it, so it is an orphan.
-    themes = tmp_path / "wiki" / "ai-tech" / "themes"
-    (themes / "lonely.md").write_text(
-        "---\nstatus: active\ntype: theme\n---\n# Lonely\n\nNo one links here.\n",
+    # Add an UNLINKED concept — nothing references it, so it is an orphan. And a human-owned
+    # people note whose ONLY inbound reference would come from itself: it must never be an orphan
+    # (kind `person` is outside ORPHAN_KINDS) and its OUTBOUND link must not un-orphan anything.
+    concepts = tmp_path / "wiki" / "concepts"
+    (concepts / "lonely.md").write_text(
+        "---\nstatus: active\nkind: concept\n---\n# Lonely\n\nNo one links here.\n",
+        encoding="utf-8",
+    )
+    (concepts / "unloved.md").write_text(
+        "---\nstatus: active\nkind: concept\n---\n# Unloved\n\nOnly a human links here.\n",
+        encoding="utf-8",
+    )
+    people = tmp_path / "wiki" / "people" / "hando"
+    people.mkdir(parents=True, exist_ok=True)
+    (people / "desk.md").write_text(
+        "---\nstatus: active\n---\n# Desk\n\nSee [Unloved](../../concepts/unloved.md).\n",
         encoding="utf-8",
     )
     handlers = AgoraHandlers(repo, writer="local")
 
     nodes = {n["id"]: n for n in handlers.graph()["nodes"]}
-    # Unlinked theme => orphan True; a linked theme => orphan False.
-    assert nodes["wiki/ai-tech/themes/lonely.md"]["orphan"] is True
+    # Unlinked concept => orphan True; a linked concept => orphan False.
+    assert nodes["wiki/concepts/lonely.md"]["orphan"] is True
     assert nodes[_INBOX]["orphan"] is False
     assert nodes[_CC]["orphan"] is False
-    # A non-theme (index/moc) is never an orphan even if nothing links to it.
+    # A non-claim kind (index/map/person) is never an orphan even if nothing links to it.
     assert nodes["index.md"]["orphan"] is False
-    assert nodes[_MOC]["orphan"] is False
+    assert nodes[_MAP]["orphan"] is False
+    assert nodes["wiki/people/hando/desk.md"]["orphan"] is False
+    # ADR-0041 D3.3: links OUT of a people note are UNGRADED, so the human's link does NOT
+    # un-orphan the concept — exactly what schema.lint's L2-1 derivation does, which is why the
+    # count parity below is a real check and not a tautology.
+    assert nodes["wiki/concepts/unloved.md"]["orphan"] is True
 
     # The orphan COUNT equals health()'s orphans (the derivation is reused verbatim).
     orphan_count = sum(1 for n in nodes.values() if n["orphan"])
     assert orphan_count == handlers.health()["orphans"]
 
 
-def test_graph_orphan_is_global_under_domain_filter(tmp_path: Path) -> None:
-    # Orphan is a GLOBAL property computed over EVERY note BEFORE any domain filter: a theme
-    # referenced only from OUTSIDE the filtered domain is still orphan=False. (A naive refactor that
-    # built the referenced-set over the filtered node subset would flip it to True — and every other
-    # test would still pass, so this is the guard for that regression.)
+def test_graph_orphan_is_global_under_subject_filter(tmp_path: Path) -> None:
+    # Orphan is a GLOBAL property computed over EVERY note BEFORE any subject filter: a concept
+    # referenced only from OUTSIDE the filtered subject is still orphan=False. (A naive refactor
+    # that built the referenced-set over the filtered node subset would flip it to True — and every
+    # other test would still pass, so this is the guard for that regression.)
     repo = _init_repo(tmp_path)
-    ai = tmp_path / "wiki" / "ai-tech" / "themes"
-    ai.mkdir(parents=True, exist_ok=True)
-    ops = tmp_path / "wiki" / "ops" / "themes"
-    ops.mkdir(parents=True, exist_ok=True)
-    # The ONLY inbound link to the ops theme comes from an ai-tech note (a different domain).
-    (ai / "src.md").write_text(
-        "---\nstatus: active\ntype: theme\n---\n# Src\n\nSee [Ops](../../ops/themes/opsnote.md).\n",
+    concepts = tmp_path / "wiki" / "concepts"
+    concepts.mkdir(parents=True, exist_ok=True)
+    # The ONLY inbound link to the ops-subject note comes from an ai-tech-subject note.
+    (concepts / "src.md").write_text(
+        "---\nstatus: active\nkind: concept\nsubjects: [ai-tech]\n---\n"
+        "# Src\n\nSee [Ops](opsnote.md).\n",
         encoding="utf-8",
     )
-    (ops / "opsnote.md").write_text(
-        "---\nstatus: active\ntype: theme\n---\n# Ops Note\n\nA leaf referenced from ai-tech.\n",
+    (concepts / "opsnote.md").write_text(
+        "---\nstatus: active\nkind: concept\nsubjects: [ops]\n---\n"
+        "# Ops Note\n\nA leaf referenced from ai-tech.\n",
         encoding="utf-8",
     )
     handlers = AgoraHandlers(repo, writer="local")
 
-    result = handlers.graph(domain="ops")
+    result = handlers.graph(subject="ops")
     nodes = {n["id"]: n for n in result["nodes"]}
-    # Only the ops note is kept (the referencing ai-tech note is filtered out)…
-    assert set(nodes) == {"wiki/ops/themes/opsnote.md"}
+    # Only the ops-subject note is kept (the referencing ai-tech note is filtered out)…
+    assert set(nodes) == {"wiki/concepts/opsnote.md"}
     # …yet it is NOT an orphan, because the referenced set is computed globally over all notes.
-    assert nodes["wiki/ops/themes/opsnote.md"]["orphan"] is False
+    assert nodes["wiki/concepts/opsnote.md"]["orphan"] is False
 
 
 # --- dangling / self-loop edges -----------------------------------------------------------------
 def test_graph_dangling_link_yields_no_edge(tmp_path: Path) -> None:
     repo = _init_repo(tmp_path)
-    domain = tmp_path / "wiki" / "ai-tech" / "themes"
-    domain.mkdir(parents=True, exist_ok=True)
-    (domain / "solo.md").write_text(
-        "---\nstatus: active\ntype: theme\n---\n# Solo\n\nA [missing](nope.md) link.\n",
+    concepts = tmp_path / "wiki" / "concepts"
+    concepts.mkdir(parents=True, exist_ok=True)
+    (concepts / "solo.md").write_text(
+        "---\nstatus: active\nkind: concept\n---\n# Solo\n\nA [missing](nope.md) link.\n",
         encoding="utf-8",
     )
     handlers = AgoraHandlers(repo, writer="local")
@@ -208,10 +273,10 @@ def test_graph_dangling_link_yields_no_edge(tmp_path: Path) -> None:
 
 def test_graph_self_loop_dropped(tmp_path: Path) -> None:
     repo = _init_repo(tmp_path)
-    domain = tmp_path / "wiki" / "ai-tech" / "themes"
-    domain.mkdir(parents=True, exist_ok=True)
-    (domain / "selfref.md").write_text(
-        "---\nstatus: active\ntype: theme\n---\n# Selfref\n\nLink to [self](selfref.md).\n",
+    concepts = tmp_path / "wiki" / "concepts"
+    concepts.mkdir(parents=True, exist_ok=True)
+    (concepts / "selfref.md").write_text(
+        "---\nstatus: active\nkind: concept\n---\n# Selfref\n\nLink to [self](selfref.md).\n",
         encoding="utf-8",
     )
     handlers = AgoraHandlers(repo, writer="local")
@@ -221,28 +286,26 @@ def test_graph_self_loop_dropped(tmp_path: Path) -> None:
     assert edges == []  # the only link is a self-loop, which is dropped
 
 
-# --- domain filter ------------------------------------------------------------------------------
-def test_graph_domain_filter(tmp_path: Path) -> None:
+# --- subject filter -----------------------------------------------------------------------------
+def test_graph_subject_filter(tmp_path: Path) -> None:
     repo = _init_repo(tmp_path)
     _write_wiki_notes(tmp_path)
-    # Add a second domain so the filter has something to exclude.
-    other = tmp_path / "wiki" / "ops"
-    other.mkdir(parents=True, exist_ok=True)
-    (other / "ops-moc.md").write_text(
-        "---\nstatus: active\ntype: moc\n---\n# Ops\n\nNo children yet.\n",
+    # Add a second subject so the filter has something to exclude.
+    (tmp_path / "wiki" / "maps" / "ops.md").write_text(
+        "---\nstatus: active\nkind: map\nsubjects: [ops]\n---\n# Ops\n\nNo children yet.\n",
         encoding="utf-8",
     )
     handlers = AgoraHandlers(repo, writer="local")
 
-    result = handlers.graph(domain="ai-tech")
+    result = handlers.graph(subject="ai-tech")
     node_ids = {n["id"] for n in result["nodes"]}
-    # Only ai-tech notes; index.md (domain None) and ops are excluded.
-    assert node_ids == {_MOC, _CC, _INBOX}
+    # Only notes whose `subjects:` CONTAINS ai-tech; index.md (no subjects) and ops are excluded.
+    assert node_ids == {_MAP, _CC, _INBOX}
     assert "index.md" not in node_ids
-    assert "wiki/ops/ops-moc.md" not in node_ids
+    assert "wiki/maps/ops.md" not in node_ids
     # Edges are induced on the kept set: moc->theme + body/related edges remain, index->moc gone.
     edges = {(e["source"], e["target"]) for e in result["edges"]}
-    assert (_MOC, _CC) in edges
+    assert (_MAP, _CC) in edges
     assert (_CC, _INBOX) in edges
     assert all(s != "index.md" for (s, _t) in edges)
 
@@ -256,14 +319,14 @@ def test_graph_truncation_caps_nodes_and_reports_honest_totals(
     # truncated is True, and node_total/edge_total report the HONEST pre-cap counts (which can
     # differ from the post-cap len(nodes)/len(edges) — no silent truncation).
     repo = _init_repo(tmp_path)
-    themes = tmp_path / "wiki" / "ai-tech" / "themes"
-    themes.mkdir(parents=True, exist_ok=True)
-    # A linear chain a -> b -> c -> d -> e (5 themes) + the root index.md = 6 notes, 4 edges.
+    concepts = tmp_path / "wiki" / "concepts"
+    concepts.mkdir(parents=True, exist_ok=True)
+    # A linear chain a -> b -> c -> d -> e (5 concepts) + the root index.md = 6 notes, 4 edges.
     chain = ["a", "b", "c", "d", "e"]
     for i, name in enumerate(chain):
         tail = f"\n\nSee [next]({chain[i + 1]}.md).\n" if i + 1 < len(chain) else "\n\nLeaf.\n"
-        (themes / f"{name}.md").write_text(
-            f"---\nstatus: active\ntype: theme\n---\n# {name}{tail}", encoding="utf-8"
+        (concepts / f"{name}.md").write_text(
+            f"---\nstatus: active\nkind: concept\n---\n# {name}{tail}", encoding="utf-8"
         )
     monkeypatch.setattr(mcp_server, "MAX_GRAPH_NODES", 3)
     handlers = AgoraHandlers(repo, writer="local")
@@ -278,12 +341,12 @@ def test_graph_truncation_caps_nodes_and_reports_honest_totals(
     assert kept_ids == sorted(kept_ids)
     assert kept_ids == [
         "index.md",
-        "wiki/ai-tech/themes/a.md",
-        "wiki/ai-tech/themes/b.md",
+        "wiki/concepts/a.md",
+        "wiki/concepts/b.md",
     ]
     # Edges are induced on survivors ONLY: a->b survives; b->c/c->d/d->e are dropped (c,d,e capped).
     survivor_edges = {(e["source"], e["target"]) for e in result["edges"]}
-    assert survivor_edges == {("wiki/ai-tech/themes/a.md", "wiki/ai-tech/themes/b.md")}
+    assert survivor_edges == {("wiki/concepts/a.md", "wiki/concepts/b.md")}
     # edge_total is the HONEST pre-cap count (all 4 chain edges) and explicitly differs from the
     # post-cap survivor count — the documented divergence under truncation.
     assert result["edge_total"] == 4
@@ -304,16 +367,16 @@ def test_graph_local_one_hop_both_directions(tmp_path: Path) -> None:
     node_ids = {n["id"] for n in result["nodes"]}
     assert _CC in node_ids  # the center
     assert _INBOX in node_ids  # a note the center links TO
-    assert _MOC in node_ids  # a note that links TO the center
+    assert _MAP in node_ids  # a note that links TO the center
     # index.md is 2 hops away (index -> moc -> cc), excluded at depth 1.
     assert "index.md" not in node_ids
 
     # Edges are INDUCED on the reached set, not just the edges incident to the center: the
     # moc -> inbox edge (between two reached NON-center neighbors) must still appear.
     edges = {(e["source"], e["target"]) for e in result["edges"]}
-    assert (_MOC, _CC) in edges  # neighbor -> center
+    assert (_MAP, _CC) in edges  # neighbor -> center
     assert (_CC, _INBOX) in edges  # center -> neighbor
-    assert (_MOC, _INBOX) in edges  # neighbor -> neighbor (does NOT touch the center)
+    assert (_MAP, _INBOX) in edges  # neighbor -> neighbor (does NOT touch the center)
     # No edge references a node outside the reached set.
     assert all(s in node_ids and t in node_ids for (s, t) in edges)
 
@@ -327,11 +390,11 @@ def test_graph_local_multi_hop_reaches_further_then_saturates(tmp_path: Path) ->
     handlers = AgoraHandlers(repo, writer="local")
 
     one = {n["id"] for n in handlers.graph(center=_INBOX, depth=1)["nodes"]}
-    assert one == {_INBOX, _CC, _MOC}
+    assert one == {_INBOX, _CC, _MAP}
     assert "index.md" not in one  # index is 3 undirected hops from inbox
 
     two = {n["id"] for n in handlers.graph(center=_INBOX, depth=2)["nodes"]}
-    assert two == {_INBOX, _CC, _MOC, "index.md"}  # the next hop reaches index
+    assert two == {_INBOX, _CC, _MAP, "index.md"}  # the next hop reaches index
 
     three = {n["id"] for n in handlers.graph(center=_INBOX, depth=3)["nodes"]}
     assert three == two  # graph saturates — no further hops, the early break holds the set steady
@@ -342,7 +405,7 @@ def test_graph_local_unknown_center_returns_empty(tmp_path: Path) -> None:
     _write_wiki_notes(tmp_path)
     handlers = AgoraHandlers(repo, writer="local")
 
-    result = handlers.graph(center="wiki/ai-tech/themes/nope.md", depth=2)
+    result = handlers.graph(center="wiki/concepts/nope.md", depth=2)
     assert result["nodes"] == []
     assert result["edges"] == []
     assert result["node_total"] == 0
@@ -383,25 +446,28 @@ def test_graph_is_deterministic(tmp_path: Path) -> None:
 
 
 def test_graph_duplicate_basename_resolves_to_first_sorted_path(tmp_path: Path) -> None:
-    # Two notes share the basename dup.md across domains a/ and b/. A link to dup.md must resolve
-    # via the setdefault-over-sorted_notes tie-break to the FIRST rel_path (wiki/a/.../dup.md),
-    # pinning the deterministic by_basename resolver.
+    # Two notes share the basename dup.md across the FREE sub-folders a/ and b/ under one kind
+    # directory (ADR-0041 D1.1: depth below the kind is free and no code reads the intermediate
+    # segments). A link to dup.md must resolve via the setdefault-over-sorted_notes tie-break to
+    # the FIRST rel_path (wiki/concepts/a/dup.md), pinning the deterministic by_basename resolver.
     repo = _init_repo(tmp_path)
-    for dom in ("a", "b"):
-        themes = tmp_path / "wiki" / dom / "themes"
-        themes.mkdir(parents=True, exist_ok=True)
-        (themes / "dup.md").write_text(
-            f"---\nstatus: active\ntype: theme\n---\n# Dup {dom}\n\nLeaf.\n", encoding="utf-8"
+    for folder in ("a", "b"):
+        sub = tmp_path / "wiki" / "concepts" / folder
+        sub.mkdir(parents=True, exist_ok=True)
+        (sub / "dup.md").write_text(
+            f"---\nstatus: active\nkind: concept\n---\n# Dup {folder}\n\nLeaf.\n",
+            encoding="utf-8",
         )
-    (tmp_path / "wiki" / "a" / "themes" / "src.md").write_text(
-        "---\nstatus: active\ntype: theme\n---\n# Src\n\nSee [Dup](dup.md).\n", encoding="utf-8"
+    (tmp_path / "wiki" / "concepts" / "a" / "src.md").write_text(
+        "---\nstatus: active\nkind: concept\n---\n# Src\n\nSee [Dup](dup.md).\n",
+        encoding="utf-8",
     )
     handlers = AgoraHandlers(repo, writer="local")
 
     edges = {(e["source"], e["target"]) for e in handlers.graph()["edges"]}
-    # wiki/a/themes/dup.md sorts before wiki/b/themes/dup.md, so the link resolves to the a/ copy.
-    assert ("wiki/a/themes/src.md", "wiki/a/themes/dup.md") in edges
-    assert ("wiki/a/themes/src.md", "wiki/b/themes/dup.md") not in edges
+    # wiki/concepts/a/dup.md sorts before wiki/concepts/b/dup.md → the link resolves to the a copy.
+    assert ("wiki/concepts/a/src.md", "wiki/concepts/a/dup.md") in edges
+    assert ("wiki/concepts/a/src.md", "wiki/concepts/b/dup.md") not in edges
 
 
 def test_graph_empty_repo(tmp_path: Path) -> None:
@@ -449,6 +515,6 @@ def test_graph_explicit_max_depth_clamps_local(tmp_path: Path) -> None:
     _write_wiki_notes(tmp_path)
     handlers = AgoraHandlers(repo, writer="local")
 
-    center = "wiki/ai-tech/themes/curator-concurrency.md"
+    center = "wiki/concepts/curator-concurrency.md"
     result = handlers.graph(center=center, depth=5, max_depth=1)
     assert result["depth"] == 1  # clamped to the supplied max_depth

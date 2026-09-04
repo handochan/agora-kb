@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from agora_kb.core.repo import GitError, Repo
+from agora_kb.core.repo import GITATTRIBUTES_NAME, GitError, Repo, blob_bytes_are_pinned
 
 pytestmark = pytest.mark.skipif(shutil.which("git") is None, reason="git not available")
 
@@ -57,6 +57,76 @@ def test_init_with_fixed_when_is_reproducible(tmp_path: Path) -> None:
     assert a == b
 
 
+# --- ADR-0041 D1.2: the seed root map, in the schema the caller asks for ------------------------
+
+
+def test_init_seeds_the_schema_2_root_map_when_given_an_identity(tmp_path: Path) -> None:
+    """``schema_version=2`` seeds ADR-0041 D1.2's root map, mirroring the ``_meta/kb.yaml`` id.
+
+    Three properties in one, because a root map that gets any of them wrong fails the FIRST lint
+    of the FIRST run: ``kind: index`` (the D2.1 mirror of a path the directory rule cannot name —
+    ``index.md`` lives at the ROOT, not under ``wiki/maps/``), the ``kb:`` ULID every schema-2 note
+    carries so a copied note still names its origin (D1.5), and ``children: []`` over an empty body
+    — an EMPTY root map, which is what L1-6's set equality demands of a repo with no maps yet.
+    """
+    kb_id = "01J8ZQ3M4N5P6Q7R8S9T0V1W2X"
+    r = Repo.resolve(tmp_path / "kb")
+    r.init(when=WHEN, schema_version=2, kb_id=kb_id)
+
+    seed = (r.root / "index.md").read_text(encoding="utf-8")
+    assert "kind: index" in seed
+    assert f"kb: {kb_id}" in seed
+    assert "subjects: []" in seed
+    assert "children: []" in seed
+    # `type:` survives ONLY as the OKF mirror of `kind` (D2.5 / OD-3), exactly as `description`
+    # mirrors `summary` — never as the kind authority.
+    assert "type: index" in seed
+
+
+def test_init_defaults_to_the_schema_1_seed_so_existing_callers_are_unchanged(
+    tmp_path: Path,
+) -> None:
+    """The default is 1 because ``Repo.init`` cannot MINT a ``kb_id`` (ADR-0041 D1.5).
+
+    The id is stamped once by ``agora repo init``, which writes ``_meta/kb.yaml`` and then passes
+    the id down. Defaulting this method to a version it cannot serve unaided would turn every
+    existing caller into a crash, so "seed schema 2" stays the deliberate, identity-carrying act.
+    """
+    r = Repo.resolve(tmp_path / "kb")
+    r.init(when=WHEN)
+    seed = (r.root / "index.md").read_text(encoding="utf-8")
+    assert "type: index" in seed
+    assert "kind: index" not in seed
+    assert "kb:" not in seed
+
+
+def test_init_refuses_schema_2_without_an_identity(tmp_path: Path) -> None:
+    """No ``kb_id``, no schema-2 seed: a note that names no knowledge base is what D1.5 forbids.
+
+    Refused BEFORE ``git init`` so a rejected call leaves no half-made repo behind.
+    """
+    r = Repo.resolve(tmp_path / "kb")
+    with pytest.raises(ValueError, match="kb_id"):
+        r.init(when=WHEN, schema_version=2)
+    assert not r.is_initialized()
+
+
+def test_a_re_init_never_rewrites_an_existing_root_map(tmp_path: Path) -> None:
+    """A plain re-run must never restamp the schema mirror of a repo built at the other version.
+
+    Two guards compose here and the test pins both: ``init`` returns early on an already-
+    initialized repo, and the seed itself is written only when ``index.md`` is absent. Together
+    they mean a schema-1 repo re-inited by a schema-2-default build keeps its own root map — the
+    half-migration ADR-0041 D6 refuses to perform.
+    """
+    r = Repo.resolve(tmp_path / "kb")
+    head = r.init(when=WHEN)
+    before = (r.root / "index.md").read_bytes()
+
+    assert r.init(when=WHEN, schema_version=2, kb_id="01J8ZQ3M4N5P6Q7R8S9T0V1W2X") == head
+    assert (r.root / "index.md").read_bytes() == before
+
+
 def test_kb_is_gitignored_and_content_is_tracked(repo: Repo) -> None:
     inbox_item = repo.layout.inbox_writer_dir("dochan") / "e.md"
     inbox_item.parent.mkdir(parents=True, exist_ok=True)
@@ -66,6 +136,83 @@ def test_kb_is_gitignored_and_content_is_tracked(repo: Repo) -> None:
     assert ".gitignore" in tracked
     assert "index.md" in tracked  # curated content IS tracked (ADR-0001)
     assert _git(repo.root, "show", "HEAD:index.md").startswith("---")
+
+
+def test_init_seeds_the_gitattributes_that_pins_raw_blob_bytes(repo: Repo) -> None:
+    """`raw/_blob/` names its files by their own sha256, so git must never rewrite their EOLs.
+
+    ADR-0041 D1.4: without the rule a CRLF, NUL-free artefact (CSV/TXT/HTML/JSON) is classified
+    TEXT and normalised to LF on commit under `core.autocrlf`, after which the committed blob no
+    longer hashes to its own basename and every later re-cite fails permanently.
+    """
+    assert GITATTRIBUTES_NAME in _git(repo.root, "ls-files").split()
+    assert "raw/_blob/** -text" in (repo.root / GITATTRIBUTES_NAME).read_text(encoding="utf-8")
+    assert blob_bytes_are_pinned(repo.root)
+
+
+def test_blob_bytes_are_pinned_reports_a_repo_created_before_the_seed(tmp_path: Path) -> None:
+    """The diagnostic `agora doctor` prints for an older repo — and it accepts a hand-written rule.
+
+    Not a byte comparison with the seed: an operator may reasonably have their own rules around it,
+    and a doctor line that flagged a hand-edited but CORRECT file would train them to ignore the
+    channel.
+    """
+    root = tmp_path / "older"
+    root.mkdir()
+    assert not blob_bytes_are_pinned(root)  # not even a git repo
+    _git(root, "init", "-q", "-b", "main")
+    assert not blob_bytes_are_pinned(root)  # no file at all
+    (root / GITATTRIBUTES_NAME).write_text("*.md text\n", encoding="utf-8")
+    assert not blob_bytes_are_pinned(root)  # a file without the rule
+    (root / GITATTRIBUTES_NAME).write_text("raw/_blob/** binary\n", encoding="utf-8")
+    assert blob_bytes_are_pinned(root)  # `binary` implies `-text`
+
+
+def test_blob_bytes_are_pinned_honours_last_match_wins(tmp_path: Path) -> None:
+    """A later broad rule OVERRIDES the blob rule, and the predicate has to say so.
+
+    gitattributes(5) resolves the LAST matching pattern, and an explicit `text` attribute outranks
+    `core.autocrlf` — so a `.gitattributes` that carries the blob line and then `* text=auto`
+    re-normalises exactly the CRLF, NUL-free artefact D1.4 protects, while a first-match presence
+    test would still report the repo healthy. Asking `git check-attr` is what makes ordering (and
+    a per-extension override the seed never mentions) part of the answer.
+    """
+    root = tmp_path / "override"
+    root.mkdir()
+    _git(root, "init", "-q", "-b", "main")
+    attrs = root / GITATTRIBUTES_NAME
+    attrs.write_text("raw/_blob/** -text -diff -merge\n", encoding="utf-8")
+    assert blob_bytes_are_pinned(root)
+    attrs.write_text("raw/_blob/** -text -diff -merge\n* text=auto\n", encoding="utf-8")
+    assert not blob_bytes_are_pinned(root)
+    # And a single-extension override under the blob tree: the `.bin` probe alone would miss it.
+    attrs.write_text("raw/_blob/** -text -diff -merge\n*.csv text\n", encoding="utf-8")
+    assert not blob_bytes_are_pinned(root)
+
+
+def test_reinit_appends_the_blob_rule_and_keeps_operator_edits(tmp_path: Path) -> None:
+    """`repo init` is re-runnable and doctor tells the operator to APPEND — so it must not truncate.
+
+    The remedy `agora doctor` prints is `printf '…' >> .gitattributes`. A seed written
+    unconditionally would make the next `agora repo init` delete exactly that edit, along with any
+    rule of the operator's own. Appending also puts our line LAST, where last-match-wins needs it.
+    """
+    root = tmp_path / "older"
+    root.mkdir()
+    _git(root, "init", "-q", "-b", "main")
+    (root / GITATTRIBUTES_NAME).write_text("*.ipynb -diff\n* text=auto\n", encoding="utf-8")
+
+    Repo.resolve(root).init(when=WHEN)
+
+    text = (root / GITATTRIBUTES_NAME).read_text(encoding="utf-8")
+    assert "*.ipynb -diff" in text  # the operator's rule survived
+    assert text.rstrip().endswith("raw/_blob/** -text -diff -merge")  # ours landed last
+    assert blob_bytes_are_pinned(root)  # and therefore beats the `* text=auto` above it
+
+    # A second init writes nothing more: the rule is already in force.
+    before = (root / GITATTRIBUTES_NAME).read_bytes()
+    Repo.resolve(root).init(when=WHEN)
+    assert (root / GITATTRIBUTES_NAME).read_bytes() == before
 
 
 # --- worktree lifecycle -----------------------------------------------------------------------
@@ -333,6 +480,35 @@ def test_git_error_on_missing_cwd(tmp_path: Path) -> None:
         r.head_commit()
 
 
+def test_git_error_message_is_printable_when_stderr_has_invalid_utf8(
+    repo: Repo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # (codex-P2) `_git` decodes stderr with errors="surrogateescape" (#85) so an undecodable byte
+    # never raises out of the subprocess call — a remote/server-hook message this process does not
+    # control (push_backup's stderr, most realistically) can carry one. Embedding that decoded
+    # string directly (rather than via `!r`) would put a lone surrogate straight into the GitError
+    # message, which raises UnicodeEncodeError the moment an operator-facing print/log encodes it
+    # under a strict stream — turning a best-effort failure into a crash. The message AND the
+    # `.stderr` attribute must always encode cleanly under UTF-8 strict.
+    import agora_kb.core.repo as repo_module
+
+    bad_byte = b"\xff".decode("utf-8", errors="surrogateescape")
+
+    class _FakeCompletedProcess:
+        returncode = 1
+        stdout = ""
+        stderr = f"server-hook said: {bad_byte}"
+
+    monkeypatch.setattr(repo_module.subprocess, "run", lambda *a, **k: _FakeCompletedProcess())
+
+    with pytest.raises(GitError) as excinfo:
+        repo._git("status")
+
+    str(excinfo.value).encode("utf-8", errors="strict")  # must not raise UnicodeEncodeError
+    assert excinfo.value.stderr is not None
+    excinfo.value.stderr.encode("utf-8", errors="strict")  # ditto for the carried attribute
+
+
 # --- push_backup (push-only git backup, issue #64) ----------------------------------------------
 def _bare_remote(tmp_path: Path, name: str = "remote.git") -> Path:
     """Create a local bare repo (on branch main) to act as the push destination."""
@@ -391,6 +567,30 @@ def test_push_backup_non_fast_forward_is_refused_and_names_issue_46(
     assert "non-fast-forward" in msg
     assert "#46" in msg  # divergence resolution is the multi-machine ADR's territory
     assert _git(remote, "rev-parse", "refs/heads/main") == ahead  # remote untouched (no force)
+
+
+def test_push_backup_error_message_is_printable_when_stderr_has_invalid_utf8(
+    repo: Repo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # (codex-P2) The exact scenario the finding names: a push whose remote/server hook emits
+    # invalid UTF-8 on stderr must still raise a GitError whose message encodes cleanly, not a
+    # UnicodeEncodeError out of best-effort backup machinery (_auto_backup_push and friends).
+    bad_byte = b"\xff".decode("utf-8", errors="surrogateescape")
+
+    def _fake_git(self, *args, cwd=None, env=None, check=True, timeout=None):  # noqa: ANN001
+        class _FakeCompletedProcess:
+            returncode = 1
+            stdout = ""
+            stderr = f"remote rejected: {bad_byte}"
+
+        return _FakeCompletedProcess()
+
+    monkeypatch.setattr(Repo, "_git", _fake_git)
+
+    with pytest.raises(GitError) as excinfo:
+        repo.push_backup("origin")
+
+    str(excinfo.value).encode("utf-8", errors="strict")  # must not raise UnicodeEncodeError
 
 
 def test_push_backup_rejects_malformed_remote_values(repo: Repo) -> None:

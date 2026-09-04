@@ -41,8 +41,10 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from .core.atomicio import atomic_write_text
+from .core.ids import is_ulid
 from .core.layout import RepoLayout
 from .core.redact import DEFAULT_ON_CLASSES, KNOWN_CLASSES, RedactionPolicy
 from .curator import BackendRegistry, TriggerConfig
@@ -61,9 +63,15 @@ __all__ = [
     "SUPPORTED_KB_SCHEMA_VERSIONS",
     "MAX_SUPPORTED_KB_SCHEMA_VERSION",
     "UnsupportedSchemaVersionError",
+    "ReadOnlySchemaVersionError",
     "assert_supported_kb_schema_version",
+    "assert_writable_kb_schema_version",
     "read_kb_schema_version",
+    "read_canonical_kb_schema_version",
     "guard_repo_schema_version",
+    "KbIdentity",
+    "load_kb_identity",
+    "write_kb_identity",
     "write_default_repo_config",
     "write_default_adapters_yaml",
     "load_backend_registry",
@@ -91,6 +99,18 @@ __all__ = [
 # Scope enum) so this config seam never imports the harvester package — the harvester imports
 # config, not the reverse, so the dependency stays acyclic. The harvester maps these to its enum.
 _SCOPE_VALUES = ("personal", "team")
+# Session-transcript format names a `session:` connector may declare (issue #147). Held HERE as
+# plain strings for the SAME reason _SCOPE_VALUES is: this config seam never imports the
+# harvester package (the harvester imports config, not the reverse), so the dependency stays
+# acyclic. The registry that maps these names to reader classes is
+# `harvester.session_sources.SESSION_READERS`; a sync test asserts the two never drift.
+#
+# This is the IMPLEMENTED subset of that registry (`session_sources.implemented_session_formats()`),
+# NOT every registered key: a registered-but-unbuilt SLOT must fail HERE, at config load, as an
+# unknown format. Accepting it would defer the failure to `build_connectors`, which builds every
+# connector before `agora harvest` applies `--connector` — so one aspirational line would disable
+# harvesting for unrelated healthy connectors while `agora doctor` still reported the repo healthy.
+_SESSION_FORMATS = ("claude-code-jsonl",)
 
 # DATA-MODEL §3: the per-repo config lives in the git-ignored operational spool at _kb/repo.yaml.
 _REPO_CONFIG_NAME = "repo.yaml"
@@ -265,10 +285,18 @@ def load_repo_config(layout: RepoLayout) -> RepoConfig:
 #
 # Widening this set is how a future build declares "I understand v2 repos too"; it is deliberately a
 # SET rather than a ceiling so a build can support {1, 2} while a hypothetical v3 stays refused.
-SUPPORTED_KB_SCHEMA_VERSIONS: frozenset[int] = frozenset({1})
+#
+# ADR-0041 D6 widens it to {1, 2} and states why it is {1, 2} and NEVER {2}: the owner's two live
+# KBs are schema 1 and `agora repo upgrade` (#63) does not exist, so a build that dropped 1 would
+# strand them. Schema 1 stays fully READABLE. What a schema-1 repo loses under a schema-2 build is
+# the WRITE path, and that refusal is a SEPARATE, narrower predicate
+# (:func:`assert_writable_kb_schema_version`) precisely because membership in this set can no
+# longer express it: with two members, "supported" and "writable" are different questions.
+SUPPORTED_KB_SCHEMA_VERSIONS: frozenset[int] = frozenset({1, 2})
 
 # Derived, never a second source of truth: message/upgrade-hint convenience so widening the set
-# above is a genuinely one-line change.
+# above is a genuinely one-line change. It is ALSO the writable version (ADR-0041 D6): Agora writes
+# exactly one layout — the newest it understands — and converts into it, never in place.
 MAX_SUPPORTED_KB_SCHEMA_VERSION: int = max(SUPPORTED_KB_SCHEMA_VERSIONS)
 
 
@@ -330,6 +358,88 @@ def assert_supported_kb_schema_version(cfg: RepoConfig, *, repo: Path | None = N
         raise UnsupportedSchemaVersionError(version, repo=repo)
 
 
+class ReadOnlySchemaVersionError(UnsupportedSchemaVersionError):
+    """This build can READ the repo's KB schema but will not WRITE it (ADR-0041 D6).
+
+    The second half of the DESIGN §10 V9 posture, HARDENED for the schema 1 → 2 bump. V9's
+    "new binary on an old repo = read-works / write-WARNS" assumes a write that is merely
+    suboptimal; here it is corrupting — APPLY would write schema-2 paths and schema-2 frontmatter
+    into a schema-1 tree, producing a repo that is neither, that no lint ruleset can gate, and
+    whose damage is a commit. So the write refuses instead of warning.
+
+    A SUBCLASS of :class:`UnsupportedSchemaVersionError` on purpose, and the direction matters:
+    every existing ``except UnsupportedSchemaVersionError`` handler (the CLI's one-line refusal,
+    the faces) keeps catching this unchanged, while a caller that wants to tell
+    *"this build cannot read your repo"* from *"this build will not write your repo"* can catch
+    the narrower type first. The remedy in the message is the ONE crossing that exists
+    (``agora import --from-kb``, ADR-0041 D6) — a converter that reads the schema-1 repo and
+    writes a NEW schema-2 one; there is no in-place migrator and the message must not imply one.
+    """
+
+    def __init__(self, version: int, *, repo: Path | None = None) -> None:
+        # Deliberately NOT super().__init__(): the parent composes the "cannot read" sentence and
+        # its "upgrade agora" remedy, both of which are wrong here (this build is already current;
+        # the REPO is the old half). Attributes are set to the same contract so callers that
+        # re-render rather than re-parse keep working across both types.
+        self.version = version
+        self.repo = repo
+        where = f"{repo}: " if repo is not None else ""
+        ConfigError.__init__(
+            self,
+            f"{where}KB schema_version {version} is READ-ONLY for this agora build: it writes "
+            f"schema_version {MAX_SUPPORTED_KB_SCHEMA_VERSION} only. Reads (query, status, "
+            f"browse, doctor, the MCP read tools, the web read routes) keep working; writes "
+            f"(curate, watch, requeue, inbox captures) refuse rather than mix two layouts in one "
+            f"repo. To move this repo forward, convert it once into a NEW repo with "
+            f"'agora import --from-kb <this-repo> <new-repo>' — there is no in-place migrator "
+            f"(ADR-0041 D6)",
+        )
+
+
+def assert_writable_kb_schema_version(
+    cfg_or_version: RepoConfig | int, *, repo: Path | None = None
+) -> None:
+    """Raise unless this build may WRITE ``cfg_or_version``'s KB schema (ADR-0041 D6).
+
+    Stricter than :func:`assert_supported_kb_schema_version` by exactly one step: support is
+    MEMBERSHIP in :data:`SUPPORTED_KB_SCHEMA_VERSIONS`, writability is EQUALITY with
+    :data:`MAX_SUPPORTED_KB_SCHEMA_VERSION`. That gap is the whole point — with the set widened to
+    ``{1, 2}`` every existing entry-point guard PASSES for a schema-1 repo, and a
+    construction-time guard structurally cannot let ``kb_query`` through while refusing
+    ``kb_remember`` on the same server object, so the write refusal needs its own per-write-path
+    predicate.
+
+    Two failure modes, two exceptions, in this order: a version this build cannot READ at all
+    raises :class:`UnsupportedSchemaVersionError` (the older, broader complaint — telling an
+    operator with a v3 repo to run ``agora import --from-kb`` would be wrong advice), and a
+    readable-but-older version raises :class:`ReadOnlySchemaVersionError`.
+
+    Accepts a :class:`RepoConfig` (the normal call — it reads ``cfg.taxonomy.schema_version``, the
+    value the loader already resolved from the canonical ``_meta/taxonomy.yaml``) or a bare int,
+    so a caller that read the version through :func:`read_kb_schema_version` need not build a
+    config to ask the question.
+
+    **WIRED.** ADR-0041 D6 names its call sites exhaustively and every one of them now reaches this
+    predicate through the ONE shared wrapper in :mod:`agora_kb.core.inbox` (which resolves the
+    repo's canonical declared version first): ``agora curate`` / ``watch`` / ``requeue`` in
+    ``cli.py``, ``Inbox.write`` itself — one call covering ``kb_remember``, the web upload route and
+    every future writer — and the ``kb_curate`` MCP handler. ``agora harvest`` is guarded too, one
+    layer earlier than it would inherit the gate, so the refusal names the repo rather than
+    surfacing per-item. READS are deliberately untouched (``status``/``query``/``browse``/``index``/
+    ``gold``), and ``agora doctor`` is exempt so the command that DIAGNOSES the skew still runs.
+    """
+    if isinstance(cfg_or_version, RepoConfig):
+        version = cfg_or_version.taxonomy.schema_version
+    elif isinstance(cfg_or_version, bool) or not isinstance(cfg_or_version, int):
+        raise TypeError(f"expected a RepoConfig or an int schema version, got {cfg_or_version!r}")
+    else:
+        version = cfg_or_version
+    if version not in SUPPORTED_KB_SCHEMA_VERSIONS:
+        raise UnsupportedSchemaVersionError(version, repo=repo)
+    if version != MAX_SUPPORTED_KB_SCHEMA_VERSION:
+        raise ReadOnlySchemaVersionError(version, repo=repo)
+
+
 def read_kb_schema_version(layout: RepoLayout) -> int | None:
     """Read ONLY the canonical KB ``schema_version``. ``None`` when it cannot be determined.
 
@@ -376,6 +486,39 @@ def read_kb_schema_version(layout: RepoLayout) -> int | None:
     return 1
 
 
+def read_canonical_kb_schema_version(layout: RepoLayout) -> int | None:
+    """Read the KB ``schema_version`` from ``_meta/taxonomy.yaml`` ALONE. ``None`` when unknown.
+
+    NARROWER than :func:`read_kb_schema_version`, which falls back to the ``_kb/repo.yaml`` mirror
+    when the canonical file omits the key. That fallback is right for the entry-point GUARD — a
+    mirror-only declaration is still a declaration this build must not read past — and wrong for
+    any decision that then WRITES the git-tracked tree: ``_kb/repo.yaml`` is git-ignored,
+    operator-local and rewritten by ``agora repo init`` itself, so letting it decide what a re-init
+    seeds would let a local, untracked edit reshape a shared repo.
+
+    ``None`` means "declares nothing determinable": the file is absent, unreadable, not a mapping,
+    or names a non-integer version. A readable file with NO ``schema_version`` key is a pre-#98
+    repo and reads as ``1`` — the documented default, so the absence of the key can never be
+    mistaken for the absence of the repo.
+    """
+    path = layout.meta_dir / "taxonomy.yaml"
+    if not path.is_file():
+        return None
+    try:
+        raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001 — unreadable/unparseable is "unknown", never a version.
+        return None
+    if not isinstance(raw, dict):
+        return None
+    value = raw.get("schema_version")
+    if value is None:
+        return 1
+    # bool is an int subclass in Python; a YAML 1.1 `yes` must not read as version 1.
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value
+
+
 def guard_repo_schema_version(layout: RepoLayout) -> None:
     """Entry-point guard: fail loud when ``layout``'s KB schema is one this build cannot support.
 
@@ -392,12 +535,182 @@ def guard_repo_schema_version(layout: RepoLayout) -> None:
         raise UnsupportedSchemaVersionError(version, repo=layout.root)
 
 
+# --- KB identity: _meta/kb.yaml (ADR-0041 D1.5) -------------------------------------------------
+# The CLOSED key set. Anything else on disk is an error, not an ignored extra — which is the
+# OPPOSITE of the `repo.yaml` convention (§3: unknown keys load without effect). The two files have
+# opposite postures because they have opposite trust properties: `_kb/repo.yaml` is git-IGNORED
+# operator-local policy, so an unknown key there is a local typo; `_meta/kb.yaml` is git-TRACKED and
+# therefore travels with a clone, so an unknown key there arrived from whoever authored the repo.
+_KB_IDENTITY_KEYS = ("kb_id", "name", "declared_kind")
+
+# Keys that must NEVER appear in `_meta/kb.yaml`, called out by name so the refusal explains the
+# ACTUAL hazard instead of saying "unknown key". `kind` is the load-bearing one:
+# `load_harvest_policy` reads the ENFORCING repo kind from git-ignored `_kb/repo.yaml`, and the
+# ADR-0007 scope lock uses it to decide whether personal sources may feed this repo. A git-tracked,
+# enforcing `kind` would let an UPSTREAM author's `kind: personal` unlock a DOWNSTREAM operator's
+# personal-scope connectors — converting a local safety declaration into a remote claim (ADR-0041
+# D1.5). The rest are the other policy surfaces that would acquire the same remote-claim property
+# if they were ever git-tracked.
+_KB_IDENTITY_FORBIDDEN_KEYS = frozenset(
+    {
+        "kind",
+        "harvest",
+        "curator",
+        "domains",
+        "allowed_tags",
+        "taxonomy_policy",
+        "schema_version",
+        "triggers",
+        "redact",
+        "backup",
+        "index",
+        "web",
+        "connectors",
+        "review_mode",
+        "git_remote",
+        "policy",
+    }
+)
+
+
+class KbIdentity(BaseModel):
+    """Typed view of ``_meta/kb.yaml`` — the identity of one knowledge base (ADR-0041 D1.5).
+
+    Three fields and no policy. ``kb_id`` is a ULID minted ONCE at ``agora repo init`` and never
+    rewritten, mirrored into every note's ``kb:`` frontmatter so a note copied out of the repo
+    still names its origin. ``name`` is a display name. ``declared_kind`` is **ADVISORY ONLY**: it
+    documents what the KB's author considers it to be and is never an authorisation input — the
+    enforcing value stays ``kind`` in git-ignored ``_kb/repo.yaml``, which is what
+    :func:`load_harvest_policy` reads for the ADR-0007 scope lock.
+
+    For a KB that was not created locally, ``kb_id`` is likewise a **self-claim** (ADR-0041 R3):
+    it is display/join identity, never an authorisation input. The registry, aliasing and attach
+    semantics that consume it belong to reserved ADR-0037 and are not decided here.
+
+    ``frozen`` + ``extra='forbid'``: the closed key set is enforced by the model itself, so the
+    writer cannot emit a fourth key even by accident.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    kb_id: str
+    name: str
+    declared_kind: str | None = None
+
+    @field_validator("kb_id")
+    @classmethod
+    def _kb_id_is_a_ulid(cls, value: str) -> str:
+        if not is_ulid(value):
+            raise ValueError(
+                f"kb_id must be a canonical 26-character uppercase Crockford ULID, got {value!r}"
+            )
+        return value
+
+    @field_validator("name")
+    @classmethod
+    def _name_is_not_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("name must be a non-empty display name")
+        return value
+
+    @field_validator("declared_kind")
+    @classmethod
+    def _declared_kind_vocabulary(cls, value: str | None) -> str | None:
+        # Advisory does not mean free-form: a typo'd advisory value is a value nobody can act on.
+        # Validating the vocabulary does NOT make the field authoritative — nothing reads it for a
+        # scope decision, which is asserted by a test rather than only stated here.
+        if value is not None and value not in _SCOPE_VALUES:
+            raise ValueError(f"declared_kind must be one of {list(_SCOPE_VALUES)}, got {value!r}")
+        return value
+
+
+def load_kb_identity(layout: RepoLayout) -> KbIdentity | None:
+    """Load ``_meta/kb.yaml``; ``None`` when the file is ABSENT (ADR-0041 D1.5).
+
+    Absent is not an error HERE: every schema-1 repo predates the file, and this loader has no way
+    to know which schema the caller is operating under. The caller decides — a schema-2 write path
+    treats ``None`` as a broken repo, while a read path and ``agora doctor`` treat it as "no
+    identity declared" and carry on.
+
+    Everything else about a file that IS present fails LOUD with :class:`ConfigError`:
+    unparseable YAML, a non-mapping document, a missing/blank required field, a ``kb_id`` that is
+    not a ULID, an unknown key, and — with a pointed message of its own — any POLICY key. The
+    posture is deliberately the opposite of ``repo.yaml``'s tolerant unknown-key handling, because
+    this file is git-tracked and therefore travels with a clone (see ``_KB_IDENTITY_KEYS``).
+    """
+    path = layout.kb_meta_file
+    if not path.is_file():
+        return None
+    raw = _read_yaml_mapping(path)
+    if not raw:
+        raise ConfigError(
+            f"{path}: KB identity file is empty or not a YAML mapping; it must declare "
+            f"{list(_KB_IDENTITY_KEYS)} (ADR-0041 D1.5)"
+        )
+    _reject_kb_identity_policy_keys(raw, path=path)
+    try:
+        # model_validate rather than KbIdentity(**raw): the loader's `raw` is dict[str, object]
+        # (untrusted YAML), and **-unpacking it types every field as `object` under mypy. The
+        # validation, the closed key set and the raised ValidationError are identical.
+        return KbIdentity.model_validate(raw)
+    except ValueError as exc:  # pydantic ValidationError is a ValueError subclass
+        raise ConfigError(f"{path}: invalid KB identity: {exc}") from exc
+
+
+def write_kb_identity(layout: RepoLayout, identity: KbIdentity) -> Path:
+    """Write ``_meta/kb.yaml`` from ``identity``; return its path (ADR-0041 D1.5).
+
+    Emits exactly the closed key set, in the ADR's declared order, omitting ``declared_kind`` when
+    it is unset rather than writing an explicit ``null`` (a null advisory field reads as a value).
+    The emitted mapping is re-checked against the policy denylist before it is written, so the one
+    rule that matters — *policy must never live in the git-tracked identity file* — is enforced on
+    the WRITE side too and not only on the read side.
+
+    Atomic + non-exclusive (temp file, replace, directory fsync): the file is git-TRACKED canonical
+    data, so a torn write would be a committed corruption. ``kb_id`` is minted once and never
+    rewritten, so a caller re-writing this file is expected to pass back the SAME ``kb_id`` it
+    loaded — this function does not mint one, precisely so no code path can silently re-identify a
+    knowledge base.
+    """
+    doc: dict[str, object] = {"kb_id": identity.kb_id, "name": identity.name}
+    if identity.declared_kind is not None:
+        doc["declared_kind"] = identity.declared_kind
+    _reject_kb_identity_policy_keys(doc, path=layout.kb_meta_file)
+    path = layout.kb_meta_file
+    path.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_text(
+        path,
+        yaml.safe_dump(doc, sort_keys=False, allow_unicode=True),
+        exclusive=False,
+    )
+    return path
+
+
+def _reject_kb_identity_policy_keys(raw: dict[str, object], *, path: Path) -> None:
+    """Enforce the ``_meta/kb.yaml`` closed key set, naming policy keys explicitly (D1.5)."""
+    unknown = [k for k in raw if k not in _KB_IDENTITY_KEYS]
+    policy = sorted(k for k in unknown if k in _KB_IDENTITY_FORBIDDEN_KEYS)
+    if policy:
+        raise ConfigError(
+            f"{path}: policy key(s) {policy} must never live in the git-tracked KB identity file "
+            f"— it travels with a clone, so an upstream author's policy would become a claim on a "
+            f"downstream operator's repo. Policy belongs in git-ignored _kb/repo.yaml; kb.yaml "
+            f"carries only {list(_KB_IDENTITY_KEYS)} (ADR-0041 D1.5)"
+        )
+    if unknown:
+        raise ConfigError(
+            f"{path}: unknown key(s) {sorted(unknown)} in the KB identity file; the key set is "
+            f"CLOSED to {list(_KB_IDENTITY_KEYS)} (ADR-0041 D1.5)"
+        )
+
+
 def write_default_repo_config(
     layout: RepoLayout,
     *,
     name: str,
     domains: list[str] | tuple[str, ...],
     kind: str = _DEFAULT_KIND,
+    schema_version: int = MAX_SUPPORTED_KB_SCHEMA_VERSION,
 ) -> Path:
     """Emit a starter ``_kb/repo.yaml`` (DATA-MODEL §3); return its path.
 
@@ -407,12 +720,26 @@ def write_default_repo_config(
     derived policy, not canonical knowledge — and an idempotent re-init simply overwrites it.
     ``kind`` defaults to ``"personal"`` (the Phase-1 MVP); a ``"team"`` repo passes ``kind="team"``
     so the §3 first-class identity field is settable rather than hardcoded.
+
+    ``schema_version`` is the MIRROR of the canonical ``_meta/taxonomy.yaml`` value (ADR-0010 §5.1:
+    "engine-side ``_kb/repo.yaml`` is mirrored from the canonical value, not the reverse"), and it
+    is a parameter rather than a hardcoded literal so the mirror is written correctly ONCE by the
+    writer instead of being re-stamped afterwards by whichever caller happens to remember. Lint
+    ``L1-17`` rejects any drift between the two locations, so a caller emitting a taxonomy at a
+    different version MUST pass the same value here.
+
+    The DEFAULT is :data:`MAX_SUPPORTED_KB_SCHEMA_VERSION` — the version this build WRITES
+    (ADR-0041 D6) — expressed as that constant rather than a literal so the two can never fall out
+    of step at the next bump. A caller emitting a schema-1 repo (a converter writing a v1 source's
+    mirror, a test pinning the legacy layout) passes ``schema_version=1`` explicitly, which is the
+    right direction for the asymmetry: writing the CURRENT schema is the unremarkable case and
+    writing an older one is the deliberate act.
     """
     triggers = TriggerConfig()
     doc: dict[str, object] = {
         "name": name,
         "kind": kind,
-        "schema_version": 1,
+        "schema_version": schema_version,
         "domains": list(domains),
         "review_mode": "direct",
         "curator": {
@@ -493,7 +820,10 @@ def write_default_adapters_yaml(layout: RepoLayout, *, model: str | None = None)
         "# and harvests the sibling's content instead of the thin one-line summary. A session:\n"
         "# connector (ADR-0023) distills agent SESSION transcripts (assistant reflections with a\n"
         "# durable-knowledge marker); it redacts secrets at its boundary per harvest.redact\n"
-        "# (default on). Uncomment + point at a real source to enable harvesting.\n"
+        "# (default on). Its optional format: key picks the transcript parser (default\n"
+        "# claude-code-jsonl); harvester.session_sources.implemented_session_formats() lists the\n"
+        "# names this build can actually parse — any other name is rejected when this file loads.\n"
+        "# Uncomment + point at a real source to enable harvesting.\n"
         "# connectors:\n"
         '#   file:claude-code: { path: "~/.claude/**/MEMORY.md", scope: personal }\n'
         '#   file:hermes: { path: "~/.hermes/MEMORY.md", scope: personal, follow_links: true }\n'
@@ -727,7 +1057,8 @@ class ConnectorSpec:
     ``file:claude-code`` — the ``<type>:<agent>`` form). ``scope`` is the validated source scope
     (``personal`` | ``team``, a plain string here; the harvester maps it to its ``Scope`` enum).
     ``path`` is the source locator (a glob for a file connector; ``None`` for deferred API
-    connectors).
+    connectors). ``format`` is the ``session:`` connector's transcript grammar (issue #147);
+    ``None`` keeps the harvester's default so an existing file behaves byte-identically.
     """
 
     name: str
@@ -741,6 +1072,13 @@ class ConnectorSpec:
     #: whole-source digest, editing it did not even re-trigger a scan, so its facts were unreachable
     #: rather than merely delayed.
     max_files: int | None = None
+    #: The transcript grammar a ``session:`` connector's files are parsed with (issue #147).
+    #: ``None`` means the harvester's default (``claude-code-jsonl``) — today's behaviour, so an
+    #: existing ``adapters.yaml`` keeps parsing byte-identically. Meaningful ONLY for ``session:``
+    #: connectors; it is the config-visible half of the reader seam that previously existed in code
+    #: but was unreachable, which made EVERY agent's transcript get Claude Code's parser
+    #: (invariant #6).
+    format: str | None = None
 
 
 def load_connector_specs(path: str | Path) -> list[ConnectorSpec] | None:
@@ -750,8 +1088,9 @@ def load_connector_specs(path: str | Path) -> list[ConnectorSpec] | None:
     :func:`load_backend_registry`'s None-on-absent contract, so the caller surfaces a clear "no
     connectors configured" note rather than crashing). The existing :class:`BackendRegistry` IGNORES
     the ``connectors:`` block, so this is the connector family's OWN parser and it owns all
-    validation: a non-mapping block, a non-mapping entry, or an unknown ``scope`` value raises
-    :class:`ConfigError` (FAIL LOUD — operator config is a trust boundary, ADR-0007). An absent
+    validation: a non-mapping block, a non-mapping entry, an unknown ``scope`` value, or an
+    unknown / misplaced ``format`` raises :class:`ConfigError` (FAIL LOUD — operator config is a
+    trust boundary, ADR-0007). An absent
     per-entry ``scope`` defaults to ``personal`` (the most restrictive scope; it may feed only a
     personal repo). Commented-out ``letta:`` / ``mem0:`` examples are simply not present after YAML
     parse and so are tolerated.
@@ -790,6 +1129,22 @@ def load_connector_specs(path: str | Path) -> list[ConnectorSpec] | None:
         )
         if max_files is not None and max_files < 1:
             raise ConfigError(f"connector {name!r}: max_files must be >= 1, got {max_files!r}")
+        # format (issue #147) selects the session-transcript parser. Validated HERE against the
+        # names the harvester registry knows, so a typo is an actionable config error at load time
+        # rather than a connector that silently parses a Codex transcript with Claude Code's
+        # grammar and harvests nothing. Rejected outright on a non-session connector: a key that
+        # cannot possibly take effect must not look accepted (the same footgun max_files documents).
+        fmt = _opt_str_loud(spec.get("format"), key=f"connector {name!r}: format")
+        if fmt is not None:
+            if not str(name).startswith("session:"):
+                raise ConfigError(
+                    f"connector {name!r}: format is only meaningful for a 'session:' connector"
+                )
+            if fmt not in _SESSION_FORMATS:
+                raise ConfigError(
+                    f"connector {name!r}: unknown format {fmt!r}; "
+                    f"known formats are {list(_SESSION_FORMATS)}"
+                )
         specs.append(
             ConnectorSpec(
                 name=str(name),
@@ -797,6 +1152,7 @@ def load_connector_specs(path: str | Path) -> list[ConnectorSpec] | None:
                 path=_opt_str(spec.get("path")),
                 follow_links=follow_links,
                 max_files=max_files,
+                format=fmt,
             )
         )
     return specs
@@ -1240,7 +1596,8 @@ def _load_taxonomy(
     is NEVER synthesized from ``repo.yaml`` (which lists no tags), so the config can never widen the
     closed tag set the curator validates against.
     """
-    meta = _read_yaml_mapping(layout.root / "_meta" / "taxonomy.yaml")
+    meta_path = layout.root / "_meta" / "taxonomy.yaml"
+    meta = _read_yaml_mapping(meta_path)
     if meta:
         # _meta/taxonomy.yaml allowed_tags is a mapping {tag: {}} (emit.py); domains is a list.
         allowed_tags = meta.get("allowed_tags")
@@ -1248,18 +1605,65 @@ def _load_taxonomy(
             tags = tuple(str(t) for t in allowed_tags)
         else:
             tags = tuple(_str_list(allowed_tags))
+        version = _opt_int(meta.get("schema_version"), 1, key="schema_version")
         return Taxonomy(
-            schema_version=_opt_int(meta.get("schema_version"), 1, key="schema_version"),
+            schema_version=version,
             taxonomy_policy=_opt_str(meta.get("taxonomy_policy")) or "open",
             allowed_tags=tags,
-            domains=tuple(_str_list(meta.get("domains"))),
+            domains=_checked_domains(
+                _str_list(meta.get("domains")), path=meta_path, schema_version=version
+            ),
         )
+    version = _opt_int(repo_schema_version, 1, key="schema_version")
     return Taxonomy(
-        schema_version=_opt_int(repo_schema_version, 1, key="schema_version"),
+        schema_version=version,
         taxonomy_policy="open",
         allowed_tags=(),
-        domains=tuple(repo_domains),
+        domains=_checked_domains(
+            repo_domains, path=repo_config_path(layout), schema_version=version
+        ),
     )
+
+
+def _checked_domains(domains: list[str], *, path: Path, schema_version: int) -> tuple[str, ...]:
+    """Reject a domain beginning with ``_`` — the ``raw/`` reserved-prefix namespace (D1.4/L1-23).
+
+    ``raw/<domain>/`` and ``raw/_blob/`` share ONE namespace, so a taxonomy declaring a domain
+    literally named ``_blob`` would make APPLY write ``raw/_blob/<event_id>.md`` into the
+    content-addressed tree — and ``_pages`` is reserved the same way.
+
+    This is the SECOND of the two layers ADR-0041 D1.4 requires, not a restatement of the first.
+    The first layer guards PLAN tokens at path composition
+    (:func:`agora_kb.core.layout.RepoLayout.note_path_for`, and the ``pathsafe`` swap it belongs
+    to); ``_meta/taxonomy.yaml`` is human-written and never passes through the plan validator at
+    all, so a taxonomy entry is an input the first layer never sees. Neither layer covers the
+    other's input, which is why both exist.
+
+    **SCHEMA 2 ONLY, and the gate is not cosmetic.** L1-23 is a rule ADDED by ADR-0041 D3.1 (see
+    the ADR-0010 supersession banner), and ``schema/lint.py`` gates its own half on
+    ``version >= 2`` for exactly that reason. Enforcing it here for schema 1 as well would make an
+    underscore-leading domain a hard ``ConfigError`` on a class of repo whose behaviour this wave
+    guarantees is unchanged — and because every read surface loads config first (``agora curate``,
+    ``AgoraHandlers.health()``, the dashboard), the refusal would arrive as a load-time exception
+    on a READ path rather than as the lint finding ADR-0041 specifies. Schema 1 keeps loading such
+    a taxonomy exactly as before; nothing writes ``raw/_blob/`` under schema 1, so there is no
+    collision to prevent there.
+
+    The declaration site is guarded too: ``agora repo init`` refuses a ``--domain`` beginning with
+    ``_`` before it writes anything, so no version of the tool can mint a repo it would later
+    refuse to load.
+    """
+    if schema_version < 2:
+        return tuple(domains)
+    reserved = [d for d in domains if d.startswith("_")]
+    if reserved:
+        raise ConfigError(
+            f"{path}: domain(s) {sorted(reserved)} may not begin with '_' — that prefix is "
+            f"reserved inside raw/ for the content-addressed capture tree (raw/_blob/) and the "
+            f"long-document tier (raw/_pages/), which share the raw/<domain>/ namespace "
+            f"(ADR-0041 D1.4, lint L1-23)"
+        )
+    return tuple(domains)
 
 
 def _build_triggers(raw: object) -> TriggerConfig:

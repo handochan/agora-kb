@@ -22,11 +22,17 @@ import pytest
 
 from agora_kb.curator import subprocess_backend as sb
 from agora_kb.curator.apply import body_sentinels
-from agora_kb.curator.backends import BackendSpec
+from agora_kb.curator.backends import BackendSpec, run_backend
 from agora_kb.curator.subprocess_backend import BackendUnavailableError, SubprocessBackend
 from agora_kb.curator.worker import AuthorRegion
 
 requires_git = pytest.mark.skipif(shutil.which("git") is None, reason="git not available")
+
+try:
+    "x".encode("cp949")
+    _HAS_CP949 = True
+except LookupError:  # pragma: no cover - defensive only; cp949 ships with CPython
+    _HAS_CP949 = False
 
 
 def _python_spec(name: str, code: str) -> BackendSpec:
@@ -47,6 +53,47 @@ def test_plan_returns_backend_stdout_verbatim(tmp_path: Path) -> None:
     out = backend.plan(tmp_path)
 
     assert out == canned
+
+
+def test_run_backend_round_trips_a_non_ascii_prompt(tmp_path: Path) -> None:
+    # Pins the #85 encoding pin (tests-3) on run_backend's subprocess call (backends.py): a Korean
+    # prompt must come back byte-for-byte on stdout regardless of the process locale, exercising the
+    # real subprocess path so it fails if the `encoding="utf-8"` pin regresses.
+    spec = _python_spec("stub", "import sys; sys.stdout.write(sys.stdin.read())")
+
+    result = run_backend(spec, worktree=tmp_path, prompt="한국어 메모")
+
+    assert result.returncode == 0
+    assert result.stdout == "한국어 메모"
+
+
+def test_run_backend_child_env_carries_forced_utf8_vars(tmp_path: Path) -> None:
+    # (codex-P1) run_backend must force BOTH vars on the CHILD's env, on top of whatever `env` the
+    # caller passed (or os.environ when env=None) — pinning encoding="utf-8" on THIS process's end
+    # of the pipe (above) does nothing to a Python-based backend child's OWN locale-driven decode.
+    spec = _python_spec(
+        "env-echo",
+        "import os,sys; sys.stdout.write("
+        "os.environ.get('PYTHONIOENCODING','') + '|' + os.environ.get('PYTHONUTF8',''))",
+    )
+    result = run_backend(spec, worktree=tmp_path, prompt="")
+    assert result.stdout == "utf-8|1"
+
+
+@pytest.mark.skipif(not _HAS_CP949, reason="cp949 codec unavailable in this interpreter")
+def test_run_backend_round_trips_korean_despite_hostile_outer_pythonioencoding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # (codex-P1) A hostile PYTHONIOENCODING on the OUTER (this-process) env — e.g. a cp949 Windows
+    # console — must not leak into the backend child: run_backend forces its own child-side UTF-8
+    # regardless of what os.environ (the env=None default) carries.
+    monkeypatch.setenv("PYTHONIOENCODING", "cp949")
+    spec = _python_spec("stub", "import sys; sys.stdout.write(sys.stdin.read())")
+
+    result = run_backend(spec, worktree=tmp_path, prompt="한국어 메모", env=None)
+
+    assert result.returncode == 0
+    assert result.stdout == "한국어 메모"
 
 
 def test_plan_reads_bundle_from_cwd(tmp_path: Path) -> None:

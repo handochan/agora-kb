@@ -1,6 +1,7 @@
 # ADR-0017 — Harvester file-connector mechanics (segmentation, cursor, loop, scope)
 
 **Status:** Accepted · 2026-06-20
+**AMENDED (append-only) — [ADR-0041](0041-stratum-kind-first-layout.md) (Proposed, KB wiki schema 2) widens the INPUT SET this ADR's connectors may read, and fences the widening.** The connector MECHANICS are layout-free and UNCHANGED: segmentation, the `fact_key`/`event_key` derivation, the cursor and its D7 no-op hash, the file/match/size caps, the sentinel neutralization, and the fail-closed scope gate. What changes is that these connectors have until now read only SOURCE files OUTSIDE the repo, and ADR-0041 D3.3 makes `wiki/people/**` the first sanctioned IN-REPO read — the single route by which a human's own writing reaches the curated tree, as a gated candidate. **Companion rule (normative):** a `file:` connector on a repo-internal path may cover `wiki/people/**` and NOTHING ELSE; any other `wiki/` or `raw/` path under such a glob is skipped with a note, mirroring the existing `_is_within_gold` guard (`harvester/connectors.py`, the ADR-0027 §8 path exclusion), and `agora doctor` reports it as it already reports the gold exclusion. Without the fence a glob covering `wiki/concepts/**` would feed the curator's own output back as candidates — the reworded-loop risk §8 leaves open. The prose below is retained verbatim for history.
 
 Realizes [ADR-0007](0007-memory-harvester-safety.md) (memory harvester with provenance / gate /
 scope safety) for Phase 2. Depends on ADR-0002 (the inbox is the only write path; per-writer

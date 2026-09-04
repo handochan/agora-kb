@@ -10,7 +10,10 @@ web ``GET /api/gold/{pack}``. The suite locks the issue's completion criteria:
 - the MCP channels are driven over a REAL ``fastmcp.Client`` (tool + resource + prompt);
 - MCP and web return the SAME handler payload (the ADR-0019/0021 two-face lock).
 
-The repo fixture mirrors ``tests/test_cli.py::_gold_repo`` (hermetic git env, one eligible theme).
+The repo fixture is a KB wiki SCHEMA 2 repo (ADR-0041 D1) with one eligible concept and one
+human-owned ``wiki/people/**`` note, so the D3.3 day-1 exclusion is asserted on the CONSUMPTION
+side too — these channels serve built pack bytes, so "people notes never reach an agent through
+``kb_context``" is a property of the artifact, and this is where that is checked end to end.
 Web tests skip cleanly when fastapi is absent (``importorskip`` inside the web client helper).
 """
 
@@ -34,11 +37,21 @@ requires_git = pytest.mark.skipif(shutil.which("git") is None, reason="git not a
 
 GEN_AT = datetime(2026, 7, 25, 12, 0, 0, tzinfo=UTC)
 
-THEME_MD = (
-    "---\ntitle: Curator Concurrency\ntype: theme\naliases: []\ntags: []\n"
-    "created: '2026-06-01'\nupdated: '2026-07-01'\nstatus: active\n"
+CONCEPT_MD = (
+    "---\ntitle: Curator Concurrency\nkind: concept\nsubjects: [ai-tech]\naliases: []\n"
+    "tags: []\ncreated: '2026-06-01'\nupdated: '2026-07-01'\nstatus: active\n"
     "summary: single-writer CAS keeps the wiki consistent\nsources: [raw/a.md]\n"
     "related: []\nconfidence: high\n---\n\n# Curator Concurrency\n\nbody\n"
+)
+
+# A human-owned note carrying the SAME vocabulary as the concept above and better score inputs.
+# It must never appear in a served pack (ADR-0041 D3.3 day-1 exclusion).
+PERSON_MD = (
+    "---\ntitle: Hando Private Desk\naliases: []\ntags: []\n"
+    "created: '2026-06-01'\nupdated: '2026-07-05'\nstatus: active\n"
+    "summary: single-writer CAS keeps the wiki consistent, in my own words\n"
+    "sources: [raw/a.md, raw/b.md, raw/c.md]\nconfidence: high\n---\n\n"
+    "# Hando Private Desk\n\nprivate body\n"
 )
 
 
@@ -59,15 +72,26 @@ def _git(root: Path, *args: str) -> None:
 
 
 def _repo(tmp_path: Path) -> Repo:
-    """Init a repo with one eligible theme COMMITTED (the assembler needs a curated tip)."""
+    """Init a SCHEMA-2 repo with one eligible concept + one people note, COMMITTED.
+
+    The assembler needs a curated tip, and ``_meta/taxonomy.yaml`` is what declares the schema the
+    read side derives ``kind``/``subjects`` under (ADR-0041 D2.1/D2.2).
+    """
     root = tmp_path / "kb"
     repo = Repo.resolve(root)
     repo.init()
-    themes = root / "wiki" / "ai-tech" / "themes"
-    themes.mkdir(parents=True, exist_ok=True)
-    (themes / "curator-concurrency.md").write_text(THEME_MD, encoding="utf-8")
+    (root / "_meta").mkdir(parents=True, exist_ok=True)
+    (root / "_meta" / "taxonomy.yaml").write_text(
+        "schema_version: 2\ndomains: [ai-tech]\nallowed_tags: []\n", encoding="utf-8"
+    )
+    concepts = root / "wiki" / "concepts"
+    concepts.mkdir(parents=True, exist_ok=True)
+    (concepts / "curator-concurrency.md").write_text(CONCEPT_MD, encoding="utf-8")
+    people = root / "wiki" / "people" / "hando"
+    people.mkdir(parents=True, exist_ok=True)
+    (people / "desk.md").write_text(PERSON_MD, encoding="utf-8")
     _git(root, "add", "-A")
-    _git(root, "commit", "-m", "theme")
+    _git(root, "commit", "-m", "concept + people note")
     return repo
 
 
@@ -189,6 +213,66 @@ def test_handler_tolerates_corrupt_meta_sidecar(tmp_path: Path) -> None:
     assert payload["status"] == "ok"
     assert payload["meta"] is None
     assert payload["text"].encode("utf-8") == repo.layout.gold_pack_path("default").read_bytes()
+
+
+@requires_git
+def test_a_pack_built_by_an_older_gold_schema_is_not_served(tmp_path: Path) -> None:
+    """A ``GOLD_SCHEMA_VERSION`` bump must invalidate the SERVE path, not just the freshness key.
+
+    ``read_meta`` returns ``None`` on a version mismatch, so ``gold_status`` already reported
+    ``present: false`` for such a pack — while ``gold_pack`` (and therefore ``kb_context``, the
+    ``agora://gold/{pack}`` resource and ``GET /api/gold/{pack}``) kept serving its bytes as
+    ``ok``. That is the bump doing the opposite of its job: the 1 → 2 bump moved eligibility to the
+    kind axis and added the ``wiki/people/**`` and ``derived: true`` exclusions, so the superseded
+    selection is exactly what must stop flowing. ``_kb/`` is git-ignored, so a pack built on the
+    previous branch survives a checkout and lands here.
+    """
+    import json
+
+    repo = _built_repo(tmp_path)
+    meta_path = repo.layout.gold_meta_path("default")
+    doc = json.loads(meta_path.read_text(encoding="utf-8"))
+    doc["schema_version"] = 1  # exactly what the previous binary wrote
+    meta_path.write_text(json.dumps(doc), encoding="utf-8")
+
+    payload = AgoraHandlers(repo).gold_pack()
+    assert payload["status"] == "not_built"
+    assert payload["stale_schema"] == 1
+    assert "text" not in payload
+    assert "older gold schema" in payload["note"]
+    assert payload["packs"] == ["default"]
+
+    # …and the operator's panel says the SAME thing, with the reason attached rather than an
+    # unexplained "no pack built yet".
+    panel = AgoraHandlers(repo).gold_status()
+    assert panel["gold"]["present"] is False
+    assert panel["gold"]["stale_schema"] == 1
+
+
+@requires_git
+def test_served_pack_never_carries_people_content(tmp_path: Path) -> None:
+    """ADR-0041 D3.3: ``kb_context`` cannot emit ``wiki/people/**`` — BY CONSTRUCTION.
+
+    This channel serves the BUILT artifact and never reassembles (ADR-0027 decision 3), so the
+    exclusion is a property of the pack the producer wrote, not a filter this face applies. The
+    fixture's people note carries the same vocabulary as the eligible concept and BETTER score
+    inputs (fresher ``updated``, three ``sources:``), so its absence is an exclusion rather than a
+    lost budget race. The pull-shaped read tools are deliberately WIDER — ``kb_read`` on that same
+    path still serves it (D3.3 read-is-first-class, residual R1) — which is asserted here so the
+    two surfaces are visibly different on purpose.
+    """
+    repo = _built_repo(tmp_path)
+    payload = AgoraHandlers(repo).gold_pack()
+
+    assert payload["status"] == "ok"
+    assert "Hando Private Desk" not in payload["text"]
+    assert "wiki/people/" not in payload["text"]
+    assert payload["meta"]["note_count"] == 1  # the concept only
+
+    # …and the pull surface still reads it: the exclusion is the PUSH control, not a hidden file.
+    person = AgoraHandlers(repo).note("wiki/people/hando/desk.md")
+    assert person is not None
+    assert person["kind"] == "person"
 
 
 # --- (b) MCP channels over a real Client --------------------------------------------------------
