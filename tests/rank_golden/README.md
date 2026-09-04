@@ -1,8 +1,16 @@
 # The ranking golden — gate B for the Stratum layout flip
 
 This directory holds a **model-free, deterministic golden fixture** that pins what
-`agora_kb.core.wiki.Wiki.query` returns *today*, over a synthetic 46-note knowledge repo built in
-the **v1 wiki layout** (`wiki/<domain>/themes|daily` + `wiki/<domain>/<domain>-moc.md`).
+`agora_kb.core.wiki.Wiki.query` returns over a synthetic 46-note knowledge repo — **twice**, once
+per KB wiki schema, so the Stratum layout flip is a measured change rather than a noticed one:
+
+| record | layout | status |
+| --- | --- | --- |
+| `golden_v1.json` · `golden_v1_fm_off.json` | ADR-0010 v1 (`wiki/<domain>/themes\|daily` + `wiki/<domain>/<domain>-moc.md`) | **frozen** — history, unreproducible by this build |
+| `golden_v2.json` · `golden_v2_fm_off.json` | ADR-0041 kind-first (`wiki/concepts` · `wiki/maps` · `wiki/notes/<yyyy>/<mm>`) | live — what `regen` maintains |
+
+The flip itself is documented in **[`FLIP-DIFF.md`](FLIP-DIFF.md)**: the full `diff_snapshots`
+listing from `golden_v1` to `golden_v2`, explained per category, as ADR-0041 D5 requires.
 
 ## Why it exists
 
@@ -12,18 +20,26 @@ The Stratum plan (issues [#153](https://github.com/handochan/agora-kb/issues/153
 domain-first to kind-first. That is not a cosmetic move:
 
 ```python
+# v1, the layout golden_v1 was recorded over
 def _is_moc_path(path: str) -> bool:
     """True iff `path` matches wiki/<domain>/<domain>-moc.md (ADR-0012 §2)."""
+
+# schema 2, ADR-0041 D5 — the kind marker moved into the DIRECTORY
+def _is_map_path(path: str) -> bool:
+    """True iff `path` is wiki/maps/… with at least three segments."""
 ```
 
-`_is_moc_path` reads the MOC **out of the path**. It is what seeds `d_moc` — the structural term —
-for the entire corpus, so every note's `struct` (and therefore its combined score, its rank, and
-which notes a gold pack picks up under ADR-0027) depends on where files sit. Change the layout and
-ranking changes with it, silently.
+The predicate reads the map tier **out of the path**. It is what seeds `d_moc` — the structural
+term — for the entire corpus, so every note's `struct` (and therefore its combined score, its rank,
+and which notes a gold pack picks up under ADR-0027) depends on where files sit. Change the layout
+and ranking changes with it, silently.
 
 The original gate B was an `n=24` five-arm search harness. It never existed as code. So gate B is
-re-scoped to this: **record the ranking before the flip, so the change can be attributed to the
-flip** rather than merely noticed after the fact.
+re-scoped to this: **record the ranking on both sides of the flip, so the change can be attributed
+to the flip** rather than merely noticed after the fact. The attribution came out surprising and is
+written up in `FLIP-DIFF.md`: on this corpus the seed rule moved **nothing** — `wiki/maps/` holds
+exactly the three maps `wiki/<domain>/<domain>-moc.md` held — and the 423-line listing is the
+`type:` mirror, six renames and ADR-0041 D2.6's journal merge.
 
 ## What is pinned
 
@@ -31,9 +47,11 @@ flip** rather than merely noticed after the fact.
 | --- | --- |
 | `corpus.py` | 46 notes over `cooking` / `engineering` / `finance` — content only, no paths |
 | `queries.yaml` | 44 probes: the 4 verbatim #146 queries, 30 positives (24 paraphrases — 6 Korean, 2 mixed-script — plus the 6 `p25`–`p30` mechanism probes), 10 negatives (2 Korean) |
-| `golden_v1.json` | the record with the ADR-0012 §8 frontmatter boost **on** (the live build mode) |
-| `golden_v1_fm_off.json` | the same record with the boost **off** |
-| `regen.py` | the only sanctioned producer of both records |
+| `golden_v2.json` | the LIVE record — schema-2 layout, ADR-0012 §8 frontmatter boost **on** (the live build mode) |
+| `golden_v2_fm_off.json` | the same record with the boost **off** |
+| `golden_v1.json` · `golden_v1_fm_off.json` | the FROZEN pre-flip baseline, both §8 columns |
+| `FLIP-DIFF.md` | the ADR-0041 D5 deliverable: `diff_snapshots(golden_v1, golden_v2)` in full, explained per category |
+| `regen.py` | the only sanctioned producer of the live records — and it REFUSES to write the frozen ones |
 | `test_golden.py` | the gate |
 | `queries_dogfood.yaml` | the owner-side eval set for the private KB (see below) |
 
@@ -45,11 +63,17 @@ instant the layout flips, which is precisely the change the fixture has to measu
 `anchor` / `line` / `excerpt` are recorded because they derive from note CONTENT and not from the
 path, so they survive the flip unchanged and cost nothing in flip robustness.
 
-Both §8 columns are recorded because the boost can mask a structural change, and they now differ in
-ways a structural change would disturb differently: `p26`'s **top hit** is `finance-moc` with the
-boost on and the `deprecated` near-duplicate with it off (the −0.15 demotion is the only thing
-separating them), `p29` records 13 hits on and 14 off, and the `contested`/stub notes move several
-places throughout.
+Both §8 columns are recorded because the boost can mask a structural change, and they differ in ways
+a structural change would disturb differently: `p26`'s **top hit** is the finance map with the boost
+on and the `deprecated` near-duplicate with it off (the −0.15 demotion is the only thing separating
+them), `p29` records 13 hits on and 14 off, and the `contested`/stub notes move several places
+throughout.
+
+The two records share `corpus.py` and `queries.yaml` **verbatim** — the corpus is content-only and
+the query file states a judgement about which note should answer, not where it lives. Six basenames
+changed at the flip (`<domain>-moc` → `<domain>`, `<domain>-YYYY-MM-DD` → `YYYY-MM-DD`), and
+`queries.yaml` still names the v1 ones: `regen.expected_note` translates them once, through the
+`v2_basename` mapping `tests/support/kb_builder.py` exports for exactly this.
 
 **Nothing here scores anything.** ADR-0012 §0a reserves `lex` / `struct` / `fm` / `score` /
 `match_reason` / `anchor` / `line` / `excerpt` to the core oracle; `core/rank_snapshot.py`
@@ -84,9 +108,10 @@ image and confirm both files are byte-identical, and better still to run this jo
 a future divergence surfaces as a red gate rather than an unexplained local diff.
 
 `header["agora_version"]` is recorded but **excluded from the golden test's comparison**, so a
-release bump does not turn this gate red. It *is* rewritten by `regen`, so after a version bump a
-fresh regeneration produces a two-file diff whose only content is that key — expected, and needing
-no justification. (`diff_snapshots` does report it, because a caller comparing two arbitrary records
+release bump does not turn this gate red. It *is* rewritten by `regen` in the live records, so after
+a version bump a fresh regeneration produces a two-file diff whose only content is that key —
+expected, and needing no justification. (The frozen records keep the version they were taken under,
+which is what "frozen" means.) (`diff_snapshots` does report it, because a caller comparing two arbitrary records
 wants to know they came from different builds.)
 
 `header` also distinguishes the cache POLICY from the cache FACT: `index_cache_enabled` is the
@@ -99,10 +124,12 @@ one derived structure the layout flip is guaranteed to invalidate is not covered
 
 ## Known gaps in the RANKING
 
-**One.** `p27` (`gilt staircase over two decades`) declares `observed_rank: 2`: the alias-bearing
-orphan `bond-ladder-basics` is second, because "over two decades" is long-horizon vocabulary that
-`expense-ratio-drag` owns outright and wins on. Every other positive ranks its declared `note`
-first, and all 44 queries produce their declared `status`.
+**One, and the flip did not add to it.** `p27` (`gilt staircase over two decades`) declares
+`observed_rank: 2`: the alias-bearing orphan `bond-ladder-basics` is second, because "over two
+decades" is long-horizon vocabulary that `expense-ratio-drag` owns outright and wins on. Every other
+positive ranks its declared `note` first, and all 44 queries produce their declared `status` — in
+the schema-2 record exactly as in the schema-1 one. No `observed_rank` was added or changed at the
+flip.
 
 If a future change means a positive's expected note is no longer at its declared rank, the honest
 fix is *not* to tweak the corpus until it is. Record the truth: add or update `observed_rank: <N>`
@@ -115,12 +142,19 @@ instead of becoming a hole.
 
 A query set can look thorough and still leave a scoring term unobserved, so every term was checked
 by MUTATION: change the ranker, re-record, and see whether the golden moves. The table below is that
-measurement (`diff_snapshots` line counts against the two committed records, taken 2026-09-04), so
-the next reader knows which parts of the diff at the flip are actually gated and which are not.
+measurement (`diff_snapshots` line counts, taken 2026-09-04), so the next reader knows which parts
+of the diff at the flip are actually gated and which are not.
+
+**It was measured against the `golden_v1*` records and has NOT been re-measured against
+`golden_v2*`.** The corpus content and the query set are byte-identical across the flip and the flip
+moved four ranks and no `match_reason` at all, so the sensitivities are *expected* to carry over —
+"expected" being the honest word. Re-measuring one row is cheap (mutate, `regen`, count the lines)
+and is the right move whenever a term's coverage is actually in doubt.
 
 | mutation | fm-on / fm-off diff lines | the query that is the evidence |
 | --- | --- | --- |
 | `_is_moc_path` always `False` (the flip, simulated) | 347 / 347 | the whole set |
+| ↳ the SAME 347/347 is now measured live, every run, as the frozen baseline's drift — see below | | |
 | `STRUCT_ALPHA` → 0 · `STRUCT_BETA` → 0 | 328/348 · 237/250 | the whole set |
 | `PIVOT` 1.5 → 1.0 | 268 / 259 | the whole set |
 | CJK bigrams → unigrams (#56) | 323 / 325 | `p17`–`p24`, `n09`, `n10` |
@@ -143,12 +177,24 @@ pins the arithmetic; the branch itself is covered by the unit regression in
 `tests/core/test_wiki_lexical_evidence_146.py`. What gate B *does* pin is the #146 **guard**, via
 `p25`.
 
-Two further limits, stated rather than left to be rediscovered: the ADR-0012 §2 **cached** read path
-is never engaged (see `index_cache_used` above), and 7 recorded hits (13 in the fm-off column) sit
-in exact score ties broken by `_order_key`'s `note.path` tail — the flip changes every path, so that
-many rank swaps in the flip diff may be tie-break artifacts. `diff_snapshots` annotates a rank move
-whose score did not change with `(score unchanged)`, so a reviewer can tell those apart without the
-paths, which the record deliberately omits.
+Two further limits, stated rather than left to be rediscovered. The ADR-0012 §2 **cached** read path
+is never engaged (see `index_cache_used` above). And 7 recorded hits (13 in the fm-off column) sit in
+exact score ties broken by `_order_key`'s `note.path` tail — the flip changes every path, so those
+rank swaps were expected to show up in the flip diff as tie-break artifacts. **They did not:** the 3
+tie groups (5 in fm-off) all survived the flip in their original internal order, because no tie group
+in this corpus spans two v1 domains. `diff_snapshots` still annotates a rank move whose score did not
+change with `(score unchanged)`, and in the flip listing those annotations turned out to mark the
+reporter's *other* documented case — a note passively displaced by a neighbour that moved. See
+`FLIP-DIFF.md` §5.
+
+**What the frozen baseline is still worth.** `golden_v1*` cannot be regenerated: the schema-2 map
+predicate reads no kind out of a v1 path, so a v1 corpus loses every `d_moc = 0` seed — which is
+precisely the first row of the table above, arrived at for real rather than by mutation.
+`regen.frozen_baseline_drift()` measures that gap on every run and
+`test_the_frozen_baseline_moved_by_exactly_the_lost_seeds` asserts it at
+`regen.PRE_FLIP_SEED_LOSS_DIFF_LINES` = **347** lines per column. That assertion is the frozen
+record's only remaining defence, and it is a real one: a ranking change unrelated to the layout
+predicate moves the number and reddens the gate.
 
 ## Regenerating
 
@@ -156,21 +202,28 @@ paths, which the record deliberately omits.
 python -m tests.rank_golden.regen     # from the repo root; uv run python -m ... under uv
 ```
 
-This is the **only** way `golden_v1.json` and `golden_v1_fm_off.json` are produced. There is
-deliberately no `--regen` flag on the test: a test that can rewrite its own expectation is not a
-gate — the first red run gets "fixed" by regenerating, and the baseline the flip is measured
+This is the **only** way `golden_v2.json` and `golden_v2_fm_off.json` are produced, and it writes
+**nothing else**. `golden_v1*.json` is frozen history: `regen.write_records(..., schema_version=1)`
+raises rather than writing it, because `regen` can only ever produce the *current* layout and a
+discarded baseline cannot be re-derived (ADR-0041 D5). `test_regen_writes_the_live_record_and_nothing_else`
+runs the whole command with its output redirected and asserts the v1 files' digests are unchanged.
+
+There is deliberately no `--regen` flag on the test: a test that can rewrite its own expectation is
+not a gate — the first red run gets "fixed" by regenerating, and the baseline the flip is measured
 against quietly becomes whatever the flip produced.
 
-`regen` **writes both files even when a query contradicts `queries.yaml`** (that is how you read the
-new rank in order to record an `observed_rank`) but then **exits non-zero**, so a scripted
-`regen && git add` cannot commit a baseline that contradicts the query file.
+`regen` **writes both live files even when a query contradicts `queries.yaml`** (that is how you read
+the new rank in order to record an `observed_rank`) but then **exits non-zero**, so a scripted
+`regen && git add` cannot commit a record that contradicts the query file. It also prints the frozen
+baseline's drift on every run — a measurement, not a gate; the test is what asserts it.
 
 What defends a committed golden is reproduction, not formatting.
-`test_snapshot_matches_the_committed_golden` re-runs the ranker and compares field for field — that
-is what catches a nudged score, a swapped rank or a renamed note.
-`test_golden_files_are_canonically_serialized` is a narrower check: it catches a file that was
-*re-serialized* (reformatted by an editor, written by a different dumper, merged by hand), and an
-edit that leaves the JSON canonically formatted passes it.
+`test_snapshot_matches_the_committed_golden` re-runs the ranker over the schema-2 corpus and compares
+field for field — that is what catches a nudged score, a swapped rank or a renamed note; for the
+frozen record, `test_the_frozen_baseline_moved_by_exactly_the_lost_seeds` plays the same role at one
+remove. `test_golden_files_are_canonically_serialized` is a narrower check over all four files: it
+catches a file that was *re-serialized* (reformatted by an editor, written by a different dumper,
+merged by hand), and an edit that leaves the JSON canonically formatted passes it.
 
 ### The rule for changing a golden
 
@@ -191,6 +244,32 @@ The listing reports every recorded field — `status`, `rank`, `score`, `match_r
 really are equivalent. The one exception is a version-only diff: after a release bump `regen`
 rewrites `header["agora_version"]`, and a two-file diff whose only line is that key needs no
 justification.
+
+### What a LAYOUT-FLIP reviewer must be handed
+
+ADR-0041 D5 raises the bar for a PR that changes where notes live, and scales the obligation to
+what this fixture can actually measure. Such a PR must:
+
+1. **Add a record, never overwrite one.** `golden_v<n>*.json` for the new layout, with the
+   `regen.py` / `test_golden.py` constants that name it, keeping the previous record committed —
+   `regen` can only produce the current layout, so a discarded baseline is gone for good.
+2. **Attach the full `diff_snapshots` listing**, both §8 columns, in a file like `FLIP-DIFF.md`
+   that the test asserts against the records rather than a paste that can silently go stale.
+3. **Explain it per CATEGORY**, with counts that **sum to the listing** — seed-population change,
+   tie-break artefacts annotated `(score unchanged)`, `match_reason` boundary crossings, and
+   whatever else the particular flip drags along (this one dragged a `type:` vocabulary change, six
+   renames and a journal merge).
+4. **Explain it per LINE** for exactly two classes: every `match_reason` change, and every rank move
+   *not* annotated `(score unchanged)` — the moves where a score actually changed.
+5. **Cite the 347/347 simulated-flip baseline** from the coverage table above, so a materially
+   larger listing is itself a signal that something beyond the seed rule moved. (It was: the real
+   flip's listing is 423/423, and reading the excess is how the `type` mirror and the journal merge
+   got separated from the seed rule at all.)
+6. **State plainly which lines are the seed rule and which are anything else.** For the Stratum
+   flip the answer was "none of them" — see `FLIP-DIFF.md`.
+
+An empty listing is a red flag, not a green one: a flip *should* move something, and a listing with
+no lines means the seed rule did not actually change.
 
 ## The owner-side dogfood snapshot
 
