@@ -286,3 +286,30 @@ def test_kind_directories_mapping_matches_the_d2_5_table() -> None:
     assert "index" not in KIND_DIRECTORIES
     assert "person" not in KIND_DIRECTORIES
     assert WIKI_KINDS == frozenset({*KIND_DIRECTORIES, "person"})
+
+
+def test_the_claim_bearing_kind_set_is_one_object_in_all_three_modules() -> None:
+    """One question, one answer: the L2-1 orphan gate, the dashboard, and gold must agree.
+
+    ``schema.lint._V2_SOURCED_KINDS`` gates L1-7/L1-8/L1-8b/L1-10/L1-19 and the L2-1 orphan warning
+    that STOPS a curator run (``curator.lint.max_orphans``, ADR-0022 §E);
+    ``faces.mcp_server.ORPHAN_KINDS`` shows the same orphan population on the dashboard; and
+    ``core.gold.GOLD_KINDS`` decides what a standing context pack may contain. They used to be
+    three independently-declared literals whose docstrings merely PROMISED to stay equal — an
+    operator cannot act on two different answers to one question, so the promise is pinned here as
+    well as bound in code.
+    """
+    from agora_kb.core.gold import GOLD_KINDS
+    from agora_kb.core.layout import CLAIM_BEARING_KINDS
+    from agora_kb.faces.mcp_server import ORPHAN_KINDS
+    from agora_kb.schema.lint import _V2_SOURCED_KINDS
+
+    assert CLAIM_BEARING_KINDS == frozenset({"concept", "summary"})
+    assert GOLD_KINDS is CLAIM_BEARING_KINDS
+    assert ORPHAN_KINDS is CLAIM_BEARING_KINDS
+    assert _V2_SOURCED_KINDS is CLAIM_BEARING_KINDS
+    # `entity` and `person` are exempt BY CONSTRUCTION, not by omission: an entity may not be a map
+    # child (D1.3) and the curator may not link into `people/` at all (D3.3), so counting either
+    # would make every one of them an orphan and turn the signal into noise.
+    assert "entity" not in CLAIM_BEARING_KINDS
+    assert "person" not in CLAIM_BEARING_KINDS

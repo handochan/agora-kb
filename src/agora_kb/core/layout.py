@@ -26,6 +26,7 @@ __all__ = [
     "safe_path_component",
     "KIND_DIRECTORIES",
     "WIKI_KINDS",
+    "CLAIM_BEARING_KINDS",
 ]
 
 # A writer is a single path component: starts alphanumeric, then alphanumerics plus ._- . No
@@ -60,6 +61,23 @@ KIND_DIRECTORIES: dict[str, str] = {
 # directories above plus the human-owned ``people/``. The lint-facing rule that rejects any other
 # directory (L1-22) reads its own copy in ``schema/``; this one exists for path composition.
 WIKI_KINDS: frozenset[str] = frozenset({*KIND_DIRECTORIES, "person"})
+
+#: The CLAIM-BEARING kinds — the tiers that carry an atomic, sourced claim (ADR-0041 D2.5).
+#:
+#: It lives HERE, next to the kind vocabulary itself, because three modules ask the same question
+#: of it and an operator cannot act on three answers: ``schema.lint._V2_SOURCED_KINDS`` gates
+#: L1-7 / L1-8 / L1-8b / L1-10 / L1-19 and the L2-1 orphan warning that stops a curator run
+#: (``curator.lint.max_orphans``, ADR-0022 §E), ``faces.mcp_server.ORPHAN_KINDS`` is the SAME
+#: orphan population as the dashboard reports it, and ``core.gold.GOLD_KINDS`` is what a context
+#: pack may contain. All three used to be independently-declared literals whose docstrings merely
+#: PROMISED to stay equal; each now binds to this object, so the promise is structural.
+#:
+#: The set is schema-agnostic on purpose (:attr:`Note.kind <agora_kb.schema.notes.Note.kind>` is
+#: derived on both schemas and the frozen D2.5 table maps ``type: theme`` → ``concept``), and
+#: ``entity`` is deliberately absent: D2 lets an entity carry empty ``sources:`` while
+#: ``status: stub``, and ``wiki/entities/`` has no day-1 producer (OD-8). ``map`` / ``index`` /
+#: ``note`` are navigation and journal tiers, not claims; ``person`` is human-owned (D3.3).
+CLAIM_BEARING_KINDS: frozenset[str] = frozenset({"concept", "summary"})
 
 # Kinds whose notes are FLAT under their kind directory (D1.1: free sub-folders are permitted but
 # nothing composes one). ``note`` is the exception — it is date-sharded, see :meth:`note_path_for`.

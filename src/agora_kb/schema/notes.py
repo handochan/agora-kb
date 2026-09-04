@@ -60,6 +60,7 @@ __all__ = [
     "DIRECTORY_BY_KIND",
     "PEOPLE_DIR_PREFIX",
     "is_people_path",
+    "is_ungraded_people_note",
     "kind_directory_segment",
     "path_kind",
     "kind_from_type",
@@ -114,6 +115,21 @@ def is_people_path(rel_path: str) -> bool:
     return rel_path.startswith(PEOPLE_DIR_PREFIX)
 
 
+def is_ungraded_people_note(note: Note) -> bool:
+    """True iff ``note`` is a schema-2 ``wiki/people/**`` note — human-owned and ungraded (D3.3).
+
+    The SINGLE answer to "is this note outside the curated wiki?", shared by every caller that
+    has to agree with :func:`agora_kb.schema.lint.lint`. The version test is not decoration:
+    ``lint()`` computes its own exclusion as ``skip_people = version >= 2``, so an unconditional
+    path test would make a caller disagree with the gate on a schema-1 repo that merely happens to
+    own a ``people`` DOMAIN (where ``wiki/people/x.md`` is an ordinary v1 note, graded like any
+    other). One question, one answer — which is why the D3.3 read-side exclusions in
+    :mod:`agora_kb.core.gold` and :mod:`agora_kb.faces.mcp_server` call this rather than
+    :func:`is_people_path` directly.
+    """
+    return note.schema_version >= 2 and is_people_path(note.rel_path)
+
+
 def kind_directory_segment(rel_path: str) -> str | None:
     """Return segment 1 under ``wiki/`` when it is a DIRECTORY component, else ``None``.
 
@@ -155,6 +171,12 @@ def v1_path_domain(rel_path: str) -> str | None:
     ``wiki/<domain>/...`` ⇒ ``<domain>``. The root ``index.md`` (and any other non-``wiki/`` note)
     has no domain. This is the v1 subject carrier; schema 2 records the subject in ``subjects:``
     and NO code derives one from a path (ADR-0041 D3.2).
+
+    The ``>= 2`` guard is deliberate and is what makes this the LINT reading rather than the read
+    one: ``wiki/stray.md`` yields ``"stray.md"``, so a note tolerated directly under ``wiki/`` still
+    fails L1-5's domain-membership check. The read facet (:func:`_derive_subjects`) wants the
+    opposite and guards on a real directory component, because reporting that filename as a SUBJECT
+    would invent a value no note declares.
     """
     parts = rel_path.split("/")
     if len(parts) >= 2 and parts[0] == "wiki":
@@ -266,8 +288,10 @@ class Note:
       (``theme→concept``, ``daily→note``, ``moc→map``, ``index→index``), so both schemas are read
       through ONE vocabulary. ``None`` when neither source yields a kind.
     * ``subjects`` — the note's subjects. On schema 2 the ``subjects:`` frontmatter list (``()`` is
-      a legal, honest value, D2.2). On schema 1 the single path domain (``wiki/<domain>/…``), or
-      ``()`` for the root index — the v1 path IS the subject carrier.
+      a legal, honest value, D2.2). On schema 1 the single path DOMAIN DIRECTORY
+      (``wiki/<domain>/…``) — the v1 path is the subject carrier there — or ``()`` for the root
+      index and for a stray note sitting directly under ``wiki/``, which has no domain directory
+      and therefore no subject (see :func:`_derive_subjects`).
     * ``kb`` — the ``_meta/kb.yaml`` ``kb_id`` stamped into the note (D1.5), or ``None``.
     * ``provenance`` — the D2.3 trusted/untrusted split (see :class:`Provenance`).
     * ``derived`` — D2.4's marker for output of a proposal/derivation plane; ``False`` by default.
@@ -356,11 +380,21 @@ def _derive_subjects(rel_path: str, fm: dict[str, object], version: int) -> tupl
 
     Schema 2 reads ``subjects:`` and NOTHING else — no code derives a subject from a path (D3.2),
     and an empty list is a legal, honest value. Schema 1 has exactly one subject and it lives in
-    the path segment, so the single path domain is lifted into the same tuple shape.
+    the path segment, so the single path DIRECTORY is lifted into the same tuple shape.
+
+    The v1 leg guards on :func:`kind_directory_segment` (segment 1 only when it is a real DIRECTORY
+    component) rather than on :func:`v1_path_domain`, and the difference is the whole point: a
+    stray note tolerated directly under ``wiki/`` (``wiki/README.md`` — ADR-0014 D1's tolerant read
+    exists for exactly that file) has NO domain directory, and ``v1_path_domain``'s ``>= 2`` guard
+    would hand back its FILENAME as a subject. That fabricated value would then surface as a
+    heading on the web home page, a chip on ``/graph``, and a member of ``GET /api/notes``'
+    ``subjects`` union. ``v1_path_domain`` itself is deliberately left alone: lint's
+    ``_note_domain`` wants the ``>= 2`` reading so ``wiki/stray.md`` still raises L1-5 instead of
+    silently passing.
     """
     if version >= 2:
         return _str_tuple(fm.get("subjects"))
-    domain = v1_path_domain(rel_path)
+    domain = kind_directory_segment(rel_path)
     return (domain,) if domain is not None else ()
 
 

@@ -16,7 +16,9 @@ never in the ADR-0008 INGEST allowlist); the read path opens it strictly read-on
 
 The algorithm is the LEXICAL-UNION FRONTIER with a single pure-Python scorer (ADR-0012 §4-§7):
 
-1. **SEED** navigation roots from ``index.md`` + every in-scope ``<domain>-moc.md``.
+1. **SEED** navigation roots from ``index.md`` + every in-scope ``wiki/maps/**`` map. Since KB wiki
+   schema 2 (ADR-0041 D5) the map tier is read out of the DIRECTORY, not out of a ``-moc`` filename
+   suffix, and a map's subject scope is its own ``subjects:`` frontmatter, not a path segment.
 2. **FRONTIER** = BFS over the note link graph (``max_hops=2``) UNION lexical candidates. Edges are
    the ADR-0014 D3 BODY markdown links ``[Title](relative.md)`` (resolved path→basename), the
    frontmatter ``related:`` / ``children:`` ``"[[basename]]"`` arrays, and any tolerated stray body
@@ -53,7 +55,7 @@ from pydantic import BaseModel, ConfigDict
 
 from . import frontmatter, index_cache
 from .cjk import CJK_RANGES
-from .layout import InvalidWriterError, RepoLayout
+from .layout import KIND_DIRECTORIES, InvalidWriterError, RepoLayout
 
 if TYPE_CHECKING:
     from agora_kb.config import IndexPolicy
@@ -137,6 +139,18 @@ STOPWORDS: frozenset[str] = frozenset(
 
 # linked-theme=0 < heading=1 < lexical=2 (ADR-0012 §7 ordering)
 _REASON_RANK: dict[str, int] = {"linked-theme": 0, "heading": 1, "lexical": 2}
+
+# KB wiki schema 2 (ADR-0041 D1/D3.1): ``wiki/<segment-1>`` → kind. Inverted from the one path
+# composer's table (``core.layout.KIND_DIRECTORIES``) so a read can never disagree with a write
+# about which directory names a kind, plus the human-owned ``people/`` tree, which is READ first
+# class (D3.3) but has no composer and so is absent from that table. ``index`` is deliberately not
+# a directory: the root map lives at ``index.md`` (D1.2).
+_KIND_BY_WIKI_DIRECTORY: dict[str, str] = {
+    **{directory: kind for kind, directory in KIND_DIRECTORIES.items()},
+    "people": "person",
+}
+_MAP_KIND = "map"  # the kind whose notes seed d_moc = 0 (ADR-0012 §4 stage 1, re-keyed by D5)
+_PERSON_KIND = "person"  # the human-owned tree, outside the basename identity space (ADR-0041 D3.3)
 
 # ATX heading line: 1-6 leading '#', a space, then text (closing '#'s optional and trimmed).
 _HEADING_RE = re.compile(r"^(#{1,6})[ \t]+(.*?)[ \t]*#*[ \t]*$")
@@ -337,8 +351,10 @@ class _Note:
 
     path: str  # repo-relative POSIX path
     basename: str
-    is_moc: bool
+    is_moc: bool  # the note is a MAP (ADR-0012's `d_moc` vocabulary, re-seeded by ADR-0041 D5)
     is_index: bool
+    kind: str | None  # schema-2 kind, read from the DIRECTORY (ADR-0041 D2.1); None off-layout
+    subjects: tuple[str, ...]  # schema-2 `subjects:` — the ONLY subject carrier (ADR-0041 D3.2)
     title: str
     title_line: int  # 1-based line of the H1 (or 1 if none)
     headings: list[_Heading]
@@ -363,6 +379,8 @@ def _note_to_dict(note: _Note) -> dict:
         "basename": note.basename,
         "is_moc": note.is_moc,
         "is_index": note.is_index,
+        "kind": note.kind,
+        "subjects": list(note.subjects),
         "title": note.title,
         "title_line": note.title_line,
         "headings": [
@@ -400,6 +418,8 @@ def _note_from_dict(data: dict) -> _Note:
         basename=data["basename"],
         is_moc=data["is_moc"],
         is_index=data["is_index"],
+        kind=data["kind"],
+        subjects=tuple(data["subjects"]),
         title=data["title"],
         title_line=data["title_line"],
         headings=[
@@ -460,6 +480,23 @@ def _parse_note(path: str, basename: str, is_index: bool, raw_text: str) -> _Not
     raw_summary = fm.get("summary")
     summary = raw_summary if isinstance(raw_summary, str) else ""
 
+    # subjects (ADR-0041 D2.2/D3.2): the schema-2 subject carrier, and the ONLY one — no code
+    # derives a subject from a path any more. A schema-1 note simply has no `subjects:` and yields
+    # the empty tuple. The accepted shape is a LIST OF STRINGS and nothing else — byte-for-byte
+    # `schema.notes._str_tuple`, deliberately, and NOT the looser tags/aliases handling: D3.2
+    # leaves exactly one place a subject is recorded, so a second reader answering differently for
+    # the same bytes would put the note in one subject scope for the STAGE-1 ranking focus and
+    # another (or none) for the browse/graph facet. A bare scalar (`subjects: finance`) and a typed
+    # item (an unquoted YAML date) therefore yield `()` here exactly as they do there; lint L1-5
+    # already constrains `subjects:` to a list of declared domains, so the strict read is the
+    # producer rule and the tolerant read is the divergence.
+    raw_subjects = fm.get("subjects")
+    subjects = (
+        tuple(s for s in raw_subjects if isinstance(s, str))
+        if isinstance(raw_subjects, list)
+        else ()
+    )
+
     # status (normalize to the §8 enum; default 'neutral' for ranking)
     raw_status = fm.get("status")
     status = str(raw_status).strip().lower() if isinstance(raw_status, str) else "neutral"
@@ -467,7 +504,14 @@ def _parse_note(path: str, basename: str, is_index: bool, raw_text: str) -> _Not
     fm_title = fm.get("title")
     fm_title_str = str(fm_title) if isinstance(fm_title, str) else None
 
-    is_moc = _is_moc_path(path)
+    # The DIRECTORY is the kind (ADR-0041 D2.1), so the kind here is a pure function of the path
+    # and `is_moc` is that kind being `map`. The frontmatter `kind:` mirror is deliberately NOT
+    # consulted: it is falsifiable by a brain writing prose, and — decisively — `core.gold` seeds
+    # `d_moc` from the SAME path predicate over rel-paths alone (ADR-0041 D5, "one shared edit"),
+    # so a frontmatter fallback here would let the two centrality computations disagree about
+    # which notes are maps.
+    kind = _path_kind(path)
+    is_moc = kind == _MAP_KIND
 
     # Walk body lines: collect headings (H1 → title; H2-H6 → headings list), tracking code fences.
     body_lines_raw = body.split("\n")
@@ -575,6 +619,8 @@ def _parse_note(path: str, basename: str, is_index: bool, raw_text: str) -> _Not
         basename=basename,
         is_moc=is_moc,
         is_index=is_index,
+        kind=kind,
+        subjects=subjects,
         title=title,
         title_line=title_line,
         headings=headings,
@@ -587,20 +633,103 @@ def _parse_note(path: str, basename: str, is_index: bool, raw_text: str) -> _Not
     )
 
 
-def _is_moc_path(path: str) -> bool:
-    """True iff ``path`` matches ``wiki/<domain>/<domain>-moc.md`` (ADR-0012 §2)."""
+def _path_kind(path: str) -> str | None:
+    """Return the schema-2 kind ``path`` declares, or ``None`` when it declares none.
+
+    ADR-0041 D1/D2.1: under ``wiki/`` the FIRST segment IS the kind, and the directory is
+    authoritative. The root ``index.md`` is ``index`` (D1.2 — it is the ROOT OF the map tier, not a
+    member of it, which is why it keeps seeding at ``d_moc = 1`` rather than 0). A note directly
+    under ``wiki/``, or under an unknown segment-1 directory, declares no kind (lint L1-22).
+
+    This is the read-path twin of :func:`agora_kb.schema.notes.path_kind`; it is re-derived from
+    :data:`~agora_kb.core.layout.KIND_DIRECTORIES` rather than imported because ``schema.notes``
+    imports from ``core`` (importing it back here would close a cycle), and the scorer must not pay
+    a lazy import per note.
+
+    **A schema-1 repo declares no kind through this function and that is deliberate** (ADR-0041 D5,
+    "no shim"): a v1 path (``wiki/<domain>/themes/<slug>.md``, ``wiki/<d>/<d>-moc.md``) has an
+    unknown segment-1 directory, so it yields ``None``, no note is a map, and the corpus simply gets
+    no level-0 structural seeds — ``index.md`` still seeds level 1 and every lexical candidate still
+    scores, so a v1 repo stays READABLE (it must never crash) with a flatter structural term. The
+    one pathological overlap is a v1 repo whose domain is literally named ``maps``/``concepts``/…;
+    its notes then read as that kind. No shim is added for it: this build's ``agora repo init``
+    writes schema 2, the owner's two v1 KBs carry no such domain, and a version branch here would
+    put a config read (and a second code path) inside the oracle.
+    """
+    if path == "index.md":
+        return "index"
     parts = path.split("/")
-    if len(parts) != 3 or parts[0] != "wiki":
-        return False
-    domain = parts[1]
-    return parts[2] == f"{domain}-moc.md"
+    if len(parts) >= 3 and parts[0] == "wiki":
+        return _KIND_BY_WIKI_DIRECTORY.get(parts[1])
+    return None
 
 
-def _moc_domain(path: str) -> str | None:
-    """Return the ``<domain>`` of a ``<domain>-moc.md`` path, else ``None``."""
-    if not _is_moc_path(path):
-        return None
-    return path.split("/")[1]
+def _is_map_path(path: str) -> bool:
+    """True iff ``path`` is a MAP — ``wiki/maps/…`` with at least three segments (ADR-0041 D5).
+
+    The schema-2 replacement for the v1 ``wiki/<domain>/<domain>-moc.md`` test: the kind marker
+    moved out of the filename and into the directory, so the ``-moc`` suffix is gone and a map may
+    sit at any depth under ``wiki/maps/`` (D1.1 free sub-folders). Everything the seed feeds —
+    ``d_moc`` levels, ``max_hops``, the ``struct`` formula, ``W_LEX``/``W_STRUCT``/``FLOOR`` — keeps
+    its ADR-0012 definition verbatim.
+
+    :mod:`core.gold` imports this predicate for the SAME seeding over rel-paths (ADR-0012 §5
+    machinery, query-independent) — "one shared edit, not two" — which is why it takes a path
+    rather than a parsed note.
+    """
+    return _path_kind(path) == _MAP_KIND
+
+
+#: Back-compatible alias for :func:`_is_map_path` under its pre-Stratum name. The two are the SAME
+#: object, so an importer on either name gets the schema-2 predicate and the two seeding sites can
+#: never drift apart mid-migration.
+_is_moc_path = _is_map_path
+
+
+def _is_people_path(path: str) -> bool:
+    """True iff ``path`` is inside the human-owned ``wiki/people/`` tree (ADR-0041 D3.3).
+
+    Used to keep people notes OUT of the ``[[basename]]`` identity space, which D3.3 states
+    normatively: *"People basenames do NOT join the global basename identity space … a people note
+    is addressed by path, never by ``[[basename]]``."* Without the exclusion a human file at
+    ``wiki/people/hando/flock.md`` silently captures every link written to the curated
+    ``wiki/concepts/flock.md`` — stealing its in-degree, inheriting the map's ``d_moc = 0`` seed,
+    and surfacing the private note as a ``linked-theme`` hit asserting a map link that does not
+    exist. The collision is LEGAL by construction: D3.3 excludes people from lint's L1-1 duplicate
+    rule precisely so a human's filename can never veto a curator basename.
+
+    Deliberately unconditional on the schema, like every other predicate in this module: the oracle
+    reads no config file (see :func:`_map_subjects`) and D5 forbids a compatibility branch here, so
+    a v1 repo owning a literal ``people`` DOMAIN reads as this tree — the same pathological overlap
+    :func:`_path_kind` already names and accepts for ``maps``/``concepts``. The GRADING side of the
+    same rule (lint's ``skip_people``, the dashboard's orphan count, gold eligibility) is version-
+    gated instead, through :func:`agora_kb.schema.notes.is_ungraded_people_note`, because those
+    callers already hold a parsed ``schema_version`` and must agree with ``lint()`` exactly. That
+    asymmetry is a DISCLOSED consequence, not an oversight: ADR-0041 records it as **residual risk
+    R6** (accepted — version-gating the oracle would put a config read on the query hot path and
+    give one repo two rankings), so a future reader meets it in the decision record, not here only.
+
+    Used on BOTH sides of the link graph — the ``by_basename`` target map and
+    :meth:`Wiki._compute_indegrees`'s source loop — so a people note neither takes nor gives
+    structural credit.
+    """
+    return _path_kind(path) == _PERSON_KIND
+
+
+def _map_subjects(note: _Note) -> tuple[str, ...]:
+    """Return a map's declared subject scope — its ``subjects:`` frontmatter (ADR-0041 D3.2).
+
+    The successor to v1's ``_moc_domain``, which read the subject out of the path segment of a
+    ``<domain>-moc.md``. A frontmatter read replacing a path read, and nothing else: the in-scope
+    subject vocabulary is still exactly what the corpus DECLARES (v1: the domains that own a MOC on
+    disk; schema 2: the values the maps carry in ``subjects:``, which lint L1-5 already constrains
+    to the taxonomy ``domains``), so the ranker still reads no config file — the "restricted to the
+    declared domains" property is inherited from the producer rule, exactly as it was in v1.
+
+    A non-map note has no subject SCOPE — its own ``subjects:`` filter nothing — so this returns
+    ``()`` for one rather than silently widening the focus set.
+    """
+    return note.subjects if note.is_moc else ()
 
 
 class SearchHit(BaseModel):
@@ -706,7 +835,16 @@ class Wiki:
         if not q_tokens:
             return QueryResult(query=question, status="not_found", hits=())
 
-        by_basename: dict[str, _Note] = {n.basename: n for n in notes}
+        # The `[[basename]]` identity space, and `wiki/people/**` is OUTSIDE it (ADR-0041 D3.3).
+        # People notes stay in `notes` — read is first class, they are tokenized, scored and
+        # returned like any other note — they simply cannot be the TARGET a basename resolves to,
+        # so they take no in-degree and no `d_moc` seed from a link the curator wrote to a concept
+        # of the same name. Excluding them here rather than from `notes` is the whole distinction
+        # D3.3 draws: a people note is addressed by path, never by basename. The give side of the
+        # same exclusion lives in `_compute_indegrees`, which skips people notes as link SOURCES.
+        by_basename: dict[str, _Note] = {
+            n.basename: n for n in notes if not _is_people_path(n.path)
+        }
         self._compute_indegrees(notes, by_basename)
 
         seeds = self._seed(notes, by_basename, q_tokens)
@@ -767,6 +905,11 @@ class Wiki:
         full body instead of crashing the browse face — matching :meth:`query`'s tolerant-read
         posture (ADR-0014 D1). Imported lazily inside the method to avoid a ``core`` ⇄
         ``schema.notes`` import cycle (``schema.notes`` imports from ``core``).
+
+        Each returned :class:`~agora_kb.schema.notes.Note` carries ``kind`` and ``subjects``, the
+        two schema-2 facets a browse face filters on (ADR-0041 D2.1/D3.2) — derived under the
+        repo's own ``schema_version``, so a schema-1 repo's ``type:`` reaches the caller through
+        the SAME ``kind`` vocabulary and a face never branches on the layout.
         """
         from agora_kb.schema.notes import parse_all_notes
 
@@ -922,10 +1065,27 @@ class Wiki:
 
     @staticmethod
     def _compute_indegrees(notes: list[_Note], by_basename: dict[str, _Note]) -> None:
-        """Set ``indeg`` per note: in-degree over RESOLVED outlinks (ADR-0012 §2)."""
+        """Set ``indeg`` per note: in-degree over RESOLVED outlinks (ADR-0012 §2).
+
+        ``wiki/people/**`` is out of the link graph on BOTH sides (ADR-0041 D3.3). ``by_basename``
+        already keeps a human-owned note from being a link TARGET; the source loop skips it too, so
+        it cannot CAST a vote either. Without the give-side skip an ungraded file under
+        ``wiki/people/`` would raise a curated note's ``indeg`` and move its frozen ADR-0012
+        ``struct`` score — and the oracle would then disagree with :mod:`core.gold` (which drops
+        people from the population BEFORE ``_compute_centrality``, so they contribute no in-degree
+        and no BFS edge) and with ``faces.mcp_server``'s ``health()``/``graph()`` (which skip people
+        as reference sources): three answers to one question about which links exist, one of them
+        gating a curator run. Symmetry is also what the BFS already does — ``_frontier`` walks
+        outlinks via ``by_basename``, so a people note is never a traversal source there.
+
+        Reading stays first class, exactly as D3.3 says: a people note is still parsed, tokenized,
+        scored and returned on its own lexical merit. It neither takes nor gives structural credit.
+        """
         for n in notes:
             n.indeg = 0
         for n in notes:
+            if _is_people_path(n.path):
+                continue
             for target in n.outlinks:
                 tgt = by_basename.get(target)
                 if tgt is not None:
@@ -940,28 +1100,37 @@ class Wiki:
     ) -> dict[str, tuple[int, set[str]]]:
         """Stage 1 SEED: navigation roots → ``{basename: (d_moc, moc_label_tokens)}``.
 
-        Targets of a ``<domain>-moc.md`` → ``d_moc=0`` (and the MOC itself → 0). Targets of root
+        Targets of a ``wiki/maps/**`` map → ``d_moc=0`` (and the map itself → 0). Targets of root
         ``index.md`` → ``d_moc=1`` (and ``index.md`` itself → 1). If the question contains a token
-        exactly matching an in-scope ``<domain>`` name, only that domain's MOC is seeded; else all.
+        exactly matching a declared SUBJECT, only the maps carrying that subject are seeded; else
+        all maps are (ADR-0041 D5 re-expressing ADR-0012 §4's domain in-scope filter).
         """
         q_token_set = set(q_tokens)
         moc_notes = [n for n in notes if n.is_moc]
-        # Domain in-scope filter (ADR-0012 §4): if the question carries a token exactly matching a
-        # <domain> kebab name, seed only that domain's MOC. A kebab domain like "ai-tech" tokenizes
-        # to {ai, tech} under the §3 [a-z0-9]+ alphabet, so we require ALL of the domain's tokens to
-        # be present (a literal hyphenated token can never appear, so a substring match is the only
-        # workable reading and keeps multi-word domains from silently disabling the optimization).
-        domain_focus: str | None = None
+        # Subject in-scope filter (ADR-0012 §4 as re-expressed by ADR-0041 D5): if the question
+        # carries a token exactly matching a subject a map DECLARES, seed only the maps whose
+        # `subjects:` contain it. This is a frontmatter read replacing a path read AND NOTHING ELSE
+        # — the token-matching rule is carried over verbatim from the v1 domain version, including
+        # its operational reading: a kebab subject like "ai-tech" tokenizes to {ai, tech} under the
+        # §3 [a-z0-9]+ alphabet, so a literal hyphenated token can never appear in a question and
+        # "exactly matching" can only mean ALL of the subject's tokens being present (which also
+        # keeps multi-word subjects from silently disabling the optimization).
+        #
+        # What genuinely moves (ADR-0041 D5, stated rather than hoped): v1 bounded the seed set at
+        # one MOC per domain, while `wiki/maps/` may hold arbitrarily many maps and a map may
+        # declare several subjects — so a focused query can now seed MORE than one map, and an
+        # unfocused one seeds however many maps exist. No scoring constant moves with it.
+        subject_focus: str | None = None
         for n in moc_notes:
-            dom = _moc_domain(n.path)
-            if dom is None:
-                continue
-            dom_tokens = set(_tokenize(dom))
-            if dom_tokens and dom_tokens <= q_token_set:
-                domain_focus = dom
+            for subject in _map_subjects(n):
+                subject_tokens = set(_tokenize(subject))
+                if subject_tokens and subject_tokens <= q_token_set:
+                    subject_focus = subject
+                    break
+            if subject_focus is not None:
                 break
-        if domain_focus is not None:
-            moc_notes = [n for n in moc_notes if _moc_domain(n.path) == domain_focus]
+        if subject_focus is not None:
+            moc_notes = [n for n in moc_notes if subject_focus in _map_subjects(n)]
 
         seeds: dict[str, tuple[int, set[str]]] = {}
 
@@ -980,15 +1149,15 @@ class Wiki:
                     new_labels |= label_tokens
                 seeds[basename] = (new_d, new_labels)
 
-        # MOC notes themselves are d_moc=0; their linked targets are d_moc=0 children.
+        # Maps themselves are d_moc=0; their linked targets are d_moc=0 children.
         for moc in moc_notes:
             _add(moc.basename, 0, set())
             for target, label_tokens in self._moc_link_labels(moc):
                 _add(target, 0, label_tokens)
 
-        # index.md itself is d_moc=1; its linked targets are d_moc=1 (only when not domain-focused,
-        # since domain focus restricts seeding to that MOC — but index is a navigation root too;
-        # the ADR seeds EVERY in-scope MOC plus root index. Domain focus restricts MOCs, not index).
+        # index.md itself is d_moc=1; its linked targets are d_moc=1 (unaffected by a subject focus,
+        # which restricts MAPS, not the root index — the ADR seeds EVERY in-scope map PLUS the root
+        # index, and the root map is the root OF the map tier rather than a member of it, D1.2).
         index_note = by_basename.get("index")
         if index_note is not None and index_note.is_index:
             _add("index", 1, set())
@@ -1043,6 +1212,10 @@ class Wiki:
         matched (``path not in lexical_paths``) is skipped: it has ``d_moc == max_hops+1`` and
         ``lex == 0``, so it can never pass the §6 gate — dropping it here is output-identical to
         building it and letting the gate drop it, only cheaper.
+
+        "BFS-reached" excludes ``wiki/people/**`` unconditionally (ADR-0041 D3.3) — see the comment
+        on the candidate loop: the BFS result is basename-keyed, so a human note is otherwise handed
+        a colliding curated note's structural attribution.
         """
         # BFS recording MIN hop distance as d_moc (independent of expansion order).
         d_moc: dict[str, int] = {}
@@ -1083,10 +1256,19 @@ class Wiki:
         # a non-frontier note unreachable within max_hops gets d_moc = MAX_HOPS+1).
         candidates: list[_Candidate] = []
         for n in notes:
-            if n.basename not in d_moc and n.path not in lexical_paths:
+            # `wiki/people/**` is outside the basename identity space (ADR-0041 D3.3), and the BFS
+            # result is keyed on BASENAME — so a human note sharing a curated note's basename would
+            # otherwise INHERIT its `d_moc` and its MOC-label tokens and come back as a
+            # `linked-theme` hit, asserting a map link that does not exist. (That collision is legal
+            # by construction: D3.3 keeps people out of lint's L1-1 duplicate rule precisely so a
+            # human filename cannot veto a curator basename.) A people note therefore enters the
+            # candidate set on its own LEXICAL merit alone, at the unreached distance — read stays
+            # first class, attribution does not transfer.
+            reached = n.basename in d_moc and not _is_people_path(n.path)
+            if not reached and n.path not in lexical_paths:
                 continue  # cannot pass the §6 gate (lex==0 AND d_moc!=0); prefilter drop.
-            dm = d_moc.get(n.basename, MAX_HOPS + 1)
-            lab = labels.get(n.basename, set())
+            dm = d_moc[n.basename] if reached else MAX_HOPS + 1
+            lab = labels.get(n.basename, set()) if reached else set()
             candidates.append(_Candidate(note=n, d_moc=dm, moc_label_tokens=lab))
         return candidates
 

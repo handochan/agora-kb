@@ -5,14 +5,14 @@ in `core/wiki.py` MUST keep these tests passing UNMODIFIED. If a proposed change
 test in this file, the ranker's lexical-evidence guarantee got weaker, not simpler, and the diff
 should say so out loud.
 
-WHAT #146 MEASURED. On the live corpus, empty MOC stubs beat the correct answer in 3 of 4 queries,
+WHAT #146 MEASURED. On the live corpus, empty map stubs beat the correct answer in 3 of 4 queries,
 and in one case an honest ``not_found`` turned into three stubs. STRATEGY-2026-08 §12 recorded it;
 this file pins the mechanism.
 
 THE MECHANISM. ``_passes_gate`` admits a candidate on either of two branches: ``lex > 0``, or
 ``d_moc == 0`` with the query overlapping the note's *theme token set* — which includes
-``moc_label_tokens``, i.e. the LINK TEXT the MOC uses to point at the note. That second branch is
-reachable with ``lex`` at exactly zero, because the MOC's link text is not one of the note's own
+``moc_label_tokens``, i.e. the LINK TEXT the map uses to point at the note. That second branch is
+reachable with ``lex`` at exactly zero, because the map's link text is not one of the note's own
 scoring fields (``_FIELDS`` = title/aliases/tags/headings/summary/body).
 
 Before the fix, such a candidate still received the full structural score:
@@ -33,8 +33,8 @@ THE INVARIANT PINNED HERE: **structure amplifies lexical evidence, it never subs
 A note with no lexical match scores at most its frontmatter boost, which is below the floor.
 
 WHAT THIS DOES NOT FIX, pinned as a strict xfail below rather than left as folklore: a husk's mere
-EXISTENCE can still flip an honest ``not_found`` to ``ok``, because the MOC bullet that points at it
-puts the husk's topic words into the MOC's own body. That is the other half of #146 — thin pages
+EXISTENCE can still flip an honest ``not_found`` to ``ok``, because the map bullet that points at it
+puts the husk's topic words into the map's own body. That is the other half of #146 — thin pages
 winning on *real* lexical matches — and it needs a content/length prior, not a gate change.
 """
 
@@ -47,32 +47,39 @@ import pytest
 from agora_kb.core.layout import RepoLayout
 from agora_kb.core.wiki import FLOOR, W_STRUCT, Wiki
 
-# --- fixture: the #57 `note-<sha8>` husk, linked from a MOC by a descriptive label ---------------
+# --- fixture: the #57 `note-<sha8>` husk, linked from a MAP by a descriptive label ---------------
 #
 # This is the real shape, not a contrivance. A Korean/CJK-titled note slugs to `note-<sha8>` (the
-# #57 fallback), and the MOC bullet carries the human-readable title. So the topic words live in the
-# MOC's link TEXT while the note file itself can be an empty stub whose own fields match nothing.
+# #57 fallback), and the map bullet carries the human-readable title. So the topic words live in the
+# map's link TEXT while the note file itself can be an empty stub whose own fields match nothing.
+#
+# LAYOUT: KB wiki schema 2 (ADR-0041 D1) — the map is `wiki/maps/eng.md` (the `-moc` suffix is gone,
+# the DIRECTORY is the kind) and the husk is a concept. The husk is still a `d_moc == 0` child of a
+# map, which is the only structural property any assertion in this file depends on, so the whole
+# conformance block — the strict xfail included — keeps its meaning verbatim across the flip.
 
 INDEX_MD = """\
 # personal
 
-- [Eng MOC](wiki/eng/eng-moc.md)
+- [Eng MOC](wiki/maps/eng.md)
 """
 
-# Written exactly as `curator/apply.py::_update_moc` writes it: title + summary carry the domain
+# Written exactly as `curator/apply.py::_update_moc` writes it: title + summary carry the subject
 # token at field weights 3.0/2.0, and the body is nothing but link bullets.
 ENG_MOC = """\
 ---
 status: active
+kind: map
+subjects: [eng]
 title: eng MOC
 summary: Map of content for the eng domain.
 ---
 # eng MOC
 
-- [Deadlock recovery](themes/note-a1b2c3d4.md)
+- [Deadlock recovery](../concepts/note-a1b2c3d4.md)
 """
 
-# The husk: `d_moc == 0` (linked straight from the MOC) and structurally maximal, but its own
+# The husk: `d_moc == 0` (linked straight from the map) and structurally maximal, but its own
 # title/aliases/tags/headings/summary/body share NO token with "deadlock recovery".
 HUSK = """\
 ---
@@ -97,25 +104,26 @@ The recovery order is fixed so two hosts never both back off.
 """
 
 
+MAP_PATH = "wiki/maps/eng.md"
+HUSK_PATH = "wiki/concepts/note-a1b2c3d4.md"
+SUBSTANTIVE_PATH = "wiki/concepts/real-answer.md"
+
+
 def _build_repo(root: Path, *, with_substantive: bool = False) -> RepoLayout:
-    (root / "wiki" / "eng" / "themes").mkdir(parents=True)
+    (root / "wiki" / "concepts").mkdir(parents=True)
+    (root / "wiki" / "maps").mkdir(parents=True)
     (root / "index.md").write_text(INDEX_MD, encoding="utf-8")
     moc = ENG_MOC
     if with_substantive:
-        moc += "- [Real answer](themes/real-answer.md)\n"
-        (root / "wiki" / "eng" / "themes" / "real-answer.md").write_text(
-            SUBSTANTIVE, encoding="utf-8"
-        )
-    (root / "wiki" / "eng" / "eng-moc.md").write_text(moc, encoding="utf-8")
-    (root / "wiki" / "eng" / "themes" / "note-a1b2c3d4.md").write_text(HUSK, encoding="utf-8")
+        moc += "- [Real answer](../concepts/real-answer.md)\n"
+        (root / SUBSTANTIVE_PATH).write_text(SUBSTANTIVE, encoding="utf-8")
+    (root / MAP_PATH).write_text(moc, encoding="utf-8")
+    (root / HUSK_PATH).write_text(HUSK, encoding="utf-8")
     return RepoLayout(root)
 
 
-HUSK_PATH = "wiki/eng/themes/note-a1b2c3d4.md"
-
-
 def test_146_husk_with_zero_lexical_evidence_is_not_a_hit(tmp_path: Path) -> None:
-    """A MOC-linked note with lex == 0 must never appear in the hits."""
+    """A map-linked note with lex == 0 must never appear in the hits."""
     layout = _build_repo(tmp_path / "personal")
     result = Wiki(layout).query("deadlock recovery")
     assert HUSK_PATH not in {h.path for h in result.hits}
@@ -127,7 +135,7 @@ def test_146_husk_never_outranks_a_note_that_actually_matches(tmp_path: Path) ->
     result = Wiki(layout).query("deadlock recovery")
     assert result.status == "ok"
     paths = [h.path for h in result.hits]
-    assert "wiki/eng/themes/real-answer.md" in paths
+    assert SUBSTANTIVE_PATH in paths
     assert HUSK_PATH not in paths
 
 
@@ -144,9 +152,9 @@ def test_146_the_husk_itself_is_gone_from_both_corpora(tmp_path: Path) -> None:
     reason=(
         "RESIDUAL of #146, deliberately pinned rather than hidden. The husk no longer appears as a "
         "hit, but its EXISTENCE still flips an honest not_found to ok: `moc_label_tokens` comes "
-        "from the MOC's BODY link labels, so the bullet `- [Deadlock recovery](.../husk.md)` puts "
-        "those words in the MOC's own body — a scoring field at weight 1.0. Delete the bullet and "
-        "the query is not_found; keep it and the MOC is returned. The user is pointed at a map "
+        "from the MAP's BODY link labels, so the bullet `- [Deadlock recovery](.../husk.md)` puts "
+        "those words in the map's own body — a scoring field at weight 1.0. Delete the bullet and "
+        "the query is not_found; keep it and the map is returned. The user is pointed at a map "
         "whose only relevant entry is empty. Fixing this needs a THIN-PAGE / CONTENT prior (the "
         "'mode (i)' half of #146: thin pages winning on real lexical matches), which the "
         "lexical-evidence fix deliberately does not attempt. When that lands, this test flips to "
@@ -157,10 +165,12 @@ def test_146_residual_a_husk_still_flips_not_found_to_ok_via_its_moc_bullet(tmp_
     with_husk = Wiki(_build_repo(tmp_path / "with-husk")).query("deadlock recovery")
 
     root = tmp_path / "no-husk"
-    (root / "wiki" / "eng" / "themes").mkdir(parents=True)
+    (root / "wiki" / "concepts").mkdir(parents=True)
+    (root / "wiki" / "maps").mkdir(parents=True)
     (root / "index.md").write_text(INDEX_MD, encoding="utf-8")
-    (root / "wiki" / "eng" / "eng-moc.md").write_text(
-        ENG_MOC.replace("- [Deadlock recovery](themes/note-a1b2c3d4.md)\n", ""), encoding="utf-8"
+    (root / MAP_PATH).write_text(
+        ENG_MOC.replace("- [Deadlock recovery](../concepts/note-a1b2c3d4.md)\n", ""),
+        encoding="utf-8",
     )
     without_husk = Wiki(RepoLayout(root)).query("deadlock recovery")
 
@@ -194,8 +204,8 @@ def test_146_lexical_hits_are_unaffected(tmp_path: Path) -> None:
     layout = _build_repo(tmp_path / "personal")
     result = Wiki(layout).query("deadlock recovery")
     assert result.status == "ok"
-    moc = next(h for h in result.hits if h.path == "wiki/eng/eng-moc.md")
-    # struct == 1.0 for the MOC (d_moc 0, max in-degree), so its score must still carry W_STRUCT.
+    moc = next(h for h in result.hits if h.path == MAP_PATH)
+    # struct == 1.0 for the map (d_moc 0, max in-degree), so its score must still carry W_STRUCT.
     assert moc.score > W_STRUCT, (
         "a lexically-matching note lost its structural boost; the fix over-reached"
     )

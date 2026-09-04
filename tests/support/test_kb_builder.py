@@ -127,8 +127,10 @@ _BUILDER_AUTHORED = ("index.md", "wiki/", "raw/")
 #: Digest of the v1 tree the builder writes for :data:`CORPUS`. This is the byte-identity claim
 #: wave W2.1 makes: schema-1 repos keep exactly today's bytes. If it goes red, either the v1 layout
 #: moved (a bug — the golden was recorded over it) or something the builder DERIVES from production
-#: code moved (then re-record here, and re-record ``tests/rank_golden/golden_v1*.json`` if the
-#: goldens move with it).
+#: code moved (then re-record here, and re-run ``python -m tests.rank_golden.regen`` if the goldens
+#: move with it). Note WHICH golden: ``regen`` writes ``golden_v2*.json`` and REFUSES to rewrite
+#: ``golden_v1*.json`` — the pre-flip baseline is frozen history and is no longer reproducible,
+#: because a v1 path declares no kind under the ADR-0041 D5 map predicate.
 #:
 #: RE-RECORDED ONCE, deliberately, for ADR-0041 D4.4 (the pathsafe slugger swap). The pre-swap
 #: value was ``19a60061c19fd8eb798227a320288f17fdee2a8b1b3facfa341502335c38fbc6``. ``build_kb``

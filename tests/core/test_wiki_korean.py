@@ -7,7 +7,10 @@ runs (unigram for a length-1 run), plus the ``aliases`` (3.0) / ``summary`` (2.0
 
 The corpus here is Korean-heavy on purpose (ADR-0027 decision 5 documents the owner's KB as
 Korean-heavy): Korean titles/bodies under English slugs (the ADR-0022-addendum filename posture),
-an English-titled note reachable ONLY via its Korean alias, and a summary-only evidence probe.
+an English-titled note reachable ONLY via its Korean alias, and a summary-only evidence probe. It
+is materialised in the KB wiki schema-2 kind-first layout (ADR-0041 D1) — ``wiki/maps/<subject>.md``
+plus ``wiki/concepts/<slug>.md`` — because the ranker seeds ``d_moc`` from the map DIRECTORY since
+D5; the note CONTENT, which is what these probes are about, is unchanged.
 """
 
 from __future__ import annotations
@@ -84,18 +87,20 @@ def test_tokenize_tags_kebab_rule_unchanged_and_korean_tags_visible() -> None:
 KO_INDEX_MD = """\
 # personal
 
-- [에이전트 기술 MOC](wiki/ai-tech/ai-tech-moc.md)
+- [에이전트 기술 MOC](wiki/maps/ai-tech.md)
 """
 
 KO_MOC = """\
 ---
 status: active
+kind: map
+subjects: [ai-tech]
 ---
 # 에이전트 기술
 
-- [큐레이터 동시성](themes/curator-concurrency.md) — 단일 작성자 큐레이터는 쓰기를 직렬화한다
-- [Memory Hub](themes/memory-hub.md) — 크로스 세션 지식 공유
-- [AI 에이전트](themes/ai-agent.md) — 도구를 호출하는 에이전트
+- [큐레이터 동시성](../concepts/curator-concurrency.md) — 단일 작성자 큐레이터는 쓰기를 직렬화한다
+- [Memory Hub](../concepts/memory-hub.md) — 크로스 세션 지식 공유
+- [AI 에이전트](../concepts/ai-agent.md) — 도구를 호출하는 에이전트
 """
 
 KO_CURATOR = """\
@@ -156,13 +161,14 @@ status: active
 def _build_ko_repo(root: Path) -> RepoLayout:
     root.mkdir(parents=True, exist_ok=True)
     (root / "index.md").write_text(KO_INDEX_MD, encoding="utf-8")
-    themes = root / "wiki" / "ai-tech" / "themes"
-    themes.mkdir(parents=True)
-    (root / "wiki" / "ai-tech" / "ai-tech-moc.md").write_text(KO_MOC, encoding="utf-8")
-    (themes / "curator-concurrency.md").write_text(KO_CURATOR, encoding="utf-8")
-    (themes / "memory-hub.md").write_text(KO_MEMORY_HUB, encoding="utf-8")
-    (themes / "ai-agent.md").write_text(KO_AI_AGENT, encoding="utf-8")
-    (themes / "deploy-pipeline.md").write_text(KO_DEPLOY, encoding="utf-8")
+    concepts = root / "wiki" / "concepts"
+    concepts.mkdir(parents=True)
+    (root / "wiki" / "maps").mkdir(parents=True)
+    (root / "wiki" / "maps" / "ai-tech.md").write_text(KO_MOC, encoding="utf-8")
+    (concepts / "curator-concurrency.md").write_text(KO_CURATOR, encoding="utf-8")
+    (concepts / "memory-hub.md").write_text(KO_MEMORY_HUB, encoding="utf-8")
+    (concepts / "ai-agent.md").write_text(KO_AI_AGENT, encoding="utf-8")
+    (concepts / "deploy-pipeline.md").write_text(KO_DEPLOY, encoding="utf-8")
     return RepoLayout(root)
 
 
@@ -174,7 +180,7 @@ def test_korean_query_finds_korean_note(tmp_path: Path) -> None:
     result = wiki.query("큐레이터 동시성")
     assert result.status == "ok"
     top = result.hits[0]
-    assert top.path == "wiki/ai-tech/themes/curator-concurrency.md"
+    assert top.path == "wiki/concepts/curator-concurrency.md"
     # d_moc==0 child whose Korean title tokens intersect the query → linked-theme.
     assert top.match_reason == "linked-theme"
 
@@ -212,7 +218,7 @@ def test_korean_alias_reaches_english_slug_note(tmp_path: Path) -> None:
     result = wiki.query("메모리 허브")
     assert result.status == "ok"
     top = result.hits[0]
-    assert top.path == "wiki/ai-tech/themes/memory-hub.md"
+    assert top.path == "wiki/concepts/memory-hub.md"
     assert top.match_reason == "linked-theme"
 
 
@@ -234,7 +240,7 @@ def test_korean_heading_hit_anchor_is_empty_not_fabricated(tmp_path: Path) -> No
     result = wiki.query("재시도 정책")
     assert result.status == "ok"
     top = result.hits[0]
-    assert top.path == "wiki/ai-tech/themes/deploy-pipeline.md"
+    assert top.path == "wiki/concepts/deploy-pipeline.md"
     assert top.match_reason == "heading"
     assert top.anchor == ""  # NOT "-1" — `## 재시도 정책` is the note's 2nd empty-slug heading
     assert top.line == 8  # the `## 재시도 정책` line

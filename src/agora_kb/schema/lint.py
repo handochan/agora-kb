@@ -69,7 +69,7 @@ import yaml
 
 from agora_kb.core import frontmatter
 from agora_kb.core.frontmatter import FrontmatterError
-from agora_kb.core.layout import RepoLayout
+from agora_kb.core.layout import CLAIM_BEARING_KINDS, RepoLayout
 
 # The L1-20 body-sentinel grammar (ADR-0011 §4.4 check 6 / ADR-0010 §2.6) + the L2-6 unauthored-
 # region grader. These MUST match the curator's apply.py sentinel grammar BYTE-FOR-BYTE so the gate
@@ -144,7 +144,10 @@ _DAILY_DATE_RE = re.compile(r"-(?P<date>\d{4}-\d{2}-\d{2})\Z")
 # absent: ADR-0041 D2 lets an entity carry empty `sources:` while `status: stub`, the banner
 # EXCLUDES it from L1-7's non-stub-needs-sources rule by name, and `wiki/entities/` has no day-1
 # producer at all (OD-8), so there is nothing for the rule to grade.
-_V2_SOURCED_KINDS = frozenset({"concept", "summary"})
+# It IS `core.layout.CLAIM_BEARING_KINDS` (the same object, not a copy of its members): the L2-1
+# orphan warning this set gates STOPS a curator run, and `faces.mcp_server.ORPHAN_KINDS` shows the
+# same number on the dashboard, so the two must be the same question with one answer.
+_V2_SOURCED_KINDS = CLAIM_BEARING_KINDS
 
 # L1-6 (children == child-bullet set) and L1-24 (admitted child kinds). The v1 predicate was
 # `type in (moc, index)`; the set-equality check itself is unchanged.
@@ -270,8 +273,14 @@ def _note_domain(rel_path: str) -> str | None:
 
     SCHEMA 2 NEVER CALLS THIS. ADR-0041 D3.2 leaves exactly one place a subject is recorded — the
     ``subjects:`` frontmatter list — and no code derives one from a path. Delegates to
-    :func:`agora_kb.schema.notes.v1_path_domain` so the v1 derivation has one home, shared with the
-    ``Note.subjects`` accessor; the behaviour is unchanged, character for character.
+    :func:`agora_kb.schema.notes.v1_path_domain` so the v1 path derivation has one home; the
+    behaviour is unchanged, character for character.
+
+    It is deliberately NOT the same reading as ``Note.subjects``' v1 leg, which guards on a real
+    DIRECTORY component (:func:`~agora_kb.schema.notes.kind_directory_segment`). The two want
+    opposite things from ``wiki/stray.md``: this rule wants ``"stray.md"``, so a note tolerated
+    directly under ``wiki/`` still FAILS the L1-5 domain-membership check, while a READ facet
+    returning that filename as a subject would be fabricating a value no note declares.
     """
     return v1_path_domain(rel_path)
 

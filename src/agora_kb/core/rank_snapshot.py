@@ -1,11 +1,15 @@
 """Deterministic ranking SNAPSHOT — a model-free golden fixture over :meth:`Wiki.query` (#44).
 
-WHY THIS EXISTS. The Stratum plan flips the wiki layout axis (v1 ``wiki/<domain>/themes|daily`` +
-``<domain>-moc.md`` → a kind-first tree). :func:`agora_kb.core.wiki._is_moc_path` matches
-``wiki/<domain>/<domain>-moc.md`` and seeds the ``d_moc`` structural score for the WHOLE corpus, so
-moving a file changes ranking and, downstream, gold-pack selection. Without a baseline recorded
-BEFORE the flip, a ranking change cannot be attributed to the flip rather than to anything else in
-the diff. This module records that baseline.
+WHY THIS EXISTS. Stratum flipped the wiki layout axis (v1 ``wiki/<domain>/themes|daily`` +
+``<domain>-moc.md`` → the kind-first tree of ADR-0041 D1). :func:`agora_kb.core.wiki._is_map_path`
+— still exported under its pre-Stratum name ``_is_moc_path`` — reads the map tier out of the PATH
+(``wiki/maps/…`` now, ``wiki/<domain>/<domain>-moc.md`` before) and seeds the ``d_moc`` structural
+score for the WHOLE corpus, so moving a file changes ranking and, downstream, gold-pack selection.
+Without a baseline recorded BEFORE the flip, that change could not have been attributed to the flip
+rather than to anything else in the diff. This module recorded that baseline and is what keeps the
+frozen pre-flip record (``tests/rank_golden/golden_v1*.json``) comparable against the live
+post-flip one (``golden_v2*.json``) — see :func:`diff_snapshots`, and
+``tests/rank_golden/README.md`` for the two-record arrangement.
 
 WHAT IT IS NOT. It is **not a scorer**. ADR-0012 §0a is explicit: the pure-Python oracle in
 :mod:`agora_kb.core.wiki` is the ONLY component that computes ``lex`` / ``struct`` / ``fm`` /
@@ -27,7 +31,8 @@ module iterates is either that output or a sorted derivative). Two calls on the 
 equal dicts; ``json.dumps`` of them is byte-identical.
 
 The companion :func:`diff_snapshots` turns two such records into human-readable lines — status
-flips, rank moves, score deltas — which is the actual deliverable at the flip.
+flips, rank moves, score deltas — which was the actual deliverable at the flip (ADR-0041 D5's
+normative PR requirement) and remains the deliverable any PR that moves a golden owes.
 """
 
 from __future__ import annotations
