@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import datetime as _dt
 import os.path
+import posixpath
 import re
 import string
 from dataclasses import dataclass, field
@@ -42,10 +43,11 @@ import yaml
 from agora_kb.core import frontmatter
 from agora_kb.core.frontmatter import FrontmatterError
 from agora_kb.core.hashing import content_sha256
-from agora_kb.core.layout import RepoLayout
+from agora_kb.core.layout import KIND_DIRECTORIES, RepoLayout
 from agora_kb.core.pathsafe import safe_slug_component
 from agora_kb.core.repo import GitError, Repo
 from agora_kb.schema import Taxonomy, emit_schema, lint
+from agora_kb.schema.emit import materialize_kind_directories
 from agora_kb.schema.lint import LintResult
 from agora_kb.schema.notes import (
     PARSE_EXEMPT_BASENAMES,
@@ -60,13 +62,18 @@ __all__ = ["ImportReport", "NoteRecord", "import_vault"]
 # seed index emitted by ``Repo.init``. Emitted on the bundle-root ``index.md`` ONLY.
 _OKF_VERSION = "0.1"
 
-# The KB WIKI SCHEMA this importer emits. Named rather than repeated as a literal `1`, because it is
-# ONE fact with two consumers that must never disagree: the `Taxonomy` the emitted repo declares,
-# and the destination guard (`_assert_importable_destination`) that refuses to write this layout
-# into a repo declaring a different one. The vault normalizer still writes the schema-1 layout
-# (`wiki/<domain>/themes/<slug>.md`); the kind-first layout arrives with the
-# `agora import --from-kb` converter (ADR-0041 D6), and this constant is what that unit flips.
-IMPORTER_SCHEMA_VERSION = 1
+# The KB WIKI SCHEMA this importer emits. Named rather than repeated as a literal, because it is ONE
+# fact with several consumers that must never disagree: the `Taxonomy` the emitted repo declares,
+# the `Repo.init` seed, the lint ruleset the report attaches, and the destination guard
+# (`_assert_importable_destination`) that refuses to write this layout into a repo declaring a
+# different one.
+#
+# It is 2 (ADR-0041 D1, the kind-first layout). It was 1 through wave W2.2, and the consequence was
+# a genuine defect rather than a cosmetic lag: this build's curator WRITES schema 2 and D6 makes a
+# schema-1 repo READ-ONLY, so an importer emitting schema 1 minted a repo that refused every write
+# the moment it was created — `agora curate`, `kb_remember` and the web upload all bounced off a
+# repo whose own import had just reported `lint: clean`.
+IMPORTER_SCHEMA_VERSION = 2
 
 # STRUCTURAL / non-knowledge files that the DEST emits its OWN copy of, so importing them AS notes
 # only produces junk themes (ADR-0014 D5 v2 change A). They are NOT knowledge content:
@@ -93,9 +100,20 @@ _STRUCTURAL_DIRS = frozenset({"_templates", "_meta", "_kb"})
 # guaranteeing L1-6 (``children:``-set == child-bullet-set) holds by construction after the strip.
 _CHILD_BULLET_LINE_RE = re.compile(r"^- \[(?P<text>[^\]\r\n]*)\]\((?P<path>[^)\r\n]+)\)(?:\s.*)?$")
 
-# The ADR-0010 §2.6 status vocabulary. An existing frontmatter ``status:`` is preserved only if it
-# is one of these; anything else (or absent) is replaced with the ``active`` default.
+# The ADR-0010 §2.6 status vocabulary, carried into schema 2 unchanged. An existing frontmatter
+# ``status:`` is preserved only if it is one of these; anything else (or absent) becomes ``active``.
 _STATUS_VALUES = frozenset({"active", "stub", "contested", "deprecated"})
+
+# The MAP TIER (ADR-0041 D1.2/D1.3): the two kinds that carry ``children:`` and whose child bullets
+# lint L1-6 grades. ``index`` is the ROOT of the tier and lives at the repo root, not under
+# ``wiki/maps/`` — which is why it is named here rather than derived from a directory.
+_MAP_KINDS = frozenset({"map", "index"})
+
+# The child kinds a map may list (ADR-0041 D1.3 / lint L1-24). ``note`` is NEVER admitted (a dated
+# journal would churn the map every run) and ``entity`` is excluded on day 1 (OD-2), so an imported
+# child bullet resolving to anything outside this set is DROPPED + reported rather than written into
+# a repo the destination's own lint would reject.
+_ADMITTED_CHILD_KINDS = frozenset({"concept", "summary", "map"})
 
 # A bare ``YYYY-MM-DD`` calendar date (ADR-0010 §2). An existing ``created`` / ``updated`` is
 # preserved only when it canonicalizes to this shape; otherwise ``import_date`` is substituted.
@@ -118,6 +136,11 @@ _WIKILINK_TOKEN_RE = re.compile(r"\[\[[^\[\]\r\n]*\]\]")
 # embed, not a graph edge — it is left verbatim (tolerated, not emitted; ADR-0014 D5).
 _BODY_WIKILINK_RE = re.compile(r"(?<!\!)\[\[(?P<inner>[^\[\]\r\n]*)\]\]")
 
+# A body markdown link ``[label](target)`` — the ADR-0014 D3 graph edge in its EMITTED form, which
+# a vault may already carry. An IMAGE embed ``![label](target)`` is excluded (an attachment, not an
+# edge). Mirrors ``kb_convert._MDLINK_RE`` so the two import lanes read one grammar.
+_BODY_MDLINK_RE = re.compile(r"(?<!\!)\[(?P<label>[^\]\r\n]*)\]\((?P<target>[^)\r\n]+)\)")
+
 # First ATX H1 in a body (``# Title`` at line start). Used to infer a missing ``title`` (ADR-0010
 # §2.1 has no filename fallback for the curator, but the importer SUPPLIES one from the H1, else a
 # kebab→Title-Case of the filename, recording it in ``inferred_fields``).
@@ -139,15 +162,23 @@ class NoteRecord:
     """Per-note outcome of the import (one record per source ``.md`` note; ADR-0014 D5).
 
     ``rel_path`` is the POSIX destination-relative path the normalized note was written to (which
-    may differ from its source path when the note was MOVED to fit the layout). ``type_inferred`` is
-    the ADR-0010 note ``type`` deduced from that destination path. ``repaired_frontmatter`` is True
+    differs from its source path for every note now — schema 2 files by KIND, not by subject).
+    ``type_inferred`` is the note's schema-2 ``kind`` (ADR-0041 D2.5: ``concept`` / ``map`` /
+    ``index``), deduced from the SOURCE path and materialized as the destination directory; the
+    field keeps its name because it keeps its meaning — "the structural class this importer decided"
+    — and renaming it would break every caller that prints it. ``subjects`` is the D2.2 subject list
+    the note was filed under: the origin folder when it maps to a declared taxonomy domain, and the
+    honest empty tuple otherwise (nothing is dropped for lack of a domain, ADR-0022 leg 1/2).
+    ``repaired_frontmatter`` is True
     iff the source frontmatter was invalid YAML and was rescued (Obsidian inline-wikilink repair, or
     treated-as-empty). ``inferred_fields`` lists the required/OKF frontmatter keys this importer
     SUPPLIED because the source omitted them (e.g. ``title``, ``created``, ``summary``).
     ``stripped_tags`` are source tags dropped because they are not in the destination taxonomy
     (ADR-0010 L1-5; the importer never silently widens the taxonomy). ``converted_links`` counts the
-    body ``[[wikilink]]`` tokens rewritten to standard markdown links (ADR-0014 D3 form).
-    ``unresolved_links`` are body wikilinks left verbatim because their basename matched no note in
+    body ``[[wikilink]]`` tokens rewritten to standard markdown links (ADR-0014 D3 form) and
+    ``retargeted_links`` the PRE-EXISTING markdown links re-pointed at where their target actually
+    landed under the kind-first layout (:func:`_retarget_body_md_links`).
+    ``unresolved_links`` are body links left verbatim because their basename matched no note in
     the vault (tolerated, not dropped; ADR-0014 D4). ``warnings`` are the report-only items the
     operator/curator must resolve (a moved note, a theme with no sources, an unparseable block).
 
@@ -163,10 +194,12 @@ class NoteRecord:
 
     rel_path: str
     type_inferred: str
+    subjects: tuple[str, ...] = ()
     repaired_frontmatter: bool = False
     inferred_fields: tuple[str, ...] = ()
     stripped_tags: tuple[str, ...] = ()
     converted_links: int = 0
+    retargeted_links: int = 0
     unresolved_links: tuple[str, ...] = ()
     warnings: tuple[str, ...] = ()
     synth_raw_source: str | None = None
@@ -209,11 +242,13 @@ class _NoteBuild:
 
     src_path: Path
     rel_path: str = ""  # destination-relative POSIX path (filled once the layout is decided)
-    type_inferred: str = "theme"
+    type_inferred: str = "concept"  # the schema-2 KIND (ADR-0041 D2.5)
+    subject: str | None = None  # the single D2.2 subject, or None for `subjects: []`
     repaired_frontmatter: bool = False
     inferred_fields: list[str] = field(default_factory=list)
     stripped_tags: list[str] = field(default_factory=list)
     converted_links: int = 0
+    retargeted_links: int = 0
     unresolved_links: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     fm: dict[str, object] = field(default_factory=dict)
@@ -226,11 +261,16 @@ class _NoteBuild:
         return NoteRecord(
             rel_path=self.rel_path,
             type_inferred=self.type_inferred,
+            subjects=tuple([self.subject] if self.subject else []),
             repaired_frontmatter=self.repaired_frontmatter,
             inferred_fields=tuple(self.inferred_fields),
             stripped_tags=tuple(self.stripped_tags),
             converted_links=self.converted_links,
-            unresolved_links=tuple(self.unresolved_links),
+            retargeted_links=self.retargeted_links,
+            # De-duplicated, order-preserving: the same missing basename is legitimately seen by
+            # several passes (an fm array entry, a body link, the child bullet change C drops), and
+            # a report that lists `ghost` three times says nothing the first one did not.
+            unresolved_links=tuple(dict.fromkeys(self.unresolved_links)),
             warnings=tuple(self.warnings),
             synth_raw_source=self.synth_raw_source,
             stubbed_empty_theme=self.stubbed_empty_theme,
@@ -352,43 +392,74 @@ def _hash_basename(text: str) -> str:
     return f"note-{content_sha256(text)[:8]}"
 
 
-def _infer_layout(dest_rel: str, first_domain: str, *, text: str) -> tuple[str, str, str | None]:
-    """Infer ``(type, normalized-dest-rel, moved_from_or_None)`` from a DEST-relative path.
+def _path_subject(src_rel: str, domains: set[str]) -> str | None:
+    """The D2.2 subject a SOURCE path implies: its first component that is a declared domain.
 
-    The ADR-0010 §1 folder rules drive the inference:
+    ADR-0041 D2.2 leg 1 states the rule for this lane verbatim — the importer records "the origin
+    folder as a ``subjects:`` entry when it maps to a declared domain and ``subjects: []``
+    otherwise", which is "the same rule D6 step 2 gives the ``--from-kb`` lane, so the two importers
+    agree by construction". Scanning every DIRECTORY component (never the filename) makes one rule
+    cover both shapes at once: ``wiki/<domain>/themes/x.md`` and a plain Obsidian ``<domain>/x.md``
+    both yield ``<domain>``, and a folder the taxonomy never declared yields ``None``.
 
-    * ``index.md`` (root)                         → ``index``;
-    * ``wiki/<d>/<d>-moc.md``                      → ``moc``;
-    * ``wiki/<d>/themes/<slug>.md``                → ``theme``;
-    * ``wiki/<d>/daily/<...>.md``                  → ``daily``.
-
-    A note whose path does NOT fit any of these is MOVED to ``wiki/<first-domain>/themes/<slug>.md``
-    (a theme is the catch-all durable concept page, ADR-0010 §1) and the original path is returned
-    as the third tuple element so the caller can record a ``moved`` warning. A note already in the
-    right shape keeps its path and returns ``None`` for the move.
+    Returning ``None`` rather than ``domains[0]`` is the ADR-0022 retirement, not a regression: in
+    schema 1 the catch-all existed because a note needed a PATH and the path needed a domain, so an
+    unclassifiable note had to be given a possibly-false one. A schema-2 concept lands at
+    ``wiki/concepts/<slug>.md`` whatever its subject, so nothing is dropped for lack of a domain and
+    nothing has to assert one. The catch-all survives in exactly one place — the ``raw/<domain>/``
+    shard key (leg 3, :func:`_synth_raw_source`).
     """
-    parts = dest_rel.split("/")
+    for part in src_rel.split("/")[:-1]:
+        if part in domains:
+            return part
+    return None
 
-    if dest_rel == "index.md":
-        return "index", dest_rel, None
+
+def _infer_layout(
+    src_rel: str, *, domains: set[str], text: str
+) -> tuple[str, str, str | None, str | None]:
+    """Infer ``(kind, dest-rel, moved_from_or_None, subject_or_None)`` from a SOURCE-relative path.
+
+    This is the axis flip (ADR-0041 D1): the destination's first path segment under ``wiki/`` is the
+    note's KIND and the subject has left the path entirely for ``subjects:``. The ADR-0010 §1 source
+    shapes are still READ — a vault exported from an Agora v1 repo, or organised like one, is the
+    common case — and mapped through the frozen D2.5 table:
+
+    * ``index.md`` (root)              → ``index``   at ``index.md`` (unchanged; D1.2);
+    * ``wiki/<d>/<d>-moc.md``          → ``map``     at ``wiki/maps/<d>.md`` (the ``-moc`` suffix
+      was the kind marker in the NAME and the kind is now the DIRECTORY — D6 rule 3);
+    * ``wiki/<d>/themes/<slug>.md``    → ``concept`` at ``wiki/concepts/<slug>.md``.
+
+    **Everything else — including a ``wiki/<d>/daily/`` note — becomes a ``concept``**, the
+    catch-all durable page, with the original path returned as ``moved_from`` so the caller records
+    a warning. A daily is deliberately NOT converted to a schema-2 ``note``: D2.6 makes a journal a
+    CURATOR RUN artifact (one per ``run_date``, carrying that run's ``run_id``, sharded by its
+    date), and a vault note has no run behind it — minting a ``run_id`` for it would put a
+    fabricated back-link to a run that never happened into the permanent record. A real v1 journal
+    reaches schema 2 through
+    ``agora import --from-kb`` (:mod:`agora_kb.ingest.kb_convert`), which HAS the run to name.
+    """
+    parts = src_rel.split("/")
+    subject = _path_subject(src_rel, domains)
+
+    if src_rel == "index.md":
+        return "index", "index.md", None, None
 
     if len(parts) >= 2 and parts[0] == "wiki":
         domain = parts[1]
-        # wiki/<d>/<d>-moc.md
+        # wiki/<d>/<d>-moc.md -> wiki/maps/<d>.md  (D6 rule 3 / D5)
         if len(parts) == 3 and parts[2] == f"{domain}-moc.md":
-            return "moc", dest_rel, None
-        # wiki/<d>/themes/<slug>.md
+            slug = _slugify(domain) or _hash_basename(text)
+            return "map", f"wiki/{KIND_DIRECTORIES['map']}/{slug}.md", None, subject
+        # wiki/<d>/themes/<slug>.md -> wiki/concepts/<slug>.md
         if len(parts) == 4 and parts[2] == "themes" and parts[3].endswith(".md"):
-            return "theme", dest_rel, None
-        # wiki/<d>/daily/<...>.md
-        if len(parts) >= 4 and parts[2] == "daily" and parts[-1].endswith(".md"):
-            return "daily", dest_rel, None
+            slug = parts[3][: -len(".md")]
+            return "concept", f"wiki/{KIND_DIRECTORIES['concept']}/{slug}.md", None, subject
 
-    # Anything else: move to a theme under the first domain (catch-all), record the original path.
+    # Anything else: a concept, the catch-all durable page; record the original path.
     stem = parts[-1][: -len(".md")] if parts[-1].endswith(".md") else parts[-1]
     slug = _slugify(stem) or _hash_basename(text)
-    moved_dest = f"wiki/{first_domain}/themes/{slug}.md"
-    return "theme", moved_dest, dest_rel
+    return "concept", f"wiki/{KIND_DIRECTORIES['concept']}/{slug}.md", src_rel, subject
 
 
 # --- required + OKF frontmatter inference (ADR-0010 §2 / ADR-0014 D2) ---------------------------
@@ -436,20 +507,31 @@ def _canonical_date(value: object) -> str | None:
     return None
 
 
-def _infer_required_frontmatter(build: _NoteBuild, import_date: str) -> None:
-    """Add MISSING ADR-0010 required frontmatter to ``build.fm`` (recording each inferred key).
+def _infer_required_frontmatter(build: _NoteBuild, import_date: str, *, kb_id: str) -> None:
+    """Add MISSING ADR-0041 D2 required frontmatter to ``build.fm`` (recording each inferred key).
 
-    Implements ADR-0014 D5 auto-fix #2 (``type``) + #3 + #4 over the (already type-decided) note:
+    ADR-0014 D5 auto-fix #2 + #3 + #4, re-expressed against the schema-2 common base over the
+    (already kind-decided) note:
 
-    * ``type`` — the structural type inferred from the destination path (:func:`_infer_layout`); the
-      ADR-0010 §1 ``type`` enum is CLOSED, so this is materialized from the layout, never preserved
-      from a free-form source ``type:`` (recorded as inferred when the source had no valid value);
+    * ``kind`` — the schema-2 kind inferred from the SOURCE layout and MIRRORED by the destination
+      directory, which is authoritative where the two disagree (D2.1). ``type`` is emitted as the
+      derived OKF mirror of it (OD-3), the way ``description`` already mirrors ``summary`` —
+      nothing in Agora reads it under schema 2, so a free-form source ``type:`` is overwritten;
+    * ``kb`` — the ``_meta/kb.yaml`` ULID minted for THIS destination (D1.5), stamped into every
+      note so a note copied out of the repo still names its origin;
+    * ``subjects`` — ``[<origin domain>]`` when the origin folder maps to a declared domain, else
+      the honest ``[]`` (D2.2 / :func:`_path_subject`);
     * ``title`` — first H1 in the body, else the filename kebab→Title-Case;
     * ``created`` / ``updated`` — the existing valid ``YYYY-MM-DD`` value if present, else
       ``import_date``;
     * ``status`` — the existing value if it is a valid ADR-0010 status, else ``active``;
     * ``summary`` — the existing value, else the first body paragraph (one line, ≤~200 chars),
       else the title;
+    * ``derived: false`` — D2.4 reserves ``true`` for a proposal/derivation plane; an imported note
+      is a curated claim, not a computed one;
+    * ``provenance`` — the D2.3 split, with BOTH lists empty. An import authenticates nobody and no
+      agent declared anything, so two empty lists is the only honest value: ``writers`` is the
+      TRUSTED list and inventing an entry there would forge the custody claim the split exists for;
     * the OKF fields (ADR-0014 D2): ``description`` mirrors ``summary``; ``timestamp`` ==
       ``<updated>T00:00:00Z`` (deterministic, no wall clock); ``okf_version: '0.1'`` on the
       bundle-root ``index.md`` ONLY.
@@ -459,11 +541,23 @@ def _infer_required_frontmatter(build: _NoteBuild, import_date: str) -> None:
     """
     fm = build.fm
 
-    # type — materialized from the inferred layout (the ADR-0010 §1 enum is closed). Recorded as
-    # inferred when the source carried no matching valid type value.
-    if fm.get("type") != build.type_inferred:
-        build.inferred_fields.append("type")
-    fm["type"] = build.type_inferred
+    # kind — materialized from the inferred layout (the D2.5 kind set is CLOSED and the directory is
+    # authoritative). Recorded as inferred when the source declared no matching value.
+    if fm.get("kind") != build.type_inferred:
+        build.inferred_fields.append("kind")
+    fm["kind"] = build.type_inferred
+    fm["type"] = build.type_inferred  # the DERIVED OKF mirror (OD-3), never the kind authority
+    fm["kb"] = kb_id
+    build.inferred_fields.append("kb")
+    fm["subjects"] = [build.subject] if build.subject else []
+    build.inferred_fields.append("subjects")
+    # `aliases:` completes the D2 common base. It is normalized rather than merely preserved: a
+    # non-list (or a list carrying non-strings) would fail lint L1-4's "must be a list of strings",
+    # and an ABSENT one would leave the one common-base key APPLY always emits missing — so an
+    # imported note and a curated one would not read the same in a diff.
+    if "aliases" not in fm:
+        build.inferred_fields.append("aliases")
+    fm["aliases"] = _str_items(fm.get("aliases"))
 
     # title — H1 → filename Title Case.
     title = fm.get("title")
@@ -511,13 +605,14 @@ def _infer_required_frontmatter(build: _NoteBuild, import_date: str) -> None:
         fm["okf_version"] = _OKF_VERSION
         build.inferred_fields.append("okf_version")
 
-    # Type-specific required keys (ADR-0010 §2). An index/moc needs ``children:`` (L1-4); the
-    # importer does not synthesize child bullets, so an absent value defaults to ``[]`` — consistent
-    # with the empty child-bullet set (L1-6). A non-list existing value is normalized to ``[]`` by
-    # :func:`_normalize_fm_link_arrays`. ``daily`` ``date``/``run_id`` are NOT synthesized (no run
-    # context exists at import); a daily that lacks them is reported via the attached lint, not
-    # auto-fixed (ADR-0014 D5 — v1 does not promise a lint-clean daily).
-    if build.type_inferred in ("index", "moc") and "children" not in fm:
+    # D2.4 / D2.3: the last two keys of the common base, materialized rather than inherited.
+    fm["derived"] = fm.get("derived") is True
+    fm["provenance"] = {"writers": [], "agents": []}
+
+    # Kind-specific required keys (ADR-0041 D2). A map/index needs ``children:`` (L1-4); an absent
+    # value defaults to ``[]``, consistent with the empty child-bullet set (L1-6). A non-list
+    # existing value is normalized to ``[]`` by :func:`_normalize_fm_link_arrays`.
+    if build.type_inferred in _MAP_KINDS and "children" not in fm:
         fm["children"] = []
         build.inferred_fields.append("children")
 
@@ -550,7 +645,76 @@ def _filter_tags(build: _NoteBuild, allowed_tags: set[str]) -> None:
 # --- body link conversion (ADR-0014 D3 / increment-2 form) -------------------------------------
 
 
-def _convert_body_links(build: _NoteBuild, basename_to_relpath: dict[str, str]) -> None:
+def _retarget_body_md_links(
+    build: _NoteBuild,
+    *,
+    src_root: Path,
+    src_rel: str,
+    src_to_dest: dict[str, str],
+    basename_to_relpath: dict[str, str],
+    renames: dict[str, str],
+) -> None:
+    """Re-point a PRE-EXISTING body markdown link at where its target actually landed (ADR-0014 D3).
+
+    :func:`_convert_body_links` emits destination-correct paths for the ``[[wikilink]]`` tokens it
+    converts. The links a vault already carries in the emitted form — ``[Alpha](themes/alpha.md)``,
+    the shape every Agora-produced note and many hand-written vaults use — got no such treatment,
+    and under schema 2 that is a dead link in every case: the note moves to ``wiki/concepts/`` and
+    its map to ``wiki/maps/``, so a relative path written against the source tree resolves to
+    nothing. The import then reported ``lint: clean`` and ``unresolved_links: 0`` over prose whose
+    navigation no longer works, because L1-2/L1-6 key on BASENAMES and cannot see a rotten path.
+
+    Resolution mirrors :func:`agora_kb.ingest.kb_convert._retarget` — the two lanes have to agree,
+    since a vault and a v1 repo can hold the identical link:
+
+    1. the LITERAL path, normalized against the linking note's own SOURCE directory (exact);
+    2. failing that — and only when that path exists NOWHERE under ``src_root`` — the BASENAME
+       through the D6 rule-3 rename map, since the basename is the identity (ADR-0010 D5).
+
+    A target that DOES resolve in the source but is not an imported note (``raw/`` evidence, an
+    excluded structural file such as ``AGENTS.md``, an attachment) is a deliberate reference to a
+    NON-note and is left BYTE-IDENTICAL: re-pointing it at whatever note shares its filename stem
+    would silently rewrite the operator's own text. A target that resolves nowhere at all is left
+    verbatim too, and recorded in ``unresolved_links`` on the same no-loss terms as an unresolvable
+    wikilink. Runs BEFORE the wikilink conversion, so the links that pass emits are never re-read.
+    """
+    from_dir = str(Path(build.rel_path).parent)
+    src_dir = posixpath.dirname(src_rel)
+
+    def repl(m: re.Match[str]) -> str:
+        raw_target = m.group("target")
+        cleaned = raw_target.strip()
+        fragment = ""
+        if "#" in cleaned:
+            cleaned, _, rest = cleaned.partition("#")
+            fragment = f"#{rest}"
+        if not cleaned.endswith(".md"):
+            return m.group(0)
+        if cleaned.startswith("/") or "://" in cleaned or ":" in cleaned or "\\" in cleaned:
+            return m.group(0)
+
+        resolved = posixpath.normpath(posixpath.join(src_dir, cleaned))
+        target = src_to_dest.get(resolved)
+        if target is None:
+            if resolved == ".." or resolved.startswith("../") or (src_root / resolved).exists():
+                return m.group(0)  # a real NON-note file, or an escape: never a note edge
+            base = _basename_from_child_path(cleaned)
+            target = basename_to_relpath.get(renames.get(base, base))
+            if target is None:
+                build.unresolved_links.append(base)
+                return m.group(0)
+        rel_posix = Path(os.path.relpath(target, from_dir)).as_posix()
+        if rel_posix == cleaned:
+            return m.group(0)  # already correct (a same-directory link that did not move)
+        build.retargeted_links += 1
+        return f"[{m.group('label')}]({rel_posix}{fragment})"
+
+    build.body = _BODY_MDLINK_RE.sub(repl, build.body)
+
+
+def _convert_body_links(
+    build: _NoteBuild, basename_to_relpath: dict[str, str], renames: dict[str, str]
+) -> None:
     """Convert body ``[[wikilink]]`` tokens to standard markdown links when resolvable (ADR-0014).
 
     For each body ``[[basename]]`` / ``[[basename|display]]`` (image transclusions ``![[..]]`` are
@@ -565,6 +729,13 @@ def _convert_body_links(build: _NoteBuild, basename_to_relpath: dict[str, str]) 
     has no resolved title here, and the basename is a stable, human-readable label). The relative
     path is computed from the destination directory of THIS note to the target's destination path
     via :func:`os.path.relpath`, then POSIX-normalized.
+
+    ``renames`` is the ADR-0041 D6 rule-3 map — the basenames the FLIP itself changed, today just
+    ``<domain>-moc`` → ``<domain>`` (the ``-moc`` suffix was the kind marker in the name and the
+    kind is now the directory). A vault written against schema 1 links maps as ``[[<domain>-moc]]``,
+    so without this the flip would turn every one of those into an "unresolved link" report over
+    notes that are plainly present. The display text keeps the token the AUTHOR wrote; only the
+    target moves.
     """
     from_dir = str(Path(build.rel_path).parent)
 
@@ -575,7 +746,7 @@ def _convert_body_links(build: _NoteBuild, basename_to_relpath: dict[str, str]) 
         display = right.strip() if sep else key
         if not key:
             return m.group(0)  # an empty [[]] — leave verbatim, never a graph edge
-        target = basename_to_relpath.get(key)
+        target = basename_to_relpath.get(renames.get(key, key))
         if target is None:
             build.unresolved_links.append(key)
             return m.group(0)
@@ -613,7 +784,9 @@ def _flow_seq_basenames(entry: object) -> list[str]:
     return []
 
 
-def _normalize_fm_link_arrays(build: _NoteBuild, known_basenames: set[str]) -> None:
+def _normalize_fm_link_arrays(
+    build: _NoteBuild, known_basenames: set[str], renames: dict[str, str]
+) -> None:
     """Keep only ``related:``/``children:`` wikilinks that resolve; report the rest (ADR-0014 D3).
 
     Frontmatter ``related:`` and ``children:`` STAY ``[[basename]]`` strings (ADR-0014 D3 — the
@@ -640,27 +813,18 @@ def _normalize_fm_link_arrays(build: _NoteBuild, known_basenames: set[str]) -> N
         kept: list[str] = []
         for entry in raw:
             for base in _flow_seq_basenames(entry):
-                if base in known_basenames:
-                    kept.append(f"[[{base}]]")
+                # ADR-0041 D6 rule 3: a `[[<domain>-moc]]` written against the v1 layout still names
+                # a real note — the map — and is REWRITTEN to its flipped basename rather than
+                # reported as unresolved.
+                renamed = renames.get(base, base)
+                if renamed in known_basenames:
+                    kept.append(f"[[{renamed}]]")
                 else:
                     build.unresolved_links.append(base)
         build.fm[key] = kept
 
 
 # --- v2 grounding: raw/ provenance · MOC child sync · non-raw source strip (ADR-0014 D5) -------
-
-
-def _note_domain_of(rel_path: str) -> str | None:
-    """Return a note's domain — the first component under ``wiki/`` — or ``None`` (ADR-0010 §1).
-
-    ``wiki/<domain>/...`` ⇒ ``<domain>``. Mirrors :func:`agora_kb.schema.lint._note_domain`; the
-    root ``index.md`` and any non-``wiki/`` note have no domain (and so never carry a synth ``raw/``
-    source — only themes do, and a theme always lives under ``wiki/<domain>/themes/``).
-    """
-    parts = rel_path.split("/")
-    if len(parts) >= 2 and parts[0] == "wiki":
-        return parts[1]
-    return None
 
 
 _RAW_ROOT = "raw"
@@ -775,8 +939,8 @@ def _strip_non_raw_sources(build: _NoteBuild, *, dest: Path) -> None:
     build.fm["sources"] = kept
 
 
-def _synth_raw_source(build: _NoteBuild, *, src: Path, dest: Path) -> None:
-    """Ground a THEME in ``raw/`` provenance, or STUB an empty-body theme (change B / decision (a)).
+def _synth_raw_source(build: _NoteBuild, *, src: Path, dest: Path, shard: str) -> None:
+    """Ground a CONCEPT in ``raw/`` provenance, or STUB an empty-body one (change B / decision (a)).
 
     ADR-0014 D5 v2 change B + ADR-0010 D3 (the Karpathy "every claim traces to ``raw/``" invariant):
 
@@ -791,14 +955,20 @@ def _synth_raw_source(build: _NoteBuild, *, src: Path, dest: Path) -> None:
       recorded note — there is no content to snapshot, so forcing a source would be dishonest.
 
     Mirrors the curator's ``apply._materialize_raw_source``: the DETERMINISTIC engine (never a
-    model) writes ``raw/`` from an immutable body, the path is POSIX, and the write is idempotent (a
-    re-import over an existing snapshot rewrites the same bytes). Only ``theme`` notes are grounded;
-    index/moc/daily carry no ``sources:`` requirement.
+    model) writes ``raw/`` from an immutable body, the path is POSIX, and the write is idempotent
+    (a re-import over an existing snapshot rewrites the same bytes). Only ``concept`` notes are
+    grounded (the claim-bearing kind L1-7 grades); a map/index has no ``sources:`` requirement.
+
+    ``shard`` is the ``raw/<shard>/`` DIRECTORY the snapshot lands in, and it is the one place
+    ADR-0022's ``domains[0]`` catch-all SURVIVES the flip (D2.2 leg 3): ``raw/`` never moves (D1.4),
+    so a snapshot still needs a directory even when the note it grounds has no subject at all. The
+    caller passes the note's own subject when it has one and the first declared domain when it does
+    not — so the evidence tier is byte-for-byte the shape it was in schema 1, while the note's
+    ``subjects:`` stays honestly empty.
     """
-    if build.type_inferred != "theme":
+    if build.type_inferred != "concept":
         return
 
-    domain = _note_domain_of(build.rel_path)
     slug = note_basename(Path(build.rel_path))
 
     # A valid pre-existing raw/ source whose file exists in the SOURCE vault wins — copy it into the
@@ -830,7 +1000,7 @@ def _synth_raw_source(build: _NoteBuild, *, src: Path, dest: Path) -> None:
             return
 
     if build.body.strip():
-        ref = f"raw/{domain}/{slug}.md" if domain else f"raw/{slug}.md"
+        ref = f"raw/{shard}/{slug}.md" if shard else f"raw/{slug}.md"
         out = dest / ref
         out.parent.mkdir(parents=True, exist_ok=True)
         # Immutable import snapshot: the theme's (normalized) body verbatim. Deterministic — a pure
@@ -843,34 +1013,39 @@ def _synth_raw_source(build: _NoteBuild, *, src: Path, dest: Path) -> None:
         build.fm["status"] = "stub"
         build.fm["sources"] = []
         build.stubbed_empty_theme = True
-        build.warnings.append("imported empty theme -> stub")
+        build.warnings.append("imported empty concept -> stub")
 
 
-def _sync_moc_children(build: _NoteBuild, written_basenames: set[str]) -> None:
-    """Make a moc/index's ``children:`` EXACTLY its resolvable child-bullet set (change C / L1-6).
+def _sync_moc_children(build: _NoteBuild, admissible_basenames: set[str]) -> None:
+    """Make a map/index's ``children:`` EXACTLY its ADMISSIBLE child-bullet set (change C / L1-6).
 
-    ADR-0014 D5 v2 change C: ADR-0010 L1-6 requires ``children:`` (resolved via ``wikilinks``) to
-    equal the body child-bullet basename set (the FROZEN §3.2 grammar, :func:`child_bullets`). The
-    importer makes this hold BY CONSTRUCTION on the NORMALIZED body (after
-    :func:`_convert_body_links` has rewritten resolvable ``[[wikilink]]`` bullets to the standard
-    markdown-link form the grammar matches):
+    ADR-0014 D5 v2 change C: L1-6 requires ``children:`` (resolved via ``wikilinks``) to equal the
+    body child-bullet basename set (the FROZEN §3.2 grammar, :func:`child_bullets`, which ADR-0041
+    D1.3 keeps byte-for-byte). The importer makes this hold BY CONSTRUCTION on the NORMALIZED body
+    (after :func:`_convert_body_links` has rewritten resolvable ``[[wikilink]]`` bullets to the
+    standard markdown-link form the grammar matches):
 
     1. compute ``child_bullets`` over the normalized body;
-    2. DROP any indent-0 child-bullet line whose basename does NOT resolve to a WRITTEN note (record
-       it in ``unresolved_links``) — so the body never carries a child bullet L1-2 would reject;
-    3. set ``children:`` to the canonical ``[[basename]]`` strings of the RESOLVABLE set, sorted.
+    2. DROP any indent-0 child-bullet line whose basename is not in ``admissible_basenames``
+       (recording it in ``unresolved_links``) — so the body never carries a child bullet L1-2 or
+       L1-24 would reject;
+    3. set ``children:`` to the canonical ``[[basename]]`` strings of the ADMISSIBLE set, sorted.
 
-    Runs on ``moc`` / ``index`` notes only (index children = domain MOCs; moc children = themes). A
-    non-child-bullet body link (inline prose, an indented sub-bullet) is untouched — only the L1-6
-    child set is synchronized.
+    ``admissible_basenames`` is narrower than "every written note" under schema 2, and the narrowing
+    is a RULE rather than tidiness: D1.3 admits only ``concept`` / ``summary`` / ``map`` as a map's
+    children, and lint L1-24 enforces it. A bullet pointing at anything else is dropped on the same
+    no-loss terms as an unresolvable one — recorded, never silently kept.
+
+    Runs on ``map`` / ``index`` notes only. A non-child-bullet body link (inline prose, an indented
+    sub-bullet) is untouched — only the L1-6 child set is synchronized.
     """
-    if build.type_inferred not in ("moc", "index"):
+    if build.type_inferred not in _MAP_KINDS:
         return
 
     # The FROZEN §3.2 grammar (the SAME function L1-6 evaluates) yields the child-bullet basename
     # set on the normalized body — never reimplemented here, so importer and linter can't drift.
     all_children = child_bullets(build.body)
-    resolvable = {b for b in all_children if b in written_basenames}
+    resolvable = {b for b in all_children if b in admissible_basenames}
     unresolvable = all_children - resolvable
 
     if unresolvable:
@@ -890,6 +1065,236 @@ def _sync_moc_children(build: _NoteBuild, written_basenames: set[str]) -> None:
     build.fm["children"] = [f"[[{b}]]" for b in sorted(resolvable)]
 
 
+def _child_bullet(*, basename: str, target: str, label: str, from_dir: str) -> str:
+    """Render ONE §3.2 child bullet that is GUARANTEED to parse back to ``basename``.
+
+    The label a navigation bullet wants is the child's human ``title:`` — an operator-authored
+    string that has been through no slugger and may hold any character at all. The §3.2 child-bullet
+    grammar is FROZEN (``_CHILD_BULLET_LINE_RE``, byte-identical to the one L1-6 evaluates) and its
+    link text is ``[^\\]\\r\\n]*``, so a title containing ``]`` produces a line the grammar either
+    cannot match, or — worse — matches with the WRONG path: for ``title: 'a](x.md) b'`` the regex
+    stops at the inner ``]``, reads ``x.md`` as the target and swallows the real link into the
+    optional trailing-prose group. Either way the emitted bullet set stops equalling ``children:``,
+    and the importer reports L1-6 findings in the repo it just minted — against its own contract
+    that set equality holds BY CONSTRUCTION.
+
+    So the grammar is ASSERTED rather than assumed: each candidate label is rendered, matched, and
+    the parsed path resolved back to a basename; the first candidate that round-trips to
+    ``basename`` wins. The title is tried first (it is what a human wants to read); the child's own
+    BASENAME is the fallback, and it is a total one — a basename is a ``core.pathsafe`` component,
+    whose closed category allowlist (Unicode ``L``/``N``/``M`` plus ``-_.``) contains neither ``]``
+    nor ``)`` nor a newline, and the target path is composed of those same components. A degraded
+    label costs a bullet its prose title; a broken one costs the repo its lint.
+    """
+    rel = Path(os.path.relpath(target, from_dir)).as_posix()
+    for candidate in (label, basename):
+        line = f"- [{candidate}]({rel})"
+        m = _CHILD_BULLET_LINE_RE.match(line)
+        if m is not None and _basename_from_child_path(m.group("path")) == basename:
+            return line
+    # Unreachable while the target path is pathsafe (see above); emitting the basename form is
+    # still the closest thing to a correct bullet, and the destination lint grades the result.
+    return f"- [{basename}]({rel})"
+
+
+def _navigation_note(
+    *,
+    rel_path: str,
+    kind: str,
+    title: str,
+    summary: str,
+    subject: str | None,
+    children: list[tuple[str, str, str]],
+    import_date: str,
+    kb_id: str,
+) -> tuple[str, str]:
+    """Render one SYNTHESIZED navigation note — a domain map, or the root map (ADR-0041 D1.2/D1.3).
+
+    Returns ``(rel_path, rendered_text)``.
+
+    ``children`` is ``(basename, dest_rel, label)`` per child, in the order the bullets are emitted.
+    Both sides of L1-6 are built from that ONE list — the ``children:`` frontmatter array and the
+    body child bullets in the FROZEN §3.2 grammar — so set equality holds by construction rather
+    than by a later sync, and every bullet's target is a real relative path a human can click. The
+    bullets go through :func:`_child_bullet`, which is what makes "by construction" true for a child
+    whose ``title:`` holds a ``]``: the rendered line is matched against the frozen grammar and must
+    parse back to the child's basename, or the basename is used as the label instead.
+
+    The frontmatter is the D2 common base in the ADR's own key order (the same order
+    ``curator.apply._common_frontmatter`` emits), so a synthesized map and a map APPLY later
+    re-renders read identically in a diff.
+    """
+    from_dir = str(Path(rel_path).parent)
+    bullets = [
+        _child_bullet(basename=basename, target=target, label=label, from_dir=from_dir)
+        for basename, target, label in children
+    ]
+    body = f"# {title}\n"
+    if bullets:
+        body += "\n" + "\n".join(bullets) + "\n"
+    fm: dict[str, object] = {
+        "title": title,
+        "kind": kind,
+        "type": kind,
+        "kb": kb_id,
+    }
+    if kind == "index":
+        fm["okf_version"] = _OKF_VERSION
+    fm["subjects"] = [subject] if subject else []
+    fm["aliases"] = []
+    fm["tags"] = []
+    fm["created"] = import_date
+    fm["updated"] = import_date
+    fm["timestamp"] = f"{import_date}T00:00:00Z"
+    fm["status"] = "active"
+    fm["summary"] = summary
+    fm["description"] = summary
+    fm["derived"] = False
+    fm["provenance"] = {"writers": [], "agents": []}
+    fm["children"] = [f"[[{basename}]]" for basename, _target, _label in children]
+    return rel_path, frontmatter.render(fm, body)
+
+
+def _build_navigation(
+    builds: list[_NoteBuild],
+    *,
+    domains: list[str],
+    import_date: str,
+    kb_id: str,
+) -> tuple[list[tuple[str, str]], int, int]:
+    """Complete the schema-2 NAVIGATION tier (ADR-0041 D1.2/D1.3/D5).
+
+    Returns ``(files, synthesized_maps, index_synthesized)``.
+
+    Two obligations schema 2 puts on an importer that schema 1 did not, both structural rather than
+    decorative:
+
+    * **a map per subject.** ADR-0041 D5 seeds the ranker's whole structural term from
+      ``wiki/maps/**`` (``core.wiki._is_map_path``), so a repo with no maps ranks on lexical
+      evidence alone and every concept in it is an orphan for the curator's own ``max_orphans``
+      gate (ADR-0022 §E). A ``wiki/maps/<domain>.md`` is therefore synthesized for every DECLARED
+      domain that has concepts, with ``children:`` == those concepts. An IMPORTED map for that
+      domain WINS and is left exactly as the operator wrote it (its children were synced from its
+      own bullets by change C) — the importer completes the tier, it never overrules it.
+    * **the root map.** ``index.md`` is the ROOT of the map tier (D1.2), so its ``children:`` is
+      every map. An imported index keeps its own prose and its own bullets and is EXTENDED with the
+      maps it does not already list; absent one, it is synthesized whole.
+
+    A domain whose map basename is already taken by an imported note is SKIPPED with a warning on
+    that note rather than renamed: a renamed map is a map nothing links to, and D6 rule 7's reason
+    for refusing silent renames applies just as much here.
+
+    Both sides of L1-6 come from ONE list per note, so ``children:`` and the body child bullets are
+    equal by construction; every child is a ``concept`` or a ``map``, which is exactly the D1.3
+    admitted set (L1-24).
+    """
+    by_dest = {build.rel_path: build for build in builds}
+    taken = {note_basename(Path(build.rel_path)): build for build in builds}
+
+    concepts_by_domain: dict[str, list[_NoteBuild]] = {}
+    for build in builds:
+        if build.type_inferred == "concept" and build.subject:
+            concepts_by_domain.setdefault(build.subject, []).append(build)
+
+    files: list[tuple[str, str]] = []
+    synthesized_maps = 0
+    # (basename, dest_rel, label) per map the destination ends up with — imported or synthesized
+    maps: list[tuple[str, str, str]] = [
+        (note_basename(Path(build.rel_path)), build.rel_path, _title_of(build))
+        for build in builds
+        if build.type_inferred == "map"
+    ]
+
+    for domain in domains:
+        concepts = concepts_by_domain.get(domain)
+        if not concepts:
+            continue
+        map_rel = f"wiki/{KIND_DIRECTORIES['map']}/{domain}.md"
+        if map_rel in by_dest:
+            continue  # the operator's own map for this domain — never overruled
+        clash = taken.get(domain)
+        if clash is not None:
+            clash.warnings.append(
+                f"basename {domain!r} is this note's, so no wiki/maps/{domain}.md was synthesized "
+                f"for the {domain!r} subject; its concepts have no map (ADR-0041 D1.3)"
+            )
+            continue
+        children = sorted(
+            ((note_basename(Path(c.rel_path)), c.rel_path, _title_of(c)) for c in concepts),
+            key=lambda entry: entry[0],
+        )
+        files.append(
+            _navigation_note(
+                rel_path=map_rel,
+                kind="map",
+                title=f"{domain} map",
+                summary=f"Map of content for the {domain} subject.",
+                subject=domain,
+                children=children,
+                import_date=import_date,
+                kb_id=kb_id,
+            )
+        )
+        maps.append((domain, map_rel, f"{domain} map"))
+        synthesized_maps += 1
+
+    maps.sort(key=lambda entry: entry[0])
+
+    index_build = by_dest.get("index.md")
+    if index_build is None:
+        files.append(
+            _navigation_note(
+                rel_path="index.md",
+                kind="index",
+                title="Knowledge base",
+                summary="Root map of every subject in this knowledge base.",
+                subject=None,
+                children=maps,
+                import_date=import_date,
+                kb_id=kb_id,
+            )
+        )
+        return files, synthesized_maps, 1
+
+    # An IMPORTED index: keep its frontmatter, prose and existing bullets; append only the maps it
+    # does not already list, so the operator's own ordering and labels survive the import.
+    #
+    # ``children:`` is EXTENDED, never replaced. Change C has already synced it to the admissible
+    # child-bullet set of this note's own body (a CONCEPT is an admitted D1.3 child of the index,
+    # not only a map), so overwriting it with the map list alone would delete a child whose bullet
+    # is still in the body — and L1-6, which grades ``children:`` against exactly that bullet set,
+    # would reject the repo the importer just announced as clean. Both sides stay derived from ONE
+    # list: the bullets already there, plus the ones appended just below, in that order.
+    declared_order = list(
+        dict.fromkeys(wikilinks(" ".join(_str_items(index_build.fm.get("children")))))
+    )
+    declared = set(declared_order)
+    missing = [entry for entry in maps if entry[0] not in declared]
+    if missing:
+        from_dir = str(Path(index_build.rel_path).parent)
+        bullets = [
+            _child_bullet(basename=basename, target=target, label=label, from_dir=from_dir)
+            for basename, target, label in missing
+        ]
+        body = index_build.body.rstrip("\n")
+        index_build.body = f"{body}\n\n" + "\n".join(bullets) if body else "\n".join(bullets)
+        index_build.fm["children"] = [
+            f"[[{basename}]]" for basename in declared_order + [entry[0] for entry in missing]
+        ]
+    return files, synthesized_maps, 0
+
+
+def _str_items(value: object) -> list[str]:
+    """The string members of a frontmatter list value, else ``[]`` (tolerant accessor)."""
+    return [v for v in value if isinstance(v, str)] if isinstance(value, list) else []
+
+
+def _title_of(build: _NoteBuild) -> str:
+    """The human label a navigation bullet uses for ``build`` (its resolved ``title:``)."""
+    title = build.fm.get("title")
+    return title.strip() if isinstance(title, str) and title.strip() else build.rel_path
+
+
 def _basename_from_child_path(path: str) -> str:
     """Return the child basename from a markdown-link target path (mirrors notes._basename..).
 
@@ -906,25 +1311,31 @@ def _basename_from_child_path(path: str) -> str:
 
 
 def _assert_importable_destination(dest: Path) -> None:
-    """Refuse an import into a destination whose declared KB schema this importer cannot write.
+    """Refuse an import into ANY destination that is already a knowledge base.
 
     The vault normalizer is a DIRECT ``wiki/`` writer — it composes paths itself and never goes
-    through ``Inbox.write`` — so it inherits none of the ADR-0041 D6 write refusal. It also still
-    emits the SCHEMA-1 layout (``wiki/<domain>/themes/<slug>.md``); teaching it the kind-first
-    layout is the ``agora import --from-kb`` converter's work, a separate unit.
+    through ``Inbox.write`` — so it inherits none of the ADR-0041 D6 write refusal and needs its own
+    boundary guard. It writes a **new** repo, and the guard is what makes that word true: only a
+    FRESH destination (nothing declared) passes.
 
-    Until then this is the boundary guard: importing into an EXISTING schema-2 repo would commit
-    ``wiki/<domain>/themes/…`` beside ``wiki/concepts/`` — two layouts in one repo, verbatim the
-    state D6's refusal exists to prevent — and the importer would not even SEE it, because it lints
-    its own output with its own hard-coded schema-1 ``Taxonomy``. Reproduced live before this guard
-    existed: exit 0, a committed mixed-layout tree, and two misleading ``L1-17`` header findings.
+    **A schema-1 destination** would get ``wiki/concepts/…`` committed beside
+    ``wiki/<domain>/themes/…`` — two layouts in one repo, verbatim the state D6's refusal exists to
+    prevent — and the importer would not even SEE it, because it lints its own output with its own
+    ``Taxonomy``. (That was reproduced live before the guard existed: exit 0, a committed
+    mixed-layout tree, and two misleading ``L1-17`` header findings.) A schema-1 repo crosses to
+    schema 2 exactly once, through ``agora import --from-kb``
+    (:func:`agora_kb.ingest.kb_convert.convert_kb`), which is the only crossing D6 authorises.
 
-    A FRESH destination (nothing declared) and a schema-1 destination both pass: the importer's own
-    output is schema 1, which is exactly what it can write. That such a repo is then READ-ONLY for
-    this build is said out loud by the caller (``agora import`` prints it), not enforced here — the
-    import itself is a legitimate, non-destructive act.
+    **A schema-2 destination is refused too, and that half is not symmetry for its own sake.** The
+    importer is not an incremental writer: it mints ``_meta/kb.yaml`` and it composes the root map
+    ``index.md`` from THIS vault's maps alone. Run against a populated schema-2 repo it therefore
+    re-stamps the KB with a NEW ``kb_id`` while the notes already there keep the old one (ADR-0041
+    D1.5 says a ``kb_id`` is minted once and never rewritten), drops the advisory ``declared_kind``,
+    and rewrites ``children:`` and the map bullets of a root map it did not build — reported, in
+    the live repro of this, as ``lint: clean``. Adding to an existing KB is what the INBOX is for
+    (``kb_remember`` / the web upload / ``agora curate``); the importer creates one.
     """
-    from agora_kb.config import ConfigError, read_canonical_kb_schema_version
+    from agora_kb.config import ConfigError, load_kb_identity, read_canonical_kb_schema_version
 
     layout = RepoLayout(Path(dest))
     try:
@@ -935,7 +1346,30 @@ def _assert_importable_destination(dest: Path) -> None:
         raise ValueError(
             f"{layout.root} is a schema-{declared} KB and 'agora import' writes the "
             f"schema-{IMPORTER_SCHEMA_VERSION} layout — importing would leave TWO layouts in one "
-            f"repo. Import into a NEW directory instead (ADR-0041 D6)"
+            f"repo. Import into a NEW directory instead, and convert the existing repo once with "
+            f"'agora import --from-kb {layout.root} <new-repo>' (ADR-0041 D6)"
+        )
+    if declared is not None:
+        raise ValueError(
+            f"{layout.root} is already a schema-{declared} KB and 'agora import' writes a NEW one "
+            f"— it would re-mint _meta/kb.yaml with a fresh kb_id the notes already there do not "
+            f"carry (ADR-0041 D1.5: a kb_id is stamped once and never rewritten) and rebuild the "
+            f"root map index.md from this vault alone. Import into a NEW directory; to ADD to an "
+            f"existing KB, capture through the inbox ('kb_remember' / the web upload) and run "
+            f"'agora curate'"
+        )
+    # Defence in depth for a HALF-initialized destination: `_meta/kb.yaml` present with no
+    # `_meta/taxonomy.yaml` declares no schema, so the check above cannot see it, and minting over
+    # it would still rewrite an identity D1.5 says is written once.
+    try:
+        identity = load_kb_identity(layout)
+    except ConfigError:
+        return
+    if identity is not None:
+        raise ValueError(
+            f"{layout.root} already declares a KB identity (_meta/kb.yaml, kb_id "
+            f"{identity.kb_id}) and 'agora import' writes a NEW repo — a kb_id is stamped once and "
+            f"never rewritten (ADR-0041 D1.5). Import into a NEW directory"
         )
 
 
@@ -946,6 +1380,8 @@ def import_vault(
     domains: list[str],
     import_date: str,
     tags: list[str] | None = None,
+    kb_id: str | None = None,
+    name: str | None = None,
 ) -> ImportReport:
     """Import an external Obsidian/markdown vault at ``src`` into a normalized Agora repo at dest.
 
@@ -962,13 +1398,16 @@ def import_vault(
 
     1. tolerant frontmatter read with Obsidian inline-wikilink REPAIR
        (:func:`_repair_obsidian_frontmatter`) — never crashes;
-    2. note ``type`` + layout inference from the DEST-relative path
-       (:func:`_infer_layout`); a non-conforming path is MOVED under the first domain's ``themes/``;
-    3. missing required ADR-0010 frontmatter SUPPLIED (``title``/``created``/``updated``/``status``/
-       ``summary``) + 4. the OKF fields (``description``/``timestamp``/``okf_version`` on index)
+    2. note ``kind`` + layout inference from the SOURCE-relative path (:func:`_infer_layout`); a
+       non-conforming path becomes a ``concept`` (the catch-all durable page) and is reported;
+    3. missing required ADR-0041 D2 frontmatter SUPPLIED (``kind``/``kb``/``subjects``/``title``/
+       ``created``/``updated``/``status``/``summary``/``derived``/``provenance``) + 4. the OKF
+       fields (``description``/``timestamp``/``okf_version`` on index)
        (:func:`_infer_required_frontmatter`);
-    5. body ``[[wikilink]]`` → standard markdown link when the basename resolves
-       (:func:`_convert_body_links`); an unresolvable link is left verbatim and reported;
+    5. pre-existing body markdown links RE-TARGETED at where their note actually landed, since
+       schema 2 moves every note (:func:`_retarget_body_md_links`), then body ``[[wikilink]]`` →
+       standard markdown link when the basename resolves (:func:`_convert_body_links`); an
+       unresolvable link is left verbatim and reported;
     6. tags outside the destination taxonomy are STRIPPED + recorded (:func:`_filter_tags`).
 
     v2 GROUNDING auto-fixes — what makes a real vault like ``~/knowledge`` import LINT-CLEAN and
@@ -984,9 +1423,16 @@ def import_vault(
        non-empty body is snapshotted VERBATIM to ``raw/<domain>/<slug>.md`` and cited as the theme's
        ``sources:`` (satisfies L1-7 + L1-8 + the Karpathy "every claim traces to ``raw/``"
        invariant, ADR-0010 D3); an EMPTY-body theme becomes ``status: stub`` (L1-7-exempt) instead;
-    C. each ``moc`` / ``index`` has its ``children:`` SYNCED to exactly the resolvable child-bullet
-       basename set of its normalized body (:func:`_sync_moc_children`), dropping unresolvable child
-       bullets — so L1-6 (``children:``-set == child-bullet-set) holds by construction.
+    C. each ``map`` / ``index`` has its ``children:`` SYNCED to exactly the ADMISSIBLE child-bullet
+       basename set of its normalized body (:func:`_sync_moc_children`), dropping unresolvable and
+       inadmissible child bullets — so L1-6 (``children:``-set == child-bullet-set) and L1-24 (the
+       D1.3 admitted child kinds) both hold by construction;
+    E. the NAVIGATION TIER is completed (:func:`_navigation_note`): a ``wiki/maps/<domain>.md`` is
+       SYNTHESIZED for every declared domain that has concepts and does not already have an imported
+       map, and the root ``index.md`` is made the ROOT MAP over every map. This is new in schema 2
+       and it is not cosmetic: the ranker seeds its whole structural term from ``wiki/maps/**``
+       (ADR-0041 D5), so an imported repo with no maps would rank on lexical evidence alone, and
+       every concept in it would be an orphan for the curator's own ``max_orphans`` gate.
 
     REPORT-ONLY (recorded as warnings for the operator/curator, not blocking): a note that was MOVED
     to fit the layout; stripped unknown tags; stripped non-raw sources; unresolved links; an empty
@@ -997,7 +1443,9 @@ def import_vault(
     remains the honest surface for any residue.
 
     Raises ``FileNotFoundError`` / ``NotADirectoryError`` if ``src`` is missing or not a directory
-    (a hard error). ``domains`` must be non-empty (the first domain is the move target).
+    (a hard error). ``domains`` must be non-empty (the first is the ``raw/`` shard-key floor, D2.2
+    leg 3). ``kb_id`` overrides the minted ``_meta/kb.yaml`` ULID (a test pins it; production mints
+    one) and ``name`` its display name, defaulting to the destination directory name.
     """
     src = Path(src)
     dest = Path(dest)
@@ -1006,10 +1454,11 @@ def import_vault(
     if not src.is_dir():
         raise NotADirectoryError(f"source vault is not a directory: {src}")
     if not domains:
-        raise ValueError("import_vault requires at least one domain (the move target)")
+        raise ValueError("import_vault requires at least one domain (the raw/ shard-key floor)")
     _assert_importable_destination(dest)
 
     first_domain = domains[0]
+    declared_domains = set(domains)
     src = src.resolve()
 
     # --- pass 0: discover every source .md note (tolerant: ignore non-.md and hidden dirs) -------
@@ -1071,14 +1520,17 @@ def import_vault(
                     "frontmatter could not be parsed; treated as empty (needs review)"
                 )
 
-        # Infer the type + (possibly moved) destination path from the SOURCE-relative path.
-        type_inferred, dest_rel, moved_from = _infer_layout(src_rel, first_domain, text=body)
-        build.type_inferred = type_inferred
+        # Infer the KIND + destination path + subject from the SOURCE-relative path (ADR-0041 D1).
+        kind, dest_rel, moved_from, subject = _infer_layout(
+            src_rel, domains=declared_domains, text=body
+        )
+        build.type_inferred = kind
+        build.subject = subject
         build.rel_path = dest_rel
         if moved_from is not None:
             build.warnings.append(
-                f"moved to fit the ADR-0010 layout (was {moved_from!r}; "
-                f"no {type_inferred} path matched)"
+                f"moved to fit the ADR-0041 kind-first layout (was {moved_from!r}; "
+                f"no {kind} path matched)"
             )
         builds.append(build)
 
@@ -1088,28 +1540,73 @@ def import_vault(
     # not exist there is no duplicate basename left for lint L1-1 to report, so the import announced
     # ``lint: clean`` over notes it had just destroyed. Disambiguate deterministically with the same
     # content-keyed suffix, in a stable order, and say so in the per-note warnings.
+    #
+    # The claim is keyed on the destination BASENAME rather than on the destination PATH, and under
+    # schema 2 that is the only key that works: the kind is now the directory, so two notes can land
+    # on DIFFERENT paths (``wiki/concepts/general.md`` and ``wiki/maps/general.md``) while sharing
+    # one basename — which is a hard L1-1 duplicate, because the basename is the global identity
+    # every ``[[basename]]`` resolves on (ADR-0010 D5). The path-keyed check would have passed that
+    # pair straight through to a lint failure at the end of a completed import.
+    #
+    # ``index`` is RESERVED, and it is the one basename the loop cannot defend by itself: the root
+    # map may not be an imported note at all — change E synthesizes one when the vault has none, and
+    # ``Repo.init`` seeds one after that — so a source note that lands elsewhere basenamed ``index``
+    # (an Obsidian ``general/index.md`` folder note becomes ``wiki/concepts/index.md``) collides
+    # with a note that does not exist yet. That is exactly the path-key-vs-basename-key blind spot
+    # this claim pass was rewritten to close, one branch further along. Reserving it up front keeps
+    # the rule identical for both: the ROOT index keeps the name, every other claimant is renamed by
+    # the same content-keyed suffix, and lint L1-13 ("only the root note is basenamed index") holds.
+    reserved: set[str] = set()
+    if not any(build.rel_path == "index.md" for build in builds):
+        reserved.add("index")
     claimed: dict[str, _NoteBuild] = {}
     for build in sorted(builds, key=lambda b: b.rel_path):
-        first = claimed.get(build.rel_path)
-        if first is None:
-            claimed[build.rel_path] = build
+        basename = note_basename(Path(build.rel_path))
+        first = claimed.get(basename)
+        if first is None and basename not in reserved:
+            claimed[basename] = build
             continue
         collided = build.rel_path
         parent = PurePosixPath(collided).parent
-        build.rel_path = (
-            f"{parent}/{PurePosixPath(collided).stem}-{content_sha256(build.body)[:8]}.md"
+        build.rel_path = f"{parent}/{basename}-{content_sha256(build.body)[:8]}.md"
+        renamed_to = PurePosixPath(build.rel_path).name
+        claim = (
+            f"was already claimed by {first.src_path.name!r}"
+            if first is not None
+            else "is RESERVED for the ROOT map at index.md (ADR-0041 D1.2, lint L1-13)"
         )
         build.warnings.append(
-            f"destination {collided!r} was already claimed by {first.src_path.name!r}; "
-            f"renamed to {PurePosixPath(build.rel_path).name!r} so neither note is lost"
+            f"basename {basename!r} {claim}; renamed to {renamed_to!r} so neither note is lost"
         )
-        claimed[build.rel_path] = build
+        claimed[note_basename(Path(build.rel_path))] = build
 
-    # Build the basename→dest-relpath map over ALL notes (last writer wins on a basename clash; a
-    # genuine duplicate basename is an L1-1 the attached lint will surface).
+    # ADR-0041 D6 rule 3, applied to THIS lane: a vault written against schema 1 links its maps as
+    # ``[[<domain>-moc]]``, and the flip renames that note to ``<domain>``. The rename map is built
+    # AFTER the disambiguation above so it names where the map ACTUALLY landed, and it is confined
+    # to the map tier: a concept whose slug merely differs from its source stem is NOT aliased,
+    # because that is normalization, not a rename the flip performed, and aliasing it would start
+    # resolving links the schema-1 importer honestly reported as unresolved.
+    renames: dict[str, str] = {}
+    for build in builds:
+        if build.type_inferred != "map":
+            continue
+        source_stem = note_basename(build.src_path)
+        dest_stem = note_basename(Path(build.rel_path))
+        if source_stem != dest_stem:
+            renames[source_stem] = dest_stem
+
+    # Build the basename→dest-relpath map over ALL notes (basenames are now unique by construction),
+    # and beside it the SOURCE-relpath→dest-relpath map the body markdown-link retarget resolves on
+    # first (the exact answer; the basename map is its fallback).
+    src_to_dest: dict[str, str] = {}
     for build in builds:
         basename_to_relpath[note_basename(Path(build.rel_path))] = build.rel_path
+        src_to_dest[build.src_path.relative_to(src).as_posix()] = build.rel_path
     known_basenames = set(basename_to_relpath)
+    # L1-24: only these kinds may appear in a map's ``children:`` (ADR-0041 D1.3).
+    admissible_children = {
+        note_basename(Path(b.rel_path)) for b in builds if b.type_inferred in _ADMITTED_CHILD_KINDS
+    }
 
     # --- the closed destination taxonomy (operator-declared; never widened) ----------------------
     # ADR-0010 D6 / ADR-0014 D5: ``allowed_tags`` is exactly what the operator passed via ``--tag``;
@@ -1124,6 +1621,18 @@ def import_vault(
     layout = RepoLayout(dest)
     dest.mkdir(parents=True, exist_ok=True)
 
+    # ADR-0041 D1.5: the KB identity is minted ONCE, here, and every note mirrors it into ``kb:``.
+    # It is written BEFORE the notes so a run that fails part-way leaves an identity-bearing repo
+    # rather than notes stamped with an id no file declares. The mint is UNCONDITIONAL because
+    # `_assert_importable_destination` above has already proved there is no identity here to
+    # overwrite — that guard, not a second absence check, is what keeps D1.5's "stamped once and
+    # never rewritten" true for this lane.
+    from agora_kb.config import KbIdentity, write_kb_identity
+    from agora_kb.core.ids import new_ulid
+
+    kb_identity = KbIdentity(kb_id=kb_id or new_ulid(), name=name or dest.name or "knowledge")
+    write_kb_identity(layout, kb_identity)
+
     # --- pass 2: normalize frontmatter + links for every note ------------------------------------
     # Order matters for the v2 grounding (ADR-0014 D5): D (strip foreign sources) THEN B (synth the
     # authoritative raw/ snapshot or stub) THEN C (sync MOC children on the NORMALIZED body, after
@@ -1131,34 +1640,69 @@ def import_vault(
     # frozen child-bullet grammar matches). ``known_basenames`` is exactly the WRITTEN-note set
     # (structural files were excluded in pass 0), so it is the resolvable target set for change C.
     for build in builds:
-        _infer_required_frontmatter(build, import_date)
+        _infer_required_frontmatter(build, import_date, kb_id=kb_identity.kb_id)
         _filter_tags(build, allowed_tags)
-        _normalize_fm_link_arrays(build, known_basenames)
-        _convert_body_links(build, basename_to_relpath)
+        _normalize_fm_link_arrays(build, known_basenames, renames)
+        # Retarget BEFORE the wikilink conversion: the links that pass emits are already
+        # destination-relative, and re-reading them against the SOURCE tree would break them.
+        _retarget_body_md_links(
+            build,
+            src_root=src,
+            src_rel=build.src_path.relative_to(src).as_posix(),
+            src_to_dest=src_to_dest,
+            basename_to_relpath=basename_to_relpath,
+            renames=renames,
+        )
+        _convert_body_links(build, basename_to_relpath, renames)
         _strip_non_raw_sources(build, dest=dest)  # change D — drop non-raw//escaping sources
-        _synth_raw_source(build, src=src, dest=dest)  # change B — synth raw/ provenance or stub
-        _sync_moc_children(build, known_basenames)  # change C — children == resolvable child set
-        if build.type_inferred == "theme" and build.fm.get("status") != "stub":
-            # After change B every non-stub theme has a synth (or kept) raw/ source; a residual
-            # empty-sources theme (none — defensive) is still reported for the operator (L1-7).
+        # change B — synth raw/ provenance or stub. The shard key is the note's own subject and
+        # falls back to `domains[0]`: ADR-0022's catch-all survives in the raw/ tier and ONLY there
+        # (D2.2 leg 3), because raw/ never moves and a snapshot still needs a directory.
+        _synth_raw_source(build, src=src, dest=dest, shard=build.subject or first_domain)
+        _sync_moc_children(build, admissible_children)  # change C — children == admissible set
+        if build.type_inferred == "concept" and build.fm.get("status") != "stub":
+            # After change B every non-stub concept has a synth (or kept) raw/ source; a residual
+            # empty-sources concept (none — defensive) is still reported for the operator (L1-7).
             if not _has_sources(build.fm):
                 build.warnings.append(
-                    "theme has no raw/ sources (L1-7): needs sources or status: stub"
+                    "concept has no raw/ sources (L1-7): needs sources or status: stub"
                 )
 
+    # --- change E: complete the NAVIGATION tier (ADR-0041 D1.2/D1.3) -----------------------------
+    navigation, synthesized_maps, synthesized_index = _build_navigation(
+        builds,
+        domains=domains,
+        import_date=import_date,
+        kb_id=kb_identity.kb_id,
+    )
+
     # --- write the normalized notes under dest ---------------------------------------------------
-    # Change B already wrote the immutable ``raw/<domain>/<slug>.md`` snapshots; here the normalized
+    # Change B already wrote the immutable ``raw/<shard>/<slug>.md`` snapshots; here the normalized
     # wiki notes themselves are emitted (raw/ is outside the wiki tree and never overwritten here).
     for build in builds:
         out_path = dest / build.rel_path
         out_path.parent.mkdir(parents=True, exist_ok=True)
         out_path.write_text(frontmatter.render(_ordered_fm(build.fm), build.body), encoding="utf-8")
+    for rel_path, text in navigation:
+        out_path = dest / rel_path
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(text, encoding="utf-8")
+
+    # The kind CONTAINERS are the schema; their population is not. ``wiki/summaries/`` and
+    # ``wiki/entities/`` ship EMPTY (ADR-0041 OD-7/OD-8) and ``wiki/people/`` is human-owned, so the
+    # importer creates the directories and writes into none of them. This is ``agora repo init``'s
+    # OWN helper, deliberately — not a local ``mkdir``: each container gets a ``.gitkeep``, because
+    # git cannot track an empty directory and the admin commit below would otherwise drop every
+    # unpopulated container, leaving an imported repo a DIFFERENT tree from an init'd one at the
+    # same schema — and the containers would vanish on ``agora sync`` + clone.
+    materialize_kind_directories(layout)
 
     # --- emit schema + taxonomy, git-init, then lint ---------------------------------------------
     # The injected ``import_date`` pins the init/admin commit date so the repo is byte-reproducible
     # (no wall clock; ADR-0010 D1 discipline). ``Repo.init`` seeds its own ``index.md`` only when
-    # one is absent, so an imported index is preserved; the import's notes are committed as one
-    # admin commit. An empty diff over the seed (a vault with no notes) is a no-op, not an error.
+    # one is absent — and change E always writes one, so the seed never fires and the ROOT MAP the
+    # importer built (children == every map) is what the repo keeps. The import's notes are
+    # committed as one admin commit; an empty diff is a no-op, not an error.
     emit_schema(layout, taxonomy=taxonomy)
     repo = Repo(layout)
     when = datetime.fromisoformat(f"{import_date}T00:00:00+00:00").astimezone(UTC)
@@ -1166,13 +1710,13 @@ def import_vault(
     # that may move, and the importer's output layout is fixed by `_infer_layout`. Passing the
     # constant keeps the DECLARED version and the WRITTEN tree one fact — a repo declaring 2
     # over a schema-1 tree is the exact half-migration ADR-0041 D6 refuses.
-    repo.init(when=when, schema_version=IMPORTER_SCHEMA_VERSION)
+    repo.init(when=when, schema_version=IMPORTER_SCHEMA_VERSION, kb_id=kb_identity.kb_id)
     try:
         repo.commit_all("chore: import external vault (agora import)", when=when)
     except GitError:
         pass  # nothing to commit (no diff over the seed)
 
-    lint_result = lint(layout, taxonomy=taxonomy)
+    lint_result = lint(layout, taxonomy=taxonomy, schema_version=IMPORTER_SCHEMA_VERSION)
 
     # --- assemble the report ---------------------------------------------------------------------
     records = tuple(sorted((b.finalize() for b in builds), key=lambda r: r.rel_path))
@@ -1181,6 +1725,7 @@ def import_vault(
         "repaired_frontmatter": sum(1 for r in records if r.repaired_frontmatter),
         "moved": sum(1 for r in records if any("moved to fit" in w for w in r.warnings)),
         "converted_links": sum(r.converted_links for r in records),
+        "retargeted_links": sum(r.retargeted_links for r in records),
         "unresolved_links": sum(len(r.unresolved_links) for r in records),
         "stripped_tags": sum(len(r.stripped_tags) for r in records),
         "themes_without_sources": sum(
@@ -1194,6 +1739,12 @@ def import_vault(
         "stubbed_empty_themes": sum(1 for r in records if r.stubbed_empty_theme),
         "stripped_sources": sum(len(r.stripped_sources) for r in records),
         "excluded_structural_files": excluded_structural,
+        # change E (ADR-0041): the navigation tier the importer COMPLETED rather than imported.
+        # Counted separately and kept OUT of ``notes`` on purpose: ``notes`` is "one record per
+        # imported SOURCE note", and folding a synthesized map into it would make the count of what
+        # the operator's vault contained a function of what the importer decided to add.
+        "synthesized_maps": synthesized_maps,
+        "synthesized_index": synthesized_index,
         "lint_findings": len(lint_result.findings),
     }
     return ImportReport(notes=records, summary=summary, warnings=(), lint=lint_result)
@@ -1211,17 +1762,22 @@ def _has_sources(fm: dict[str, object]) -> bool:
 def _ordered_fm(fm: dict[str, object]) -> dict[str, object]:
     """Return ``fm`` reordered into the ADR-0010 §2 documented key order (stable rendered YAML).
 
-    The curator's APPLY emits frontmatter in a fixed order (``title``, ``type``, ``okf_version`` on
-    index, ``aliases``, ``tags``, ``created``, ``updated``, ``timestamp``, ``status``, ``summary``,
-    ``description``, then type-specific keys). Mirroring that order keeps an imported note's YAML
+    The curator's APPLY emits the ADR-0041 D2 common base in a fixed order
+    (``curator.apply._common_frontmatter``): ``title``, ``kind``, the ``type`` OKF mirror, ``kb``,
+    ``okf_version`` on the bundle-root index only, ``subjects``, ``aliases``, ``tags``, ``created``,
+    ``updated``, ``timestamp``, ``status``, ``summary``, ``description``, ``derived``,
+    ``provenance``, then the kind-specific keys. Mirroring that order keeps an imported note's YAML
     byte-comparable to a curated one and the diff readable. Unknown keys (preserved from the source
     per the tolerant round-trip, ADR-0014 D4) are appended in their original order after the known
     ones.
     """
     order = [
         "title",
+        "kind",
         "type",
+        "kb",
         "okf_version",
+        "subjects",
         "aliases",
         "tags",
         "created",
@@ -1230,6 +1786,8 @@ def _ordered_fm(fm: dict[str, object]) -> dict[str, object]:
         "status",
         "summary",
         "description",
+        "derived",
+        "provenance",
         "sources",
         "related",
         "children",
@@ -1237,6 +1795,7 @@ def _ordered_fm(fm: dict[str, object]) -> dict[str, object]:
         "run_id",
         "origin",
         "confidence",
+        "body_status",
     ]
     ordered: dict[str, object] = {}
     for key in order:
