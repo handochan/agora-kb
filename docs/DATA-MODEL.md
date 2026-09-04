@@ -110,14 +110,90 @@ sha256: <hex of the body only>              # re-ingest: skip if unchanged, flag
 mime: application/pdf
 ```
 
+**`raw/` did NOT move under KB wiki schema 2, and that is load-bearing** ([ADR-0041](adr/0041-stratum-kind-first-layout.md)
+D1.4/D3.4). The shapes above are byte-identical to schema 1, so every `sources:` string written under
+schema 1 stays resolvable verbatim and lint L1-7/L1-8/L1-8b keep working unmodified. The `<domain>`
+segment survives as a **shard key only** — no code reads a subject out of it; the subject lives in
+the note's `subjects:` frontmatter. This is also the one place ADR-0022's `domains[0]` catch-all
+still applies: `raw/<domain>/<event_id>.md` needs a directory, so domain tokens stay ASCII
+kebab-case even though they are no longer wiki path segments — a rule of the ADR and a convention
+of every producer, not a gate any layer enforces today (§10).
+
+Two prefixes are **reserved inside `raw/`** and share its namespace with `<domain>`:
+
+| path | status today |
+|---|---|
+| `raw/_blob/<ab>/<sha256>.<ext>` + `<file>.meta.yaml` | **Reserved, no writer.** The destination for a captured artefact's original bytes — content-addressed (`<ab>` = the first two hex chars of the digest), immutable, and admissible only by membership in the APPLY `raw_writes` set *with matching bytes* (content-addressing is an extra self-check, never a substitute for that authorship check). `RepoLayout.blob_dir` resolves the path; nothing writes it, and the transport ADR-0041 D4.2 specifies (an optional attachment beside the inbox event) is unbuilt — `Inbox.write` still takes `text: str` + an optional `raw_ref: str` and no bytes. The sidecar name is the **full filename plus** `.meta.yaml`, which keeps L1-8b ("cite the artefact, not its sidecar") working unmodified. |
+| `raw/_pages/` | **Reserved prefix only.** No writer, and the reservation grants no gate exception — a file appearing there fails the final diff like any other unauthored `raw/` path. It exists so the long-document contract (reserved ADR-0040, **unauthored**) can populate it later. |
+
+Because both share one namespace with `raw/<domain>/`, a `_meta/taxonomy.yaml` `domains` entry
+beginning with `_` is rejected by lint **L1-23** (schema 2 only), and the plan-side path composer
+rejects a leading `_` in a path component independently — two layers over two different inputs,
+neither covering the other.
+
+## 2a. Wiki note & KB identity (KB wiki schema 2)
+
+The wiki layout and the note frontmatter are specified by [ADR-0010](adr/0010-kb-wiki-schema.md) as
+amended/superseded by [ADR-0041](adr/0041-stratum-kind-first-layout.md), and emitted verbatim into
+each repo as its `AGENTS.md`/`SCHEMA.md`. Recorded here only as the shapes the rest of this document
+refers to.
+
+**The path is a function of the KIND.** The first segment under `wiki/` *is* the kind and is
+authoritative; `kind:` in frontmatter is a mirror of it, and lint hard-rejects a disagreement
+(L1-11) or a `wiki/` sub-directory outside the closed set (L1-22).
+
+| kind | path | notes |
+|---|---|---|
+| `concept` | `wiki/concepts/<slug>.md` | the v1 `type: theme` |
+| `summary` | `wiki/summaries/<slug>.md` | **ships empty** — no producer (ADR-0040 unauthored; OD-7) |
+| `note` | `wiki/notes/<yyyy>/<mm>/<yyyy>-<mm>-<dd>.md` | the v1 `type: daily`; ONE journal per `run_date`, repo-wide |
+| `map` | `wiki/maps/<slug>.md` | the v1 `<domain>-moc.md`; children may be `concept`/`summary`/`map` (L1-24) |
+| `entity` | `wiki/entities/<slug>.md` | **ships empty** — no day-1 producer (OD-8) |
+| `person` | `wiki/people/<person>/**.md` | HUMAN-owned; the curator never writes it, lint never grades it |
+| `index` | `index.md` (repo root) | exactly one; the root *of* the map tier, not a member of it |
+
+Free sub-folders under a kind are legal and no code reads the intermediate segments; the exceptions
+are the `notes/<yyyy>/<mm>` date shard (composed from the run date, never parsed out of a
+model-supplied basename) and the `people/<person>` namespace.
+
+**Frontmatter common base** every curator-written note carries (UTF-8 / LF / dates `YYYY-MM-DD`):
+`title`, `kind`, `kb` (the `_meta/kb.yaml` `kb_id`, so a note copied out still names its origin),
+`subjects` (0..n declared taxonomy domains — `[]` is a legal, honest value), `aliases`, `tags`,
+`created`, `updated`, `status`, `summary`, `derived` (bool, default `false`) and `provenance`
+(`writers:` = authenticated principals, TRUSTED; `agents:` = agent self-declarations, RECORDED and
+NEVER trusted). Per-kind additions carry over from v1 unchanged in shape: `concept`/`summary` add
+`sources`/`related`/`origin`/`confidence`/`body_status` + the contested triple, `note` adds
+`date`/`run_id`/`sources`/`body_status`, `map`/`index` add `children`, `entity` adds
+`sources`/`related`. APPLY additionally emits the ADR-0014 D2 OKF mirrors it already emitted —
+`description` beside `summary`, `timestamp` beside `updated`, `okf_version` on the root index — plus
+a derived `type:` mirroring `kind` (ADR-0041 OD-3): `type:` is retired **as the kind authority**
+(nothing reads it on schema 2), not deleted from the emitted bundle.
+
+**`_meta/kb.yaml` — the KB identity, a CLOSED key set, and no policy** (ADR-0041 D1.5):
+
+```yaml
+kb_id: 01J8Z...          # ULID, minted ONCE at `agora repo init`, never rewritten; mirrored into
+                         # every note's `kb:` frontmatter
+name: general            # display name
+declared_kind: personal  # ADVISORY ONLY — never an authorisation input
+```
+
+Three keys and nothing else; `load_kb_identity` / `write_kb_identity` enforce the set on both sides
+and reject a policy key. The *enforcing* `kind` stays in git-ignored `_kb/repo.yaml` (§3), which is
+where `load_harvest_policy` reads it — a git-tracked enforcing `kind` would let an upstream author's
+declaration unlock a downstream operator's personal-scope connectors. For a KB not created locally,
+`kb_id` is a **self-claim**: join/display identity, never authorisation.
+
 ## 3. Repo metadata — `_kb/repo.yaml`
 
 Per-repo configuration & identity.
 
 ```yaml
 name: engineering
-kind: team | personal
-schema_version: 1
+kind: team | personal                       # the ENFORCING kind (the advisory one is _meta/kb.yaml)
+schema_version: 2                           # MIRROR of _meta/taxonomy.yaml (the canonical location,
+                                            # ADR-0010 §5.1); `agora repo init` writes 2 for a new
+                                            # repo, 1 stays readable but refuses every write
 domains: [ai-tech, economy, general]
 git_remote: https://forgejo.internal/agora/engineering.git
 review_mode: direct | pr                    # curator commits directly, or opens PRs
@@ -183,8 +259,12 @@ These promote three previously-hardcoded/inert tunables (ADR-0011 §1.3) to oper
 - `curator.limits.related_k` (default `8`) — the `wiki.query_lexical(limit=…)` breadth for the
   bundle's related-notes fetch (the model-free oracle the write path is pinned to, #144).
 - `curator.lint.max_orphans` (default **absent ⇒ check skipped**, byte-identical to today) — when set,
-  `lint` emits **one `warning`-severity** `L2-1` finding if the whole-tree orphan-theme count exceeds
+  `lint` emits **one `warning`-severity** `L2-1` finding if the whole-tree orphan count exceeds
   it; a warning never flips `LintResult.ok`, so it does not break the §4.4 gate or the dashboard.
+  The *surface* is unchanged but the *population* moved with the schema: the orphan predicate is now
+  the claim-bearing kinds (`concept`/`summary` — `core.layout.CLAIM_BEARING_KINDS`, the same object
+  the dashboard's orphan count and the gold pack's eligibility set bind to), with `entity` and
+  `person` exempt because both would be orphans by construction.
 
 `L2-6` (stale `body_status`) is the other `warning`-severity finding `lint` emits — unconditional, with
 no threshold to configure: one per note whose `body_status: pending` survives over a body with no
@@ -550,7 +630,7 @@ query: "How is curator concurrency controlled?"
 status: ok | not_found
 hits:
   - repo: personal
-    path: wiki/ai-tech/themes/curator-concurrency.md
+    path: wiki/concepts/curator-concurrency.md
     anchor: "curator-concurrency"
     line: 1
     excerpt: "Exactly one curator advances the curated branch..."
@@ -566,10 +646,41 @@ consume this result but may not replace or hide the underlying evidence.
 ## 10. ID & naming conventions
 - **Inbox id:** `YYYY-MM-DDTHH-MM-SS.mmmZ--<6 hex>` — sortable + unique; safe as a filename.
 - **Note basenames are globally unique** within a repo (only the root `index.md` is named `index`),
-  so `[[basename]]` resolves unambiguously in Obsidian/Logseq. Domain MOCs are `<domain>-moc.md`.
+  so `[[basename]]` resolves unambiguously in Obsidian/Logseq. **Maps are `wiki/maps/<slug>.md`** —
+  the `-moc` suffix is retired, because the kind marker moved from the filename into the directory
+  (ADR-0041 D6 step 3 renames `<domain>-moc` to `<domain>` on conversion).
   Note: plan `links[]` carry basenames, but APPLY resolves each to a standard markdown body link
   `[Title](relative.md)` (the git+Obsidian+OKF-native form; ADR-0014 D3); only frontmatter
   `related:`/`children:` remain `[[basename]]`.
+- **`wiki/people/**` is OUTSIDE the basename identity space** (ADR-0041 D3.3). People basenames are
+  excluded from the curator's `live_basenames` (so a human file can never veto a curator name), from
+  L1-1's duplicate check, and from L1-15's alias/basename union. The stated consequence: **a people
+  note is addressed by path, never by `[[basename]]`** — a `[[ ]]` link into the tree does not
+  resolve and is an L1-2 broken link, and the curator may not author one anyway.
+- **Journal basenames are `<YYYY-MM-DD>`**, one per `run_date` repo-wide, at
+  `wiki/notes/<yyyy>/<mm>/`. v1's `<domain>-<YYYY-MM-DD>` namespacing existed only because bare
+  dates would collide across domains, and the domain is out of the path. The
+  ADR-0011 §4.1 check-5 `(daily exempt)` clause is **kept**: it guards *pre-existence*, so retiring
+  it would fail the second `agora curate` of any day. §10 itself has never carried a daily exemption
+  and still does not.
+- **Basenames and slugs are Unicode**, validated by `core/pathsafe.py`: a closed
+  Unicode-**category** allowlist (`L`/`N`/`M` plus `-_.`), NFC-normalised, Windows reserved device
+  stems rejected, capped at 180 UTF-8 bytes, leading `_` rejected at the composition site (the
+  `raw/` reserved-prefix namespace). Case is not folded. Basename identity, alias uniqueness and
+  link resolution compare NFC-normalised strings, so a macOS NFD directory read cannot make a name
+  unequal to itself. The `note-<sha8>` fallback (#57) remains the last resort but fires far less
+  often — a Korean title now yields a Korean component instead of an empty one. What stays **ASCII**
+  is everything derived from `core/layout.py`'s writer regex — writer namespaces
+  (`_kb/inbox/<writer>/`), harvest cursor stems, gold pack names and reader-cache stems, all
+  validated by `layout.validate_writer` / `safe_path_component`. `subjects:`/domain tokens stay
+  ASCII kebab-case too ([ADR-0041](adr/0041-stratum-kind-first-layout.md) D2.2 leg 3, because they
+  are still `raw/` path segments) — but on a **different footing**, which matters to anyone reading
+  this as a guarantee: a domain token never passes through that writer regex (`core/layout.py` says
+  so at the composition site), and no layer gates its character class today. `curator/plan.py`
+  grades a `Disposition.domain` with the same Unicode `pathsafe` rule as a basename plus the
+  leading-`_` rejection, and `config._checked_domains` checks only the leading `_`. So ASCII kebab
+  is the rule the ADR states and the convention every tool follows; it is not yet an enforced gate,
+  and a taxonomy that declares a non-ASCII domain is admitted rather than refused.
 - **Tags** are kebab-case and must exist in the repo schema's taxonomy before use (prevents sprawl).
 
 ## 11. Curator plan & content hash (PLAN-APPLY-AUTHOR)
@@ -621,8 +732,17 @@ materializes ALL structure and ALL frontmatter from it (C7): the model DECIDES, 
 ```
 
 Disposition fields the model DECIDES: `candidate_id`, `event_ids[]`, `op` ∈ {CREATE_THEME, APPEND_DAILY, MERGE_INTO_THEME, MARK_CONTESTED, DROP, NOOP} (closed vocabulary; ADR-0011 §2),
-`domain`, `basename` (the NEW note's basename for `CREATE_THEME`/`APPEND_DAILY`; null otherwise),
-`target_basename` (the EXISTING theme note targeted by `MERGE_INTO_THEME`/`MARK_CONTESTED`; null otherwise)
+`domain` (**singular, and it stays singular** — ADR-0041 D2.2/OD-9 deliberately did not widen the
+plan wire to a `subjects` tuple, because that would bump the plan-envelope `schema_version`; its
+meaning narrows to the `raw/<domain>/` shard key, and APPLY uses it to seed a ONE-element
+`subjects:` on the note, or `subjects: []` when it is null. 0..n subjects are an APPLY-and-human
+capability, not a model capability),
+`basename` (the NEW note's basename for `CREATE_THEME`/`APPEND_DAILY`; null otherwise — and for
+`APPEND_DAILY` it must equal the run date, which is what makes the `wiki/notes/<yyyy>/<mm>/` shard a
+composed curator-owned fact rather than something parsed out of model output),
+`target_basename` (the EXISTING claim-bearing note targeted by `MERGE_INTO_THEME`/`MARK_CONTESTED` —
+kind `concept` or `summary`, derived from the DIRECTORY so a brain cannot falsify it; a journal, a
+map, `index.md` or a `wiki/people/` note is rejected at the PLAN gate. Null otherwise)
 — both null for `DROP`/`NOOP`, `title`, `summary`,
 `status` (the C1 enum: `active | stub | contested | deprecated`), `aliases[]`, `tags[]` (each must already
 exist in `_meta/taxonomy.yaml`, C5), `links[]` (wikilink basenames; APPLY resolves each to a standard

@@ -90,6 +90,50 @@ Goal: humans contribute and observe via the browser.
       (Neo4j) was rejected on license/SSOT/overkill grounds.
 **Exit:** upload a PDF/URL in the browser → it becomes a linked wiki note; dashboard shows the queue.
 
+## Stratum — KB wiki schema 2 (ADR-0041, IN PROGRESS) — issue #153
+
+The wiki's two axes are flipped: the first path segment under `wiki/` **is** the note's kind, and the
+subject leaves the path for the `subjects:` frontmatter list. `raw/` does not move, which is what
+keeps every `sources:` string resolvable and the conversion cheap. The ADR is **Proposed** — the work
+below is landing on `feat/stratum-unit2-schema2`, not on `main`, and acceptance is a status flip.
+
+**Landed (wave by wave, with the commit on this branch):**
+
+| wave | what | commit |
+|---|---|---|
+| W2.1 | schema-2 note model (`kind`/`subjects`/`kb`/`provenance`/`derived`, derived for BOTH schemas) + the L1 ruleset dispatched by `schema_version`, incl. new L1-22/23/24 | `19d21f5` |
+| W2.1 | `core/layout.py` kind directories + `note_path_for`, inline ULID (`core/ids.py`), `_meta/kb.yaml` identity, and `assert_writable_kb_schema_version` / `ReadOnlySchemaVersionError` | `f58c7a2` |
+| W2.1 | the schema-2 brain contract (`schema/templates/kb_schema_v2.md`) + `agora repo init --schema` (schema 2 OPT-IN and not yet curate-able; materializes the six kind directories) | `c6c79e8` |
+| W2.1 | the shared fixture builder materializes schema-2 repos from the same `NoteSpec` content | `266cf66`, `510d06c` |
+| W2.2 | schema-2 plan path grammar, the `wiki/people/` allowlist carve-out, the `pathsafe` swap (+ leading-`_` rejection) and the Unicode sluggers | `708da4b` |
+| W2.2 | APPLY writes KB wiki schema 2 — kind-first paths, the D2 common base, lazy `wiki/maps/<subject>.md`, one journal per run date | `18bb029` |
+| W2.2 | the curator runs on schema 2; `agora repo init --schema` now **defaults to 2** for a new repo; **schema-1 repos become read-only** (D6: `curate`/`watch`/`requeue`/`harvest`/`kb_curate`/`Inbox.write` refuse, and `agora doctor` prints a `write: READ-ONLY` line and ends `status: unhealthy`, exit 1) | `883291a` |
+| W2.3 | the ranker seeds from `wiki/maps/` and reads the in-scope filter from `subjects:`; reader cache `CACHE_SCHEMA_VERSION` 2 → 3 | `0c250aa` |
+| W2.3 | gold packs, the MCP face and the web face on `kind` + `subjects`; `wiki/people/**` never leaves through a pack; `browse`/`note`/`graph` payloads change shape | `853d774` |
+| W2.3 | the pre-flip golden pinned (`golden_v1*`) and the post-flip golden recorded (`golden_v2*`), discharging the ADR-0041 D5 diff obligation | `c1c3d9e`, `9a5bab6` |
+| W2.4 | `agora import <vault> <dest>` writes the schema-2 layout (`IMPORTER_SCHEMA_VERSION = 2`) and refuses a destination that is ALREADY a knowledge base — of either schema, since the importer mints `_meta/kb.yaml` and composes the root map from the vault alone, so re-importing into a live KB would re-stamp its `kb_id` and rebuild its index; pre-existing body markdown links are re-targeted at where each note actually landed; `agora import --from-kb <old-repo> <dest>` converts a repo off the old layout by the D6 rules 1-7, printing a conversion report (note/rename/merge/`raw/` counts, the renamed basenames, the merges, and everything in the source tree it did not carry over) and failing loudly with the NAMED basename collisions rather than renaming; `agora doctor` / `agora status` print a READ-ONLY line naming `--from-kb` on a schema-1 repo (and doctor's overall verdict on one is `status: unhealthy`, exit 1); the web upload turns `ReadOnlySchemaVersionError` into a per-file receipt error instead of a 500, and the dashboard health panel + `/metrics` (`agora_kb_schema_version`, `agora_kb_schema_writable`) carry the same write verdict so a read-only repo cannot show as green | this wave |
+
+**Remaining before ADR-0041 can be Accepted:**
+
+- **W2.5 — `raw/_blob` capture.** The destination and admission rule are decided (D1.4/D4.2) and
+  `RepoLayout.blob_dir` resolves the path, but nothing writes it: `Inbox.write` still carries no
+  bytes, so the D4.2 attachment transport is unbuilt. `raw/_pages/` stays a reserved prefix with no
+  writer and no gate exception.
+- **The two empty tiers.** `wiki/summaries/` and `wiki/entities/` ship with directories, frontmatter
+  shapes and lint rules and **no producer** (OD-7 / OD-8, deliberate). `summaries/` waits on
+  **ADR-0040**, which is reserved and **unauthored**.
+- **The `people/` fences ADR-0041 specifies but no code implements.** The `file:`-connector rule
+  ("a repo-internal glob may cover `wiki/people/**` and nothing else") has no counterpart in
+  `harvester/connectors.py`, which guards only the gold directory; and the pull-surface control for
+  people content reaching `kb_query`/`kb_read`/`kb_neighbors` is named and left undesigned
+  (residual risk R1).
+- **The open sub-decisions.** OD-1..OD-10 are recorded in the ADR. Two are consequential to read as
+  "not shipped" rather than "decided": **OD-9** (the plan wire keeps a singular `domain`; 0..n
+  subjects are an APPLY-and-human capability, and widening it bumps the plan-envelope version) and
+  **OD-10** (D2.2's classification leg — a producer that actually emits `subjects: []` — is not
+  reachable end to end, because PLAN check 5 still rejects a domain-less op and the reference brain
+  still substitutes the ADR-0022 catch-all).
+
 ## 0.1.0-beta — release cutline (next; the first tagged, installable release) — epic #93
 
 Goal: hand the shipped Phases 1–3.6 to people who are **not** the author — a developer dogfooder and
@@ -341,9 +385,26 @@ Stated as user-facing risk, not as a feature backlog. Every line is a thing that
 - **Instant retrieval** — a capture is queryable only after a curator run publishes it. There is no
   read-your-own-write overlay (ADR-0033, reserved and unauthored), so "I just saved it and search
   can't find it" is expected behavior, not a bug.
-- **Schema migration** — `agora repo upgrade` is #63, open, and `schema_version` is read but never
-  compared against a supported range (`config.py:174/909/915`). A repo initialized by this beta is
-  expected to keep working, but there is no migration command if the schema moves.
+- **Schema migration** — `agora repo upgrade` is #63 and remains open; there is **no in-place
+  migrator, and ADR-0041 D6 decided there will not be one for this bump**. `schema_version` *is* now
+  compared against a supported range (`config.SUPPORTED_KB_SCHEMA_VERSIONS`, #98), and that range is
+  `{1, 2}` since the wiki-schema flip: a repo on the older layout still **reads** (query, status,
+  browse, doctor, the MCP read tools, the web read routes) while **every write path refuses** —
+  `curate`, `watch`, `requeue`, `harvest`, `kb_curate`, and `Inbox.write`, which covers
+  `kb_remember` and the web upload. The sanctioned crossing is a **conversion into a NEW repo** —
+  `agora import --from-kb <old-repo> <new-repo>`, which never modifies the source (ROADMAP
+  "Stratum" § W2.4). Expanded in [`LIMITATIONS.md`](LIMITATIONS.md) §6a.
+- **The two empty note tiers** — `wiki/summaries/` and `wiki/entities/` exist as directories with
+  frontmatter shapes and lint rules and **nothing produces a note in either**. Long documents have no
+  home: their contract, ADR-0040, is reserved and unauthored, and the `raw/_pages/` prefix held for
+  it is empty and unprivileged. Do not plan around either tier
+  ([`LIMITATIONS.md`](LIMITATIONS.md) §6c).
+- **`wiki/people/` is human-owned and searchable, not private** — the curator never writes it and
+  lint never grades it, and it is excluded from gold packs and `kb_context`. That is the *push*
+  surface only: `kb_query`/`kb_read`/`kb_neighbors` still return people content to an agent that
+  asks, and the control for that pull surface is named and undesigned (ADR-0041 R1). The
+  repo-internal `file:`-connector fence the same ADR specifies is also unimplemented
+  ([`LIMITATIONS.md`](LIMITATIONS.md) §6b).
 - **Embeddings / semantic search** — deliberately absent; deterministic BM25F ranking is the contract
   (ADR-0009/0012). ADR-0032 is reserved and evidence-triggered, not planned for beta.
 - **Cloud brains** — the default brain is a local Ollama model and an OSS path is mandatory

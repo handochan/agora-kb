@@ -6,20 +6,25 @@
 > what you can do about it now, and where it is tracked. Every claim carries a file/line, an ADR, or
 > an issue number that was checked against the tree at commit `a8906bf` (`agora 0.1.0b1`). Where a
 > claim needed a run to prove it, the run is reproduced in §7.
+>
+> **§6a–§6c are newer than that commit** and were checked against the KB wiki schema 2 work on
+> `feat/stratum-unit2-schema2` (ADR-0041, Proposed) rather than against `a8906bf`.
 
 Related, and deliberately not duplicated here:
 
 | Doc | Covers |
 |---|---|
-| [`../CHANGELOG.md`](../CHANGELOG.md) → "Known limitations" | The short list this document expands (11 items) |
+| [`../CHANGELOG.md`](../CHANGELOG.md) → "Known limitations" | The short list this document expands (12 items) |
 | [`ROADMAP.md`](ROADMAP.md) → "Not in 0.1.0-beta" | The **normative** list — if the two ever disagree, ROADMAP wins |
 | [`../SECURITY.md`](../SECURITY.md) | Threat model, supported scope, private vulnerability reporting |
 | [`DEPLOY-TEAM.md`](DEPLOY-TEAM.md) (**Korean**) | Running one KB for 2–10 people: hub topology, proxy auth, footguns |
 | [`../deploy/README.md`](../deploy/README.md) | Always-on units — and the **SSOT** for the terminal-failure recovery procedure §7 summarizes |
 
 Limits that are *capability* gaps rather than data-safety risks — native Windows (epic #85), no
-embeddings/semantic search (ADR-0009/0012), no schema-migration command (#63/#98), no contributor
-process — are listed in the CHANGELOG and are not repeated below.
+embeddings/semantic search (ADR-0009/0012), no contributor process — are listed in the CHANGELOG
+and are not repeated below. The absence of a schema-migration command (#63/#98) is the exception:
+once a repo predates the wiki-schema flip it is a data-safety matter, so it is expanded here in §6a
+rather than left to the short list.
 
 ---
 
@@ -35,6 +40,11 @@ process — are listed in the CHANGELOG and are not repeated below.
    put an authenticating reverse proxy in front for a team (§8).
 5. **Know which brain you wired.** The default is a local model and nothing leaves your machine. A
    `claude`/`codex`/`gemini` brain sends your KB to that vendor on every run (§9).
+6. **A repo on the old wiki schema is read-only here.** Reads work; `curate`, `watch`, `requeue`,
+   `harvest`, `kb_remember` and the web upload all refuse. There is no in-place upgrade — the
+   crossing is a conversion into a new repo (§6a).
+7. **`wiki/people/` is human-owned and searchable, not private.** It is kept out of gold packs and
+   `kb_context`, but an agent that asks for it through `kb_query`/`kb_read` gets it (§6b).
 
 ---
 
@@ -313,7 +323,14 @@ temporary worktree and has no network, so a read alone cannot leave the machine
 and a content hash — becomes the inbox capture. The original binary is not stored verbatim, and the
 re-ingest drift sidecar that would let you diff a re-extraction against the source bytes is absent
 (`docs/adr/0020-web-upload-write-path.md:69-72`). `raw/` holds the curator-materialized markdown
-source; the curator alone writes it (`curator/apply.py:572-576`, ADR-0002/0020).
+source; the curator alone writes it (ADR-0002/0020).
+
+**A named destination is not a feature.** ADR-0041 D1.4/D4.2 gave the original bytes a home —
+`raw/_blob/<ab>/<sha256>.<ext>` plus a `<file>.meta.yaml` sidecar, content-addressed and immutable —
+and `RepoLayout.blob_dir` resolves that path. **Nothing writes it.** The transport the ADR specifies
+(an optional attachment written beside the inbox event and materialized by APPLY at claim time) does
+not exist: `Inbox.write` still takes `text: str` and an optional `raw_ref: str`, and carries no
+bytes. So the limitation below is unchanged; only its future shape is now decided.
 
 **When it bites.** You upload a PDF, delete your copy, and later want the PDF — or want to
 re-extract it with a better extractor and compare. Neither is possible from the KB.
@@ -322,7 +339,157 @@ re-extract it with a better extractor and compare. Neither is possible from the 
 archive of the document.
 
 **Tracking.** [#48](https://github.com/handochan/agora-kb/issues/48) — never-lossy original-asset
-preservation (curator-side binary staging).
+preservation (curator-side binary staging); the destination and admission rule are ADR-0041 D1.4.
+
+---
+
+## 6a. Schema-1 repos are read-only in this build
+
+**What is true.** This build writes **KB wiki schema 2** ([ADR-0041](adr/0041-stratum-kind-first-layout.md),
+Proposed): the first directory under `wiki/` is the note's kind (`concepts/`, `summaries/`, `notes/`,
+`maps/`, `entities/`, `people/`) and the topic lives in the note's `subjects:` frontmatter.
+`agora repo init` creates schema 2 by default. `config.SUPPORTED_KB_SCHEMA_VERSIONS` is `{1, 2}`, so
+a repo created by an earlier release still **reads**: `agora query`/`status`/`browse`/`doctor`, the
+MCP read tools, and the web read routes all work on it. Every **write** path refuses, with one
+message naming the conversion — `agora curate`, `agora watch`, `agora requeue`, `agora harvest`, the
+`kb_curate` MCP tool, and `Inbox.write` itself, which is the single gate covering `kb_remember` and
+the web upload. The refusal is `ReadOnlySchemaVersionError`, a subclass of
+`UnsupportedSchemaVersionError`, so it is distinguishable from "this build cannot read your repo".
+
+**`agora doctor` runs, and still fails the verdict — know this before you gate a unit on it.**
+Doctor keeps its diagnostic exemption: it is the one command that reaches such a repo and explains
+why the others refuse, printing a `write: READ-ONLY …` line naming `--from-kb`. Running is not
+passing, though. The overall run ends `status: unhealthy` with **exit 1**, on the same judgement
+that made an unrunnable curator unhealthy in #96 — a KB that can accept nothing new is not a healthy
+deployment — and `--skip-probe` does not silence it, because the cause is the repo, not the brain.
+So **a launchd/systemd health gate on `agora doctor` goes red on a schema-1 repo**, with a
+documented cause ([`../deploy/README.md`](../deploy/README.md) "Health check") and one fix: the
+conversion below, not a flag.
+
+**Why a refusal rather than a warning.** DESIGN §10 V9's posture for a new binary on an old repo is
+"read-works / write-warns", and a warn assumes the write is merely suboptimal. Here it would be
+corrupting: APPLY would commit schema-2 paths and schema-2 frontmatter into a schema-1 tree,
+producing a repo that is neither, that no lint ruleset can gate, and whose damage is already in git
+history. The inbox write refuses too, for a related reason — an inbox that can never drain, and that
+a re-import into a new repo would orphan, is silent data loss dressed as success.
+
+**There is no in-place migrator, and there will not be one for this bump.** No `agora repo upgrade`
+(#63), no dual-layout reader, no compatibility shim. The sanctioned crossing is a **conversion into
+a NEW repo**, and it is one command:
+
+```bash
+agora import --from-kb <old-repo> <new-repo>
+```
+
+The source repo is **never modified**. The conversion implements ADR-0041 D6 rules 1–7: each note's
+`type:` becomes its `kind:` and the note moves into that kind's directory; the path domain becomes
+`subjects: [<domain>]` whenever that domain is declared in the source taxonomy — the v1 path domain
+is a real curator assertion and is never silently discarded; a domain the source taxonomy no longer
+declares converts with `subjects: []` **and a per-note warning**, because lint L1-5 grades
+`subjects:` against the copied taxonomy and writing an undeclared one would mint a repo that fails
+its own lint (a note with no path domain at all, such as the root `index.md`, gets the same
+`subjects: []` structurally and needs no warning — there was never a subject to carry);
+`wiki/<d>/<d>-moc.md` becomes `wiki/maps/<d>.md` with every `[[<d>-moc]]` and body link rewritten; same-date dailies from different domains **merge**
+into the one `wiki/notes/<yyyy>/<mm>/<date>.md` journal, sections concatenated in domain order,
+`sources:` unioned, each merged section keeping its origin domain as a `subjects:` entry; `raw/` is
+copied **byte-identically** and `sources:` strings are **not** rewritten (which is the whole reason
+the conversion is cheap); and `_meta/kb.yaml` is minted with a **new** `kb_id` stamped into every
+note, because the destination is a new KB rather than a continuation. It prints a conversion report
+— the note, rename, merge and `raw/` counts, every renamed basename, every merge, and every
+top-level path in the source it did NOT carry over (a `README.md`, a `docs/` folder, `.obsidian/`:
+left exactly where they are, never copied and never deleted). A basename collision the conversion
+would introduce is a **hard failure with the colliding names listed**, exit 1, never a silent rename: a converter that renames
+silently is a converter that loses `[[basename]]` edges.
+
+**When it bites.** You have a KB created by an earlier Agora release. Your first `agora curate` or
+`kb_remember` on it refuses, and `agora doctor` / `agora status` print a READ-ONLY line pointing at
+`--from-kb` — `doctor` additionally ends `status: unhealthy` and exits 1, which is the expected
+verdict for such a repo rather than a second fault to chase. On the web face, an upload into such a repo comes back as a **per-file receipt error**
+naming the same remedy — not a 500 — and the dashboard's KB-health panel carries a
+`write: READ-ONLY` stat beside `lint`, with `agora_kb_schema_writable 0` on `/metrics`, so a repo
+that lints clean while refusing every capture cannot show as green.
+
+**What you can do now.** Read from it normally, and convert when you are ready. Do not point a
+capture path at it and assume the events will drain later — they will not. Keep the old repo: the
+conversion reads it and writes a new tree, so nothing is destroyed by waiting, and nothing is
+destroyed by converting either.
+
+**Two things a schema-1 repo silently loses on the READ side, and they are worth knowing:**
+
+- **Ranking degrades — on a schema-1 repo specifically.** `core/wiki.py`'s map predicate is now
+  `wiki/maps/…` unconditionally, with no schema-1 branch, so a schema-1 repo's
+  `wiki/<domain>/<domain>-moc.md` files are no longer level-0 seeds. They are still reached as
+  children of the root `index.md` (at `d_moc = 1`), and their own children one hop further out, so
+  the structural term shifts rather than disappears — but hit order will not match what an earlier
+  release returned for the same question. (This is *not* what the flip does to a converted corpus:
+  measured on the `tests/rank_golden/` fixture, the seed rule contributed **zero** lines to the
+  before/after diff, because `wiki/maps/` ends up holding exactly the maps the v1 MOCs held —
+  `tests/rank_golden/FLIP-DIFF.md`.) `agora eval` is how to see it on your own corpus.
+- **Gold packs and `kb_context` still work**, because `Note.kind` is derived for *both* schemas — a
+  schema-1 `type: theme` maps to `concept` through the frozen ADR-0041 D2.5 table — so the
+  claim-bearing population a pack draws from is the same set of notes it always was.
+
+**Tracking.** ADR-0041 D6; the schema-version guard is #98.
+
+---
+
+## 6b. `wiki/people/` is excluded from gold packs and `kb_context` — but not from agent reads
+
+**What is true.** `wiki/people/**` is a human-owned namespace: the curator may never write it (any
+add, modify, rename or delete under it in a curated diff fails the run), `lint()` permanently
+excludes it from its graded population for *every* caller, and its basenames are outside the global
+`[[basename]]` identity space — a people note is addressed by path, never by `[[basename]]`. Read is
+first class: it is indexed and returned by search like any other note.
+
+On day 1 it is **excluded from every gold pack and from `kb_context`**, because the outbound
+redaction boundary for a human-owned read corpus is undesigned. The ADR-0023 connector-boundary
+redaction and a *read-corpus* boundary are not the same boundary, and shipping human notes into
+every agent session's standing context before that is designed would be an unreviewed egress. This
+is a default, not a permanent rule; lifting it needs the boundary design, not a config flag.
+
+**The gap this does NOT close, stated rather than papered over.** The exclusion covers the **push**
+surface only. `kb_query`, `kb_read` and `kb_neighbors` will return people content to an agent on
+demand — a pull-shaped, agent-initiated read — and the control for that surface is **distinct and
+still undesigned** (ADR-0041 residual risk R1; it amends ADR-0027 §8's scope sentence rather than
+claiming the push exclusion covers it).
+
+**Two further fences ADR-0041 specifies are NOT implemented yet.** (a) The `file:` connector fence —
+"a connector glob on a path inside the repo may cover `wiki/people/**` and nothing else" — has no
+code: `harvester/connectors.py` guards only the gold directory (`_is_within_gold`). Until it lands,
+do not point a `file:` connector at a glob inside your own KB, or the curator's own output can be
+fed back to it as candidates. (b) `raw/_pages/` is a reserved prefix with no writer and no gate
+exception.
+
+**When it bites.** You file something personal under `wiki/people/you/` expecting it to stay out of
+agent context. It stays out of packs; it does not stay out of an agent that asks for it.
+
+**What you can do now.** Treat `wiki/people/**` as *human-owned and searchable*, not as *private*.
+The repo is still the only security boundary (§8), and §2 still applies: there is no delete.
+
+**Tracking.** ADR-0041 D3.3 + residual risk R1.
+
+---
+
+## 6c. Long documents, `summaries/` and `entities/` have containers but no contents
+
+**What is true.** Schema 2 ships two kinds that nothing produces. `wiki/summaries/` and
+`wiki/entities/` have directories (created at `repo init`, each with a `.gitkeep`), declared
+frontmatter shapes, and lint rules — and **no producer**: no curator op creates one, the importer has
+no rule that emits one, and there is no human authoring route with a `people/`-style carve-out. That
+is deliberate: shipping the container before the contract avoids a second migration, while inventing
+a producer would create a population no ADR governs (ADR-0041 OD-7/OD-8).
+
+The long-document contract those tiers are waiting on — **ADR-0040** — **has not been written**. The
+`raw/_pages/` prefix reserved for it is likewise empty and unprivileged.
+
+**When it bites.** You expect to file a long document, or a person/product/project as an entity page,
+and find there is no command that does it.
+
+**What you can do now.** File it as a concept, or as your own note under `wiki/people/`. Nothing you
+write by hand into `summaries/` or `entities/` is *rejected* — those directories are inside the
+closed kind set — but nothing produces or maintains such a note either.
+
+**Tracking.** ADR-0041 OD-7 / OD-8; ADR-0040 is reserved and unauthored.
 
 ---
 

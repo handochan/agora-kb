@@ -806,6 +806,11 @@ migrator: it reads a schema-1 repo and writes a **new** schema-2 repo, never mut
    list** — never a silent rename. A converter that renames silently is a converter that loses
    `[[basename]]` edges.
 
+> **Rule 2 carries one shipped exception**, recorded append-only in the *D6 rule 2 as shipped*
+> addendum at the end of this ADR: a path domain the **source taxonomy no longer declares** converts
+> to `subjects: []` **with a per-note warning**, because writing it would mint a repo its own lint
+> L1-5 rejects. Rule 2's text below is normative for every domain the taxonomy does declare.
+
 **The owner's two KBs are re-imported once.** Re-import, not re-curation: the dogfood `raw/` is
 byte-identical to the owner's own prose, so regenerating the wiki through a model would paraphrase
 the owner's writing. Measured cost: one to two days.
@@ -1060,3 +1065,48 @@ are never force-re-emitted by this change, and no command silently upgrades one.
   oracle would put a config read on the query hot path and give one repo two rankings depending on
   a `_meta/kb.yaml` field, which is a worse trade than one path-name collision. Reconsider if a
   real schema-1 repo is ever found with that domain; migrating it to schema 2 removes the case.
+
+---
+
+## Addendum — D6 rule 2 as shipped: an UNDECLARED path domain converts to `subjects: []` + a warning (#153, landed 2026-09-04)
+
+D6 rule 2 above says the path domain becomes `subjects: [<domain>]` — *not* `[]` — and gives the
+reason: the v1 path domain is a genuine curator assertion, so discarding it loses exactly the
+information the flip exists to preserve. That reason is intact and the rule is unchanged **for every
+domain the source taxonomy declares**, which is the case rule 2 was written about. Implementation
+(`ingest/kb_convert.py`, `_plan_note`) found one case the clause did not anticipate, and this
+addendum records the shipped behaviour so the code is not deviating from an unamended ADR.
+
+**The case.** A schema-1 repo can hold `wiki/<domain>/…` for a `<domain>` its own
+`_meta/taxonomy.yaml` does **not** list — a domain removed from the vocabulary after its notes were
+written, or a hand-created directory that was never added. Rule 5's cheapness argument is what makes
+this reachable: the conversion copies the source taxonomy across **verbatim** (it is the destination
+taxonomy), so whatever the source did not declare, the destination does not declare either.
+
+**The conflict.** Lint L1-5 grades `subjects:` against the taxonomy's `domains`. Writing
+`subjects: [<undeclared>]` would therefore mint a destination repo that **fails its own lint on the
+first run** — and D6's whole promise is a conversion whose output is a legal schema-2 repo. Rule 2
+would be honoured in the letter and the crossing would be broken in fact.
+
+**The shipped rule.**
+
+- The path domain is written as `subjects: [<domain>]` **whenever the source taxonomy declares that
+  domain** — rule 2 unchanged, and the overwhelmingly common case.
+- A path domain the source taxonomy does **not** declare converts to `subjects: []` **plus a
+  per-note warning** naming the note and the dropped domain, carried in `ConvertReport.warnings` and
+  printed by `agora import --from-kb`. The assertion is not discarded *silently*, which is the
+  property rule 2 was actually protecting; the operator is told, and the remedy is to declare the
+  domain in the **source** `_meta/taxonomy.yaml` and re-convert (ADR-0022 §D's
+  `agora taxonomy add-domain` is still unimplemented) — or to accept the `[]`.
+- The root `index.md` has **no path domain at all** and writes `subjects: []` **structurally**, with
+  no warning. There was never a subject to carry, so there is nothing to report; a warning there
+  would fire on every conversion and train the operator to ignore the channel.
+
+**Why not the alternatives.** Extending the destination taxonomy with the undeclared domains would
+have the converter make a governance decision ADR-0022 §D reserves for an explicit operator command,
+in a repo the operator has not yet seen. Refusing the conversion outright would strand a real KB on
+a directory that is, at worst, untidy. Both are worse than writing the honest empty value and saying
+so.
+
+**Scope.** This addendum touches rule 2 only. Rules 1 and 3–7 are unchanged, and nothing here
+weakens the "source is never modified" property or rule 7's hard-failure-with-a-named-list contract.

@@ -249,18 +249,31 @@ against the code. The normative version lives in
    not shipped. The compensating control ADR-0013 promises for `allow_reduced_isolation` (forced
    review mode) is not implemented (#91).
    The real last line of defense is the deterministic FINAL-DIFF gate, not the kernel.
-9. **No schema migration command.** `agora repo upgrade` is #63, still open. The *read* side is
-   guarded as of #98 — a build that meets a repo whose `schema_version` it does not support
+9. **No IN-PLACE schema upgrade command.** `agora repo upgrade` is #63, still open. The *read* side
+   is guarded as of #98 — a build that meets a repo whose `schema_version` it does not support
    refuses every acting command with one line and exit 1, and `agora doctor` says so on its
    `schema:` line — so an old binary can no longer silently misread a newer repo and write on top
-   of that misreading. What is still missing is the other half: if the schema moves, there is no
-   command to move a repo with it. A repo initialized by this beta is expected to keep working —
-   the format is what is stable, not `main`.
+   of that misreading. What is still missing is the *in-place* half: no command upgrades a repo
+   where it stands, on its own history. Crossing a schema boundary is not impossible — item 12
+   names the conversion into a **new** repo (`agora import --from-kb`) that this build does ship —
+   it is upgrading a repo without moving it that #63 still owes. A repo initialized by this beta is
+   expected to keep working — the format is what is stable, not `main`.
 10. **No embeddings and no semantic search.** Deterministic BM25F ranking is the contract
     (ADR-0009/0012), not a gap waiting to be filled; ADR-0032 is reserved and evidence-triggered.
     If you want vector recall, Agora is the wrong tool today.
 11. **No contributor process yet.** `CONTRIBUTING.md` and `CODE_OF_CONDUCT.md` are deliberately
     post-beta; the beta's audience is dogfooders and evaluators, not contributors.
+12. **A KB created by an earlier build is read-only, and there is no in-place upgrade.** This build
+    writes **KB wiki schema 2** (the note's kind is the first directory under `wiki/`; the topic
+    lives in `subjects:` — ADR-0041). `agora repo init` creates schema 2 by default. A repo on the
+    old layout still **reads** — `query`, `status`, `browse`, the MCP read tools, the web read
+    routes — while every **write** path refuses with one message naming the crossing: `curate`,
+    `watch`, `requeue`, `harvest`, `kb_curate`, and `Inbox.write` itself, which covers `kb_remember`
+    and the web upload. `agora doctor` still runs on such a repo but fails the verdict
+    (`status: unhealthy`, exit 1), so a `doctor`-based health gate sees it. The one sanctioned
+    crossing is a conversion into a NEW repo — `agora import --from-kb <old-repo> <new-repo>` —
+    which never modifies the source; there is no `agora repo upgrade` (#63/#98) and no dual-layout
+    reader. Expanded in [`docs/LIMITATIONS.md`](docs/LIMITATIONS.md) §6a.
 
 <!-- No version-compare link definitions here on purpose: Keep a Changelog's footer links point at
      git tags, and this repo has none yet (see "Release status"). They get added with the first tag,

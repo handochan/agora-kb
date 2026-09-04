@@ -435,11 +435,12 @@ curator:
 ```
 
 Nothing is lost to a lower cap — a capped backlog drains across successive triggers in FIFO slices.
-This matters most right after `agora import`, which queues an entire vault at once.
+This matters most after a bulk capture session, which queues far more than one run's worth at once.
 
 ## 4. Your first knowledge base
 
-Five steps, each with a verification command and the output it produced.
+Five steps, each with a verification command and the output it produced — plus an optional sixth for
+Obsidian.
 
 > **`/tmp/my-kb` is a scratch path, on purpose.** It keeps every command below literally
 > copy-pasteable and every pasted output honest. **Do not keep a knowledge base there** — macOS
@@ -479,6 +480,31 @@ _kb/
 `_kb/` — the inbox, curator state, cursors, caches and gold packs — is **git-ignored by design**.
 Only curated markdown is versioned. What that means for backups is
 [`LIMITATIONS.md`](LIMITATIONS.md); read it before this repo holds anything you care about.
+
+**The repo is created on KB wiki schema 2** ([ADR-0041](adr/0041-stratum-kind-first-layout.md)) —
+that is the default for a new repo, and it is the only schema this build's curator writes. What it
+means in one line: **the first directory under `wiki/` is the note's kind, not its topic.**
+
+```bash
+cat /tmp/my-kb/_meta/kb.yaml && ls /tmp/my-kb/wiki/ && head -5 /tmp/my-kb/index.md
+```
+
+`_meta/kb.yaml` holds three keys and no policy — `kb_id` (a ULID minted once here and mirrored into
+every note's `kb:` frontmatter), `name`, and an advisory `declared_kind`. `index.md` is the root map
+(`kind: index`). All six kind directories are created up front, each with a `.gitkeep`, because the
+kind vocabulary is closed *at the directory level*: `concepts/`, `summaries/`, `notes/`, `maps/`,
+`entities/`, `people/`. The curator fills `concepts/`, `maps/` and `notes/<yyyy>/<mm>/` as it files
+things. Two of them **ship empty** — `summaries/` and `entities/` have directories, frontmatter
+shapes and lint rules but no producer yet. `people/` is yours: the curator never writes it, lint
+never grades it, and it is still fully searchable.
+
+`--schema 1` still builds the old layout, but a schema-1 repo is **read-only** to this build: query,
+status and browse work; `curate`, `watch`, `requeue`, `harvest`, `kb_remember` and the web upload all
+refuse with a message naming the conversion, `agora import --from-kb`. `agora doctor` still runs and
+reports the repo — it is the command you reach for when the others refuse — but it prints a
+`write: READ-ONLY` line and the run ends `status: unhealthy` with **exit 1**. That is the expected
+verdict for a schema-1 repo, not a brain fault. There is no in-place upgrade — the conversion writes
+a new repo and never touches the source.
 
 **The repo now exists, so §3 applies from here on.** If you chose Path A, apply the
 [§3](#3-pin-the-model-path-a-only) pin now — its heredoc targets exactly the `/tmp/my-kb` this step
@@ -721,7 +747,7 @@ retry budget leaves `last_run` at its old value, so those three lines are where 
   "hits": [
     {
       "repo": "my-kb",
-      "path": "wiki/general/themes/wiki-editing-protocol.md",
+      "path": "wiki/concepts/wiki-editing-protocol.md",
       "anchor": "wiki-editing-protocol",
       "line": 1,
       "excerpt": "Wiki Editing Protocol Defines the strict boundary governing wiki modification and event logging operations.",
@@ -730,7 +756,7 @@ retry budget leaves `last_run` at its old value, so those three lines are where 
     },
     {
       "repo": "my-kb",
-      "path": "wiki/general/general-moc.md",
+      "path": "wiki/maps/general.md",
       "anchor": "",
       "line": 2,
       "excerpt": "Wiki Editing Protocol",
@@ -742,13 +768,33 @@ retry budget leaves `last_run` at its old value, so those three lines are where 
 ```
 
 **Verify:** `status: "ok"` with at least one hit. Hits are citations into `wiki/` — path, anchor and
-line — not synthesized prose (ADR-0009/0012). The file is plain markdown; open it and read it:
+line — not synthesized prose (ADR-0009/0012). Do **not** treat the `score` numbers as a target:
+scores are a deterministic function of the corpus and the ranking rules, and both move. What to
+check is the shape — `status`, a `wiki/` path, an `anchor`, and a `match_reason` you can explain.
+
+Note the two paths, because they are the schema-2 layout in miniature: the concept is filed by its
+**kind** (`wiki/concepts/`), and its topic lives in the note's `subjects:` frontmatter, which is
+also what named the map (`wiki/maps/general.md` — created lazily at the first concept of that
+subject; v1 would have written `wiki/general/themes/…` and `wiki/general/general-moc.md`).
+
+The file is plain markdown; open it and read it:
 
 ```bash
-cat /tmp/my-kb/wiki/general/themes/wiki-editing-protocol.md
+cat /tmp/my-kb/wiki/concepts/wiki-editing-protocol.md
 ```
 
 That is the whole loop: capture → curate → query. Everything else in Agora is a face over it.
+
+### Step 6 — (optional) open it in Obsidian
+
+The repo is a plain folder of markdown, so "Open folder as vault" is the whole setup. One setting is
+worth changing on day 1, under **Settings → Files and links**: turn **"Use [[Wikilinks]]" OFF**.
+Agora's own body links are standard markdown links — `[Title](../concepts/foo.md)` in a map body,
+`[Title](wiki/maps/foo.md)` in the root index (ADR-0014 D3) — and only the frontmatter `related:`
+and `children:` arrays are `[[basename]]`. With wikilinks on, every link *you* create is a form the
+curator does not write, and one of them will not resolve at all: `wiki/people/**` basenames are
+outside the `[[basename]]` identity space by design (ADR-0041 D3.3), so a `[[ ]]` pointing into your
+own people notes is a broken link, while a plain markdown link to the file works.
 
 ## 5. Register the MCP face with your agent
 
@@ -804,6 +850,7 @@ tools appear, confirmed live via `tools/list`:
 | `agora web` dies with a traceback ending `ModuleNotFoundError: No module named 'fastapi'` | The `web` extra is not installed. The clean message `_cmd_web` intends (`cli.py` `_cmd_web`) does **not** fire: `uvicorn` arrives transitively with `fastmcp`, so both guarded imports succeed and the real failure lands later at `build_app` (verified in a core-only venv). No issue tracks this yet; it is a cosmetic guard, not a functional defect — and the message it would print names a `pip install 'agora-kb[web]'` that cannot work anyway, since there is no PyPI distribution ([§0](#0-before-you-start)) | `uv sync --extra web --extra ingest --extra metrics` — see [§2](#2-install) |
 | `agora curate` prints `status: failed` with a `failed_record:` path, and the exit code is still `0` | A failing run is normal self-healing, not a crash: within-budget events go back to `inbox/` and `agora curate` returns `0` deliberately so cron/systemd do not manufacture a restart loop (`cli.py:618-625`). The cause is on stdout and in `_kb/failed/<date>/<run-id>/error.json` | Read the `failed_checks:` line, then `uv run agora status --repo /tmp/my-kb` for `last_failure: UNRESOLVED …`. Once the budget is exhausted the events are terminal; return them with `agora requeue` — **never hand-move files inside `_kb/`**. The full lifecycle, including `--reset-attempts` and `_kb/requeued/`, is [`LIMITATIONS.md`](LIMITATIONS.md) |
 | `agora curate` prints `should_run: False` / `reason: none` / `note: no consolidation run was due` | **The inbox is empty.** No trigger fires over depth 0 — threshold needs `depth >= threshold` (min 1), idle needs `depth > 0`, and cron explicitly refuses an empty inbox (`curator/triggers.py:116-130`). On a repo that *has* captures this is not the message you get: a never-run repo fires `reason: cron` immediately | Capture something (step 3) and re-run. `--force` still prints `should_run: True` but a run over an empty inbox changes nothing |
+| `agora doctor` prints `write: READ-ONLY — this build reads KB schema 1 …`, ends `status: unhealthy` and exits `1` | **Expected, and not a brain fault.** The repo is on the old wiki layout, which this build reads but will not write, so doctor fails the verdict deliberately — a KB that can accept nothing new is not a healthy deployment, and a launchd/systemd health gate that greened on one would hide a frozen hub. `--skip-probe` does not silence it: the cause is the repo, not the brain | Convert once into a new repo: `uv run agora import --from-kb <old-repo> <new-repo>`, then point `curate`/`serve`/`web` at the new one ([`LIMITATIONS.md`](LIMITATIONS.md) §6a). The source is never modified |
 | `agora doctor` says `status: healthy` in a directory that is not a knowledge repo | Deliberate: an **absent** `adapters.yaml` is "setup not done", not a misconfiguration, so it passes with `brains: not probed (no adapters.yaml — no backend configured)` (`cli.py` `_doctor_brains`) | Check the `repo …: not initialized (run 'agora repo init')` line — that is the one telling you where you are |
 | `pytest` or `ruff` is suddenly "command not found" after an install step | A bare `uv sync` pruned them; `dev` is an *extra*, not a dependency group (`pyproject.toml:42-48`) | Re-run the full command in [§2](#2-install). Confirm before you sync next time with `uv sync --dry-run` |
 
@@ -823,5 +870,41 @@ tools appear, confirmed live via `tools/list`:
   compensate.
 - [`DESIGN.md`](DESIGN.md) and [`adr/`](adr/) — why the inbox is append-only, why exactly one
   process writes the wiki, and why retrieval is navigation instead of vector search.
-- `uv run agora --help` — the commands this walkthrough did not touch: `import` (normalize an
-  existing Obsidian vault), `harvest`, `index`, `gold`, `sync`, `watch`, `web`.
+- `uv run agora eval --repo <repo> --queries <file>` — run a YAML/JSON list of
+  `{id, question, expect}` through the deterministic ranker and print one row per query (expected vs
+  actual status, top hit, score). Model-free, network-free, server-free. `--out` writes the full
+  JSON snapshot (every hit with its score and `match_reason`); `--fm on|off` forces the frontmatter
+  boost; `--limit` caps hits per query. **Exit code 1 when any query's status differs from its
+  declared `expect`**, so it works as a CI gate — and as a before/after whenever you change the
+  corpus or the ranking. It is the same machinery `tests/rank_golden/` uses to record and diff
+  snapshots, and the reason the schema-2 flip could be measured rather than assumed.
+- `uv run agora --help` — the commands this walkthrough did not touch: `import`, `harvest`,
+  `index`, `gold`, `sync`, `watch`, `web`.
+
+`agora import` is one subcommand with two modes, and both write a **new** destination while leaving
+the source untouched:
+
+```bash
+# normalize an external Obsidian / plain-markdown vault into a fresh schema-2 repo
+uv run agora import ~/existing-vault ~/imported-kb --domain general
+
+# convert a KB created by an earlier Agora release (the old wiki layout) into a fresh schema-2 repo
+uv run agora import --from-kb ~/old-kb ~/converted-kb
+```
+
+Both modes write the schema-2 layout into a **new** destination, and a destination that is already a
+knowledge base is refused rather than written into — the old schema, because two wiki layouts must
+never land in one tree; the current one, because both modes mint a fresh `kb_id` and rebuild the
+root map, which on a live KB would re-stamp an identity that is written once. To ADD to a KB you
+already have, capture through the inbox (`kb_remember`, the web upload) and run `agora curate`.
+`--from-kb` is the only sanctioned crossing off the old layout (there is no
+in-place upgrade): it maps each note's `type:` to its `kind` and moves it into that kind's
+directory, turns the path domain into `subjects: [<domain>]`, renames `wiki/<d>/<d>-moc.md` to
+`wiki/maps/<d>.md` and rewrites every link to it, merges same-date dailies from different domains
+into the one `wiki/notes/<yyyy>/<mm>/<date>.md` journal, copies `raw/` **byte-identically** with
+`sources:` strings left alone, and mints a new `kb_id`. It prints a conversion report: the note, rename, merge
+and `raw/` counts, every renamed basename, every merge, and everything in the source tree it did
+not carry over (a `README.md`, a `docs/` folder, `.obsidian/` — left where they are, never copied
+and never deleted). If the conversion would introduce a basename collision it **fails and
+names them**, exiting 1 — it never silently renames, because a silent rename loses `[[basename]]`
+edges.
