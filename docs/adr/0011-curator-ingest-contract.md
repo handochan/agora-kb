@@ -1,6 +1,7 @@
 # ADR-0011 — Curator INGEST contract (plan-apply-author)
 
 **Status:** Accepted · 2026-06-13 · **§7.1 routing superseded by [ADR-0015](0015-per-task-brain-routing.md)** · **§5.1 corrected + §5.1a added 2026-07-29 (issue #99)** · **§3.1 addendum 2026-08-15 (issue #131)**
+**AMENDED (append-only) — [ADR-0041](0041-stratum-kind-first-layout.md) (Proposed, KB wiki schema 2):** §2's STRUCTURAL-EFFECT column moves to the kind-first paths (`wiki/concepts/`, `wiki/notes/<yyyy>/<mm>/`, `wiki/maps/`) — **the op NAMES are UNCHANGED** (`CREATE_THEME`/`APPEND_DAILY`/… stay, because the plan-envelope version and the KB `schema_version` must never reference each other, `config.py:255-268`), and **no new op is added**. §4.0's allowlist gains the `wiki/people/` carve-out. **§4.1, check by check:** check **4** (TAXONOMY) is UNCHANGED IN SHAPE — it keeps grading the Disposition's singular `domain` against `domains`; `subjects ⊆ domains` is asserted on the MATERIALISED NOTE by L1-5's successor, not on the plan, because `Disposition` keeps its singular `domain` field (ADR-0041 D2.2/OD-9) and widening it would bump the plan-envelope version. Check **5** (BASENAME) **KEEPS its `(daily exempt)` clause** — the exemption guards PRE-EXISTENCE, not cross-domain collision, so one-journal-per-`run_date` does not retire it and removing it would fail the second `agora curate` of any day — and its `live_basenames` input EXCLUDES `wiki/people/**` (human-owned basenames are outside the global identity space, so a human file can never veto a curator basename). Check **6** (PATH/ALLOWLIST) validates through `core/pathsafe.py` PLUS a leading-`_` reserved-prefix rejection (which `pathsafe` does not provide today and `_SAFE_TOKEN_RE_PATTERN` does), and gains `run_date` as an injected deterministic fact so the `wiki/notes/<yyyy>/<mm>/` shard is COMPOSED, never parsed out of a model-supplied basename. §6.1 (schema/taxonomy evolution is OUT of INGEST) is KEPT VERBATIM. The prose below is retained verbatim for history.
 
 ## Context
 The transactional curator loop (ADR-0008) delegates exactly one cognitive step — INGEST — to a
@@ -131,7 +132,9 @@ reachable through exactly one candidate's `provenance[]`; the §4.1 coverage che
 scoped to the manifest universe only.
 
 **§1.1 Pre-fetched related view (what makes a small Qwen reliable).** For each candidate the worker runs
-the SAME deterministic `core.read` used by `kb_query` (ADR-0009) over the current wiki and writes
+`core.read`'s deterministic, model-free lexical oracle `Wiki.query_lexical` (ADR-0009; ADR-0012 §0a
+and its #144 addendum — NOT `Wiki.query`, the read face, which may one day grow a ranking tier the
+write path must not follow) over the current wiki and writes
 `related/<cand-id>.json` = an ordered `QueryResult` (`status`, `hits[]` with
 repo/path/anchor/line/excerpt/match_reason/score, plus each hit's frontmatter `title,tags,sources`). The
 backend does retrieve-then-decide with ZERO network and NO search tool — honoring the sandbox invariant
@@ -337,8 +340,9 @@ they may EXIST unchanged, but any add/modify/delete touching them FAILS the run 
    within the plan (daily exempt); each `target_basename` exists in the live tree. (The bundle registry is
    advisory; this check re-scans the tree, §1.2.)
 6. **PATH/ALLOWLIST** — every implied target path resolves under the canonical `ALLOWLIST` (§4.0); no
-   `_kb/`, `_templates/`, `raw/`, git internals, hooks, symlinks introduced/modified by the plan, or `..`
-   escapes (ADR-0008 §4; symlink scope per §4.5).
+   `_kb/`, `_templates/`, `raw/`, git internals, hooks, or `..` escapes (ADR-0008 §4). Symlinks are
+   NOT graded here — this check is a pure function over plan-implied path *names*, and a name cannot
+   disclose that it names a symlink; symlink rejection is the diff-scoped §4.5 FINAL-DIFF gate.
 7. **LINK RESOLVABILITY** — every `links[]` target resolves to an existing (live-tree) or same-plan
    basename.
 8. **PROVENANCE** — every `CREATE_THEME`/`APPEND_DAILY`/`MERGE_INTO_THEME` lists ≥1 `event_id`;

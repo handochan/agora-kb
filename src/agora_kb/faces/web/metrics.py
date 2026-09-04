@@ -26,8 +26,9 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
+from agora_kb.config import MAX_SUPPORTED_KB_SCHEMA_VERSION
 from agora_kb.core import Repo
-from agora_kb.faces.mcp_server import AgoraHandlers
+from agora_kb.faces.mcp_server import AgoraHandlers, _canonical_schema_version
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -97,6 +98,26 @@ class AgoraCollector:
         status = handlers.status()
         curator = handlers.curator_status()
         harvester = handlers.harvester_status()
+
+        # --- the ADR-0041 D6 WRITE verdict (one canonical-file read; never lint) -----------------
+        # A schema-1 repo scrapes perfectly: depth, throughput and backend all look normal while
+        # every capture is refused. Without a series for it, a Prometheus alert cannot tell a
+        # healthy quiet hub from a frozen one. Keyed on the same canonical declaration
+        # `Inbox.write` consults; an undeterminable version is reported as not writable and its
+        # version series is omitted rather than guessed.
+        schema_version = _canonical_schema_version(self._repo.layout)
+        if schema_version is not None:
+            yield GaugeMetricFamily(
+                "agora_kb_schema_version",
+                "The KB wiki schema version this repo declares (_meta/taxonomy.yaml).",
+                value=float(schema_version),
+            )
+        yield GaugeMetricFamily(
+            "agora_kb_schema_writable",
+            "1 when this build may WRITE the repo's KB wiki schema, 0 when it is read-only "
+            "(ADR-0041 D6 — convert with 'agora import --from-kb').",
+            value=1.0 if schema_version == MAX_SUPPORTED_KB_SCHEMA_VERSION else 0.0,
+        )
 
         # --- inbox / backlog gauges (cheap dir count + state.json) -------------------------------
         yield GaugeMetricFamily(

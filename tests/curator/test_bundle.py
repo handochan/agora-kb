@@ -21,6 +21,7 @@ from agora_kb.core.layout import RepoLayout
 from agora_kb.core.models import Confidence, Kind
 from agora_kb.core.repo import Repo
 from agora_kb.core.state import CuratorState
+from agora_kb.core.wiki import Wiki
 from agora_kb.curator import bundle
 from agora_kb.curator.bundle import build_bundle
 from agora_kb.curator.claim import claim, curator_lock
@@ -248,20 +249,24 @@ def test_candidates_json_and_related_written(tmp_path: Path) -> None:
 
 
 def test_build_bundle_threads_related_k(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """The repo-global related_k reaches wiki.query(limit=…); default = DEFAULT_RELATED_K."""
+    """related_k reaches wiki.query_lexical(limit=…); default = DEFAULT_RELATED_K.
+
+    The spied method is ``query_lexical``, not ``query`` — the write path is pinned to the
+    model-free oracle (#144); see ``test_bundle_never_touches_the_read_face_query``.
+    """
     layout = RepoLayout(tmp_path)
     inbox = Inbox(layout)
     _write(inbox, text="a fact worth relating", second=10)
     manifest = _claim(layout)
 
     seen: list[int | None] = []
-    orig = bundle.Wiki.query
+    orig = bundle.Wiki.query_lexical
 
     def spy(self, *args, **kwargs):  # type: ignore[no-untyped-def]
         seen.append(kwargs.get("limit"))
         return orig(self, *args, **kwargs)
 
-    monkeypatch.setattr(bundle.Wiki, "query", spy)
+    monkeypatch.setattr(bundle.Wiki, "query_lexical", spy)
 
     build_bundle(layout, Repo(layout), manifest, related_k=3)
     assert seen == [3]  # one candidate → one query at the operator's breadth
@@ -278,7 +283,10 @@ def test_schema_and_taxonomy_copied_into_bundle(tmp_path: Path) -> None:
     layout.schema_file.write_text(schema_text, encoding="utf-8")
     meta_dir = layout.root / "_meta"
     meta_dir.mkdir(parents=True, exist_ok=True)
-    taxonomy_text = "schema_version: 1\nallowed_tags: [curator]\ndomains: [ai-tech]\n"
+    # schema_version 2: the version this build WRITES (ADR-0041 D6). A `_meta/taxonomy.yaml`
+    # declaring 1 makes the repo READ-ONLY, and `Inbox.write` below then refuses the capture this
+    # test needs — which is the refusal working, not a bundle failure.
+    taxonomy_text = "schema_version: 2\nallowed_tags: [curator]\ndomains: [ai-tech]\n"
     (meta_dir / "taxonomy.yaml").write_text(taxonomy_text, encoding="utf-8")
 
     inbox = Inbox(layout)
@@ -310,3 +318,188 @@ def test_build_bundle_is_deterministic(tmp_path: Path) -> None:
         c.candidate_id for c in result2.candidates
     ]
     assert [c.event_ids for c in result.candidates] == [c.event_ids for c in result2.candidates]
+
+
+# --- #144: the related/ view is pinned to the model-free oracle ---------------------------------
+def _build_wiki_corpus(layout: RepoLayout) -> None:
+    """Materialize a small real wiki under ``layout`` so the related/ view has genuine hits.
+
+    Without notes every ``related/<cid>.json`` is a trivially-identical ``not_found``, and the
+    determinism lock below would pass vacuously.
+    """
+    (layout.root / "index.md").write_text(
+        "# personal\n\n- [AI Tech map](wiki/maps/ai-tech.md)\n", encoding="utf-8"
+    )
+    themes = layout.root / "wiki" / "concepts"
+    themes.mkdir(parents=True, exist_ok=True)
+    maps = layout.root / "wiki" / "maps"
+    maps.mkdir(parents=True, exist_ok=True)
+    (maps / "ai-tech.md").write_text(
+        "---\nstatus: active\n---\n# AI Tech\n\n"
+        "- [Curator concurrency](../concepts/curator-concurrency.md) — the single-writer curator\n"
+        "- [Inbox design](../concepts/inbox-design.md) — append-only per-writer inbox\n",
+        encoding="utf-8",
+    )
+    (themes / "curator-concurrency.md").write_text(
+        "---\nstatus: active\ntags: [single-writer, concurrency]\n---\n"
+        "# Curator Concurrency\n\n"
+        "The curator acquires a per-repo flock so exactly one writer advances the branch.\n",
+        encoding="utf-8",
+    )
+    (themes / "inbox-design.md").write_text(
+        "---\nstatus: active\ntags: [inbox, append-only]\n---\n"
+        "# Inbox Design\n\n"
+        "The inbox is append-only and per-writer namespaced; items are never edited.\n",
+        encoding="utf-8",
+    )
+
+
+# The candidate text is chosen to actually retrieve against the corpus above, so the locked bytes
+# carry real hits (path/anchor/line/excerpt/match_reason/score) rather than an empty result.
+_RELATED_CANDIDATE_TEXT = "the curator is a single-writer that serializes concurrency"
+
+
+def _bundle_once(tmp_path: Path, name: str) -> tuple[Path, dict[str, bytes]]:
+    """Build one bundle in its own repo and return (bundle_dir, related/<cid>.json bytes).
+
+    ``name`` only varies the PARENT directory: the repo directory itself is always ``personal``
+    because ``SearchHit.repo`` is derived from the layout root's name, and the point here is to
+    lock retrieval, not to prove that two differently-named repos disagree about their own name.
+    """
+    layout = RepoLayout(tmp_path / name / "personal")
+    layout.root.mkdir(parents=True, exist_ok=True)
+    _build_wiki_corpus(layout)
+    inbox = Inbox(layout)
+    _write(inbox, text=_RELATED_CANDIDATE_TEXT, second=10)
+    _write(inbox, text="the inbox is append-only and per-writer namespaced", second=11)
+    manifest = _claim(layout)
+
+    result = build_bundle(layout, Repo(layout), manifest)
+    related = {
+        path.name: path.read_bytes() for path in sorted((result.bundle_dir / "related").iterdir())
+    }
+    return result.bundle_dir, related
+
+
+def test_related_view_bytes_are_deterministic(tmp_path: Path) -> None:
+    """The ARTEFACT is locked, not just the code path (#144 'test gap').
+
+    Two independent runs — separate repos, separate ``Wiki`` instances, separate claims — must
+    write byte-identical ``related/<cid>.json``. This file is the planning brain's tier-3 input
+    and decides MERGE_INTO_THEME targets, so a drift here is a drift in what the curator merges.
+    """
+    _, first = _bundle_once(tmp_path, "run-a")
+    _, second = _bundle_once(tmp_path, "run-b")
+
+    assert sorted(first) == sorted(second) == ["c1.json", "c2.json"]
+    assert first == second
+
+    # The lock is not vacuous: at least one candidate really retrieved something.
+    hits = [json.loads(blob.decode("utf-8"))["hits"] for blob in first.values()]
+    assert any(hits), "corpus/candidate text no longer retrieves — determinism lock is vacuous"
+
+
+def test_bundle_never_touches_the_read_face_query(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Simulate a future model tier on ``Wiki.query``: the curator must not notice it exists.
+
+    ``query`` is the read face and MAY grow a tier above the lexical floor; the write path is
+    pinned to ``query_lexical`` forever (#144, ADR-0012 §0a). If the pin regresses, this raises
+    inside ``build_bundle``.
+    """
+
+    def exploded(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+        raise AssertionError("the curator write path must never call Wiki.query")
+
+    monkeypatch.setattr(bundle.Wiki, "query", exploded)
+
+    _, related = _bundle_once(tmp_path, "no-query")
+    assert sorted(related) == ["c1.json", "c2.json"]
+    assert any(json.loads(blob.decode("utf-8"))["hits"] for blob in related.values())
+
+
+# --- #152: the related/ view offers only LEGAL merge targets ------------------------------------
+def _related_with(tmp_path: Path, name: str, mergeable: set[str] | None) -> dict[str, dict]:
+    """Build one bundle over the shared corpus and return the parsed ``related/`` views."""
+    layout = RepoLayout(tmp_path / name / "personal")
+    layout.root.mkdir(parents=True, exist_ok=True)
+    _build_wiki_corpus(layout)
+    inbox = Inbox(layout)
+    _write(inbox, text=_RELATED_CANDIDATE_TEXT, second=10)
+    manifest = _claim(layout)
+    result = build_bundle(layout, Repo(layout), manifest, mergeable_paths=mergeable)
+    return {
+        path.name: _read_json(path) for path in sorted((result.bundle_dir / "related").iterdir())
+    }
+
+
+def test_related_view_is_unfiltered_by_default(tmp_path: Path) -> None:
+    """``mergeable_paths=None`` is today's behaviour — no path is dropped."""
+    views = _related_with(tmp_path, "unfiltered", None)
+    hits = views["c1.json"]["hits"]
+    assert views["c1.json"]["status"] == "ok"
+    assert "wiki/concepts/curator-concurrency.md" in {h["path"] for h in hits}
+
+
+def test_mergeable_paths_withholds_a_target_the_plan_gate_would_reject(tmp_path: Path) -> None:
+    """A note the curator did not write is not a legal MERGE target, so it is not offered as one.
+
+    PASS 1 picks ``target_basename`` out of these hits (kb_schema.md §7.1) and naming a
+    human-written note is a BASENAME plan error that fails the WHOLE run (#152). The engine must
+    not hand the model a menu item it will then be punished for choosing.
+    """
+    unfiltered = _related_with(tmp_path, "before", None)["c1.json"]
+    assert unfiltered["hits"], "corpus no longer retrieves — the filter test would be vacuous"
+
+    keep = "wiki/concepts/inbox-design.md"
+    filtered = _related_with(tmp_path, "after", {keep})["c1.json"]
+    assert {h["path"] for h in filtered["hits"]} <= {keep}
+    # Everything else about the surviving hits is untouched: this is a path-set drop, not a re-rank
+    # (ADR-0012 §0a — nothing outside core computes lex/struct/fm/score/match_reason).
+    by_path = {h["path"]: h for h in unfiltered["hits"]}
+    for hit in filtered["hits"]:
+        assert hit == by_path[hit["path"]]
+
+
+def test_an_emptied_related_view_reports_not_found(tmp_path: Path) -> None:
+    """The brain reads ONE shape for "no eligible evidence" — never ``ok`` with zero hits."""
+    view = _related_with(tmp_path, "empty", set())["c1.json"]
+    assert view["hits"] == []
+    assert view["status"] == "not_found"
+
+
+def test_the_filter_over_fetches_so_the_view_still_carries_k_eligible_hits(tmp_path: Path) -> None:
+    """Filtering AFTER retrieval must not silently shrink the view below ``related_k``.
+
+    The failure this locks is a RECALL loss with a real consequence: a candidate whose top
+    ``related_k`` hits are all ineligible would hand PASS 1 an EMPTY related view, and an empty
+    view is exactly what tells the planning brain "genuinely new -> CREATE_THEME" (kb_schema.md
+    §7.1 rule 6) — a duplicate theme beside the curator note it should have merged into.
+
+    The eligible set is derived FROM the real ranking (the second hit), so the test is
+    non-vacuous by construction: with ``related_k=1`` the un-over-fetched call would retrieve only
+    the FIRST hit, which is ineligible here, and the view would come back empty.
+    """
+    layout = RepoLayout(tmp_path / "overfetch" / "personal")
+    layout.root.mkdir(parents=True, exist_ok=True)
+    _build_wiki_corpus(layout)
+    inbox = Inbox(layout)
+    _write(inbox, text=_RELATED_CANDIDATE_TEXT, second=10)
+    manifest = _claim(layout)
+
+    full = Wiki(layout).query_lexical(_RELATED_CANDIDATE_TEXT, limit=20).hits
+    assert len(full) >= 2, "corpus no longer retrieves 2+ notes — the over-fetch test is vacuous"
+    second_best = full[1].path
+
+    result = build_bundle(
+        layout, Repo(layout), manifest, related_k=1, mergeable_paths={second_best}
+    )
+    view = _read_json(result.bundle_dir / "related" / "c1.json")
+
+    assert view["status"] == "ok"
+    assert [h["path"] for h in view["hits"]] == [second_best]
+    # Still a suffix trim of the SAME ranking, never a re-rank (ADR-0012 §0a): the surviving hit is
+    # byte-identical to the oracle's own.
+    assert view["hits"][0]["score"] == full[1].score
+    assert view["hits"][0]["match_reason"] == full[1].match_reason

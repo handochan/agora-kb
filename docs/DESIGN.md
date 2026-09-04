@@ -91,15 +91,27 @@ repo's own `AGENTS.md`/`SCHEMA.md`, tool-agnostic via symlinks `CLAUDE.md`/`QWEN
 ```
 <repo>/
   AGENTS.md / SCHEMA.md / CLAUDE.md…   the KB schema (conventions: frontmatter, links, INGEST/QUERY/LINT)
-  index.md                             top Map-of-Content (navigation hub)
+  index.md                             the ROOT MAP (kind: index) — exactly one, at the repo root
   log.md                               append-only action log
-  raw/<domain>/                        Layer 1: immutable sources (+ sha256 for re-ingest drift)
-  wiki/<domain>/
-    <domain>-moc.md                    domain Map-of-Content
-    daily/                             dated notes (briefings/captures)
-    themes/                            durable, atomic concept pages
+  raw/                                 Layer 1: immutable sources — NEVER MOVED by schema 2
+    <domain>/                          (+ sha256 sidecar for binaries); <domain> is a SHARD KEY only
+                                       — no code reads a subject out of it
+    _blob/                             RESERVED: content-addressed original bytes (ADR-0041 D1.4) —
+                                       the path accessor exists; nothing writes it yet (wave W2.5)
+    _pages/                            RESERVED PREFIX ONLY (ADR-0040, unauthored) — no writer, no
+                                       gate exception; `_`-prefixed domain names are rejected (L1-23)
+  wiki/                                the FIRST segment under wiki/ IS the note's KIND (ADR-0041 D1)
+    concepts/<slug>.md                 kind: concept — durable, atomic concept pages (was type: theme)
+    summaries/<slug>.md                kind: summary — SHIPS EMPTY (no producer; ADR-0040/OD-7)
+    notes/<yyyy>/<mm>/<yyyy-mm-dd>.md  kind: note — ONE journal per run_date, repo-wide (was daily/)
+    maps/<slug>.md                     kind: map — Map-of-Content (was <domain>-moc.md)
+    entities/<slug>.md                 kind: entity — SHIPS EMPTY (no day-1 producer; OD-8)
+    people/<person>/**.md              kind: person — HUMAN-OWNED; the curator never writes it
   assets/                              binary assets (images), referenced from notes
-  _templates/                          note templates
+  _meta/                               repo-init/admin inputs, read-only during INGEST
+    taxonomy.yaml                      schema_version, domains, allowed_tags, taxonomy_policy
+    kb.yaml                            KB identity: {kb_id, name, declared_kind} — no policy (D1.5)
+  _templates/                          note templates for hand editing (schema 2: concept.md, note.md)
   _kb/                                 git-ignored operational area (NOT wiki content)
     inbox/<writer>/                    WRITE path: append-only captures
     processing/<run-id>/               atomically claimed immutable items + run manifest
@@ -121,13 +133,41 @@ operational spool; it is durable on the repo owner's storage but is not canonica
 indexes/state are rebuildable from retained events and git history. Schemas are in
 [DATA-MODEL.md](DATA-MODEL.md).
 
+**KB wiki schema 2 — directory is the kind** ([ADR-0041](adr/0041-stratum-kind-first-layout.md),
+Proposed; the layout above). The two axes of the v1 layout were inverted: the *path* carried the
+subject (`wiki/<domain>/themes/<slug>.md`) while a closed four-value `type:` enum carried the kind.
+Schema 2 flips them. The first segment under `wiki/` is the kind and is **authoritative** — a
+directory outside the closed set `{concepts, summaries, notes, maps, entities, people}` is a hard
+lint reject (L1-22) — while `kind:` in frontmatter is only a mirror of it. The subject moves into a
+`subjects:` list whose values must already exist in `_meta/taxonomy.yaml`, and `subjects: []` is a
+legal, honest value: a concept lands at `wiki/concepts/<slug>.md` whether or not its subject is
+known, so nothing is dropped for lack of a domain. Free sub-folders under a kind are permitted and
+no code reads the intermediate segments; the three exceptions are `notes/<yyyy>/<mm>/` (a date shard
+composed from the run date), `people/<person>/` (the person namespace) and the kind segment itself.
+`raw/` is **never moved** — its `<domain>` survives as a shard key only — which is what keeps every
+`sources:` string written under schema 1 resolvable verbatim.
+
+`config.SUPPORTED_KB_SCHEMA_VERSIONS` is `{1, 2}`, and the two versions are **not** symmetric:
+`agora repo init` creates schema 2 by default, and on a schema-1 repo reads keep working
+(`query`/`status`/`browse`/`doctor`, the MCP read tools, the web read routes — `agora doctor` runs
+and reports, though its overall verdict on such a repo is `status: unhealthy`, exit 1, since a KB
+that can accept nothing new is not a healthy deployment) while every write path **refuses** — `agora curate`/`watch`/`requeue`/`harvest`, `kb_curate`, and `Inbox.write` itself, so
+`kb_remember` and the web upload are covered by one gate. That is a deliberate hardening of the §10
+V9 "write-warns" posture for this bump only: writing schema-2 paths and frontmatter into a schema-1
+tree would produce a repo that is neither, and the damage would be a commit. There is **no in-place
+migrator** (no `agora repo upgrade`, no dual-layout reader); the one sanctioned crossing is a
+conversion into a NEW repo, `agora import --from-kb <old-repo> <new-repo>`, which never modifies the
+source — see [LIMITATIONS.md](LIMITATIONS.md) §6a for the conversion rules.
+
 **Medallion tiers (vocabulary, ratified 2026-07-05).** In data-platform terms Agora is a three-tier
 pipeline: **bronze** = the ingress concept (the append-only `_kb/inbox/` spool + the immutable
 `raw/`/`assets/` captures), **silver** = the curated `wiki/` SSOT, **gold** = derived, always-fresh
 context packs assembled from the wiki for injection into agents ([ADR-0027](adr/0027-gold-context-packs.md)).
 Medallion words are a docs/vocabulary overlay; the code keeps the `inbox`/`raw`/`wiki`/`gold` names.
 A gold pack is a **pure, deterministic function of (curated commit, pack spec)** — reader-class code
-(`core/gold.py`'s `PackAssembler`) assembles verbatim summary lines from validator-gated theme notes
+(`core/gold.py`'s `PackAssembler`) assembles verbatim summary lines from validator-gated
+claim-bearing notes (`GOLD_KINDS` — `concept` and `summary`, the schema-2 successors of `type: theme`;
+`wiki/people/**` and `derived: true` notes are excluded from every pack)
 into a small, token-budgeted, byte-stable slice; no LLM runs, no new curator op, nothing writes
 `wiki/`/the inbox/indexes. It is built best-effort in the curator's finalize (never staler than
 silver), on the explicit `agora gold build`, and lazily on read. **Consumption is pull-only** and
@@ -187,6 +227,15 @@ downgrade-to-DROP on a missing valid domain; `plan.py` check-4 TAXONOMY reject o
   repo-global `curator.limits.{body_byte_bound,related_k}` / `curator.lint.max_orphans` threshold
   wiring (ADR-0022 step 2). `domains[0]` was chosen over a literal `general` because `general` is
   only the `repo init` default, not a guarantee (`repo init --domain foo,bar` has none).
+  **What schema 2 changed here, and what it did not** (ADR-0041 D2.2): the floor no longer decides a
+  *path* — a concept lands at `wiki/concepts/<slug>.md` regardless of subject, so nothing can be
+  dropped for lack of a domain because nothing needs a domain to have a path. APPLY files a
+  disposition carrying no domain with `subjects: []`, which asserts nothing rather than possibly
+  asserting a false subject. The catch-all itself is **still in the wire**: `normalize_plan` step 3
+  still substitutes `domains[0]` and the §4.1 BASENAME check still rejects a domain-less
+  `CREATE_THEME`/`APPEND_DAILY`, because `raw/<domain>/<event_id>.md` still needs a shard directory
+  (`raw/` did not move). So the `subjects: []` path exists and is exercised, but no producer reaches
+  it end to end — recorded as ADR-0041 **OD-10**, deferred deliberately rather than claimed.
 - **Governed new-domain proposal (separate lane).** The same capture **MAY** additionally trigger a
   *governed* domain-creation proposal. Domain creation is a deliberately-closed decision (ADR-0010
   D6 / ADR-0011 §6.1) and stays so: the sandboxed brain may **never** directly widen
@@ -262,14 +311,19 @@ write path the MCP face uses — the web face never reads or mutates `wiki/` / g
   dispatch seam — image/OCR/audio stay deferred behind their own opt-in extra + ADR-0005 license
   vetting. The **curator remains the sole writer of `raw/`** (ADR-0002): it materializes `raw/` from
   each capture body during consolidation; the *face* never writes `raw/`. (ADR-0020.) Staging the
-  **original binary** verbatim in `raw/` (+ the sha256 re-ingest-drift sidecar) and image/OCR
-  extraction remain deferred follow-ups. Per-batch max-files / total-bytes caps shipped with the
+  **original binary** verbatim still does not happen: ADR-0041 D1.4 gave it a *destination* —
+  `raw/_blob/<ab>/<sha256>.<ext>` plus a `<file>.meta.yaml` sidecar, content-addressed and immutable
+  — and `RepoLayout.blob_dir` resolves it, but **nothing writes it yet**. The transport the ADR
+  specifies (an optional attachment beside the inbox event, materialized by APPLY at claim time) is
+  unbuilt: `Inbox.write` still takes `text: str` and an optional `raw_ref: str`, no bytes. So a
+  reserved path is all that exists today; image/OCR extraction likewise remains a deferred
+  follow-up. Per-batch max-files / total-bytes caps shipped with the
   multi-upload surface (**ADR-0025**, Accepted); the untrusted-input hardening landed as the
   extractor-layer SSRF guard (#66) + zip decompression-bomb cap (#53) — see the ADR-0025 appendix —
   while SVG/HTML XSS stays covered at render time (markdown-it `html=False`).
 - **Knowledge graph** (read-only) at `/graph`: a derived, Obsidian-like view of the wiki's
-  link/relation structure — global plus a per-note local ego-graph (node click → the note, a domain
-  filter, contested/orphan accents). It is purely derived from the
+  link/relation structure — global plus a per-note local ego-graph (node click → the note, a
+  **subject** filter, contested/orphan accents). It is purely derived from the
   markdown (reuses the §5.3 dashboard helpers — `Wiki.list_notes` + body link basenames + frontmatter
   `related`/`children`), holds no canonical state (invariant 1), and never writes. Rendering is a
   single vendored MIT force-graph lib over a JSON graph endpoint (`GET /api/graph` + the `/graph`
@@ -290,9 +344,12 @@ Implemented (Phase 3 — part of the web face). A read-only meta face served at 
 `AgoraHandlers.health` / `curator_status` / `harvester_status`. **All data it needs already exists**
 in `_kb/state.json`, the live `inbox/` count, `log.md`, git history, `processed/`+`failed/`, and the
 harvest cursors. Panels:
-- **KB health (per team / per person):** note counts, themes vs daily, tag distribution, growth,
-  orphan notes vs broken links (distinct lint signals — `health` reuses the existing `lint()` path
-  verbatim), last consolidation.
+- **KB health (per team / per person):** note counts (a TOTAL `by_kind` census over the ADR-0041
+  kind vocabulary plus an `unknown` residue bucket, with `concepts`/`journals` lifted out as the two
+  headline scalars that replace v1's `themes`/`dailies`), tag distribution, growth, orphan notes vs
+  broken links (distinct lint signals — `health` reuses the existing `lint()` path verbatim; the
+  orphan population is the claim-bearing kinds only, and `wiki/people/**` is never graded and is
+  reported instead as `by_kind['person']`), last consolidation.
 - **Curator/agent status:** queue depth, in-flight, throughput, success/fail, active backend+model,
   cost (if a paid backend), and a work-log timeline (what was ingested/merged/dropped).
 - **Harvester status:** connectors enabled, last scan per source, candidates proposed/accepted/rejected
@@ -380,7 +437,11 @@ state + schema. **Team repos** (shared) and **personal repos** (private to one u
 - A user belongs to multiple teams and owns ≥1 personal repo.
 - **Write routing:** `target="team:engineering" | "personal"` selects the repo's inbox (default: personal).
 - **Read scope:** `scope=[...]` queries across the repos the caller may read.
-- **Roles:** `owner > editor > reader` per repo; optionally per-domain ACL (`wiki/<domain>`).
+- **Roles:** `owner > editor > reader` per repo; optionally a per-subject convenience filter. (The
+  path basis that clause once named — a `wiki/<domain>` subtree — no longer exists under schema 2:
+  the subject lives in `subjects:` frontmatter, not in a directory. ADR-0036 had already demoted the
+  per-domain ACL to a convenience filter; ADR-0041 records that its mechanism is gone too. The repo
+  stays the only security boundary.)
 - **Isolation is hard:** writes land in that repo's `_kb/inbox/<user>/…`; a repo's curator only ever touches
   that repo's files. Cross-repo leakage is structurally impossible (separate git repos).
 
@@ -502,8 +563,21 @@ on a new repo = fail-loud.
 cross-location drift stays lint `L1-17`'s finding. The loader deliberately never raises, so
 `agora doctor` — the one exempt command, alongside `--version` and `repo init` — can still READ a
 skewed repo to diagnose it, reporting `schema: repo=<n> supported=[…] (UNSUPPORTED …)` and
-`status: unhealthy`. The *write-warns* half is unobservable while the supported set is `{1}` and
-lands with the first bump; `agora repo upgrade` is #63.
+`status: unhealthy`.
+
+*The first bump landed (ADR-0041 D6), and it HARDENED the write half rather than implementing it.*
+`SUPPORTED_KB_SCHEMA_VERSIONS` is now `{1, 2}`, so `guard_repo_schema_version` — a membership test —
+passes for a schema-1 repo, which is exactly the point: reads keep working. Writability is a
+**separate, stricter predicate**, `config.assert_writable_kb_schema_version`, which requires equality
+with `MAX_SUPPORTED_KB_SCHEMA_VERSION` and raises `ReadOnlySchemaVersionError` (a subclass of
+`UnsupportedSchemaVersionError`, so existing handlers keep working) so a caller can tell *"this build
+cannot read your repo"* from *"this build will not write your repo"*. It is asserted per WRITE PATH,
+not per entry point: `agora curate` / `watch` (per tick) / `requeue` / `harvest` in `cli.py`, the
+`kb_curate` MCP handler, and `Inbox.write` itself — one call there covers `kb_remember`, the web
+upload, and every future writer. `agora doctor` keeps its diagnostic exemption. So the posture for
+this bump is read-works / **write-REFUSES**, not write-warns: a warn assumes the write is merely
+suboptimal, and here it would be corrupting. `agora repo upgrade` (#63) still does not exist and is
+not a prerequisite — the crossing is a conversion into a new repo, not an in-place migration.
 
 **Consumption reaches restricted environments (Q3).** Because corporate hosts often block MCP, the
 file-`@include` channel is first-class: a per-agent memory-path map (e.g. `CLAUDE.md`,

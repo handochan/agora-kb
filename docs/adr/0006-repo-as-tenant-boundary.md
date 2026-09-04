@@ -1,6 +1,7 @@
 # ADR-0006 — Repo = tenant boundary (team & personal repos)
 
 **Status:** Accepted · 2026-06-13
+**AMENDED (append-only) — [ADR-0041](0041-stratum-kind-first-layout.md) (Proposed, KB wiki schema 2) removes the PATH BASIS of the §Decision clause *"optional per-domain ACL (`wiki/<domain>`)"*:** the subject leaves the path for `subjects:` frontmatter, so there is no `wiki/<domain>` subtree left to scope an ACL to. ADR-0036 had already demoted that ACL to a convenience filter (#55); repo-as-tenant-boundary itself is UNCHANGED. The prose below is retained verbatim for history.
 
 ## Context
 Agora must serve individuals and teams, with per-team access separation and a **separate personal

@@ -30,8 +30,13 @@ function noteHref(id) {
 }
 
 /* A deterministic node color: contested status -> warm red; orphan -> muted grey; otherwise a
- * stable hue derived from hashing the domain (or "index" when domainless) into HSL. Same input ->
- * same color across reloads (no Math.random). */
+ * stable hue derived from hashing the node's FIRST subject (or "index" when it declares none)
+ * into HSL. Same input -> same color across reloads (no Math.random).
+ *
+ * A note may carry 0..n subjects (ADR-0041 D2.2) and a canvas node has exactly one fill, so the
+ * first entry is a presentation choice, not a claim that the note has only one subject: the list
+ * is ORDERED as written, so the colour is stable, and the subject filter (which is a membership
+ * test) still finds the note under every subject it declares. */
 function colorFor(node) {
   if (node && node.status === "contested") {
     return "#c0392b"; // warm red
@@ -39,7 +44,8 @@ function colorFor(node) {
   if (node && node.orphan) {
     return "#9aa3ad"; // muted grey
   }
-  const key = (node && node.domain) || "index";
+  const subjects = (node && node.subjects) || [];
+  const key = subjects.length > 0 ? String(subjects[0]) : "index";
   let hash = 0;
   for (let i = 0; i < key.length; i++) {
     hash = (hash * 31 + key.charCodeAt(i)) | 0;
@@ -83,7 +89,7 @@ function initGraph(el) {
           nodes.length +
           " of " +
           data.node_total +
-          " notes (capped). Narrow with the domain filter above to see a focused graph.";
+          " notes (capped). Narrow with the subject filter above to see a focused graph.";
         el.parentNode.insertBefore(banner, el);
       }
 

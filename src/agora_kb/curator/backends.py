@@ -25,7 +25,9 @@ never builds a shell command line — argv injection is structurally impossible.
 
 from __future__ import annotations
 
+import os
 import subprocess
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Literal
 
@@ -256,6 +258,39 @@ def _substitute_worktree(value: str, worktree: str) -> str:
     return value.replace(_WORKTREE_TOKEN, worktree)
 
 
+def with_utf8_child_env(env: Mapping[str, str] | None) -> dict[str, str]:
+    """Return ``env`` (or the current process env when ``env`` is ``None``) plus a forced UTF-8
+    child-side stdio encoding.
+
+    Pinning ``encoding="utf-8"`` on THIS process's end of the pipe (below) only fixes the PARENT
+    side of the stdin/stdout protocol; it does nothing to the CHILD's own locale-driven encoding
+    (#85). The built-in ``agora-ollama-brain`` / ``agora-cli-brain`` shims read ``sys.stdin`` /
+    write ``sys.stdout`` — on a non-UTF-8 child locale (a Python child inheriting
+    ``PYTHONIOENCODING=cp949``, or a cp949 Windows console) a Korean prompt sent as UTF-8 can raise
+    ``UnicodeDecodeError`` in the child before planning ever starts, and cp949 child output cannot
+    be decoded back here. ``PYTHONIOENCODING=utf-8`` and ``PYTHONUTF8=1`` are standard CPython
+    env vars that force a Python child's stdio streams to UTF-8 regardless of the host locale —
+    they make every backend launched through :func:`run_backend` (and, via
+    ``adapters.cli_agent_brain.call_cli_agent``, the CLI agent it shells out to) speak the same
+    protocol this process does, with no code change needed in the child.
+
+    Merged ONTO the base env (``dict(env)`` copy, or ``dict(os.environ)`` when ``env is None``) —
+    never replacing it — so credential-scrubbing (:func:`agora_kb.curator.isolation.scrub_env`) and
+    every other key the caller composed survive unchanged; only these two keys are added/overridden.
+    Harmless to a non-Python backend (``claude``/``codex``/``gemini`` CLIs and the like): they are
+    UTF-8 by nature and simply ignore env vars naming a CPython behaviour they do not implement.
+
+    PUBLIC because :func:`run_backend` is not the only spawn point: the ADR-0013 SANDBOXED PASS-2
+    path (``curator.subprocess_backend.SubprocessBackend._invoke_sandboxed``) builds its own
+    :class:`~agora_kb.curator.isolation.SandboxSpec` env and never reaches ``run_backend``, so it
+    composes the same two keys through this one helper rather than re-spelling them.
+    """
+    merged = dict(env) if env is not None else dict(os.environ)
+    merged["PYTHONIOENCODING"] = "utf-8"
+    merged["PYTHONUTF8"] = "1"
+    return merged
+
+
 def run_backend(
     spec: BackendSpec,
     *,
@@ -281,7 +316,17 @@ def run_backend(
       the resulting plan/diff deterministically.
 
     ``timeout`` (seconds) and ``env`` are passed through to :func:`subprocess.run`; an ``env`` of
-    ``None`` inherits the parent environment unchanged.
+    ``None`` inherits the parent environment (see below), otherwise the given mapping is used as
+    given, in both cases plus a forced UTF-8 child-side stdio encoding.
+
+    ``env`` is passed through :func:`with_utf8_child_env`, which ADDS ``PYTHONIOENCODING=utf-8``
+    and ``PYTHONUTF8=1`` on top of whatever ``env`` already carries (never replacing it — the
+    caller's credential-scrubbed env, e.g. ``curator.isolation.scrub_env``, survives unchanged) so
+    the CHILD's own stdio encoding matches the UTF-8 this call already pins on the parent side
+    below (#85 — see :func:`with_utf8_child_env` for the full failure mode). External CLI agents
+    (``claude``/``codex``/``gemini`` and the like, reached via ``adapters.cli_agent_brain``) are
+    UTF-8-native by construction, so these two Python-specific env vars are inert noise to them,
+    never a behaviour change.
     """
     worktree_str = str(worktree)
     argv = [_substitute_worktree(arg, worktree_str) for arg in spec.argv]
@@ -293,8 +338,20 @@ def run_backend(
         input=prompt,
         capture_output=True,
         text=True,
+        # Pinned, not left to the process locale (#85): with no `encoding=`, a non-ASCII `prompt`
+        # (a Korean candidate body, say) is ENCODED for stdin using the locale's preferred encoding,
+        # so a non-UTF-8 locale can raise UnicodeEncodeError on the way IN — before the brain ever
+        # runs — and any non-UTF-8-locale host would decode the brain's stdout/stderr the same
+        # locale-dependent way on the way OUT. UTF-8 is what every backend here actually speaks.
+        # KNOWN RESIDUAL (not #85's scope): `errors` stays at the default "strict", so a backend
+        # that emits one invalid UTF-8 byte makes this call raise UnicodeDecodeError, which
+        # `SubprocessBackend._invoke`'s `except (FileNotFoundError, PermissionError)` does not
+        # catch. Python children now emit UTF-8 (see the env above); a non-Python CLI agent writing
+        # binary noise on stderr still can. The sandboxed twin already decodes with
+        # errors="replace" — deciding both together is a follow-up, not a drive-by here.
+        encoding="utf-8",
         timeout=timeout,
-        env=env,
+        env=with_utf8_child_env(env),
         check=False,
     )
     return BackendResult(

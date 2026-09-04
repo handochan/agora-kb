@@ -142,5 +142,8 @@ jobs:
       # appear. The only expected reasons are explicit platform conditionals — on ubuntu the
       # two macOS-only seatbelt markers plus "plutil not available (non-macOS)", and on any
       # runner without a local Ollama the two isolation tests that skip rather than guess.
+      # `-m 'not live'` (pyproject addopts) also DESELECTS the live-model e2e suite, which is
+      # minutes long and non-deterministic by design; it runs on demand with
+      # `AGORA_LIVE_E2E=1 uv run pytest -m live`.
       - name: Test (pytest)
         run: uv run pytest -ra

@@ -6,12 +6,12 @@
     <span class="value">{{ health.note_total }}</span>
   </div>
   <div class="stat">
-    <span class="label">Themes</span>
-    <span class="value">{{ health.themes }}</span>
+    <span class="label">Concepts</span>
+    <span class="value">{{ health.concepts }}</span>
   </div>
   <div class="stat">
-    <span class="label">Dailies</span>
-    <span class="value">{{ health.dailies }}</span>
+    <span class="label">Journals</span>
+    <span class="value">{{ health.journals }}</span>
   </div>
   <div class="stat">
     <span class="label">Contested</span>
@@ -20,6 +20,14 @@
   <div class="stat">
     <span class="label">Orphans</span>
     <span class="value">{{ health.orphans }}</span>
+  </div>
+  {# Unmanaged = notes with no curator stamp (#152): read, indexed and linkable, but outside the
+     producer lint's subject and never a MERGE/CONTEST target. It is WHY a lint finding can sit
+     there run after run without the curator fixing it, so the panel that shows the findings has
+     to show this too. `wiki/people/**` is not counted — human-owned by design (ADR-0041 D3.3). #}
+  <div class="stat">
+    <span class="label">Unmanaged</span>
+    <span class="value">{{ health.unmanaged_notes }}</span>
   </div>
   <div class="stat">
     <span class="label">Broken links</span>
@@ -37,11 +45,40 @@
       {%- else %}ok{% endif %}
     </span>
   </div>
+  {# The WRITE verdict (ADR-0041 D6). A schema-1 repo reads and lints perfectly while refusing
+     every capture, so a panel that showed only `lint_ok` reported a green KB whose next upload
+     comes back as a receipt error. Keyed on the same canonical declaration `Inbox.write` reads. #}
+  <div class="stat">
+    <span class="label">Write</span>
+    <span class="value {{ 'ok' if health.writable_schema else 'warn' }}">
+      {% if health.writable_schema %}schema {{ health.kb_schema_version }}
+      {%- elif health.kb_schema_version %}READ-ONLY · schema {{ health.kb_schema_version }}
+      {%- else %}READ-ONLY · schema unknown{% endif %}
+    </span>
+  </div>
   <div class="stat">
     <span class="label">Last consolidation</span>
     <span class="value mono">{{ health.last_consolidation or "—" }}</span>
   </div>
 </div>
+{% if not health.writable_schema %}
+<p class="empty">
+  This build writes KB wiki schema {{ health.writable_schema_version }} and refuses to write this
+  repo, so every capture — <code>kb_remember</code>, an upload here, <code>agora curate</code> — is
+  rejected. Convert once into a NEW repo with
+  <code>agora import --from-kb &lt;this-repo&gt; &lt;new-repo&gt;</code>; the source is never
+  modified.
+</p>
+{% endif %}
+
+<h3>By kind</h3>
+{# The ADR-0041 kind census. `summaries`/`entities` ship empty (OD-7/OD-8) and `people` is the
+   human-owned tree, so zeros here are the expected day-1 shape, not a defect. #}
+<ul class="kv">
+  {% for name, count in health.by_kind.items() %}
+    <li><span class="k">{{ name }}</span><span class="v">{{ count }}</span></li>
+  {% endfor %}
+</ul>
 
 <h3>By status</h3>
 <ul class="kv">

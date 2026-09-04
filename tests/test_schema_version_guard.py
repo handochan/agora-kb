@@ -30,9 +30,11 @@ from agora_kb.config import (
     MAX_SUPPORTED_KB_SCHEMA_VERSION,
     SUPPORTED_KB_SCHEMA_VERSIONS,
     ConfigError,
+    ReadOnlySchemaVersionError,
     RepoConfig,
     UnsupportedSchemaVersionError,
     assert_supported_kb_schema_version,
+    assert_writable_kb_schema_version,
     guard_repo_schema_version,
     load_repo_config,
     read_kb_schema_version,
@@ -165,7 +167,10 @@ def test_criterion_2_the_schema_line_is_what_moves_the_verdict(
     assert cli_mod._doctor_schema(RepoLayout(good)) is True
     assert cli_mod._doctor_schema(RepoLayout(bad)) is False
     out = capsys.readouterr().out.splitlines()
-    assert out[0] == f"  schema: repo={MAX_SUPPORTED_KB_SCHEMA_VERSION} supported=[1]"
+    assert out[0] == (
+        f"  schema: repo={MAX_SUPPORTED_KB_SCHEMA_VERSION} "
+        f"supported={sorted(SUPPORTED_KB_SCHEMA_VERSIONS)}"
+    )
     assert "(UNSUPPORTED" in out[1]
 
 
@@ -187,7 +192,9 @@ def test_doctor_reads_the_canonical_file_not_the_defaulted_config(
 
     out = capsys.readouterr().out
     assert "repo.yaml: unreadable" in out  # the config problem is still reported, once
-    assert f"  schema: repo={_FUTURE} supported=[1] (UNSUPPORTED" in out
+    assert (
+        f"  schema: repo={_FUTURE} supported={sorted(SUPPORTED_KB_SCHEMA_VERSIONS)} (UNSUPPORTED"
+    ) in out
     assert "status: unhealthy" in out
     assert rc == 1
 
@@ -204,7 +211,8 @@ def test_doctor_says_so_when_the_version_cannot_be_read(
     rc = main(["doctor", "--repo", str(tmp_path), "--skip-probe"])
 
     out = capsys.readouterr().out
-    assert "  schema: repo=? supported=[1] (UNREADABLE — cannot verify)" in out
+    supported = sorted(SUPPORTED_KB_SCHEMA_VERSIONS)
+    assert f"  schema: repo=? supported={supported} (UNREADABLE — cannot verify)" in out
     assert "status: unhealthy" in out
     assert rc == 1
 
@@ -313,9 +321,12 @@ def test_criterion_5_a_repo_with_no_schema_declaration_is_unchanged(
 ) -> None:
     """Absent taxonomy file, absent key, and empty key all keep reading as 1 — zero regression."""
     # (a) nothing at all — not even an Agora repo. The guard must be SILENT here, not a complaint
-    #     about a schema in a directory that has none.
+    #     about a schema in a directory that has none. So must the ADR-0041 D6 read-only note that
+    #     `agora status` grew: it is keyed on the CANONICAL declaration, which a bare directory
+    #     does not have, precisely so "wrong cwd" never surfaces as a schema verdict.
     guard_repo_schema_version(RepoLayout(tmp_path))
     assert main(["status", "--repo", str(tmp_path)]) == 0
+    assert capsys.readouterr().err == ""
 
     # (b) a taxonomy.yaml with every key EXCEPT schema_version.
     meta = tmp_path / "_meta"
@@ -330,7 +341,14 @@ def test_criterion_5_a_repo_with_no_schema_declaration_is_unchanged(
     _write_repo_yaml(tmp_path, "name: r\ndomains: [general]\n")
     guard_repo_schema_version(RepoLayout(tmp_path))
     assert main(["status", "--repo", str(tmp_path)]) == 0
-    assert capsys.readouterr().err == ""
+    # The GUARD stays silent — that is this test's subject. Once a `_meta/taxonomy.yaml` exists,
+    # though, a missing `schema_version:` key reads as 1 (a pre-#98 repo), so `agora status` now
+    # adds the D6 read-only note. That is not a regression but the same verdict `Inbox.write` would
+    # give this repo, from the same canonical reader — it just arrives before the refusal instead
+    # of after it. Asserting the absence of the guard's own complaint keeps the two apart.
+    err = capsys.readouterr().err
+    assert "not supported by this agora build" not in err
+    assert "READ-ONLY for this agora build" in err
 
 
 def test_criterion_5_an_unreadable_config_is_not_the_guards_verdict(
@@ -379,18 +397,25 @@ def test_criterion_6_the_kb_constant_is_not_the_plan_envelope_constant(
 
     v2_plan = '{"schema_version": 2, "run_id": "r", "finished": true, "dispositions": []}'
 
-    # Widen the KB set: a v2 REPO is accepted, a v2 PLAN envelope is still refused.
-    monkeypatch.setattr("agora_kb.config.SUPPORTED_KB_SCHEMA_VERSIONS", frozenset({1, 2}))
-    assert_supported_kb_schema_version(_cfg_at(2))
+    # The demonstration version is _FUTURE, not a literal 2: the KB set is genuinely {1, 2} now
+    # (ADR-0041 D6), so 2 no longer demonstrates anything about independence. The PLAN envelope
+    # set is untouched by that widening — which is exactly the property under test — so the plan
+    # side keeps using a v2 envelope.
+    # Widen the KB set: a _FUTURE REPO is accepted, a v2 PLAN envelope is still refused.
+    monkeypatch.setattr(
+        "agora_kb.config.SUPPORTED_KB_SCHEMA_VERSIONS",
+        frozenset({*SUPPORTED_KB_SCHEMA_VERSIONS, _FUTURE}),
+    )
+    assert_supported_kb_schema_version(_cfg_at(_FUTURE))
     with pytest.raises(PlanParseError, match="unknown plan schema_version"):
         Plan.from_json(v2_plan)
     monkeypatch.undo()
 
-    # Widen the PLAN set: a v2 envelope parses, a v2 REPO is still refused.
+    # Widen the PLAN set: a v2 envelope parses, a _FUTURE REPO is still refused.
     monkeypatch.setattr(plan_mod, "SUPPORTED_SCHEMA_VERSIONS", frozenset({1, 2}))
     assert Plan.from_json(v2_plan).schema_version == 2
     with pytest.raises(UnsupportedSchemaVersionError):
-        assert_supported_kb_schema_version(_cfg_at(2))
+        assert_supported_kb_schema_version(_cfg_at(_FUTURE))
 
 
 def test_criterion_6_max_supported_is_derived_not_a_second_source_of_truth() -> None:
@@ -405,7 +430,12 @@ def test_criterion_6_max_supported_is_derived_not_a_second_source_of_truth() -> 
 def test_criterion_7_a_freshly_initialized_repo_passes_the_guard(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """``agora repo init`` emits ``schema_version: 1``; every command must then run untouched."""
+    """``agora repo init`` emits the version this build writes; every command then runs untouched.
+
+    The declared version is :data:`MAX_SUPPORTED_KB_SCHEMA_VERSION` rather than a literal since
+    ADR-0041 D6 flipped the default: a fresh repo is initialized at the schema the curator WRITES,
+    so "freshly initialized" and "fully usable" stay the same state.
+    """
     target = tmp_path / "kb"
     assert main(["repo", "init", str(target)]) == 0
     capsys.readouterr()
@@ -415,9 +445,10 @@ def test_criterion_7_a_freshly_initialized_repo_passes_the_guard(
     assert capsys.readouterr().err == ""
 
     assert main(["doctor", "--repo", str(target), "--skip-probe"]) in (0, 1)
-    assert f"  schema: repo=1 supported={sorted(SUPPORTED_KB_SCHEMA_VERSIONS)}" in (
-        capsys.readouterr().out
-    )
+    assert (
+        f"  schema: repo={MAX_SUPPORTED_KB_SCHEMA_VERSION} "
+        f"supported={sorted(SUPPORTED_KB_SCHEMA_VERSIONS)}"
+    ) in capsys.readouterr().out
 
 
 @requires_git
@@ -428,7 +459,10 @@ def test_criterion_7_repo_init_is_exempt_because_it_creates_the_repo(tmp_path: P
     """
     target = tmp_path / "fresh"
     assert main(["repo", "init", str(target)]) == 0
-    assert load_repo_config(RepoLayout(target)).taxonomy.schema_version == 1
+    assert (
+        load_repo_config(RepoLayout(target)).taxonomy.schema_version
+        == MAX_SUPPORTED_KB_SCHEMA_VERSION
+    )
 
 
 # --- the faces: the guard is not CLI-only -------------------------------------------------------
@@ -681,3 +715,130 @@ def test_watch_re_asserts_the_schema_every_tick(tmp_path: Path, monkeypatch) -> 
 
     with pytest.raises(UnsupportedSchemaVersionError):
         cli_mod._watch_tick(repo)
+
+
+# --- ADR-0041 D6: SUPPORT is membership, WRITABILITY is equality with the newest ---------------
+
+
+def test_schema_1_is_still_supported_after_the_widening() -> None:
+    """{1, 2} — never {2} (ADR-0041 D6): dropping 1 would strand the two live schema-1 KBs.
+
+    ``agora repo upgrade`` (#63) does not exist, so a build that refused schema 1 would leave them
+    unreadable with no path forward. The set is a SET rather than a ceiling for exactly this case.
+    """
+    assert SUPPORTED_KB_SCHEMA_VERSIONS == frozenset({1, 2})
+    assert MAX_SUPPORTED_KB_SCHEMA_VERSION == 2
+    assert_supported_kb_schema_version(_cfg_at(1))
+    assert_supported_kb_schema_version(_cfg_at(2))
+
+
+def test_reads_still_work_on_a_schema_1_repo(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The read half of D6's asymmetry, end to end: an old repo still answers read commands."""
+    _repo_at_schema(tmp_path, 1)
+
+    assert main(["status", "--repo", str(tmp_path)]) == 0
+    # The read SUCCEEDS (rc 0) — the property this test owns. It is not silent: `agora status`
+    # names the read-only posture and the one crossing, because the command an operator runs when
+    # captures "are not arriving" is where that has to be said (asserted in `tests/test_cli.py`).
+    # What must be absent is the GUARD's refusal, which would mean the repo could not be read.
+    assert "not supported by this agora build" not in capsys.readouterr().err
+    guard_repo_schema_version(RepoLayout(tmp_path))  # the entry-point guard stays silent
+
+
+def test_writable_predicate_accepts_only_the_newest_schema() -> None:
+    assert_writable_kb_schema_version(_cfg_at(MAX_SUPPORTED_KB_SCHEMA_VERSION))
+    assert_writable_kb_schema_version(MAX_SUPPORTED_KB_SCHEMA_VERSION)  # bare int accepted too
+
+
+def test_writable_predicate_refuses_a_readable_but_older_schema(tmp_path: Path) -> None:
+    """The gap the predicate exists for: supported (readable) is NOT the same as writable.
+
+    With the set widened to {1, 2} every entry-point guard PASSES for a schema-1 repo, so the
+    write refusal needs its own per-write-path predicate (ADR-0041 D6).
+    """
+    guard_repo_schema_version(RepoLayout(_repo_at_schema(tmp_path, 1)))  # supported: silent
+    assert_supported_kb_schema_version(_cfg_at(1))  # supported: silent
+
+    with pytest.raises(ReadOnlySchemaVersionError) as excinfo:
+        assert_writable_kb_schema_version(_cfg_at(1), repo=tmp_path)
+
+    message = str(excinfo.value)
+    assert "agora import --from-kb" in message  # the ONE crossing that exists
+    assert "READ-ONLY" in message
+    assert str(tmp_path) in message
+    assert "\n" not in message  # one line, printed verbatim by the CLI
+    assert excinfo.value.version == 1
+    assert excinfo.value.repo == tmp_path
+
+
+def test_read_only_error_is_catchable_as_the_existing_type() -> None:
+    """Subclassing keeps every ``except UnsupportedSchemaVersionError`` handler working unchanged.
+
+    …while a caller that wants to distinguish *"cannot read your repo"* from *"will not write your
+    repo"* catches the narrower type first.
+    """
+    assert issubclass(ReadOnlySchemaVersionError, UnsupportedSchemaVersionError)
+    assert issubclass(ReadOnlySchemaVersionError, ConfigError)
+    with pytest.raises(UnsupportedSchemaVersionError):
+        assert_writable_kb_schema_version(_cfg_at(1))
+
+
+def test_writable_predicate_reports_an_unreadable_schema_as_unsupported_not_read_only(
+    tmp_path: Path,
+) -> None:
+    """A v3 repo gets the "upgrade agora" complaint, NOT "run agora import --from-kb".
+
+    Two failure modes, two messages: telling an operator whose repo this build cannot even read to
+    run a converter that does not understand it either would be wrong advice.
+    """
+    with pytest.raises(UnsupportedSchemaVersionError) as excinfo:
+        assert_writable_kb_schema_version(_cfg_at(_FUTURE), repo=tmp_path)
+
+    assert not isinstance(excinfo.value, ReadOnlySchemaVersionError)
+    assert "upgrade agora" in str(excinfo.value)
+    assert "agora import --from-kb" not in str(excinfo.value)
+
+
+@pytest.mark.parametrize("bad", [None, "1", 1.0, True, object()])
+def test_writable_predicate_rejects_a_non_config_non_int(bad: object) -> None:
+    with pytest.raises(TypeError):
+        assert_writable_kb_schema_version(bad)  # type: ignore[arg-type]
+
+
+def test_the_write_refusal_is_wired_at_exactly_the_modules_D6_names() -> None:
+    """ADR-0041 D6 names the write-refusal call sites EXHAUSTIVELY; this pins that they are it.
+
+    The list in the ADR: ``agora curate`` / ``watch`` / ``requeue`` in ``cli.py``, ``Inbox.write``
+    itself (ONE call covering ``kb_remember``, the web upload route and every future writer, which
+    is why it goes there rather than at each face), and the ``kb_curate`` MCP handler. Three
+    modules carry those five sites.
+
+    Two directions, and both matter. A module going MISSING is a write path that silently
+    corrupts a schema-1 repo. A module APPEARING is a face growing its own copy of the gate —
+    which is how two surfaces end up disagreeing about which repos are writable, and how the "one
+    call covers every future writer" property quietly stops being true.
+
+    The low-level predicate is checked separately: it must stay confined to the module that
+    defines it and the ONE shared wrapper, so nothing re-derives the rule (in particular the
+    "declares nothing is UNKNOWN, not schema 1" half) from the raw version.
+    """
+    src = Path(cli_mod.__file__).resolve().parent
+
+    def modules_mentioning(symbol: str) -> list[str]:
+        return sorted(
+            path.relative_to(src).as_posix()
+            for path in src.rglob("*.py")
+            if symbol in path.read_text(encoding="utf-8")
+        )
+
+    assert modules_mentioning("assert_writable_repo_schema") == [
+        "cli.py",
+        "core/inbox.py",
+        "faces/mcp_server.py",
+    ]
+    assert modules_mentioning("assert_writable_kb_schema_version") == [
+        "config.py",
+        "core/inbox.py",
+    ]

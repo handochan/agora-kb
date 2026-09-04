@@ -24,47 +24,122 @@ def _init_repo(tmp_path: Path) -> Repo:
     return repo
 
 
-def _write_corpus(tmp_path: Path) -> None:
-    """A small corpus mixing statuses, a daily, and tag overlap for distribution/count asserts."""
-    (tmp_path / "index.md").write_text(
-        "---\ntype: index\nstatus: active\n---\n# personal\n", encoding="utf-8"
+def _write_schema2_taxonomy(tmp_path: Path, domains: str = "[ai-tech]") -> None:
+    """Declare KB wiki schema 2 (ADR-0041) — what ``resolve_schema_version`` reads.
+
+    Without it the same bytes are read under the v1 derivation, where ``kind`` comes from ``type:``
+    and the subject from the path; every ``kind`` in a kind-first tree would come back ``None``.
+    """
+    (tmp_path / "_meta").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "_meta" / "taxonomy.yaml").write_text(
+        f"schema_version: 2\ndomains: {domains}\nallowed_tags: []\n", encoding="utf-8"
     )
-    themes = tmp_path / "wiki" / "ai-tech" / "themes"
-    themes.mkdir(parents=True, exist_ok=True)
-    (themes / "curator-concurrency.md").write_text(
-        "---\ntype: theme\nstatus: active\ntags: [single-writer, concurrency]\n"
+
+
+def _write_corpus(tmp_path: Path) -> None:
+    """A schema-2 corpus mixing statuses, a journal, a people note, and overlapping tags."""
+    _write_schema2_taxonomy(tmp_path)
+    (tmp_path / "index.md").write_text(
+        "---\nkind: index\nstatus: active\n---\n# personal\n", encoding="utf-8"
+    )
+    concepts = tmp_path / "wiki" / "concepts"
+    concepts.mkdir(parents=True, exist_ok=True)
+    (concepts / "curator-concurrency.md").write_text(
+        "---\nkind: concept\nsubjects: [ai-tech]\nstatus: active\n"
+        "tags: [single-writer, concurrency]\n"
         "title: Curator Concurrency\n---\n# Curator Concurrency\n\nbody\n",
         encoding="utf-8",
     )
-    (themes / "inbox-design.md").write_text(
-        "---\ntype: theme\nstatus: stub\ntags: [single-writer]\n---\n# Inbox\n\nbody\n",
+    (concepts / "inbox-design.md").write_text(
+        "---\nkind: concept\nsubjects: [ai-tech]\nstatus: stub\ntags: [single-writer]\n"
+        "---\n# Inbox\n\nbody\n",
         encoding="utf-8",
     )
-    (themes / "contested-thing.md").write_text(
-        "---\ntype: theme\nstatus: contested\ntags: [concurrency]\n---\n# C\n\nbody\n",
+    (concepts / "contested-thing.md").write_text(
+        "---\nkind: concept\nsubjects: [ai-tech]\nstatus: contested\ntags: [concurrency]\n"
+        "---\n# C\n\nbody\n",
         encoding="utf-8",
     )
-    daily = tmp_path / "wiki" / "ai-tech" / "daily"
-    daily.mkdir(parents=True, exist_ok=True)
-    (daily / "ai-tech-2026-06-21.md").write_text(
-        "---\ntype: daily\nstatus: active\ntags: []\n---\n# Daily\n\nbody\n",
+    journal = tmp_path / "wiki" / "notes" / "2026" / "06"
+    journal.mkdir(parents=True, exist_ok=True)
+    (journal / "2026-06-21.md").write_text(
+        "---\nkind: note\nstatus: active\ntags: []\n---\n# Journal\n\nbody\n",
+        encoding="utf-8",
+    )
+    people = tmp_path / "wiki" / "people" / "hando"
+    people.mkdir(parents=True, exist_ok=True)
+    (people / "desk.md").write_text(
+        "---\nstatus: active\ntags: []\n---\n# Desk\n\nA human's own file.\n",
         encoding="utf-8",
     )
 
 
 # --- handler aggregations (transport-free) ------------------------------------------------------
+def test_health_kind_census_counts_off_layout_notes_as_unknown(tmp_path: Path) -> None:
+    """The one anomaly the closed directory vocabulary exists to catch must be VISIBLE.
+
+    A schema-2 note under an unknown ``wiki/<dir>/`` or directly under ``wiki/`` derives no kind
+    (the L1-22 population), and a census seeded only from the closed vocabulary silently dropped
+    it — so ``sum(by_kind.values()) < note_total`` with nothing on the panel saying so, and the
+    off-layout note was invisible next to ``unmanaged_notes``, its sibling anomaly signal.
+    """
+    repo = _init_repo(tmp_path)
+    _write_schema2_taxonomy(tmp_path)
+    (tmp_path / "index.md").write_text(
+        "---\nkind: index\nstatus: active\n---\n# personal\n", encoding="utf-8"
+    )
+    concepts = tmp_path / "wiki" / "concepts"
+    concepts.mkdir(parents=True, exist_ok=True)
+    (concepts / "a.md").write_text(
+        "---\nkind: concept\nsubjects: [ai-tech]\nstatus: active\n---\n# A\n\nbody\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "wiki" / "general").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "wiki" / "general" / "off.md").write_text(
+        "# No frontmatter here\n\nbody.\n", encoding="utf-8"
+    )
+    (tmp_path / "wiki" / "loose.md").write_text(
+        "---\nstatus: active\n---\n# Loose\n\nbody.\n", encoding="utf-8"
+    )
+    health = AgoraHandlers(repo).health()
+
+    assert health["note_total"] == 4
+    assert health["by_kind"]["unknown"] == 2
+    assert sum(health["by_kind"].values()) == health["note_total"]
+
+
 def test_health_counts_status_split_and_tags(tmp_path: Path) -> None:
     repo = _init_repo(tmp_path)
     _write_corpus(tmp_path)
     health = AgoraHandlers(repo).health()
 
-    # index + 3 themes + 1 daily = 5 notes; themes vs daily split is by the `type` field.
-    assert health["note_total"] == 5
-    assert health["themes"] == 3
-    assert health["dailies"] == 1
+    # index + 3 concepts + 1 journal + 1 people note = 6 notes; the split is by KIND now, derived
+    # from the directory (ADR-0041 D2.1) rather than from a `type:` the model could mistype.
+    assert health["note_total"] == 6
+    assert health["concepts"] == 3
+    assert health["journals"] == 1
+    # The census covers the whole closed kind vocabulary, so the tiers that ship EMPTY (summary /
+    # entity, OD-7/OD-8) are visibly zero rather than missing.
+    assert health["by_kind"] == {
+        "concept": 3,
+        "entity": 0,
+        "index": 1,
+        "map": 0,
+        "note": 1,
+        "person": 1,
+        "summary": 0,
+        "unknown": 0,
+    }
+    # And the census is TOTAL: every note lands in exactly one bucket, so the panel can never
+    # under-report next to the "Notes" figure printed beside it.
+    assert sum(health["by_kind"].values()) == health["note_total"]
+    # `wiki/people/**` is read and counted as a note, but it is NOT an unmanaged-note anomaly: it
+    # is human-owned BY DESIGN (D3.3). The three concepts + the journal + index have no curator
+    # stamp in this hand-written fixture, so they are the four... five that DO count.
+    assert health["unmanaged_notes"] == 5
     # status split over the frozen vocabulary; contested mirrors by_status (index + concurrency +
-    # daily are active; inbox-design is stub; contested-thing is contested).
-    assert health["by_status"] == {"active": 3, "stub": 1, "contested": 1, "deprecated": 0}
+    # journal + the people note are active; inbox-design is stub; contested-thing is contested).
+    assert health["by_status"] == {"active": 4, "stub": 1, "contested": 1, "deprecated": 0}
     assert health["contested"] == 1
     # tag distribution is a frequency map.
     assert health["tag_distribution"]["single-writer"] == 2
@@ -77,7 +152,11 @@ def test_health_counts_status_split_and_tags(tmp_path: Path) -> None:
 
 
 def test_health_broken_links_from_lint(tmp_path: Path) -> None:
-    """A body link to a missing note is a ``broken_links`` signal (L1-2 via lint() verbatim)."""
+    """A body link to a missing note is a ``broken_links`` signal (L1-2 via lint() verbatim).
+
+    Deliberately left on the SCHEMA-1 layout: ADR-0041 D6 keeps schema-1 repos READABLE by this
+    build (only writes refuse), so at least one health assertion has to run against a v1 tree.
+    """
     _init_repo(tmp_path)
     (tmp_path / "index.md").write_text(
         "---\ntype: index\nstatus: active\n---\n# personal\n", encoding="utf-8"
@@ -95,37 +174,52 @@ def test_health_broken_links_from_lint(tmp_path: Path) -> None:
 
 
 def test_health_orphans_derivation(tmp_path: Path) -> None:
-    """``orphans`` counts themes nothing links TO (read-time L2-1), NOT broken outbound links.
+    """``orphans`` counts claim-bearing notes nothing links TO (read-time L2-1), not broken links.
 
-    A theme is referenced either by another note's BODY markdown link or by a frontmatter
-    ``related:``/``children:`` ``[[ ]]`` — both inbound directions must keep a theme off the orphan
-    list; only a theme referenced by neither is an orphan (dailies / MOC / index roots are exempt).
+    A concept is referenced either by another note's BODY markdown link or by a frontmatter
+    ``related:``/``children:`` ``[[ ]]`` — both inbound directions must keep it off the orphan
+    list; only a note referenced by neither is an orphan (journals / maps / index roots, entities
+    and people are exempt). ``wiki/people/**`` links are UNGRADED (ADR-0041 D3.3), so a human's
+    link does NOT rescue a concept from the count — that is the one clause the dashboard shares
+    with ``schema.lint``'s L2-1, and it is asserted here rather than assumed.
     """
     _init_repo(tmp_path)
+    _write_schema2_taxonomy(tmp_path)
     # index body-links 'linked-body'; 'linked-body' frontmatter-relates to 'linked-fm'; 'lonely' is
-    # referenced by nobody. No dangling links anywhere → broken_links must stay 0 (distinct signal).
+    # referenced by nobody; 'human-only' is referenced ONLY from a people note. No dangling links
+    # anywhere → broken_links must stay 0 (a genuinely distinct signal).
     (tmp_path / "index.md").write_text(
-        "---\ntype: index\nstatus: active\n---\n# personal\n\n"
-        "- [Linked](wiki/ai-tech/themes/linked-body.md)\n",
+        "---\nkind: index\nstatus: active\n---\n# personal\n\n"
+        "- [Linked](wiki/concepts/linked-body.md)\n",
         encoding="utf-8",
     )
-    themes = tmp_path / "wiki" / "ai-tech" / "themes"
-    themes.mkdir(parents=True, exist_ok=True)
-    (themes / "linked-body.md").write_text(
-        "---\ntype: theme\nstatus: active\ntags: []\nrelated: ['[[linked-fm]]']\n---\n"
+    concepts = tmp_path / "wiki" / "concepts"
+    concepts.mkdir(parents=True, exist_ok=True)
+    (concepts / "linked-body.md").write_text(
+        "---\nkind: concept\nstatus: active\ntags: []\nrelated: ['[[linked-fm]]']\n---\n"
         "# LB\n\nbody\n",
         encoding="utf-8",
     )
-    (themes / "linked-fm.md").write_text(
-        "---\ntype: theme\nstatus: active\ntags: []\n---\n# LF\n\nbody\n", encoding="utf-8"
+    (concepts / "linked-fm.md").write_text(
+        "---\nkind: concept\nstatus: active\ntags: []\n---\n# LF\n\nbody\n", encoding="utf-8"
     )
-    (themes / "lonely.md").write_text(
-        "---\ntype: theme\nstatus: active\ntags: []\n---\n# Lonely\n\nbody\n", encoding="utf-8"
+    (concepts / "lonely.md").write_text(
+        "---\nkind: concept\nstatus: active\ntags: []\n---\n# Lonely\n\nbody\n",
+        encoding="utf-8",
+    )
+    (concepts / "human-only.md").write_text(
+        "---\nkind: concept\nstatus: active\ntags: []\n---\n# HO\n\nbody\n", encoding="utf-8"
+    )
+    people = tmp_path / "wiki" / "people" / "hando"
+    people.mkdir(parents=True, exist_ok=True)
+    (people / "desk.md").write_text(
+        "---\nstatus: active\n---\n# Desk\n\nSee [HO](../../concepts/human-only.md).\n",
+        encoding="utf-8",
     )
     health = AgoraHandlers(Repo.resolve(tmp_path)).health()
-    assert (
-        health["orphans"] == 1
-    )  # only 'lonely' — linked-body (body) + linked-fm (frontmatter) ref'd
+    # 'lonely' (referenced by nobody) + 'human-only' (referenced only from an ungraded people
+    # note); linked-body (body link) and linked-fm (frontmatter) are both referenced.
+    assert health["orphans"] == 2
     assert health["broken_links"] == 0  # genuinely distinct from the orphan signal
 
 
@@ -256,6 +350,40 @@ def test_harvester_status_from_planted_cursor(tmp_path: Path) -> None:
     assert conn["last_scan"] == "2026-06-21T02:00:00Z"
 
 
+def test_harvester_status_reports_the_session_connector_format(tmp_path: Path) -> None:
+    """The dashboard/MCP status face answers "which grammar is reading my transcripts" too (#147).
+
+    `agora doctor` grew that line; the two OTHER human-facing surfaces read this dict, so without
+    the key they could not answer it. Each kind-specific field is `None` on the other kind rather
+    than a default that cannot take effect — the same rule `load_connector_specs` enforces when it
+    rejects `format:` on a `file:` connector.
+    """
+    repo = _init_repo(tmp_path)
+    repo.layout.kb_dir.mkdir(parents=True, exist_ok=True)
+    (repo.layout.kb_dir / "repo.yaml").write_text(
+        "name: personal\nkind: personal\nharvest:\n  enabled: true\n", encoding="utf-8"
+    )
+    (tmp_path / "adapters.yaml").write_text(
+        "backends:\n  qwen:\n    argv: [agora-ollama-brain]\n"
+        "default_backend: qwen\n"
+        "connectors:\n"
+        '  file:claude-code: { path: "~/.claude/MEMORY.md", scope: personal }\n'
+        '  session:default: { path: "~/.claude/**/*.jsonl", scope: personal }\n'
+        '  session:pinned: { path: "~/x/**/*.jsonl", scope: personal,'
+        " format: claude-code-jsonl }\n",
+        encoding="utf-8",
+    )
+
+    by_name = {c["name"]: c for c in AgoraHandlers(repo).harvester_status()["connectors"]}
+
+    assert by_name["file:claude-code"]["format"] is None
+    assert by_name["file:claude-code"]["follow_links"] is False
+    # An undeclared format reports the EFFECTIVE default, not a blank.
+    assert by_name["session:default"]["format"] == "claude-code-jsonl"
+    assert by_name["session:pinned"]["format"] == "claude-code-jsonl"
+    assert by_name["session:default"]["follow_links"] is None
+
+
 def test_harvester_status_disabled_default(tmp_path: Path) -> None:
     repo = _init_repo(tmp_path)
     h = AgoraHandlers(repo).harvester_status()
@@ -302,8 +430,16 @@ def test_api_dashboard_endpoints(tmp_path: Path) -> None:
     health = client.get("/api/dashboard/health")
     assert health.status_code == 200
     hjson = health.json()
-    assert hjson["note_total"] == 5
-    assert set(hjson) >= {"by_status", "tag_distribution", "lint_ok", "contested", "orphans"}
+    assert hjson["note_total"] == 6
+    assert set(hjson) >= {
+        "by_kind",
+        "by_status",
+        "tag_distribution",
+        "lint_ok",
+        "contested",
+        "orphans",
+        "unmanaged_notes",
+    }
 
     curator = client.get("/api/dashboard/curator")
     assert curator.status_code == 200
@@ -324,6 +460,10 @@ def test_polled_fragment_routes_return_partials(tmp_path: Path) -> None:
     assert health.status_code == 200
     assert "<!DOCTYPE html>" not in health.text
     assert "Tag distribution" in health.text
+    # The kind census and the #152 unmanaged-note count are RENDERED, not merely in the JSON —
+    # an operator reads the panel, not /api/dashboard/health.
+    assert "By kind" in health.text
+    assert "Unmanaged" in health.text
 
     curator = client.get("/dashboard/curator")
     assert curator.status_code == 200

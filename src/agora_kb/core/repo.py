@@ -44,7 +44,7 @@ from pathlib import Path
 
 from .layout import RepoLayout
 
-__all__ = ["Repo", "GitError"]
+__all__ = ["Repo", "GitError", "GITATTRIBUTES_NAME", "blob_bytes_are_pinned"]
 
 _DEFAULT_BRANCH = "main"
 _DEFAULT_AUTHOR_NAME = "Agora Curator"
@@ -52,6 +52,106 @@ _DEFAULT_AUTHOR_EMAIL = "curator@agora.local"
 _GITIGNORE = (
     "# Agora operational spool — rebuildable, never canonical (ADR-0001).\n_kb/\n.DS_Store\n"
 )
+
+# The `.gitattributes` seeded beside `.gitignore`. `raw/_blob/<ab>/<sha256>.<ext>` holds a captured
+# artefact's ORIGINAL bytes, and its whole admission story is `hash(bytes) == basename` (ADR-0041
+# D1.4, normative). git's EOL translation is the one thing in the publish path that rewrites file
+# content behind the writer's back: with `core.autocrlf` set (Git-for-Windows installs `true`;
+# `input` is a common macOS/Linux setting), a CRLF artefact with no NUL in it — CSV, TXT, HTML,
+# JSON — is classified TEXT and normalised to LF on commit. The committed blob then no longer
+# hashes to its own filename, and the NEXT run that re-cites that digest fails permanently in
+# `_materialize_one_blob`'s re-verification. `-text` turns the translation off; `-diff -merge` say
+# the file is binary for the two other tools that would try to read it as lines.
+#
+# This is BELT-AND-BRACES with the `-c core.autocrlf=false` pin on `Repo._git`: attributes beat
+# config, so the file also protects a plain `git add` an operator runs by hand, while the argv pin
+# protects a repo that has no `.gitattributes` yet (every repo created before this change —
+# `agora doctor` reports those and names the one-line remedy).
+#: The seeded attributes file's name.
+GITATTRIBUTES_NAME = ".gitattributes"
+
+_GITATTRIBUTES = (
+    "# Agora: content-addressed originals are OPAQUE BYTES named by their own sha256 "
+    "(ADR-0041 D1.4).\n"
+    "# Never let git translate line endings here: a rewritten byte breaks "
+    "hash(bytes) == basename.\n"
+    "raw/_blob/** -text -diff -merge\n"
+)
+
+
+# The paths :func:`blob_bytes_are_pinned` asks git about. Neither needs to exist — ``check-attr``
+# answers about a PATH, not a file. TWO extensions rather than one because the property being
+# checked is "every artefact in the blob tree is out of EOL translation": a `*.csv text` line
+# placed after the blob rule re-normalises exactly the CRLF, NUL-free shape D1.4 is about, and a
+# `.bin`-only probe would report that repo healthy.
+_BLOB_ATTRIBUTE_PROBES = (
+    f"raw/_blob/ab/{'0' * 64}.bin",
+    f"raw/_blob/ab/{'0' * 64}.csv",
+)
+
+
+def blob_bytes_are_pinned(root: Path) -> bool:
+    """True if git resolves ``text`` to *unset* for ``raw/_blob/`` paths in the repo at ``root``.
+
+    The diagnostic half of ``_GITATTRIBUTES``: :meth:`Repo.init` seeds the file, but a repo created
+    before that change has none, and `agora doctor` needs a yes/no it can report with a one-line
+    remedy.
+
+    ASKS GIT rather than parsing ``.gitattributes``, because the question is not "does the seed's
+    line appear" but "what does git actually do to these bytes", and those differ in ways a reader
+    of the file cannot see. gitattributes(5) resolves LAST match wins, so a broad ``* text=auto``
+    written BELOW the blob rule silently overrides it — and an explicit ``text`` attribute outranks
+    ``core.autocrlf``, so the argv pin on :meth:`_git` cannot save that repo either. ``check-attr``
+    also accounts for ``.git/info/attributes``, a global ``core.attributesFile``, and any
+    hand-written rule of the operator's own — which is the other half of the contract: a doctor
+    line that flagged a hand-edited but CORRECT file would train the operator to ignore the channel.
+
+    One subprocess on a diagnostic-only path (doctor, and the seeding decision in :meth:`init`).
+    A directory that is not a git repo, or a host with no ``git``, answers ``False``: nothing is
+    pinned there, which is the honest reading and the one that prints the remedy.
+    """
+    try:
+        cp = subprocess.run(  # noqa: S603,S607 (argv list, no shell; `git` off PATH as everywhere)
+            ["git", "check-attr", "-z", "text", "--", *_BLOB_ATTRIBUTE_PROBES],
+            cwd=str(root),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="surrogateescape",
+        )
+    except OSError:
+        return False
+    if cp.returncode != 0:
+        return False
+    # `-z` emits NUL-separated <path> <attr> <value> triplets (and a trailing NUL, hence the final
+    # empty field, which the stride skips). `unset` is what `-text` — or `binary`, which implies it
+    # — resolves to; `set`, `auto`, `unspecified` all mean git may still translate these bytes.
+    values = cp.stdout.split("\0")[2::3]
+    return len(values) == len(_BLOB_ATTRIBUTE_PROBES) and all(v == "unset" for v in values)
+
+
+def _ensure_blob_attributes(root: Path) -> None:
+    """Put ``raw/_blob/** -text`` in force in ``root`` without discarding the operator's own rules.
+
+    `agora repo init` is documented and implemented as RE-RUNNABLE, and `agora doctor` tells the
+    operator to APPEND the blob rule to this very file — so an unconditional ``write_text`` of the
+    seed would be one command silently deleting the edit another command asked for, along with any
+    ``*.pdf binary`` / ``*.ipynb -diff`` of the operator's own. Seed when the file is absent,
+    APPEND when it exists, and write nothing when git already resolves ``text`` to unset here.
+
+    Appending (rather than prepending, or rewriting) is also what makes the rule WIN: gitattributes
+    resolves last match wins, so a rule added at the end beats a broad ``* text=auto`` the operator
+    put above it. Bytes in, bytes out — the existing file is never decoded, so a non-UTF-8 rule
+    survives untouched.
+    """
+    if blob_bytes_are_pinned(root):
+        return
+    path = root / GITATTRIBUTES_NAME
+    existing = path.read_bytes() if path.exists() else b""
+    separator = b"" if (not existing or existing.endswith(b"\n")) else b"\n"
+    path.write_bytes(existing + separator + _GITATTRIBUTES.encode("utf-8"))
+
+
 # A schema-compliant root index.md (the ADR-0010 `index` note frontmatter) so a freshly-initialized
 # repo lints clean (schema.lint L1-4); the curator's APPLY later fills children/updated, preserving
 # these keys. {date} is the init date (YYYY-MM-DD).
@@ -78,6 +178,49 @@ _SEED_INDEX = (
     "children: []\n"
     "---\n\n# Knowledge base\n"
 )
+# The KB WIKI SCHEMA 2 root map (ADR-0041 D1.2). Same OKF posture as the schema-1 seed above — it
+# is still the bundle root — plus the D2 common base: `kind` (the DIRECTORY-mirroring kind, D2.1),
+# `kb` (the `_meta/kb.yaml` ULID, D1.5) and `subjects: []`, a legal, honest empty subject list on a
+# note that genuinely has no subject (D2.2). `children: []` with an empty body is an EMPTY ROOT MAP:
+# L1-6 compares the declared set against the body child-bullet set and both are empty.
+#
+# `index.md` sits at the repo ROOT, not under `wiki/maps/`, so the directory rule cannot name it —
+# which is exactly why it carries the `kind:` mirror and why `RepoLayout.note_path_for('index', …)`
+# returns the root path. It is the root OF the map tier, not a member of it.
+#
+# `type: index` is retained as the OKF MIRROR of `kind`, not as the kind authority (D2.5 / OD-3):
+# emitted for the same reason `description` mirrors `summary`, so an OKF/Obsidian consumer that
+# keys on `type` still sees one. Nothing in Agora reads it under schema 2.
+_SEED_INDEX_V2 = (
+    "---\n"
+    "title: Index\n"
+    "kind: index\n"
+    "type: index\n"
+    "kb: {kb_id}\n"
+    "okf_version: '0.1'\n"
+    "subjects: []\n"
+    "aliases: []\n"
+    "tags: []\n"
+    "created: '{date}'\n"
+    "updated: '{date}'\n"
+    "timestamp: '{date}T00:00:00Z'\n"
+    "status: active\n"
+    "summary: Knowledge base index.\n"
+    "description: Knowledge base index.\n"
+    # `derived` + `provenance` complete the D2 common base, in D2's own key order. They are here
+    # rather than left to APPLY's first re-render because `_common_frontmatter`'s contract is that
+    # the seed and a re-rendered note read IDENTICALLY in a diff: without them the first curate run
+    # appended both keys AFTER `children`, so the bundle root was the one note whose frontmatter was
+    # not the shape D2 states — and it stayed that way silently, since lint grades `provenance:`
+    # only when present. `writers` is empty and honest (no authn plane before Phase 4); `agents` is
+    # empty because nothing has contributed to a freshly seeded index.
+    "derived: false\n"
+    "provenance:\n"
+    "  writers: []\n"
+    "  agents: []\n"
+    "children: []\n"
+    "---\n\n# Knowledge base\n"
+)
 # A full git object id: 40 hex (sha-1) or 64 hex (sha-256). Used to reject names/short-shas and,
 # crucially, the all-zero oid that `git update-ref` would interpret as a ref DELETE.
 _SHA_RE = re.compile(r"\A[0-9a-f]{40}\Z|\A[0-9a-f]{64}\Z")
@@ -98,6 +241,25 @@ _PUSH_TIMEOUT_SECONDS = 300.0
 def _require_commit_sha(value: str) -> None:
     if not isinstance(value, str) or not _SHA_RE.match(value) or set(value) == {"0"}:
         raise ValueError(f"expected a full non-zero hex object id, got {value!r}")
+
+
+def _printable(text: str) -> str:
+    """Return ``text`` with any ``errors="surrogateescape"`` lone surrogate made printable.
+
+    ``_git`` decodes git's stdout/stderr with ``errors="surrogateescape"`` (#85) so an invalid byte
+    never raises out of the subprocess call; that is correct for round-tripping, but it means a
+    string built from ``cp.stderr`` (e.g. a remote/server-hook message on ``push_backup``, which
+    this process does not control) can carry a lone surrogate code point straight into a
+    :class:`GitError` message. Embedding it directly (``f"{stderr}"``, as opposed to ``{stderr!r}``)
+    then raises ``UnicodeEncodeError`` the moment an operator-facing ``print``/log tries to encode
+    that message under a strict stream (a redirected cp949 console,
+    ``PYTHONIOENCODING=utf-8:strict``) — turning a best-effort failure (a push, a watch tick) into
+    a crash instead of a clean error.
+    Re-encoding with ``surrogateescape`` and decoding back with ``replace`` (U+FFFD) is lossy but
+    always printable, which is what an error MESSAGE needs; nothing here is byte-compared, so the
+    lossiness costs nothing meaningful.
+    """
+    return text.encode("utf-8", errors="surrogateescape").decode("utf-8", errors="replace")
 
 
 class GitError(RuntimeError):
@@ -155,13 +317,48 @@ class Repo:
         # ``timeout`` (seconds; default unbounded — every local call is fast) exists for the one
         # network-touching operation, :meth:`push_backup`: on expiry the child is killed and the
         # hang surfaces as a plain :class:`GitError`, never an uncaught TimeoutExpired.
-        cmd = ["git", "-c", f"core.hooksPath={os.devnull}", *args]
+        # core.autocrlf pinned on EVERY call so the deterministic publish can never rewrite the
+        # bytes it just wrote: an argv `-c` outranks the system/global/local config files, which
+        # `_commit_env`'s GIT_CONFIG_GLOBAL/SYSTEM devnull cannot reach for a per-repo
+        # `.git/config`. `false` is git's own default — this pins it, it does not change behaviour
+        # on a host that never set it (ADR-0041 D1.4; see `_GITATTRIBUTES`).
+        #
+        # `core.eol` is deliberately NOT pinned, though it looks like the matching half. Its
+        # default is `native`, NOT `lf` — so pinning it would be a real behaviour change on
+        # Windows (#85): `sync_worktree`'s `read-tree -m -u` writes the working tree, and under an
+        # operator's own `* text=auto` agora would check out LF where the operator's git checks out
+        # CRLF, leaving every text file dirty in their `git status` after a recovery. It also
+        # protects nothing here: `core.eol` applies only to paths whose `text` attribute is SET,
+        # and `raw/_blob/**` carries `-text`.
+        cmd = [
+            "git",
+            "-c",
+            f"core.hooksPath={os.devnull}",
+            "-c",
+            "core.autocrlf=false",
+            *args,
+        ]
         try:
             cp = subprocess.run(  # noqa: S603 (argv list, no shell)
                 cmd,
                 cwd=str(cwd or self.root),
                 capture_output=True,
                 text=True,
+                # git emits UTF-8 path bytes regardless of the host console codepage. WITHOUT an
+                # explicit encoding, ``text=True`` decodes with the LOCALE encoding, so a cp949 /
+                # latin-1 Windows console mis-decodes (or raises on) any non-ASCII path or commit
+                # message git prints back (#85). Pin UTF-8 so the decode is host-independent.
+                encoding="utf-8",
+                # ``errors="strict"`` (the default) would let a byte sequence that is not valid
+                # UTF-8 — realistic on ``push_backup``'s remote/server-hook output, which this
+                # process does not control — raise UnicodeDecodeError. That is a ValueError, which
+                # matches neither the TimeoutExpired/OSError handlers below nor any GitError catch
+                # at a caller, so it would escape this method as a raw exception instead of the
+                # GitError every caller (init/commit_worktree/push_backup/sync) is written against.
+                # ``surrogateescape`` never raises and round-trips the exact bytes losslessly, so an
+                # undecodable byte still reaches ``cp.stderr``/``cp.stdout`` — just as an
+                # unprintable surrogate — for GitError's message to report.
+                errors="surrogateescape",
                 env=env,
                 timeout=timeout,
             )
@@ -176,11 +373,12 @@ class Repo:
                 f"git {' '.join(args)} could not run: {exc}", command=tuple(args)
             ) from exc
         if check and cp.returncode != 0:
+            stderr = _printable(cp.stderr.strip())
             raise GitError(
-                f"git {' '.join(args)} failed (rc={cp.returncode}): {cp.stderr.strip()}",
+                f"git {' '.join(args)} failed (rc={cp.returncode}): {stderr}",
                 command=tuple(args),
                 returncode=cp.returncode,
-                stderr=cp.stderr.strip(),
+                stderr=stderr,
             )
         return cp
 
@@ -210,20 +408,54 @@ class Repo:
             return False
         return self._git("rev-parse", "--verify", "HEAD", check=False).returncode == 0
 
-    def init(self, *, when: datetime | None = None) -> str:
+    def init(
+        self, *, when: datetime | None = None, schema_version: int = 1, kb_id: str | None = None
+    ) -> str:
         """Initialize a knowledge repo: ``git init`` on the curated branch, ignore ``_kb/``, and
         make the initial commit (so a curated ref + HEAD exist for worktrees and CAS). Idempotent —
-        returns the current commit if already initialized. ``when`` pins the commit's date."""
+        returns the current commit if already initialized. ``when`` pins the commit's date.
+
+        ``schema_version`` selects the KB wiki schema the seed ``index.md`` is written in: ``1`` is
+        ADR-0010's root index, ``2`` is ADR-0041 D1.2's root map. Anything ``>= 2`` REQUIRES
+        ``kb_id`` — the ``_meta/kb.yaml`` ULID every schema-2 note mirrors into ``kb:`` (D1.5) —
+        and raises :class:`ValueError` without one.
+
+        **That is why the default is 1 rather than the version this build writes.** ``Repo.init``
+        cannot MINT a ``kb_id``: D1.5 says it is stamped once at repo creation and never rewritten,
+        which makes it the init COMMAND's fact (``agora repo init`` writes ``_meta/kb.yaml`` before
+        calling this, then passes the id down). Defaulting to a version this method cannot serve
+        unaided would turn every existing caller into a crash; defaulting to 1 keeps them
+        byte-identical and makes "seed schema 2" the deliberate, identity-carrying act it is.
+
+        Both seeds are written ONLY when ``index.md`` is absent, and the whole method returns early
+        on an already-initialized repo — so a re-init can never rewrite a root map, and in
+        particular can never restamp the ``kind:``/``type:`` schema mirror of a repo built at the
+        other version.
+        """
         if self.is_initialized():
             return self.head_commit()
+        if schema_version >= 2 and not kb_id:
+            raise ValueError(
+                f"seeding a KB wiki schema {schema_version} repo requires kb_id: the "
+                f"_meta/kb.yaml ULID is minted ONCE at repo creation and every note mirrors it "
+                f"into `kb:` (ADR-0041 D1.5/D2)"
+            )
         self.root.mkdir(parents=True, exist_ok=True)
         self._git("init", "-b", self._branch)
         (self.root / ".gitignore").write_text(_GITIGNORE, encoding="utf-8")
+        # AFTER `git init` (the predicate asks git, which needs a repo) and never unconditionally:
+        # see :func:`_ensure_blob_attributes` for why a re-init must not truncate this file.
+        _ensure_blob_attributes(self.root)
         when_resolved = when or datetime.now(UTC)
         index = self.layout.index_file
         if not index.exists():
             seed_date = when_resolved.astimezone(UTC).strftime("%Y-%m-%d")
-            index.write_text(_SEED_INDEX.format(date=seed_date), encoding="utf-8")
+            seed = (
+                _SEED_INDEX_V2.format(date=seed_date, kb_id=kb_id)
+                if schema_version >= 2
+                else _SEED_INDEX.format(date=seed_date)
+            )
+            index.write_text(seed, encoding="utf-8")
         env = self._commit_env(
             name=_DEFAULT_AUTHOR_NAME, email=_DEFAULT_AUTHOR_EMAIL, when=when_resolved
         )
@@ -376,7 +608,7 @@ class Repo:
         env = None if interactive else self._non_interactive_push_env()
         cp = self._git("push", "--", remote, refspec, check=False, env=env, timeout=timeout)
         if cp.returncode != 0:
-            stderr = cp.stderr.strip()
+            stderr = _printable(cp.stderr.strip())
             if "non-fast-forward" in stderr or "[rejected]" in stderr:
                 raise GitError(
                     f"push to {remote!r} rejected (non-fast-forward): the remote's {name!r} is "

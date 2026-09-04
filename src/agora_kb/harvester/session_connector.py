@@ -12,8 +12,9 @@ Pipeline (all deterministic + model-free — the curator's two acts stay the onl
 1. **Path-safe glob.** Reuses :func:`~agora_kb.harvester.connectors._resolve_glob_files` — the same
    ``~``-expand / symlink-escape-containment / gold-exclusion / size+count caps as ``file:``. The
    whole-source hash over the raw file bytes is the §6 no-op (ADR-0023 decision 8).
-2. **Parse.** Drives a :class:`~agora_kb.harvester.session_sources.SessionReader` (default
-   :class:`~agora_kb.harvester.session_sources.ClaudeCodeJsonlReader`) into flat-role turn records
+2. **Parse.** Drives the :class:`~agora_kb.harvester.session_sources.SessionReader` selected by
+   the connector's declared ``format:`` (default
+   :data:`~agora_kb.harvester.session_sources.DEFAULT_SESSION_FORMAT`) into flat-role turn records
    — role attribution FLATTENED so a transcript turn cannot impersonate engine structure (ADR-0023
    §7).
 3. **Distill (precision-first salience).** Whole agora sentinel SPANS are dropped from each
@@ -61,7 +62,7 @@ from .connectors import (
     _require_source_path,
     _resolve_glob_files,
 )
-from .session_sources import ClaudeCodeJsonlReader, SessionReader
+from .session_sources import SessionReader, build_session_reader
 
 __all__ = ["SessionConnector"]
 
@@ -98,8 +99,12 @@ def _paragraphs(text: str) -> list[str]:
 class SessionConnector:
     """Distill agent session transcripts into gated candidate facts (ADR-0023, issue #25).
 
-    Constructed from a ``session:<agent>`` connector key. ``reader`` is the format parser (default
-    :class:`ClaudeCodeJsonlReader`; the seam keeps the connector tool-agnostic — invariant #6).
+    Constructed from a ``session:<agent>`` connector key. ``reader`` is the format parser, injected
+    by :func:`~agora_kb.harvester.harvester.build_connectors` from the connector's declared
+    ``format:`` (issue #147); when omitted it resolves
+    :data:`~agora_kb.harvester.session_sources.DEFAULT_SESSION_FORMAT`. The ``<agent>`` half of the
+    key never selects a parser — a transcript grammar is a declared format, not an identity
+    (invariant #6).
     ``redact_policy`` is the connector-boundary redaction policy applied before ``fact_key`` is
     computed; ``None`` disables redaction (the operator's explicit kill-switch, accepting the
     un-scrubbable-inbox risk — ADR-0023 addendum §5). Size/count caps default larger than ``file:``
@@ -127,7 +132,13 @@ class SessionConnector:
         self._agent = agent
         self._scope = Scope(scope)
         self._path = path
-        self._reader = reader or ClaudeCodeJsonlReader()
+        # The reader is INJECTED by build_connectors from the connector's declared format
+        # (issue #147). The fallback resolves the registry's DEFAULT_SESSION_FORMAT rather
+        # than naming a reader class here, so there is exactly ONE place that decides what an
+        # undeclared format means — a connector constructed directly (a test, an embedder)
+        # and one built from config can never disagree. Behaviour is unchanged: the default
+        # format still resolves to ClaudeCodeJsonlReader.
+        self._reader = reader if reader is not None else build_session_reader()
         self._redact_policy = redact_policy
         self._max_files = max_files
         self._max_file_bytes = max_file_bytes

@@ -18,6 +18,7 @@ from pathlib import Path
 import pytest
 from fastmcp import Client
 
+from agora_kb.config import KbIdentity, ReadOnlySchemaVersionError, write_kb_identity
 from agora_kb.core import Inbox, Repo, failed_event_count
 from agora_kb.core.wiki import Wiki
 from agora_kb.faces.mcp_server import AgoraHandlers, build_server
@@ -82,8 +83,11 @@ sys.exit(0)
 # run with a `PLAN-BACKEND:` reason and a durable `_kb/failed/**/error.json` record.
 _DEAD_BRAIN = 'import sys\nsys.stderr.write("ollama: connection refused\\n")\nsys.exit(1)\n'
 
+#: The fixture `_meta/kb.yaml` identity (ADR-0041 D1.5) — APPLY refuses to write without one.
+_KB_ID = "01J8ZQ3M4N5P6Q7R8S9T0V1W2X"
+
 _TAXONOMY = Taxonomy(
-    schema_version=1,
+    schema_version=2,
     taxonomy_policy="open",
     allowed_tags=("curator", "concurrency"),
     domains=("ai-tech",),
@@ -105,8 +109,12 @@ def _init_curatable_repo(tmp_path: Path) -> Repo:
     inputs exist) plus a stub-brain adapters.yaml the SubprocessBackend shells. No real model.
     """
     repo = Repo.resolve(tmp_path)
-    repo.init(when=datetime(2026, 6, 12, 0, 0, 0, tzinfo=UTC))
-    emit_schema(repo.layout, taxonomy=_TAXONOMY)
+    write_kb_identity(repo.layout, KbIdentity(kb_id=_KB_ID, name="agora-fixture"))
+    for name in ("concepts", "summaries", "notes", "maps", "entities", "people"):
+        (repo.layout.wiki_dir / name).mkdir(parents=True, exist_ok=True)
+        (repo.layout.wiki_dir / name / ".gitkeep").write_text("", encoding="utf-8")
+    repo.init(when=datetime(2026, 6, 12, 0, 0, 0, tzinfo=UTC), schema_version=2, kb_id=_KB_ID)
+    emit_schema(repo.layout, taxonomy=_TAXONOMY, schema_version=2)
     repo.commit_all("chore: emit schema", when=datetime(2026, 6, 12, 1, 0, 0, tzinfo=UTC))
 
     brain = tmp_path / "stub_brain.py"
@@ -121,7 +129,7 @@ def _init_curatable_repo(tmp_path: Path) -> Repo:
     # repo.yaml carries the matching taxonomy domain + the stub as the default brain.
     (repo.layout.kb_dir).mkdir(parents=True, exist_ok=True)
     (repo.layout.kb_dir / "repo.yaml").write_text(
-        "name: personal\nkind: personal\nschema_version: 1\ndomains: [ai-tech]\n"
+        "name: personal\nkind: personal\nschema_version: 2\ndomains: [ai-tech]\n"
         "curator:\n  backend: stub\n",
         encoding="utf-8",
     )
@@ -373,7 +381,7 @@ def test_curate_with_stub_backend_publishes(tmp_path: Path) -> None:
     assert isinstance(result["published_commit"], str) and result["published_commit"]
     assert result["counts"].get("CREATE_THEME") == 1
     # Read-after-publish: the theme is on disk and the deterministic query resolves it.
-    theme = repo.layout.wiki_dir / "ai-tech" / "themes" / "curator-concurrency.md"
+    theme = repo.layout.wiki_dir / "concepts" / "curator-concurrency.md"
     assert theme.is_file()
     assert Wiki(repo.layout).query("curator concurrency").status == "ok"
     # The BODY oracle (#115). Without it this test passes on a note whose body is still the
@@ -495,3 +503,55 @@ def test_build_server_registers_seven_tools(tmp_path: Path) -> None:
         "kb_status",
         "kb_curate",
     }
+
+
+# --- ADR-0041 D6: the write refusal on the MCP face ----------------------------------------------
+
+
+def _make_schema_1(repo: Repo) -> None:
+    """Rewrite the fixture's canonical declaration to schema 1 — the owner's existing KB shape."""
+    taxonomy_path = repo.layout.meta_dir / "taxonomy.yaml"
+    raw = taxonomy_path.read_text(encoding="utf-8")
+    taxonomy_path.write_text(
+        raw.replace("schema_version: 2", "schema_version: 1"), encoding="utf-8"
+    )
+
+
+def test_kb_curate_refuses_a_schema_1_repo(tmp_path: Path) -> None:
+    """ADR-0041 D6: the ``kb_curate`` handler is one of the five exhaustive write-path call sites.
+
+    A RAISE, not a ``{"status": ...}`` dict: the ``no_backend`` shape reports a repo that is fine
+    but unconfigured, whereas this is a refusal to touch the repo at all, and the FastMCP tool
+    error carries the remedy to the calling agent verbatim. It fires BEFORE the backend is built,
+    so a schema-1 repo refuses identically whether or not a brain is wired — the verdict is about
+    the repo, never about ``adapters.yaml``.
+    """
+    repo = _init_curatable_repo(tmp_path)
+    _make_schema_1(repo)
+    handlers = AgoraHandlers(repo)
+
+    with pytest.raises(ReadOnlySchemaVersionError) as exc:
+        handlers.curate()
+
+    assert "agora import --from-kb" in str(exc.value)
+
+
+def test_kb_remember_refuses_a_schema_1_repo_while_reads_keep_working(tmp_path: Path) -> None:
+    """The server-construction guard CANNOT express this, which is why the gate is per-write-path.
+
+    ``guard_repo_schema_version`` passes for a schema-1 repo by design (``SUPPORTED_KB_SCHEMA_
+    VERSIONS`` is ``{1, 2}`` so reads keep working), so one and the SAME server object must serve
+    ``kb_query``/``kb_status`` and refuse ``kb_remember``. That asymmetry is only reachable from a
+    gate inside ``Inbox.write``.
+    """
+    repo = _init_curatable_repo(tmp_path)
+    _write_wiki_notes(tmp_path)
+    _make_schema_1(repo)
+    handlers = AgoraHandlers(repo)
+
+    with pytest.raises(ReadOnlySchemaVersionError):
+        handlers.remember(text="a fact the curator could never drain")
+
+    # Same object, same repo: the read tools are unaffected.
+    assert handlers.status()["inbox_depth"] == 0
+    assert handlers.query("curator")["status"] in ("ok", "not_found")

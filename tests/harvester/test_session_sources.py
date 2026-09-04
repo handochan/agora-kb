@@ -10,10 +10,18 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from agora_kb.harvester.session_sources import (
+    DEFAULT_SESSION_FORMAT,
+    SESSION_READERS,
     ClaudeCodeJsonlReader,
+    SessionFormatError,
     SessionReader,
     TurnRecord,
+    build_session_reader,
+    implemented_session_formats,
+    is_implemented_format,
 )
 
 
@@ -262,3 +270,73 @@ def test_read_turns_is_lazy_iterator() -> None:
     )
     # a generator — consumable once, not a materialized list
     assert iter(it) is it
+
+
+# --- the format registry (issue #147, invariant #6) ---------------------------------------------
+
+
+def test_default_format_resolves_to_the_claude_code_reader() -> None:
+    """An undeclared format keeps today's parser — the byte-identical-default guarantee."""
+    assert DEFAULT_SESSION_FORMAT == "claude-code-jsonl"
+    assert isinstance(build_session_reader(), ClaudeCodeJsonlReader)
+    assert isinstance(build_session_reader(None), ClaudeCodeJsonlReader)
+    assert isinstance(build_session_reader(DEFAULT_SESSION_FORMAT), ClaudeCodeJsonlReader)
+
+
+def test_every_registered_reader_satisfies_the_protocol() -> None:
+    """A registry entry that is not a SessionReader would break the connector at scan time."""
+    for name in SESSION_READERS:
+        try:
+            reader = build_session_reader(name)
+        except SessionFormatError:
+            continue  # a documented not-yet-implemented slot; covered by its own test below
+        assert isinstance(reader, SessionReader)
+
+
+def test_unknown_format_fails_loud_and_names_the_known_ones() -> None:
+    with pytest.raises(SessionFormatError) as exc:
+        build_session_reader("gemini-transcript")
+    msg = str(exc.value)
+    assert "gemini-transcript" in msg
+    assert DEFAULT_SESSION_FORMAT in msg  # the error tells the operator what IS available
+
+
+def test_placeholder_slot_raises_a_clear_not_implemented_error() -> None:
+    """The slot-in point exists and is tested: a registered format with no reader fails LOUDLY.
+
+    Falling back to the Claude Code parser here would be the invariant-6 bug in a new costume —
+    a foreign transcript parsed with the wrong grammar yields a silent zero-fact harvest.
+    """
+    assert "codex-jsonl" in SESSION_READERS
+    with pytest.raises(SessionFormatError) as exc:
+        build_session_reader("codex-jsonl")
+    assert "codex-jsonl" in str(exc.value)
+
+
+def test_is_implemented_format_separates_a_real_parser_from_a_slot() -> None:
+    """The predicate the config vocabulary is derived from (issue #147 review).
+
+    Derived FROM the registry, so a slot becoming real is one edit — swap the factory — and the
+    config vocabulary, `agora doctor`'s line and this test all follow without a second list.
+    """
+    assert is_implemented_format(DEFAULT_SESSION_FORMAT)
+    assert not is_implemented_format("codex-jsonl")  # registered slot, no parser in this build
+    assert not is_implemented_format("gemini-transcript")  # not registered at all
+    assert implemented_session_formats() == (DEFAULT_SESSION_FORMAT,)
+    # Every name it reports must actually build; every registered name it withholds must not.
+    for name in SESSION_READERS:
+        if is_implemented_format(name):
+            assert isinstance(build_session_reader(name), SessionReader)
+        else:
+            with pytest.raises(SessionFormatError):
+                build_session_reader(name)
+
+
+def test_registry_keys_are_formats_not_agent_names() -> None:
+    """A guard on the shape of the registry, not just its contents (invariant #6).
+
+    Keying on an agent name is what the engine must never do: two agents sharing a grammar would
+    need duplicate entries, and one agent changing grammar could not be expressed at all.
+    """
+    assert "claude-code" not in SESSION_READERS
+    assert "codex" not in SESSION_READERS

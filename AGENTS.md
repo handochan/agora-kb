@@ -22,7 +22,11 @@ edits the shared wiki. Repo = tenant boundary. See [`docs/ARCHITECTURE.md`](docs
 1. **Markdown + git is the source of truth.** No database holds canonical knowledge; DBs are for
    metadata/indexes only and must be rebuildable from the markdown.
 2. **All writes go through the inbox.** No face writes the wiki directly. Only the curator writes
-   `wiki/`, indexes, and `log.md`.
+   `wiki/`, indexes, and `log.md` — with one carve-out ADR-0041 D3.3 states normatively:
+   `wiki/people/**` is a HUMAN-owned namespace outside the curated wiki. The curator may never
+   write it (`curator/constants.py ALLOWLIST_DENY_PREFIXES`, so both the PLAN check and the
+   final-diff assertion refuse it), lint never grades it, and its basenames are outside the global
+   `[[basename]]` identity space. Read stays first class.
 3. **The inbox is append-only and per-writer-namespaced.** Never edit or reorder inbox items.
 4. **Every component has an OSS path.** Proprietary services are optional plugins behind adapters,
    never required for the core to run. Avoid copyleft/AGPL deps in the core library.
@@ -42,7 +46,11 @@ src/agora_kb/
   core/        single internal API: inbox(write) · wiki(read) + index_cache.py (the ADR-0012 §2
                derived query reader cache, _kb/index/, issue #26) + gold.py (ADR-0027 pack
                assembler, _kb/gold/) + redact.py/sentinel.py (outbound redaction + the §8 sentinel,
-               ADR-0023/0027) · repo/tenant · state
+               ADR-0023/0027) + rank_snapshot.py (the model-free deterministic ranking snapshot
+               behind `agora eval`, #44) + layout.py (the ADR-0041 KIND_DIRECTORIES vocabulary and
+               the `note_path_for` schema-2 path composer) + pathsafe.py (the closed
+               Unicode-category component/slug allowlist that replaced the ASCII plan regex) +
+               ids.py (the inline ULID minted once as `_meta/kb.yaml kb_id`) · repo/tenant · state
   curator/     sleep-time consolidation worker + backends (BackendRegistry, per-act plan/author
                routing — ADR-0015) + triggers + isolation/ (OS sandbox)
   adapters/    curator-brain shims invoked via adapters.yaml argv: ollama_brain.py
@@ -62,10 +70,14 @@ src/agora_kb/
                HTMX/Jinja2 UI incl. /graph, ADR-0019/0020/0021), web/metrics.py (Prometheus /metrics
                exporter), web/templates/ (graph.html), web/static/ (vendored MIT htmx + force-graph +
                graph.js — no Node/CDN)
-  schema/      the KB wiki schema (AGENTS.md template emitted into each knowledge repo) + lint
+  schema/      the KB wiki schema (AGENTS.md template emitted into each knowledge repo:
+               templates/kb_schema.md for schema 1, templates/kb_schema_v2.md for schema 2 —
+               `emit_schema` picks by the repo's `schema_version`) + notes.py (the kind/subjects
+               reading layer, derived for BOTH schemas) + lint (the L1 ruleset, dispatched by the
+               same version; L1-22/23/24 are schema-2 only)
   config.py    load config (adapters.yaml, repo.yaml, triggers + harvest policy + connector specs)
   cli.py       `agora` entry point (repo init · import · status · curate · harvest · index · gold ·
-               sync · watch · serve · web · doctor)
+               eval · sync · watch · serve · web · doctor)
   # --- not yet implemented (later phases) ---
   auth/        (Phase 4+ — stub) authn/authz (tokens, OpenFGA/Forgejo delegation)
 deploy/        launchd/systemd unit templates for always-on watch/web + harvest schedule (#65)
@@ -118,6 +130,43 @@ fixes (#56/#57 — CJK-bigram tokenizer/cache v2 + `note-<sha8>` slug fallback);
 push-only remote backup (#64); `deploy/` launchd/systemd packaging (#65); upload hardening — SSRF
 guard + zip-bomb cap + `.epub` (#66/#53); per-user identity threading `web.identity.trusted_header`
 → `web:<user>` (#67); and the team deployment guide [`docs/DEPLOY-TEAM.md`](docs/DEPLOY-TEAM.md) (#68).
+
+**Stratum — KB wiki schema 2 (ADR-0041, in progress on `feat/stratum-unit2-schema2`, #153).** The
+wiki's two axes are flipped: the first path segment under `wiki/` IS the note's **kind**
+(`concepts/` · `summaries/` · `notes/<yyyy>/<mm>/` · `maps/` · `entities/` · `people/`, with the
+root map at `index.md`), and the subject leaves the path for the `subjects:` frontmatter list.
+`raw/` is unmoved and byte-identical to schema 1, which is what keeps every `sources:` string
+resolvable. Landed so far: the schema-2 note model + lint ruleset (`19d21f5`), the layout
+accessors + inline ULID + `_meta/kb.yaml` identity + the writable-schema predicate (`f58c7a2`),
+`kb_schema_v2.md` + `agora repo init --schema` (`c6c79e8`), the schema-2 plan path grammar +
+`wiki/people/` allowlist carve-out + the pathsafe swap (`708da4b`), APPLY writing schema 2
+(`18bb029`), the curator running on schema 2 with **schema-1 repos read-only** (`883291a`), the
+ranker seeding from `wiki/maps/` + reader cache v3 (`0c250aa`), gold/MCP/web on `kind` + `subjects`
+with `wiki/people/**` never leaving through a pack (`853d774`), and the pre/post-flip ranking
+goldens (`c1c3d9e`, `510d06c`, `9a5bab6`); and, in **wave W2.4**, `agora import` writing schema 2
+into a new destination plus the `--from-kb` D6 converter and the refusal surfaces around it, and in
+**wave W2.5** the `raw/_blob` capture end to end — inbox `_attach/` staging carries the original
+bytes with the event (`37dd56e`), APPLY materialises `raw/_blob/<ab>/<sha256>.<ext>` plus its
+sidecar under the bytes-mode gate so the brain never sees bytes (`d244e5e`), web uploads keep their
+original file and `agora capture --file` is the no-server capture (`7a30124`), with an opt-in
+live-brain e2e behind the `live` marker (`b3a5853`). Still open: the two empty tiers
+(`wiki/summaries/` and
+`wiki/entities/` have directories, frontmatter shapes and lint rules and NO producer — OD-7/OD-8;
+`ADR-0040` is unauthored), and the `wiki/people/` fences the ADR specifies but no code implements
+(the repo-internal `file:`-connector rule, and the undesigned pull-surface control for people
+content reaching `kb_query`/`kb_read`/`kb_neighbors` — residual risk R1). `agora repo init` now
+defaults to schema 2;
+`SUPPORTED_KB_SCHEMA_VERSIONS` is `{1, 2}`, so a schema-1 repo still READS but every write path
+refuses (D6), and the one sanctioned crossing is `agora import --from-kb <old-repo> <new-repo>` —
+a conversion into a NEW repo implementing D6 rules 1-7, never an in-place migration (W2.4, which
+also lands the schema-2 vault importer — which refuses ANY already-initialized destination and
+re-targets pre-existing body markdown links — the `doctor`/`status` READ-ONLY line, doctor's
+`status: unhealthy`/exit-1 verdict on a schema-1 repo, and the web upload's per-file receipt error
+for a read-only repo). Still NOT shipped: any producer for `wiki/summaries/` or `wiki/entities/`
+(OD-7/OD-8, ADR-0040 unauthored), and the `people/` egress fences (the repo-internal
+`file:`-connector rule and the pull-surface control, residual risk R1).
+ADR-0041 is **Accepted** (2026-09-05, OD-1..OD-10 ratified as recommended — OD-10 as a deliberate
+deferral) — read its acceptance record before changing anything it decides.
 
 Next is **Phase 4** (auth + multi-tenancy); the gating design debt is the authn/authz ADR (#69).
 See [`docs/ROADMAP.md`](docs/ROADMAP.md) and the GitHub Project "agora dev" board (the live

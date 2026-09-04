@@ -120,6 +120,29 @@ def test_author_routes_network_none_through_isolation(tmp_path: Path, monkeypatc
     assert "PATH" in sb.env  # innocuous vars survive
 
 
+def test_sandboxed_author_env_forces_utf8_child_stdio(tmp_path: Path, monkeypatch) -> None:  # noqa: ANN001
+    """(postfix-2) The SANDBOXED PASS-2 path must carry the #85 UTF-8 child-stdio pin too.
+
+    ``_invoke_sandboxed`` builds its own :class:`SandboxSpec` env and never reaches ``run_backend``,
+    so the ``with_utf8_child_env`` merge there is the ONLY thing standing between a hostile outer
+    ``PYTHONIOENCODING`` and a shim child that decodes the UTF-8 prompt bytes we hand it on stdin
+    at the wrong encoding. ``network: 'none'`` — the confined posture — is exactly the ADR-0013
+    ``sandbox: strict`` configuration, so this is the supported path, not a hypothetical one.
+    """
+    monkeypatch.setenv("PYTHONIOENCODING", "cp949")  # the hostile outer env Codex named
+    monkeypatch.delenv("PYTHONUTF8", raising=False)
+    note_rel = "wiki/general/themes/probe.md"
+    _note_with_sentinel(tmp_path, note_rel)
+    spec = BackendSpec(name="confined", argv=(sys.executable, "-c", "pass"), network="none")
+    iso = _RecordingIsolation()
+
+    SubprocessBackend(spec, isolation=iso).author(tmp_path, {note_rel: ["c1"]}, {})
+
+    assert len(iso.specs) == 1
+    assert iso.specs[0].env["PYTHONIOENCODING"] == "utf-8"
+    assert iso.specs[0].env["PYTHONUTF8"] == "1"
+
+
 def test_plan_is_never_confined(tmp_path: Path) -> None:
     """PASS 1 (plan) writes no wiki files; it runs UNCONFINED even with an isolation adapter."""
     canned = '{"schema_version": 1, "run_id": "r", "finished": true, "dispositions": []}'

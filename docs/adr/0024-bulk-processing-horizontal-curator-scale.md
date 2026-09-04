@@ -1,6 +1,7 @@
 # ADR-0024 — Bulk knowledge processing & horizontal curator scale (shard by repo)
 
 **Status:** Accepted · 2026-07-05 (Step-0 ratified, #36) · Proposed 2026-06-24
+**AMENDED (append-only) — [ADR-0041](0041-stratum-kind-first-layout.md) (Proposed, KB wiki schema 2) narrows the recorded OPTION SET:** the deferred alternative (b), *"domain-partitioned writers owning disjoint `wiki/<domain>/` subtrees"*, becomes STRUCTURALLY UNAVAILABLE — there are no per-domain subtrees to partition once the subject leaves the path. **This ADR's actual decision is UNCHANGED and unaffected** (shard by repo only, never a second writer within a repo; the OD-3a claim cap is untouched). The prose below is retained verbatim for history.
 
 Extends [ADR-0002](0002-cqrs-single-writer-curator.md) (CQRS + exactly one curator per repo) and
 [ADR-0006](0006-repo-as-tenant-boundary.md) (repo = tenant boundary; the natural sharding axis).

@@ -363,3 +363,58 @@ def test_heading_slug_step6_counter_is_per_base_collision_documented() -> None:
     assert heading_slug("Notes", seen=seen) == "notes-1"  # base 'notes', count 1 -> 'notes-1'
     assert heading_slug("Notes 1", seen=seen) == "notes-1"  # base 'notes-1', count 0 -> 'notes-1'
     assert heading_slug("Notes 1", seen=seen) == "notes-1-1"  # base 'notes-1', count 1
+
+
+# --- ADR-0041 D2.2 / D3.2: where a subject comes from, and where it does NOT ---------------------
+@pytest.mark.parametrize(
+    ("rel_path", "expected"),
+    [
+        ("wiki/finance/themes/budget.md", ("finance",)),  # a real v1 domain directory
+        ("wiki/finance/finance-moc.md", ("finance",)),
+        ("wiki/stray.md", ()),  # tolerated directly under wiki/ — NO domain directory
+        ("index.md", ()),  # the root index belongs to no domain
+        ("README.md", ()),
+    ],
+)
+def test_schema_1_subjects_come_from_a_domain_directory_never_a_filename(
+    rel_path: str, expected: tuple[str, ...]
+) -> None:
+    """A stray note under ``wiki/`` has no subject — reporting its FILENAME would invent one.
+
+    ADR-0014 D1's tolerant read exists for exactly that file (``wiki/README.md``, an un-normalized
+    vault file), and the fabricated value would reach every read payload: a heading on the web home
+    page, a chip on ``/graph``, and a member of ``GET /api/notes``' ``subjects`` union.
+    """
+    from agora_kb.schema.notes import _derive_subjects
+
+    assert _derive_subjects(rel_path, {}, 1) == expected
+
+
+def test_lint_still_reads_a_stray_notes_domain_so_l1_5_can_reject_it() -> None:
+    """The two v1 readings differ ON PURPOSE — this pins the half the read facet must not copy."""
+    from agora_kb.schema.notes import v1_path_domain
+
+    assert v1_path_domain("wiki/stray.md") == "stray.md"
+    assert v1_path_domain("wiki/finance/themes/budget.md") == "finance"
+    assert v1_path_domain("index.md") is None
+
+
+def test_the_people_exclusion_is_one_schema_gated_predicate() -> None:
+    """ADR-0041 D3.3's tree exists only on schema 2 (``lint``'s ``skip_people = version >= 2``).
+
+    ``core.gold`` and ``faces.mcp_server`` both ask this question, and an unconditional path test
+    in either would make a schema-1 repo that merely owns a ``people`` DOMAIN answer one way for
+    the dashboard and another for the pack.
+    """
+    from agora_kb.schema.notes import Note, is_people_path, is_ungraded_people_note
+
+    v2 = Note(rel_path="wiki/people/hando/desk.md", basename="desk", type=None, schema_version=2)
+    v1 = Note(rel_path="wiki/people/hando/desk.md", basename="desk", type=None, schema_version=1)
+    concept = Note(rel_path="wiki/concepts/a.md", basename="a", type=None, schema_version=2)
+
+    assert is_ungraded_people_note(v2) is True
+    assert is_ungraded_people_note(v1) is False  # an ordinary v1 domain, graded like any other
+    assert is_ungraded_people_note(concept) is False
+    # The bare path predicate is schema-blind by design; the gate above is what callers use.
+    assert is_people_path("wiki/people/hando/desk.md") is True
+    assert is_people_path("wiki/People/hando/desk.md") is False  # exact-case, D3.1 closed set

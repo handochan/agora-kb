@@ -1,0 +1,43 @@
+# The OWNER-SIDE eval set: the same four issue-#146 questions, asked of a REAL knowledge base.
+#
+#   agora eval --repo ~/knowledge-agora-dogfood \
+#              --queries tests/rank_golden/queries_dogfood.yaml \
+#              --out .omc/eval/dogfood-v1.json
+#
+# WHY IT EXISTS. `golden_v1.json` pins the ranker over a 42-note synthetic corpus, which is the
+# only corpus that can live in git: the dogfood KB is private and its content must never enter this
+# repo. So the private half of gate B is a snapshot the OWNER takes on their own machine, keeps
+# under `.omc/eval/` (git-ignored), and re-takes after the Stratum layout flip. `diff_snapshots`
+# then reads the before/after pair exactly as it reads the committed golden — the record is keyed
+# on note BASENAMES, so it survives the layout move.
+#
+# WHAT IS AND IS NOT DECLARED HERE. `expect: ok` only. No `note:` is asserted, because the right
+# answer depends on the private corpus and this file is public: naming an expected note would leak
+# a fragment of the KB and would go stale the first time the curator rewrites that note. The gate
+# on the dogfood side is therefore the exit code (does the real KB still answer these at all?) plus
+# the human reading of the snapshot diff.
+#
+# EXTENDING IT. The owner is expected to append their own questions — the ones they actually ask
+# the KB — as further `id: d0N` entries, keeping the four below verbatim and unchanged. Adding
+# entries invalidates nothing: the record is keyed on query `id`, and `diff_snapshots` reports an
+# id present on only one side as "query added"/"query removed" rather than as a ranking change.
+
+- id: q146-1
+  question: "unbilled receivables"
+  expect: ok
+  rationale: The #146 anchor query, asked of the real KB.
+
+- id: q146-2
+  question: "investing index funds"
+  expect: ok
+  rationale: Every token is also structural furniture in a finance-heavy KB.
+
+- id: q146-3
+  question: "cooking finance investing"
+  expect: ok
+  rationale: Cross-domain; exercises the ADR-0012 §4 Stage-1 domain focus on a real domain set.
+
+- id: q146-4
+  question: "finance segment reporting thresholds"
+  expect: ok
+  rationale: Domain-focused and heading-shaped; the §6 reason-precedence probe.

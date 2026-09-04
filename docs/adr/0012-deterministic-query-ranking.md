@@ -1,6 +1,7 @@
 # ADR-0012 — Deterministic Query Ranking for core.wiki
 
 **Status:** Accepted · 2026-06-13
+**AMENDED (append-only) — [ADR-0041](0041-stratum-kind-first-layout.md) (Proposed, KB wiki schema 2) replaces the §2 `is_moc` definition and the §4 stage-1 SEED rule:** a map is any note under `wiki/maps/**` (segment 1 == `maps`), not `wiki/<domain>/<domain>-moc.md`; the domain-in-scope filter is re-expressed as a read of a map's own `subjects:` frontmatter. Everything downstream is KEPT VERBATIM — §0a (no external scorer), the §1/§3 tokenizer and its #56 addendum, §5 weights, §6 gate, §7 extraction, §8 `fm` boost, `FLOOR`, the multi-seed label-union rule, and the #146 addendum's `lex > 0` conditionality. **`CACHE_SCHEMA_VERSION` 2 → 3 IS REQUIRED.** `core/index_cache.py`'s own normative rule — *"MUST be bumped whenever the serialized `_Note` shape, the tokenizer, or the parser changes"* — fires twice: `is_moc` is parser-computed (`_parse_note`: `is_moc = _is_moc_path(path)`) **and serialized** into the cache payload, so a v1 verdict would survive forever behind an unchanged `source_digest`; and `_Note` gains a `subjects` accessor, which is a serialized-shape change in itself. `indeg`/`d_moc` are indeed recomputed at load and are not the reason. The fresh-repo argument does not cover it either: `SUPPORTED_KB_SCHEMA_VERSIONS` becomes `{1, 2}`, so a schema-1 repo with a populated `_kb/index/` is reachable by the schema-2 build — exactly the stale-cache case the bump exists for. The prose below is retained verbatim for history.
 
 Refines ADR-0009 (does not supersede); depends on ADR-0001, ADR-0002, ADR-0006, ADR-0008. Amended by ADR-0014 D3 (body graph edges are now standard markdown links `[Title](relative.md)`; frontmatter `related:`/`children:` stay `[[basename]]`).
 **Amends DATA-MODEL §9** (see §12).
@@ -797,3 +798,55 @@ proposed change requires editing a test in that file, the lexical-evidence guara
 simpler, and the diff should say so.
 
 [#146]: https://github.com/handochan/agora-kb/issues/146
+
+## Addendum — the WRITE path is pinned to the oracle: `query_lexical` (#144, landed 2026-09-04)
+
+**Status:** Accepted · amends §0's contract by ADDING one entry point. Nothing in §0's semantics,
+`QueryResult`/`SearchHit` shape, tokenizer, weights, floor or ordering changes; no existing caller
+changes behaviour.
+
+### Why
+
+§0 froze `core.wiki.query(...)` as *deterministic, model-free retrieval*, and §0a puts
+`lex`/`struct`/`fm`/`score`/`match_reason` inside core and nowhere else. What §0 did not say is
+**which callers depend on that freeze for what**. Two of them do, asymmetrically:
+
+* the **READ** face (`kb_query`, the web face) wants the best answer it can get. If a ranking tier
+  is ever added above the lexical floor, this is where it belongs, and the cost of a bad read is one
+  transient answer.
+* the **WRITE** path — `curator/bundle.py`'s §1.1 `related/` view — feeds the planning brain the
+  hits it picks `MERGE_INTO_THEME` targets from. The cost of a bad hit there is **permanent**: the
+  closed ADR-0011 op vocabulary has no DELETE, `apply.py` stamps the merged fact with real `raw/`
+  provenance, the inbox event drains to `processed/`, and tier-2 `content_sha256` dedup never
+  re-proposes it.
+
+Both called `Wiki.query`. So a change made for the read face would silently change what the curator
+merges — a coupling nobody would see in the diff that made it.
+
+### Decision
+
+`Wiki.query_lexical(question, *, limit)` is added as a SECOND public entry point on the same frozen
+contract: same signature, same `QueryResult`, and **byte-for-byte the same computation** — it *is*
+the implementation, and `query` delegates down to it. The split is a promise about the FUTURE, not a
+behaviour change:
+
+* `query_lexical` **never gains a model tier.** It is the §0a oracle, and the curator write path is
+  pinned to it (`curator/bundle.py`, `curator/constants.py DEFAULT_RELATED_K`).
+* `query` stays the read face's entry point and is the ONLY place a further tier may be added — and
+  because it is a pure delegation, a tier can only be written into `query`'s own body.
+* Adding a tier to `query` therefore still needs its own ADR (§0 remains frozen in that sense);
+  what this addendum removes is the possibility of doing it **by accident** on the write path.
+
+`tests/core/test_wiki_query_lexical_144.py` pins both halves: equivalence today, and independence
+(the oracle must not route through the read face).
+
+### Rejected alternatives
+
+* **A boolean flag on `query`** (`query(..., model_tier=False)`). The default would decide the write
+  path's fate, and every future caller would have to remember which value is the safe one. A named
+  method cannot be got wrong by omission.
+* **A comment at the call site only.** That is what the first draft had; a comment does not survive
+  a "unify these two callers" refactor, and the module docstring one screen above it was already
+  asserting the opposite.
+
+[#144]: https://github.com/handochan/agora-kb/issues/144

@@ -1,6 +1,7 @@
 # ADR-0021 — Interactive knowledge-graph viz: the first ADR-0019 §7 vendored per-route viz
 
 **Status:** Accepted · 2026-06-24 · realizes [ADR-0019](0019-web-face-stack.md) §7(b)
+**AMENDED (append-only) — [ADR-0041](0041-stratum-kind-first-layout.md) (Proposed, KB wiki schema 2) changes the graph NODE SHAPE:** `domain` (0..1, derived from the path by `_wiki_domain`) becomes `subjects` (0..n, read from frontmatter), `type` becomes `kind`, and `wiki/people/**` JOINS the node set (read-first-class). `/api/graph` is a face contract, so this is a visible release change. The node cap, the BFS, the `truncated` flag and the vendored force-graph choice are UNCHANGED. The prose below is retained verbatim for history.
 
 Realizes the **interactive knowledge-graph / backlink explorer** that ADR-0019 §7(b) enumerated as a
 qualifying trigger for the **per-route SPA-island / client-canvas viz** escape hatch. Binds the OSS

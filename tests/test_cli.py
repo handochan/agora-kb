@@ -8,6 +8,7 @@ not on PATH.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -26,8 +27,15 @@ from agora_kb import __version__
 from agora_kb import cli as cli_mod
 from agora_kb.adapters import cli_agent_brain, ollama_brain
 from agora_kb.cli import main
-from agora_kb.config import load_backend_registry
+from agora_kb.config import (
+    ConfigError,
+    ReadOnlySchemaVersionError,
+    WebUploadConfig,
+    load_backend_registry,
+    load_kb_identity,
+)
 from agora_kb.core import Inbox, Repo, RepoLayout, StateStore, failed_event_count
+from agora_kb.core.ids import is_ulid
 from agora_kb.core.inbox import InboxReturn
 from agora_kb.core.state import LastFailure
 from agora_kb.core.wiki import Wiki
@@ -35,6 +43,7 @@ from agora_kb.curator.claim import curator_lock
 from agora_kb.curator.isolation import SandboxUnavailable
 from agora_kb.curator.worker import RunFailure, RunReport
 from agora_kb.schema import lint
+from tests.support.kb_builder import NoteSpec, build_kb
 
 requires_git = pytest.mark.skipif(shutil.which("git") is None, reason="git not available")
 
@@ -170,10 +179,649 @@ def test_repo_init_emits_schema_and_repo_config_and_lints_clean(
     assert lint(layout).ok
 
 
+# --- repo init --schema 2 (ADR-0041 D6; OPT-IN in this wave) ------------------------------------
+_V2_KIND_DIRS = ("concepts", "summaries", "notes", "maps", "entities", "people")
+
+
+@requires_git
+def test_repo_init_schema_2_emits_the_v2_seed_and_lints_clean(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`repo init --schema 2` produces a repo that passes the SCHEMA-2 lint with zero findings.
+
+    This is the whole point of the flag: the seed must satisfy the ruleset it declares, or the
+    first thing an operator sees on a fresh v2 repo is a red KB it did not cause.
+    """
+    target = tmp_path / "kb"
+    argv = ["repo", "init", str(target), "--schema", "2", "--domain", "ai-tech", "--tag", "arch"]
+    assert main(argv) == 0
+    assert len(capsys.readouterr().out.strip()) in (40, 64)  # the admin commit sha
+
+    layout = RepoLayout(target)
+    # The emitted contract is ADR-0041's, and its header mirrors the canonical taxonomy (L1-17).
+    doc = layout.schema_file.read_text(encoding="utf-8")
+    assert "KB Wiki Schema v2" in doc
+    assert "is **`2`**" in doc
+    taxonomy = yaml.safe_load((target / "_meta" / "taxonomy.yaml").read_text(encoding="utf-8"))
+    assert taxonomy["schema_version"] == 2
+    repo_yaml = yaml.safe_load((layout.kb_dir / "repo.yaml").read_text(encoding="utf-8"))
+    assert repo_yaml["schema_version"] == 2  # the MIRROR agrees, or L1-17 fires
+
+    # Zero findings under BOTH the taxonomy-derived ruleset and an explicit schema-2 lint.
+    assert lint(layout).findings == ()
+    assert lint(layout, schema_version=2).findings == ()
+
+
+@requires_git
+def test_repo_init_schema_2_mints_kb_identity_mirrored_into_the_index(tmp_path: Path) -> None:
+    """`_meta/kb.yaml` carries a ULID `kb_id`, and the root map's `kb:` mirrors it (D1.5)."""
+    target = tmp_path / "kb"
+    assert main(["repo", "init", str(target), "--schema", "2", "--kind", "team"]) == 0
+
+    identity = load_kb_identity(RepoLayout(target))
+    assert identity is not None
+    assert is_ulid(identity.kb_id)
+    assert identity.name == "kb"
+    assert identity.declared_kind == "team"  # ADVISORY; the enforcing kind stays in _kb/repo.yaml
+
+    index = yaml.safe_load((target / "index.md").read_text(encoding="utf-8").split("---\n")[1])
+    assert index["kind"] == "index"
+    assert index["kb"] == identity.kb_id
+    assert index["subjects"] == []
+    assert index["children"] == []  # an EMPTY root map: no children, no child bullets
+    assert index["type"] == "index"  # the OKF mirror of `kind` (ADR-0041 OD-3), not the authority
+
+
+@requires_git
+def test_repo_init_schema_2_materializes_the_kind_directories(tmp_path: Path) -> None:
+    """The six kind directories exist with a .gitkeep, and the tree is fully committed.
+
+    The directory IS the kind under schema 2, so the tree is the schema's own statement of what
+    kinds exist — including the two that ship EMPTY (summaries, entities) and the one the curator
+    may never create (people). An uncommitted placeholder would leave `repo init` handing back a
+    dirty worktree.
+    """
+    target = tmp_path / "kb"
+    assert main(["repo", "init", str(target), "--schema", "2"]) == 0
+    for name in _V2_KIND_DIRS:
+        assert (target / "wiki" / name / ".gitkeep").is_file()
+    status = subprocess.run(
+        ["git", "status", "--porcelain"], cwd=target, capture_output=True, text=True, check=True
+    )
+    assert status.stdout == ""
+
+
+@requires_git
+def test_repo_init_schema_2_writes_per_kind_templates(tmp_path: Path) -> None:
+    target = tmp_path / "kb"
+    assert main(["repo", "init", str(target), "--schema", "2"]) == 0
+    templates = target / "_templates"
+    assert (templates / "concept.md").is_file()
+    assert (templates / "note.md").is_file()
+    assert not (templates / "theme.md").exists()  # the per-TYPE pair belongs to schema 1
+
+
+@requires_git
+def test_repo_init_schema_2_is_idempotent_and_never_remints_kb_id(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A kb_id is minted ONCE at repo creation and never rewritten (ADR-0041 D1.5).
+
+    Re-minting on a re-init would silently re-identify the knowledge base, orphaning the `kb:`
+    stamp already mirrored into every note.
+    """
+    target = tmp_path / "kb"
+    assert main(["repo", "init", str(target), "--schema", "2"]) == 0
+    first_sha = capsys.readouterr().out.strip()
+    identity = load_kb_identity(RepoLayout(target))
+    assert identity is not None
+
+    assert main(["repo", "init", str(target), "--schema", "2"]) == 0
+    assert capsys.readouterr().out.strip() == first_sha  # no new curated commit
+    again = load_kb_identity(RepoLayout(target))
+    assert again is not None
+    assert again.kb_id == identity.kb_id
+
+
+@requires_git
+def test_repo_init_defaults_to_schema_2(tmp_path: Path) -> None:
+    """A NEW repo gets the version this build WRITES (ADR-0041 D6) — no flag required.
+
+    The default is the write target and not a literal: a repo initialized at anything less is
+    read-only the moment it exists (curate/watch/requeue and every capture refuse), which is not a
+    default anyone would choose. All three declarations agree — the canonical taxonomy, the
+    git-ignored mirror, and the emitted schema doc header — so L1-17 finds no drift.
+    """
+    target = tmp_path / "kb"
+    assert main(["repo", "init", str(target), "--domain", "ai-tech"]) == 0
+
+    layout = RepoLayout(target)
+    assert "KB Wiki Schema v2" in layout.schema_file.read_text(encoding="utf-8")
+    assert (
+        yaml.safe_load((target / "_meta" / "taxonomy.yaml").read_text(encoding="utf-8"))[
+            "schema_version"
+        ]
+        == 2
+    )
+    assert (
+        yaml.safe_load((layout.kb_dir / "repo.yaml").read_text(encoding="utf-8"))["schema_version"]
+        == 2
+    )
+    # The whole schema-2 skeleton, on the DEFAULT path now.
+    identity = load_kb_identity(layout)
+    assert identity is not None
+    for name in _V2_KIND_DIRS:
+        assert (target / "wiki" / name / ".gitkeep").is_file()
+    assert (target / "_templates" / "concept.md").is_file()
+    assert not (target / "_templates" / "theme.md").exists()
+    index = (target / "index.md").read_text(encoding="utf-8")
+    assert "kind: index" in index
+    assert f"kb: {identity.kb_id}" in index
+    assert lint(layout).findings == ()
+
+
+@requires_git
+def test_repo_init_schema_1_still_works_and_says_it_is_read_only(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`--schema 1` is still buildable and still lints — and the operator is TOLD what it costs.
+
+    The inverse of the note this replaces. A schema-1 repo is readable (query/status/browse/doctor)
+    but READ-ONLY for this build (ADR-0041 D6), and the operator must hear that at init rather than
+    discover it at the first refused capture.
+    """
+    target = tmp_path / "kb"
+    assert main(["repo", "init", str(target), "--schema", "1", "--domain", "ai-tech"]) == 0
+
+    err = capsys.readouterr().err
+    assert "READ-ONLY" in err
+    assert "import --from-kb" in err
+    layout = RepoLayout(target)
+    assert "KB Wiki Schema v1" in layout.schema_file.read_text(encoding="utf-8")
+    assert not (target / "_meta" / "kb.yaml").exists()
+    assert not (target / "wiki").exists()
+    assert (target / "_templates" / "theme.md").is_file()
+    index = (target / "index.md").read_text(encoding="utf-8")
+    assert "type: index" in index and "kind: index" not in index
+    assert lint(layout).findings == ()
+
+
+@requires_git
+def test_repo_init_refuses_to_convert_an_existing_schema_1_repo_and_writes_NOTHING(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """ADR-0041 D6: "there is no in-place migrator", and no command silently upgrades a repo.
+
+    The regression this pins is a HALF-migration: seeding the schema-2 skeleton and re-stamping the
+    git-ignored `_kb/repo.yaml` mirror to 2 over a canonical `_meta/taxonomy.yaml` that stays at 1
+    leaves a previously healthy v1 repo permanently L1-17-broken, with the failure arriving only at
+    the lint gate AFTER the writes. The refusal must therefore come BEFORE anything is written.
+    """
+    target = tmp_path / "kb"
+    assert main(["repo", "init", str(target), "--schema", "1", "--domain", "general"]) == 0
+    capsys.readouterr()
+    before = sorted(q.relative_to(target).as_posix() for q in target.rglob("*") if q.is_file())
+
+    assert main(["repo", "init", str(target), "--schema", "2", "--domain", "general"]) == 1
+    err = capsys.readouterr().err
+    assert "no in-place migrator" in err
+    assert "import --from-kb" in err
+
+    # Nothing was written: same files, same mirror, and the repo still lints clean.
+    assert sorted(q.relative_to(target).as_posix() for q in target.rglob("*") if q.is_file()) == (
+        before
+    )
+    layout = RepoLayout(target)
+    assert not (target / "_meta" / "kb.yaml").exists()
+    assert not (target / "wiki").exists()
+    assert (
+        yaml.safe_load((layout.kb_dir / "repo.yaml").read_text(encoding="utf-8"))["schema_version"]
+        == 1
+    )
+    assert lint(layout).ok
+
+
+@requires_git
+def test_repo_init_refuses_to_downgrade_an_existing_schema_2_repo(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The refusal is symmetric — a conversion in either direction is a re-import, not an edit."""
+    target = tmp_path / "kb"
+    assert main(["repo", "init", str(target), "--schema", "2"]) == 0
+    capsys.readouterr()
+
+    assert main(["repo", "init", str(target), "--schema", "1"]) == 1
+    assert "import --from-kb" in capsys.readouterr().err
+    assert lint(RepoLayout(target)).ok
+
+
+@requires_git
+def test_repo_init_re_init_without_the_flag_KEEPS_the_repos_own_schema_version(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A bare re-init is IDEMPOTENT (this command's own docstring) on a schema-2 repo too.
+
+    The regression: `--schema` defaulting to 1 made a flagless re-init rewrite the `_kb/repo.yaml`
+    MIRROR to 1 while the canonical `_meta/taxonomy.yaml` kept saying 2 — permanent L1-17 drift
+    that fails every later lint and therefore the curator's §4.4 gate, clearable only by hand.
+    """
+    target = tmp_path / "kb"
+    assert main(["repo", "init", str(target), "--schema", "2"]) == 0
+    first_sha = capsys.readouterr().out.strip()
+
+    assert main(["repo", "init", str(target)]) == 0  # no --schema at all
+    assert capsys.readouterr().out.strip() == first_sha
+
+    layout = RepoLayout(target)
+    mirror = yaml.safe_load((layout.kb_dir / "repo.yaml").read_text(encoding="utf-8"))
+    canonical = yaml.safe_load((target / "_meta" / "taxonomy.yaml").read_text(encoding="utf-8"))
+    assert mirror["schema_version"] == canonical["schema_version"] == 2
+    assert lint(layout).ok  # no L1-17 drift
+
+
+@requires_git
+def test_repo_init_refuses_a_declaration_that_runs_AHEAD_of_the_tree(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A hand-bumped `_meta/taxonomy.yaml` must NOT make a flagless re-init seed a v2 skeleton.
+
+    "Edit the declared version" is the first thing an operator reaches for when asking how to
+    migrate (ADR-0041 D6 answers "you don't"). Resolving the version from the declaration is
+    right, but SEEDING schema 2 into the schema-1 tree underneath it is the same half-migration
+    the `--schema` contradiction refusal exists to prevent: it leaves `_meta/kb.yaml`, a v2 root
+    map and six `wiki/<kind>/` directories as untracked residue behind a failed lint gate, on this
+    run and on every re-run. A repo we refuse gets ZERO writes.
+    """
+    target = tmp_path / "kb"
+    assert main(["repo", "init", str(target), "--schema", "1"]) == 0  # a plain schema-1 repo
+    capsys.readouterr()
+    taxonomy_path = target / "_meta" / "taxonomy.yaml"
+    taxonomy = yaml.safe_load(taxonomy_path.read_text(encoding="utf-8"))
+    taxonomy["schema_version"] = 2
+    taxonomy_path.write_text(yaml.safe_dump(taxonomy, sort_keys=False), encoding="utf-8")
+
+    assert main(["repo", "init", str(target)]) == 1  # a refusal, not a warning
+    err = capsys.readouterr().err
+    assert "import --from-kb" in err  # the D6 remedy, not a list of lint codes
+
+    # No residue: nothing the schema-2 seed would have written exists.
+    assert not (target / "_meta" / "kb.yaml").exists()
+    assert not (target / "wiki" / "maps").exists()
+    assert not (target / "wiki" / "concepts").exists()
+
+
+@requires_git
+def test_repo_init_refuses_to_adopt_an_UNDECLARED_schema_1_TREE_at_the_new_default(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An UNPARSEABLE taxonomy declares nothing — and the tree underneath it is still schema 1.
+
+    `read_canonical_kb_schema_version` returns `None` both for a merely git-initialized directory
+    AND for a schema-1 repo whose `_meta/taxonomy.yaml` is missing/corrupt. Keying the guard on the
+    DECLARATION alone would adopt the second case at the flipped default 2: `_meta/kb.yaml` + six
+    kind directories minted over schema-1 notes that `Repo.init` (early-returning) never replaces,
+    leaving a repo that DECLARES 2 and fails the v2 lint gate on every curate — stickily, since
+    `_meta/kb.yaml` now exists. So the guard reads the TREE's own witness.
+    """
+    target = tmp_path / "kb"
+    assert main(["repo", "init", str(target), "--schema", "1"]) == 0
+    capsys.readouterr()
+    (target / "_meta" / "taxonomy.yaml").write_text("domains: [oops\n", encoding="utf-8")
+
+    assert main(["repo", "init", str(target)]) == 1  # a refusal, not a silent adoption
+    err = capsys.readouterr().err
+    assert "import --from-kb" in err  # the D6 remedy
+    assert "--schema 1" in err  # ...and the escape hatch for a tree that IS schema 1
+    # ZERO writes: none of the schema-2 seed exists.
+    assert not (target / "_meta" / "kb.yaml").exists()
+    assert not (target / "wiki" / "concepts").exists()
+
+    # The named escape hatch works: no declaration means no contradiction refusal, and schema 1
+    # does not trip the guard, so the repo re-emits the layout it is actually on.
+    assert main(["repo", "init", str(target), "--schema", "1"]) == 0
+    capsys.readouterr()
+    assert not (target / "_meta" / "kb.yaml").exists()
+
+
+@requires_git
+def test_repo_init_adopts_an_EMPTY_initialized_directory_at_the_default(tmp_path: Path) -> None:
+    """The other side of the same guard: an initialized directory with NO KB content is a FIRST
+    init, so it takes the default (schema 2) rather than a refusal whose message would be false
+    about a tree that was never built at either version."""
+    target = tmp_path / "kb"
+    target.mkdir()
+    env = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": "t",
+        "GIT_AUTHOR_EMAIL": "t@example.com",
+        "GIT_COMMITTER_NAME": "t",
+        "GIT_COMMITTER_EMAIL": "t@example.com",
+    }
+    subprocess.run(["git", "init", "-b", "main", str(target)], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-C", str(target), "commit", "--allow-empty", "-m", "empty"],
+        check=True,
+        capture_output=True,
+        env=env,
+    )
+
+    assert main(["repo", "init", str(target), "--domain", "ai-tech"]) == 0
+    layout = RepoLayout(target)
+    assert load_kb_identity(layout) is not None
+    for name in _V2_KIND_DIRS:
+        assert (target / "wiki" / name / ".gitkeep").is_file()
+
+
+@requires_git
+def test_repo_init_never_lets_the_git_ignored_mirror_decide_the_schema(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`_kb/repo.yaml` is git-ignored, operator-local and rewritten HERE — never the authority.
+
+    A pre-#98-shaped repo (canonical taxonomy with no `schema_version` key) plus a mirror
+    hand-edited to 2 must still resolve to the canonical default 1: an untracked local edit may not
+    reshape a shared, git-tracked tree.
+    """
+    target = tmp_path / "kb"
+    assert main(["repo", "init", str(target), "--schema", "1"]) == 0
+    capsys.readouterr()
+    layout = RepoLayout(target)
+
+    taxonomy_path = target / "_meta" / "taxonomy.yaml"
+    taxonomy = yaml.safe_load(taxonomy_path.read_text(encoding="utf-8"))
+    taxonomy.pop("schema_version", None)
+    taxonomy_path.write_text(yaml.safe_dump(taxonomy, sort_keys=False), encoding="utf-8")
+    mirror_path = layout.kb_dir / "repo.yaml"
+    mirror = yaml.safe_load(mirror_path.read_text(encoding="utf-8"))
+    mirror["schema_version"] = 2
+    mirror_path.write_text(yaml.safe_dump(mirror, sort_keys=False), encoding="utf-8")
+
+    assert main(["repo", "init", str(target)]) == 0
+    capsys.readouterr()
+    assert not (target / "_meta" / "kb.yaml").exists()
+    assert not (target / "wiki" / "maps").exists()
+    # The mirror is re-stamped from the CANONICAL resolution, not from its own stale value.
+    assert yaml.safe_load(mirror_path.read_text(encoding="utf-8"))["schema_version"] == 1
+    # ...and it never gets to veto an explicit --schema either: the canonical file says 1.
+    assert main(["repo", "init", str(target), "--schema", "2"]) == 1
+    assert "schema-1 KB" in capsys.readouterr().err
+
+
+@requires_git
+def test_repo_init_schema_2_says_nothing_about_being_opt_in(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Schema 2 is the ordinary case now and needs no announcement (ADR-0041 D6).
+
+    The note it replaces said the opposite — that schema 2 was opt-in and not curate-able — and a
+    stale reassurance is worse than none: an operator who reads it would not trust the very default
+    the flip just made correct.
+    """
+    assert main(["repo", "init", str(tmp_path / "kb"), "--schema", "2"]) == 0
+    err = capsys.readouterr().err
+    assert "not yet curate-able" not in err
+    assert "READ-ONLY" not in err
+
+
+@requires_git
+@pytest.mark.parametrize("reserved", ["_blob", "_pages"])
+def test_repo_init_refuses_a_reserved_underscore_domain(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], reserved: str
+) -> None:
+    """The tool must never mint a repo whose taxonomy a later load refuses (ADR-0041 D1.4/L1-23).
+
+    `raw/<domain>/` and `raw/_blob/` share one namespace, so the reservation is enforced at the
+    DECLARATION site as well as at load and by lint — before anything is written.
+    """
+    target = tmp_path / "kb"
+    assert main(["repo", "init", str(target), "--domain", reserved]) == 1
+    assert reserved in capsys.readouterr().err
+    assert not (target / "_meta").exists()
+
+
+@requires_git
+def test_curate_reports_an_invalid_config_as_one_line_not_a_traceback(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A config refusal on the write path is an operator message, like every other command's."""
+    target = tmp_path / "kb"
+    assert main(["repo", "init", str(target)]) == 0
+    capsys.readouterr()
+    (RepoLayout(target).kb_dir / "repo.yaml").write_text("name: [broken\n", encoding="utf-8")
+
+    assert main(["curate", "--repo", str(target)]) == 1
+    captured = capsys.readouterr()
+    assert "curate: invalid config" in captured.err
+    assert "Traceback" not in captured.err
+
+
+@requires_git
+def test_curate_renders_a_schema_refusal_as_itself_not_as_an_invalid_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`ReadOnlySchemaVersionError` is a `ConfigError` — the arms must be ORDERED, as elsewhere.
+
+    W2.2 wires `assert_writable_kb_schema_version` into exactly this command. Caught by the blanket
+    `except ConfigError`, "this KB is READ-ONLY for this agora build" would print as
+    `invalid config: ...` and send the operator to edit a repo.yaml that is perfectly fine.
+    """
+    target = tmp_path / "kb"
+    assert main(["repo", "init", str(target)]) == 0
+    capsys.readouterr()
+
+    def _refuse(layout: RepoLayout) -> None:
+        raise ReadOnlySchemaVersionError(1, repo=layout.root)
+
+    monkeypatch.setattr(cli_mod, "load_repo_config", _refuse)
+
+    assert main(["curate", "--repo", str(target)]) == 1
+    err = capsys.readouterr().err
+    assert "invalid config" not in err
+    assert "Traceback" not in err
+    assert "READ-ONLY" in err.upper()
+
+
+def test_repo_init_rejects_an_unknown_schema_version(capsys: pytest.CaptureFixture[str]) -> None:
+    """argparse gates the version at the boundary — 3 is not a schema this build can emit."""
+    with pytest.raises(SystemExit) as exc:
+        main(["repo", "init", "unused", "--schema", "3"])
+    assert exc.value.code == 2
+    assert "--schema" in capsys.readouterr().err
+
+
 def test_repo_without_subcommand_returns_2(capsys: pytest.CaptureFixture[str]) -> None:
     rc = main(["repo"])
     assert rc == 2
     assert "subcommand" in capsys.readouterr().err
+
+
+# --- capture (the local file→inbox surface with the bytes attached; ADR-0041 D4.2) ---------------
+def _sole_inbox_event(layout: RepoLayout) -> tuple[dict[str, object], str]:
+    """The single pending event's parsed frontmatter + body (asserts there is exactly one)."""
+    from agora_kb.core import frontmatter
+
+    paths = sorted(layout.inbox_dir.glob("*/*.md"))
+    assert len(paths) == 1, f"expected exactly one inbox event, got {paths}"
+    return frontmatter.parse(paths[0].read_text(encoding="utf-8"))
+
+
+def test_capture_writes_the_event_and_stages_the_original_bytes(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The happy path: extracted text is the BODY, the file's own bytes are the ATTACHMENT.
+
+    The whole point of the surface (ADR-0020's deferred half): extraction is lossy, so the artefact
+    survives beside the text read out of it. The staged file must be byte-identical to the source
+    AND live at its own content address — that equality is what ``raw/_blob/``'s integrity story
+    rests on (ADR-0041 D1.4), and it has to be true from the very first hop.
+    """
+    src = tmp_path / "note.md"
+    payload = b"# Findings\n\nThe curator is the single writer.\n"
+    src.write_bytes(payload)
+    repo = tmp_path / "kb"
+
+    rc = main(["capture", "--repo", str(repo), "--file", str(src), "--domain", "ai-tech"])
+
+    assert rc == 0
+    layout = RepoLayout(repo)
+    fm, body = _sole_inbox_event(layout)
+    assert fm["writer"] == "local" and fm["source"] == "manual" and fm["domain"] == "ai-tech"
+    assert "single writer" in body
+    digest = hashlib.sha256(payload).hexdigest()
+    assert fm["attachments"] == [
+        {
+            "sha256": digest,
+            "ext": "md",
+            "filename": "note.md",
+            "media_type": "text/markdown",
+            "bytes": len(payload),
+        }
+    ]
+    staged = layout.inbox_attachment_path("local", digest, "md")
+    assert staged.read_bytes() == payload
+    out = capsys.readouterr().out
+    assert digest in out and "captured:" in out
+
+
+def test_capture_stubs_the_body_for_a_file_no_extractor_claims(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An unroutable extension is NOT a refusal — the bytes are the knowledge worth keeping.
+
+    A capture surface that only accepted what it could read would drop exactly the artefacts that
+    need an archive (a binary blob, a raw log, a format this build has no extractor for). The event
+    body degrades to a one-line stub NAMING the attachment so the curator and a human reading the
+    inbox can both see what arrived.
+    """
+    src = tmp_path / "capture.bin"
+    payload = bytes(range(256)) * 4
+    src.write_bytes(payload)
+    repo = tmp_path / "kb"
+
+    rc = main(["capture", "--repo", str(repo), "--file", str(src), "--writer", "cli"])
+
+    assert rc == 0
+    layout = RepoLayout(repo)
+    fm, body = _sole_inbox_event(layout)
+    assert body.strip().count("\n") == 0, "the stub body is ONE line"
+    assert "capture.bin" in body
+    digest = hashlib.sha256(payload).hexdigest()
+    attachments = fm["attachments"]
+    assert isinstance(attachments, list)
+    assert attachments[0]["sha256"] == digest and attachments[0]["ext"] == "bin"
+    assert layout.inbox_attachment_path("cli", digest, "bin").read_bytes() == payload
+    assert "body: stub" in capsys.readouterr().out
+
+
+def test_capture_refuses_a_schema_1_repo_and_stages_nothing(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """ADR-0041 D6 applies to the newest writer for free — it goes through ``Inbox.write``.
+
+    D6 puts the refusal at the ONE write primitive precisely so a face added later cannot forget
+    it. The test that matters is therefore not only the exit code but that NOTHING was staged: an
+    attachment written before a refused event would leave bytes in an inbox that can never drain.
+    """
+    repo = tmp_path / "kb"
+    (repo / "_meta").mkdir(parents=True)
+    (repo / "_meta" / "taxonomy.yaml").write_text(
+        "schema_version: 1\ndomains: [general]\nallowed_tags: []\n", encoding="utf-8"
+    )
+    src = tmp_path / "note.md"
+    src.write_text("# Nope\n", encoding="utf-8")
+
+    rc = main(["capture", "--repo", str(repo), "--file", str(src)])
+
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "READ-ONLY for this agora build" in err
+    assert "agora import --from-kb" in err
+    assert not (repo / "_kb" / "inbox").exists()
+
+
+def test_capture_refuses_a_file_over_the_attachment_cap(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The per-file byte cap is the web upload's cap — enforced BEFORE extraction and write."""
+    monkeypatch.setattr(cli_mod, "WebUploadConfig", lambda: WebUploadConfig(max_bytes=8))
+    monkeypatch.setattr(
+        cli_mod, "load_web_config", _raising_web_config
+    )  # the fallback branch: an unreadable `web:` block never blocks a local capture
+    src = tmp_path / "big.md"
+    src.write_text("x" * 64, encoding="utf-8")
+    repo = tmp_path / "kb"
+
+    rc = main(["capture", "--repo", str(repo), "--file", str(src)])
+
+    assert rc == 1
+    assert "over the 8-byte per-file limit" in capsys.readouterr().err
+    assert not (repo / "_kb").exists()
+
+
+def _raising_web_config(layout: object) -> object:
+    raise ConfigError("malformed web: block")
+
+
+def test_capture_enforces_the_repos_configured_upload_cap(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`agora capture` reads the OPERATOR's `web.upload.max_bytes`, not the library default.
+
+    INGEST-CONTRACT §0.1 rule 3 ("one byte cap, one number"): lowering the cap must lower it for
+    BOTH capture surfaces. Before the fix the CLI used `WebUploadConfig().max_bytes` — the pydantic
+    class default — so a repo configured at 8 bytes still accepted a 25 MiB file from the shell.
+    """
+    repo = tmp_path / "kb"
+    (repo / "_kb").mkdir(parents=True)
+    (repo / "_kb" / "repo.yaml").write_text("web:\n  upload:\n    max_bytes: 8\n", encoding="utf-8")
+    src = tmp_path / "big.md"
+    src.write_text("x" * 64, encoding="utf-8")
+
+    rc = main(["capture", "--repo", str(repo), "--file", str(src)])
+
+    assert rc == 1
+    assert "over the 8-byte per-file limit" in capsys.readouterr().err
+    assert not (repo / "_kb" / "inbox").exists()
+
+
+def test_capture_threads_the_operators_zip_bomb_cap_into_the_extractor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The decompression-bomb ceiling is ONE number for both capture surfaces, like the byte cap.
+
+    `web.upload.max_uncompressed_bytes` (issue #53) guards zip-based formats (docx/xlsx/pptx/epub).
+    The web face threads it into `extract()`; before this fix the CLI did not, so a locally
+    captured archive fell back to the extractor's own built-in default and an operator who LOWERED
+    the cap had not lowered it for `agora capture` — the same two-surfaces-one-number drift
+    INGEST-CONTRACT §0.1 rule 3 closes for `max_bytes`.
+    """
+    import agora_kb.ingest.extractors as extractors_mod
+
+    seen: dict[str, object] = {}
+    real = extractors_mod.extract
+
+    def _spy(**kwargs: object) -> object:
+        seen.update(kwargs)
+        return real(**kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(extractors_mod, "extract", _spy)
+    repo = tmp_path / "kb"
+    (repo / "_kb").mkdir(parents=True)
+    (repo / "_kb" / "repo.yaml").write_text(
+        "web:\n  upload:\n    max_uncompressed_bytes: 4096\n", encoding="utf-8"
+    )
+    src = tmp_path / "note.md"
+    src.write_text("# Findings\n\nThe curator is the single writer.\n", encoding="utf-8")
+
+    assert main(["capture", "--repo", str(repo), "--file", str(src)]) == 0
+    assert seen["max_uncompressed_bytes"] == 4096
+
+
+def test_capture_is_listed_in_the_top_level_help(capsys: pytest.CaptureFixture[str]) -> None:
+    """A capture surface nobody can find is not a surface (the #99 discoverability rule)."""
+    with pytest.raises(SystemExit):
+        main(["--help"])
+    assert "capture" in capsys.readouterr().out
 
 
 # --- status -------------------------------------------------------------------------------------
@@ -377,6 +1025,159 @@ def test_status_on_a_non_utf8_state_json_is_also_a_clean_error(
     assert f"repo: {layout.root}" in captured.out
 
 
+# --- ADR-0041 D6: the write refusal at the three CLI surfaces ------------------------------------
+
+
+def _init_schema_1_repo(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> Path:
+    """A real, lint-clean schema-1 repo — the owner's existing KBs, which must stay READABLE."""
+    target = tmp_path / "kb"
+    assert main(["repo", "init", str(target), "--schema", "1", "--domain", "ai-tech"]) == 0
+    capsys.readouterr()
+    return target
+
+
+@requires_git
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["curate", "--force"],
+        ["watch", "--once"],
+        ["requeue", "--all"],
+    ],
+    ids=["curate", "watch", "requeue"],
+)
+def test_a_write_command_refuses_a_schema_1_repo(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], argv: list[str]
+) -> None:
+    """ADR-0041 D6: curate / watch / requeue REFUSE, rather than mixing two layouts in one repo.
+
+    V9's "new binary on an old repo = read-works / write-WARNS" is HARDENED to a refusal for this
+    one bump, because the write here is not merely suboptimal but corrupting: APPLY would put
+    schema-2 paths and schema-2 frontmatter into a schema-1 tree, producing a repo that is neither,
+    that no lint ruleset can gate, and whose damage is a commit.
+
+    All three exits are non-zero and all three messages carry the ONE crossing that exists. Note
+    that ``requeue`` is here although it never calls ``Inbox.write``: it is a location-only
+    ``os.replace`` back into the inbox (#99), so it would otherwise refill a queue this build's
+    curator refuses to drain.
+    """
+    target = _init_schema_1_repo(tmp_path, capsys)
+
+    rc = main([*argv, "--repo", str(target)])
+
+    assert rc == 1
+    combined = capsys.readouterr()
+    message = combined.err + combined.out
+    assert "READ-ONLY for this agora build" in message
+    assert "agora import --from-kb" in message
+    assert "Traceback" not in message
+
+
+@requires_git
+def test_reads_keep_working_on_the_repo_the_writes_refuse(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The other half of D6, and the reason ``SUPPORTED_KB_SCHEMA_VERSIONS`` stays ``{1, 2}``.
+
+    A build that dropped 1 would STRAND the owner's two live KBs. Reads are what make the refusal
+    survivable: the operator can still see the repo they are being told to convert.
+
+    The reads SUCCEED (rc 0 for status and index build) — that is the property. They are no longer
+    silent about the posture, though: ``status`` and ``doctor`` each say the repo is read-only,
+    which is the second half of the same contract and is asserted in its own tests below.
+    """
+    target = _init_schema_1_repo(tmp_path, capsys)
+
+    assert main(["status", "--repo", str(target)]) == 0
+    assert main(["doctor", "--repo", str(target), "--skip-probe"]) in (0, 1)
+    assert main(["index", "build", "--repo", str(target)]) == 0
+
+
+@requires_git
+def test_status_reports_the_read_only_schema_with_a_value_line_and_a_remedy(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`agora status` is where an operator looks when captures "are not arriving" (ADR-0041 D6).
+
+    On a schema-1 repo they never will, so status has to say so. Two channels, deliberately: the
+    STDOUT line keeps status's ``key: <machine-readable value>`` grammar (a `grep '^schema:'`
+    answers "can this be written?"), and the REMEDY — a sentence with no value slot — goes to
+    stderr, exactly where ``repo init`` puts the same sentence.
+    """
+    target = _init_schema_1_repo(tmp_path, capsys)
+
+    assert main(["status", "--repo", str(target)]) == 0
+
+    captured = capsys.readouterr()
+    assert "schema: 1 (READ-ONLY — writes refuse)" in captured.out
+    assert "READ-ONLY" in captured.err
+    assert f"agora import --from-kb {target} <new-repo>" in captured.err
+
+
+@requires_git
+def test_status_on_a_writable_repo_prints_no_schema_line(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The read-only line must not become noise on every run of the ordinary case."""
+    target = tmp_path / "kb"
+    assert main(["repo", "init", str(target), "--domain", "general"]) == 0
+    capsys.readouterr()
+
+    assert main(["status", "--repo", str(target)]) == 0
+
+    captured = capsys.readouterr()
+    assert "schema:" not in captured.out
+    assert "READ-ONLY" not in captured.out + captured.err
+
+
+@requires_git
+def test_doctor_reports_a_read_only_repo_as_unhealthy_with_the_one_crossing(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Doctor answers the question the other commands refuse on — including "can I WRITE it?".
+
+    ``SUPPORTED_KB_SCHEMA_VERSIONS`` stays ``{1, 2}`` so reads keep working, which makes
+    ``schema: repo=1 supported=[1, 2]`` a PASSING line over a repo whose curator can never run
+    again. The ``write:`` line is the missing half, and it FAILS the verdict on the same judgement
+    ``test_doctor_offers_requeue_...`` already pins for an unrunnable curator: reporting
+    ``healthy`` for a repo that cannot curate is issue #96's opening complaint, and a launchd
+    health check that greens on a frozen hub hides it indefinitely.
+    """
+    target = _init_schema_1_repo(tmp_path, capsys)
+
+    rc = main(["doctor", "--repo", str(target), "--skip-probe"])
+
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "  schema: repo=1 supported=[1, 2]" in out
+    assert "write: READ-ONLY" in out
+    assert "reads KB schema 1 and refuses to write it" in out
+    assert f"'agora import --from-kb {target} <new-repo>'" in out
+    assert "status: unhealthy" in out
+
+
+@requires_git
+def test_doctor_says_nothing_about_writability_on_a_schema_2_repo(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The ordinary case is silent, and a NON-repo directory is silent too.
+
+    The second half is the reason the line is keyed on the CANONICAL declaration: the broader
+    reader ``doctor``'s ``schema:`` line uses defaults a bare directory to ``1``, so a banner keyed
+    on it would tell every operator running ``agora doctor`` in the wrong cwd that their writes
+    are refused.
+    """
+    target = tmp_path / "kb"
+    assert main(["repo", "init", str(target), "--domain", "general"]) == 0
+    capsys.readouterr()
+
+    main(["doctor", "--repo", str(target), "--skip-probe"])
+    assert "write: READ-ONLY" not in capsys.readouterr().out
+
+    main(["doctor", "--repo", str(tmp_path / "not-a-repo"), "--skip-probe"])
+    assert "write: READ-ONLY" not in capsys.readouterr().out
+
+
 # --- curate -------------------------------------------------------------------------------------
 def test_curate_on_empty_repo_should_not_run(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
@@ -551,12 +1352,12 @@ def test_curate_with_stub_backend_publishes_and_query_reflects_it(
     assert "CREATE_THEME=1" in out
 
     # The published theme is on disk (read-after-publish sync) and the deterministic query finds it.
-    theme = layout.wiki_dir / "ai-tech" / "themes" / "curator-concurrency.md"
+    theme = layout.wiki_dir / "concepts" / "curator-concurrency.md"
     assert theme.is_file()
     assert "The single curator holds a per-repo flock." in theme.read_text(encoding="utf-8")
     result = Wiki(layout).query("curator concurrency")
     assert result.status == "ok"
-    assert any(h.path == "wiki/ai-tech/themes/curator-concurrency.md" for h in result.hits)
+    assert any(h.path == "wiki/concepts/curator-concurrency.md" for h in result.hits)
     # The inbox is drained.
     assert Inbox(layout).depth() == 0
     # PASS 2 authored every region, so the run reports zero pending prose and warns about nothing.
@@ -604,7 +1405,7 @@ def test_curate_warns_loudly_when_pass2_authors_no_prose(
     assert "warning: PROSE PENDING" in captured.err
     # The backend's own stderr reaches the operator, so the cause is actionable, not a mystery.
     assert "simulated launch failure" in captured.err
-    theme = layout.wiki_dir / "ai-tech" / "themes" / "curator-concurrency.md"
+    theme = layout.wiki_dir / "concepts" / "curator-concurrency.md"
     assert "_summary pending_" in theme.read_text(encoding="utf-8")
 
 
@@ -1694,6 +2495,67 @@ def test_doctor_reports_initialized_repo(
     rc = main(["doctor", "--repo", str(target)])
     assert rc in (0, 1)
     assert "initialized" in capsys.readouterr().out
+
+
+@requires_git
+def test_doctor_reports_a_repo_missing_the_raw_blob_gitattributes_rule(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A repo created before the seed keeps working; the operator is told, with the fix inline.
+
+    ADR-0041 D1.4: `raw/_blob/` files are named by their own sha256, so git must never translate
+    their line endings. `repo init` now seeds the rule; an older repo has no `.gitattributes` at
+    all. Reporting only — it never moves the verdict, because the argv pins on every engine git
+    call already protect what the curator writes; the file extends that to a hand-run `git add`.
+    """
+    target = tmp_path / "kb"
+    Repo.resolve(target).init()
+    assert "raw/_blob/ pinned out of git EOL translation" in _doctor_out(target, capsys)
+
+    # Removed from the INDEX as well as the working tree, which is what "created before the seed"
+    # actually means. Deleting only the file leaves the committed copy still answering for it —
+    # `git check-attr` says the bytes are pinned there because git really does still honour it, a
+    # truth a scan of the (now missing) file would have got backwards.
+    subprocess.run(["git", "rm", "--cached", "-q", ".gitattributes"], cwd=target, check=True)
+    (target / ".gitattributes").unlink()
+
+    out = _doctor_out(target, capsys)
+    assert ".gitattributes: missing the raw/_blob/ rule" in out
+    assert "raw/_blob/** -text -diff -merge" in out
+
+
+def _doctor_out(target: Path, capsys: pytest.CaptureFixture[str]) -> str:
+    main(["doctor", "--repo", str(target)])
+    return capsys.readouterr().out
+
+
+@requires_git
+def test_doctor_notes_line_counts_what_the_curator_does_not_own(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """#152: the operator surface for a note the curator reads but will never curate.
+
+    Before #152 such a note was worse than invisible — it failed every run. Now it is quietly
+    excluded, which is only honest if somebody says so; this is the line that does. It never moves
+    the verdict: writing in `wiki/` is supported, not ill health.
+
+    (No ``--skip-probe``: a bare repo has no adapters.yaml, so no brain probe and no network call.)
+    """
+    target = tmp_path / "kb"
+    Repo.resolve(target).init()
+
+    main(["doctor", "--repo", str(target)])
+    # The seed index.md carries the engine's `timestamp:` stamp, so a fresh repo owns everything.
+    assert "  notes: 1 total, none out of schema" in capsys.readouterr().out
+
+    hand_written = target / "wiki" / "concepts" / "human-note.md"
+    hand_written.parent.mkdir(parents=True, exist_ok=True)
+    hand_written.write_text("# Just a note\n\nStraight from Obsidian.\n", encoding="utf-8")
+
+    rc = main(["doctor", "--repo", str(target)])
+    out = capsys.readouterr().out
+    assert "  notes: 2 total, 1 out of schema (read + indexed, never curated)" in out
+    assert rc in (0, 1)  # observability only — the count never decides the verdict
 
 
 def test_doctor_failures_line(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
@@ -3769,7 +4631,7 @@ def test_tick_failure_detail_is_one_bounded_line() -> None:
     assert cli_mod._tick_failure_detail(RuntimeError()) == "RuntimeError: <no message>"
 
 
-# --- import (the opt-in Obsidian/markdown vault normalizer, ADR-0014 D5) ------------------------
+# --- import (the vault normalizer, ADR-0014 D5 — now emitting KB wiki schema 2) ------------------
 @requires_git
 def test_import_happy_path_creates_dest_and_prints_digest(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
@@ -3795,7 +4657,14 @@ def test_import_happy_path_creates_dest_and_prints_digest(
 def test_import_defaults_to_general_domain(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """With --domain omitted, an off-layout note lands under wiki/general/themes/ (the default)."""
+    """With --domain omitted, an off-layout note lands in the schema-2 CONCEPT directory.
+
+    The v1 assertion was ``wiki/general/themes/loose-idea.md`` — domain-first, ``themes`` naming
+    the kind. Under ADR-0041 the directory IS the kind and the domain has left the path for
+    ``subjects:``, so the same note lands in ``wiki/concepts/`` and the default domain survives as
+    a subject rather than as a folder. The digest also names the navigation tier the importer
+    SYNTHESIZES (D5), which has no counterpart in the source vault.
+    """
     src = tmp_path / "vault"
     dest = tmp_path / "out"
     note = src / "Loose Idea.md"
@@ -3805,8 +4674,11 @@ def test_import_defaults_to_general_domain(
     rc = main(["import", str(src), str(dest)])
 
     assert rc == 0
-    capsys.readouterr()
-    assert (dest / "wiki" / "general" / "themes" / "loose-idea.md").is_file()
+    assert "synthesized_maps=" in capsys.readouterr().out
+    imported = dest / "wiki" / "concepts" / "loose-idea.md"
+    assert imported.is_file()
+    assert not (dest / "wiki" / "general").exists()
+    assert "kind: concept" in imported.read_text(encoding="utf-8")
 
 
 @requires_git
@@ -3844,6 +4716,332 @@ def test_import_with_warnings_still_exits_0_and_prints_them(
     out = capsys.readouterr().out
     assert "moved to fit" in out
     assert "stripped tags: unknown-tag" in out
+
+
+@requires_git
+def test_import_produces_a_repo_this_build_can_actually_write(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The inverse of the note this replaces: an imported repo is CURATE-ABLE the moment it exists.
+
+    While the importer emitted schema 1, ``agora import`` minted a repo that was read-only the
+    moment it was created and had to say so out loud — a ``lint: clean`` line over a repo the
+    operator cannot curate is a true statement that leaves a false impression. The importer now
+    emits schema 2 (ADR-0041 D6), so the warning must be GONE and its absence must be earned: the
+    proof is that the write path, which refuses a schema-1 repo, accepts this one.
+    """
+    src = tmp_path / "vault"
+    dest = tmp_path / "out"
+    note = src / "wiki" / "general" / "themes" / "topic.md"
+    note.parent.mkdir(parents=True)
+    note.write_text("# Topic\n\nA body paragraph.\n", encoding="utf-8")
+
+    rc = main(["import", str(src), str(dest)])
+
+    assert rc == 0
+    combined = capsys.readouterr()
+    assert "READ but not WRITE" not in combined.err
+    assert "READ-ONLY" not in combined.err + combined.out
+    # The claim is TRUE, not merely unstated: the ADR-0041 D6 write refusal does NOT fire here.
+    Inbox(RepoLayout(dest)).write(text="A captured fact.", writer="test", source="manual")
+    assert main(["status", "--repo", str(dest)]) == 0
+    assert "READ-ONLY" not in capsys.readouterr().out
+
+
+@requires_git
+def test_import_into_a_schema1_repo_exits_1_and_writes_nothing(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Two layouts in one repo is the state D6's refusal exists to prevent.
+
+    The guard flipped with the importer: it now emits schema 2, so the destination it must refuse
+    is a schema-**1** repo (importing there would commit ``wiki/concepts/…`` beside
+    ``wiki/<domain>/themes/…``). The remedy on the message is the one crossing that exists.
+    """
+    src = tmp_path / "vault"
+    dest = tmp_path / "kb1"
+    note = src / "wiki" / "general" / "themes" / "topic.md"
+    note.parent.mkdir(parents=True)
+    note.write_text("# Topic\n\nA body paragraph.\n", encoding="utf-8")
+    assert main(["repo", "init", str(dest), "--schema", "1", "--domain", "general"]) == 0
+    capsys.readouterr()
+
+    rc = main(["import", str(src), str(dest)])
+
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "schema-1 KB" in err
+    assert "import --from-kb" in err
+    assert not (dest / "wiki" / "concepts").exists()
+
+
+# --- import --from-kb (the schema-1 → schema-2 CONVERTER, ADR-0041 D6) ---------------------------
+def _schema_1_kb(root: Path) -> Path:
+    """A small but SHAPE-COMPLETE schema-1 KB: a map per domain, two themes, two same-date dailies.
+
+    Every D6 rule that produces visible output is exercised by this one corpus: the ``-moc`` rename
+    (rule 3), the two dailies of DIFFERENT domains sharing a date (rule 4's merge), the path domain
+    that must survive as a subject (rule 2) and the ``raw/`` the builder materializes for each
+    concept's ``sources:`` (rule 5).
+    """
+    return build_kb(
+        root,
+        [
+            NoteSpec(
+                kind="theme",
+                domain="ai-tech",
+                title="Retrieval Augmented Generation",
+                body="Retrieval augmented generation grounds an answer in retrieved documents.",
+            ),
+            NoteSpec(
+                kind="theme",
+                domain="ml",
+                title="Gradient Descent",
+                body="Gradient descent walks a loss surface downhill one step at a time.",
+            ),
+            NoteSpec(
+                kind="daily",
+                domain="ai-tech",
+                title="ai-tech 2026-01-12",
+                body="Captured one note about retrieval.",
+                extra_frontmatter={"date": "2026-01-12"},
+            ),
+            NoteSpec(
+                kind="daily",
+                domain="ml",
+                title="ml 2026-01-12",
+                body="Captured one note about gradients.",
+                extra_frontmatter={"date": "2026-01-12"},
+            ),
+        ],
+        schema_version=1,
+        domains=["ai-tech", "ml"],
+    )
+
+
+def _snapshot(root: Path) -> dict[str, bytes]:
+    """Every file under ``root`` by repo-relative path → bytes. The "src is never touched" proof."""
+    return {
+        p.relative_to(root).as_posix(): p.read_bytes()
+        for p in sorted(root.rglob("*"))
+        if p.is_file()
+    }
+
+
+@requires_git
+def test_import_from_kb_converts_a_schema_1_repo_and_prints_the_report(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The D6 crossing, end to end: a schema-1 repo in, a WRITABLE schema-2 repo out.
+
+    Four claims, and the last one is the point of the whole wave: the destination has the
+    kind-first shape, the report enumerates the renames and the merge (a converter that renames
+    silently is one that loses ``[[basename]]`` edges), the SOURCE is byte-for-byte untouched, and
+    the destination accepts the capture that the source refuses.
+    """
+    src = _schema_1_kb(tmp_path / "v1")
+    dest = tmp_path / "v2"
+    before = _snapshot(src)
+
+    rc = main(["import", "--from-kb", str(src), str(dest)])
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "converted 6 note(s)" in out  # 7 v1 notes in, two dailies merged into one journal
+    assert "source_notes=7" in out
+    assert "kb_id: " in out
+    # The COUNT and the LIST are different quantities (a merged journal is one destination note but
+    # two basename pairs), so they are labelled apart rather than both printed as "renamed".
+    assert "renamed_notes=" in out
+    assert "renamed basenames (" in out
+    assert "ai-tech-moc -> ai-tech" in out
+    assert "merges (1):" in out
+    assert "2026-01-12 <- " in out
+    assert "lint: clean" in out
+    # The kind-first shape: the map lost its `-moc` suffix, the concepts left their domain folder,
+    # and the two same-date dailies became ONE journal sharded under <yyyy>/<mm>.
+    assert (dest / "wiki" / "maps" / "ai-tech.md").is_file()
+    assert (dest / "wiki" / "concepts" / "retrieval-augmented-generation.md").is_file()
+    assert (dest / "wiki" / "notes" / "2026" / "01" / "2026-01-12.md").is_file()
+    assert not (dest / "wiki" / "ai-tech").exists()
+    assert (dest / "_meta" / "kb.yaml").is_file()
+    # The source is untouched — not "still lints", but the same bytes in the same files.
+    assert _snapshot(src) == before
+    # ...and the destination is the half this build can write, while the source still is not.
+    with pytest.raises(ReadOnlySchemaVersionError):
+        Inbox(RepoLayout(src)).write(text="A captured fact.", writer="test", source="manual")
+    Inbox(RepoLayout(dest)).write(text="A captured fact.", writer="test", source="manual")
+    assert main(["status", "--repo", str(dest)]) == 0
+    assert "READ-ONLY" not in capsys.readouterr().out
+
+
+@requires_git
+def test_import_from_kb_refuses_the_vault_import_flags(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``--domain`` / ``--tag`` are the VAULT path's flags and are refused, never ignored.
+
+    The converter carries the source repo's taxonomy across unchanged, so accepting ``--domain``
+    silently would let an operator believe they had re-shaped a taxonomy that in fact came over as
+    it was. Exit 2 (the argparse usage code) and NOTHING written.
+    """
+    src = _schema_1_kb(tmp_path / "v1")
+    dest = tmp_path / "v2"
+
+    rc = main(["import", "--from-kb", str(src), str(dest), "--domain", "other"])
+
+    assert rc == 2
+    assert "--domain/--tag are vault-import flags" in capsys.readouterr().err
+    assert not dest.exists()
+
+
+@requires_git
+def test_import_from_kb_refuses_a_destination_inside_the_source(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``agora import --from-kb <kb> <kb>/converted`` is refused, and the source is untouched.
+
+    The CLI closes every successful conversion with ``<src> was NOT modified``. A destination
+    nested in the source made that line false — the run planted a whole schema-2 repo, its own
+    ``.git`` included, inside the tree it had just read — so the pairing is refused outright rather
+    than the note being softened into a maybe.
+    """
+    src = _schema_1_kb(tmp_path / "v1")
+    before = _snapshot(src)
+
+    rc = main(["import", "--from-kb", str(src), str(src / "converted")])
+
+    assert rc == 1
+    assert "inside the source repo" in capsys.readouterr().err
+    assert not (src / "converted").exists()
+    assert _snapshot(src) == before
+
+
+@requires_git
+def test_import_into_an_existing_repo_is_refused_naming_the_inbox(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The VAULT lane writes a NEW repo too: an already-initialized destination is refused.
+
+    Before the guard, a second ``agora import`` into a live schema-2 KB exited 0 and printed
+    ``lint: clean`` while re-minting ``_meta/kb.yaml`` with a fresh ``kb_id`` the existing notes did
+    not carry (D1.5 mints one ONCE) and rebuilding the root map from that vault alone.
+    """
+    dest = tmp_path / "kb"
+    assert main(["repo", "init", str(dest), "--domain", "general"]) == 0
+    before = _snapshot(dest)
+    vault = tmp_path / "vault"
+    (vault / "general").mkdir(parents=True)
+    (vault / "general" / "alpha.md").write_text("# Alpha\n\nProse.\n", encoding="utf-8")
+
+    rc = main(["import", str(vault), str(dest), "--domain", "general"])
+
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "already a schema-2 KB" in err
+    assert "kb_remember" in err  # ...and it names the way to ADD to an existing KB
+    assert _snapshot(dest) == before
+
+
+@requires_git
+def test_import_from_kb_refuses_a_source_that_is_not_schema_1(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """There is exactly ONE crossing and it runs in exactly one direction (ADR-0041 D6)."""
+    src = tmp_path / "kb2"
+    assert main(["repo", "init", str(src), "--domain", "general"]) == 0
+    capsys.readouterr()
+
+    rc = main(["import", "--from-kb", str(src), str(tmp_path / "out")])
+
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "is not a KB wiki schema-1 repo" in err
+    assert "Traceback" not in err
+
+
+@requires_git
+def test_import_from_kb_refuses_an_occupied_destination(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Converting INTO a populated tree is the two-layouts-in-one-repo state D6 prevents."""
+    src = _schema_1_kb(tmp_path / "v1")
+    dest = tmp_path / "v2"
+    dest.mkdir()
+    (dest / "occupied.md").write_text("mine\n", encoding="utf-8")
+
+    rc = main(["import", "--from-kb", str(src), str(dest)])
+
+    assert rc == 1
+    assert "never converts in place" in capsys.readouterr().err
+    assert (dest / "occupied.md").read_text(encoding="utf-8") == "mine\n"
+
+
+@requires_git
+def test_import_from_kb_names_every_colliding_basename_and_writes_nothing(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """D6 rule 7: a collision the flip INTRODUCES is a hard failure with a named list.
+
+    Two v1 concepts of different domains may share a basename — the domain was in the path. Under
+    schema 2 both want ``wiki/concepts/<slug>.md``, and a converter that silently renamed one would
+    break every ``[[basename]]`` edge pointing at it. Exit 1, the names printed, dest untouched.
+    """
+    src = _schema_1_kb(tmp_path / "v1")
+    twin = src / "wiki" / "ml" / "themes" / "retrieval-augmented-generation.md"
+    twin.write_bytes(
+        (src / "wiki" / "ai-tech" / "themes" / "retrieval-augmented-generation.md").read_bytes()
+    )
+    dest = tmp_path / "v2"
+
+    rc = main(["import", "--from-kb", str(src), str(dest)])
+
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "retrieval-augmented-generation" in err
+    assert "Traceback" not in err
+    assert not dest.exists()
+
+
+@requires_git
+def test_import_from_kb_missing_src_exits_1_with_stderr(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A missing source is a HARD error on this path too — exit 1, one line, no traceback."""
+    rc = main(["import", "--from-kb", str(tmp_path / "nope"), str(tmp_path / "out")])
+
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "import --from-kb:" in err
+    assert "Traceback" not in err
+
+
+def test_import_help_names_the_schema_it_writes_and_the_one_crossing(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """``agora import --help`` must answer "which layout do I get?" without reading an ADR.
+
+    Whitespace-normalized, and every asserted phrase is HYPHEN-FREE: argparse re-wraps help to the
+    terminal width and ``textwrap`` will break a word at a hyphen, so "no in-place migrator" is not
+    a substring of its own rendered help at 80 columns.
+    """
+    with pytest.raises(SystemExit):
+        main(["import", "--help"])
+
+    out = " ".join(capsys.readouterr().out.split())
+    assert "KB wiki schema 2" in out
+    assert "--from-kb" in out
+    assert "the only crossing between the two schemas" in out
+
+
+def test_top_level_help_lists_import_as_a_schema_2_producer(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The subcommand table is where an operator first meets ``import``; it must not be neutral."""
+    with pytest.raises(SystemExit):
+        main(["--help"])
+
+    assert "new KB schema-2 Agora repo" in " ".join(capsys.readouterr().out.split())
 
 
 # --- --version (issue #101) ----------------------------------------------------------------------
@@ -4029,6 +5227,71 @@ def test_doctor_prints_the_connectors_line(
 
 
 @requires_git
+def test_doctor_reports_the_session_connector_format(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`agora doctor` answers "which grammar is reading my transcripts" (issue #147).
+
+    An undeclared format prints the DEFAULT it resolves to, not a blank — an operator debugging a
+    zero-fact harvest needs the EFFECTIVE parser. The file: line stays exactly as it was: format is
+    a session-only concept and a column of `format=n/a` would be noise.
+    """
+    target, _ = _setup_harvest_repo(tmp_path)
+    ap = target / "adapters.yaml"
+    a = yaml.safe_load(ap.read_text(encoding="utf-8"))
+    a["connectors"]["session:demo"] = {"path": str(tmp_path / "s" / "*.jsonl"), "scope": "personal"}
+    a["connectors"]["session:pinned"] = {
+        "path": str(tmp_path / "s" / "*.jsonl"),
+        "scope": "personal",
+        "format": "claude-code-jsonl",
+    }
+    ap.write_text(yaml.safe_dump(a, sort_keys=False), encoding="utf-8")
+    capsys.readouterr()
+    main(["doctor", "--repo", str(target), "--skip-probe"])
+    out = capsys.readouterr().out
+    assert "session:demo (scope=personal, format=claude-code-jsonl)" in out
+    assert "session:pinned (scope=personal, format=claude-code-jsonl)" in out
+    assert "file:demo (scope=personal)" in out  # unchanged: no format column on a file: connector
+
+
+@requires_git
+def test_a_targeted_harvest_is_not_hostage_to_another_connector(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`--connector NAME` narrows BEFORE `build_connectors`, which is all-or-nothing (#147 review).
+
+    `build_connectors` raises on the FIRST spec it cannot construct, so without the pre-filter one
+    mis-declared connector disabled harvesting for every healthy one — including a run that named
+    a different connector explicitly.
+    """
+    target, _ = _setup_harvest_repo(tmp_path)
+    ap = target / "adapters.yaml"
+    a = yaml.safe_load(ap.read_text(encoding="utf-8"))
+    # A connector TYPE the config loader accepts and `build_connectors` refuses (no such family).
+    a["connectors"]["mail:nope"] = {"path": str(tmp_path / "m"), "scope": "personal"}
+    ap.write_text(yaml.safe_dump(a, sort_keys=False), encoding="utf-8")
+
+    capsys.readouterr()
+    assert main(["harvest", "--repo", str(target), "--connector", "file:demo", "--dry-run"]) == 0
+    assert "would harvest" in capsys.readouterr().out
+
+    # Un-targeted, the bad connector is still a loud, clean failure — nothing is swallowed.
+    assert main(["harvest", "--repo", str(target), "--dry-run"]) == 1
+    assert "mail:nope" in capsys.readouterr().err
+
+
+@requires_git
+def test_harvest_unknown_connector_still_lists_the_configured_set(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The "no connector named X" message names the whole configured set, not the filtered one."""
+    target, _ = _setup_harvest_repo(tmp_path)
+    capsys.readouterr()
+    assert main(["harvest", "--repo", str(target), "--connector", "file:bogus"]) == 1
+    assert "['file:demo']" in capsys.readouterr().out
+
+
+@requires_git
 def test_harvest_follow_links_harvests_sibling_content(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -4061,7 +5324,7 @@ def _gold_repo(tmp_path: Path) -> Path:
 
     target = tmp_path / "kb"
     assert main(["repo", "init", str(target)]) == 0
-    themes = target / "wiki" / "ai-tech" / "themes"
+    themes = target / "wiki" / "concepts"
     themes.mkdir(parents=True, exist_ok=True)
     (themes / "curator-concurrency.md").write_text(
         "---\ntitle: Curator Concurrency\ntype: theme\naliases: []\ntags: []\n"
@@ -4494,3 +5757,178 @@ def test_doctor_backup_line_compresses_and_survives_corrupt_state(
         capsys.readouterr()
         main(["doctor", "--repo", str(target), "--skip-probe"])
         assert "last_push=unreadable" in capsys.readouterr().out
+
+
+# --- eval (the deterministic ranking snapshot, issue #44) ---------------------------------------
+_EVAL_INDEX = """\
+# personal
+
+- [Eng MOC](wiki/eng/eng-moc.md)
+"""
+
+_EVAL_MOC = """\
+---
+status: active
+type: moc
+title: eng MOC
+summary: Map of content for the eng domain.
+---
+# eng MOC
+
+- [Deadlock recovery](themes/deadlock-recovery.md)
+"""
+
+_EVAL_THEME = """\
+---
+status: active
+type: theme
+tags: [locking]
+---
+# Deadlock recovery
+
+A deadlock is recovered by dropping the younger advisory lock and letting the older writer
+proceed; recovery is deterministic and leaves no partial write.
+"""
+
+
+def _eval_repo(root: Path) -> Path:
+    """A minimal v1-layout KB — no git, no config, no model. `agora eval` needs none of them."""
+    (root / "wiki" / "eng" / "themes").mkdir(parents=True)
+    (root / "index.md").write_text(_EVAL_INDEX, encoding="utf-8")
+    (root / "wiki" / "eng" / "eng-moc.md").write_text(_EVAL_MOC, encoding="utf-8")
+    (root / "wiki" / "eng" / "themes" / "deadlock-recovery.md").write_text(
+        _EVAL_THEME, encoding="utf-8"
+    )
+    return root
+
+
+def _eval_queries(path: Path, *, expect_unrelated: str = "not_found") -> Path:
+    path.write_text(
+        "- id: q-deadlock\n"
+        "  question: deadlock recovery\n"
+        "  expect: ok\n"
+        "- id: q-unrelated\n"
+        "  question: quantum biology photosynthesis\n"
+        f"  expect: {expect_unrelated}\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+def test_eval_prints_a_table_and_exits_zero_when_expects_hold(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The happy path: every query matched its declared expect, so `agora eval` is a green gate."""
+    repo = _eval_repo(tmp_path / "kb")
+    queries = _eval_queries(tmp_path / "q.yaml")
+    assert main(["eval", "--repo", str(repo), "--queries", str(queries)]) == 0
+    out = capsys.readouterr().out
+    assert "fm=" in out and "cache=" in out
+    assert "q-deadlock" in out and "deadlock-recovery" in out
+    assert "0 violating expect" in out
+
+
+def test_eval_writes_the_full_json_snapshot_with_out(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`--out` is the golden-file producer: basename identity, no paths, header + per-query hits."""
+    repo = _eval_repo(tmp_path / "kb")
+    queries = _eval_queries(tmp_path / "q.yaml")
+    out = tmp_path / "nested" / "baseline.json"  # parent dirs are created, not demanded
+    assert main(["eval", "--repo", str(repo), "--queries", str(queries), "--out", str(out)]) == 0
+    assert f"wrote {out}" in capsys.readouterr().out
+
+    record = json.loads(out.read_text(encoding="utf-8"))
+    assert record["header"]["query_count"] == 2
+    assert record["header"]["corpus_note_count"] == 3
+    [deadlock] = [q for q in record["queries"] if q["id"] == "q-deadlock"]
+    assert deadlock["status"] == "ok"
+    assert deadlock["hits"][0]["note"] == "deadlock-recovery"  # BASENAME, survives a layout move
+    assert deadlock["hits"][0]["rank"] == 1
+    assert "wiki/" not in out.read_text(encoding="utf-8")
+
+
+def test_eval_exits_one_and_names_the_query_when_an_expect_is_violated(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The CI gate: a query whose status differs from its expect fails the command, on stderr."""
+    repo = _eval_repo(tmp_path / "kb")
+    queries = _eval_queries(tmp_path / "q.yaml", expect_unrelated="ok")
+    assert main(["eval", "--repo", str(repo), "--queries", str(queries)]) == 1
+    captured = capsys.readouterr()
+    assert "MISMATCH: q-unrelated expected ok, got not_found" in captured.err
+    assert "1 violating expect" in captured.out
+
+
+def test_eval_exits_one_on_an_unusable_query_file(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A malformed / missing query file is loud and non-zero — never a silently smaller eval set."""
+    repo = _eval_repo(tmp_path / "kb")
+    missing = tmp_path / "nope.yaml"
+    assert main(["eval", "--repo", str(repo), "--queries", str(missing)]) == 1
+    assert "eval: cannot read query file" in capsys.readouterr().err
+
+    bad = tmp_path / "bad.yaml"
+    bad.write_text("id: a\nquestion: x\n", encoding="utf-8")  # a mapping, not a list
+    assert main(["eval", "--repo", str(repo), "--queries", str(bad)]) == 1
+    assert "expected a LIST" in capsys.readouterr().err
+
+
+def test_eval_fm_and_limit_flags_reach_the_snapshot(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`--fm off` pins the ADR-0012 §8 Phase-1a column; `--limit` caps hits per query."""
+    repo = _eval_repo(tmp_path / "kb")
+    queries = _eval_queries(tmp_path / "q.yaml")
+    out = tmp_path / "off.json"
+    args = ["eval", "--repo", str(repo), "--queries", str(queries), "--out", str(out)]
+    assert main([*args, "--fm", "off", "--limit", "1"]) == 0
+    capsys.readouterr()
+    record = json.loads(out.read_text(encoding="utf-8"))
+    assert record["header"]["fm_enabled"] is False
+    assert record["header"]["limit"] == 1
+    assert all(len(q["hits"]) <= 1 for q in record["queries"])
+
+    assert main([*args, "--fm", "on"]) == 0
+    capsys.readouterr()
+    assert json.loads(out.read_text(encoding="utf-8"))["header"]["fm_enabled"] is True
+
+
+@pytest.mark.parametrize("limit", ["0", "-3"])
+def test_eval_rejects_a_non_positive_limit(tmp_path: Path, limit: str) -> None:
+    """`--limit 0` must not be a permanently green gate that records nothing.
+
+    `Wiki.query` fixes `status` from the eligible set BEFORE slicing `eligible[: max(0, limit)]`,
+    so `--limit 0` used to exit 0 with `status: ok` and an EMPTY hit list for every query — a
+    baseline that pins no ranking while looking green, which a copied CI line or a typo could
+    produce silently. argparse refuses it instead (exit 2, the usage-error code).
+    """
+    repo = _eval_repo(tmp_path / "kb")
+    queries = _eval_queries(tmp_path / "q.yaml")
+    with pytest.raises(SystemExit) as exc:
+        main(["eval", "--repo", str(repo), "--queries", str(queries), "--limit", limit])
+    assert exc.value.code == 2
+
+
+def test_eval_needs_no_git_no_model_and_no_server(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The gate must run on a bare directory of markdown — that is what makes it usable in CI.
+
+    `_eval_repo` writes no `.git`, no `_kb/repo.yaml`, and no `adapters.yaml`; an EMPTY directory
+    likewise answers `not_found` (ADR-0012 §5 gate (d)) instead of crashing.
+    """
+    repo = _eval_repo(tmp_path / "kb")
+    assert not (repo / ".git").exists()
+    queries = _eval_queries(tmp_path / "q.yaml")
+    assert main(["eval", "--repo", str(repo), "--queries", str(queries)]) == 0
+    capsys.readouterr()
+
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    all_not_found = _eval_queries(tmp_path / "nf.yaml")
+    all_not_found.write_text(
+        "- id: q-deadlock\n  question: deadlock recovery\n  expect: not_found\n", encoding="utf-8"
+    )
+    assert main(["eval", "--repo", str(empty), "--queries", str(all_not_found)]) == 0

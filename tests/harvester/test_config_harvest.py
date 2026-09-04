@@ -199,3 +199,118 @@ def test_connector_specs_follow_links_non_bool_raises(tmp_path: Path) -> None:
     )
     with pytest.raises(ConfigError):
         load_connector_specs(p)
+
+
+# --- format: the session-transcript parser selector (issue #147, invariant #6) -------------------
+
+_BACKENDS = "backends:\n  qwen: { argv: [x] }\ndefault_backend: qwen\n"
+
+
+def test_connector_specs_format_defaults_to_none(tmp_path: Path) -> None:
+    """An adapters.yaml that predates `format:` parses to None — today's behaviour, untouched.
+
+    None is deliberately NOT eagerly resolved to the default name here: the config seam records
+    what the operator DECLARED, and the harvester owns what "undeclared" means.
+    """
+    lo = _layout(tmp_path)
+    p = _write_adapters(
+        lo,
+        _BACKENDS + 'connectors:\n  session:demo: { path: "~/s/**/*.jsonl", scope: personal }\n',
+    )
+    specs = load_connector_specs(p)
+    assert specs is not None
+    assert specs[0].format is None
+
+
+def test_connector_specs_format_parsed(tmp_path: Path) -> None:
+    lo = _layout(tmp_path)
+    p = _write_adapters(
+        lo,
+        _BACKENDS + "connectors:\n"
+        '  session:demo: { path: "~/s/**/*.jsonl", scope: personal, format: claude-code-jsonl }\n',
+    )
+    specs = load_connector_specs(p)
+    assert specs is not None
+    assert specs[0].format == "claude-code-jsonl"
+
+
+def test_connector_specs_unknown_format_raises_at_load(tmp_path: Path) -> None:
+    """A typo'd format must fail LOUD at config load, not silently take the default parser.
+
+    Silently defaulting would parse a foreign transcript with Claude Code's grammar and harvest
+    zero facts, with nothing anywhere saying the declared format was never supported.
+    """
+    lo = _layout(tmp_path)
+    p = _write_adapters(
+        lo,
+        _BACKENDS + "connectors:\n"
+        '  session:demo: { path: "~/s/**/*.jsonl", scope: personal, format: claude-jsonl }\n',
+    )
+    with pytest.raises(ConfigError) as exc:
+        load_connector_specs(p)
+    assert "claude-jsonl" in str(exc.value)
+
+
+def test_connector_specs_format_on_a_file_connector_raises(tmp_path: Path) -> None:
+    # A key that cannot possibly take effect must not look accepted (the max_files footgun).
+    lo = _layout(tmp_path)
+    p = _write_adapters(
+        lo,
+        _BACKENDS + "connectors:\n"
+        "  file:x: { path: /m/MEMORY.md, scope: personal, format: claude-code-jsonl }\n",
+    )
+    with pytest.raises(ConfigError) as exc:
+        load_connector_specs(p)
+    assert "session:" in str(exc.value)
+
+
+def test_connector_specs_format_non_string_raises(tmp_path: Path) -> None:
+    lo = _layout(tmp_path)
+    p = _write_adapters(
+        lo,
+        _BACKENDS + "connectors:\n"
+        '  session:demo: { path: "~/s/**/*.jsonl", scope: personal, format: 7 }\n',
+    )
+    with pytest.raises(ConfigError):
+        load_connector_specs(p)
+
+
+def test_config_format_names_match_the_harvester_registry() -> None:
+    """The config seam's plain-string names must never drift from the IMPLEMENTED registry half.
+
+    `config` holds the names as strings so it never imports the harvester (the same split
+    `_SCOPE_VALUES` uses). That duplication is only safe with this assertion. The vocabulary is the
+    BUILDABLE subset: a registered slot with no parser must be rejected at config load, not at
+    build time (see the next test for why that difference matters).
+    """
+    from agora_kb.config import _SESSION_FORMATS
+    from agora_kb.harvester.session_sources import (
+        DEFAULT_SESSION_FORMAT,
+        implemented_session_formats,
+    )
+
+    assert set(_SESSION_FORMATS) == set(implemented_session_formats())
+    assert DEFAULT_SESSION_FORMAT in _SESSION_FORMATS
+
+
+def test_a_registered_slot_with_no_reader_is_rejected_at_config_load(tmp_path: Path) -> None:
+    """`format: codex-jsonl` names a real registry SLOT — and is still an unknown format here.
+
+    Deferring the rejection to `build_connectors` would take the whole harvest down: it builds
+    EVERY connector before `agora harvest` applies its `--connector` filter, so one aspirational
+    line would disable unrelated healthy connectors — on a repo `agora doctor` called healthy.
+    """
+    from agora_kb.harvester.session_sources import SESSION_READERS, is_implemented_format
+
+    assert "codex-jsonl" in SESSION_READERS  # the slot exists ...
+    assert not is_implemented_format("codex-jsonl")  # ... but this build cannot parse it
+
+    lo = _layout(tmp_path)
+    p = _write_adapters(
+        lo,
+        _BACKENDS + "connectors:\n"
+        '  session:codex: { path: "~/c/**/*.jsonl", scope: personal, format: codex-jsonl }\n',
+    )
+    with pytest.raises(ConfigError) as exc:
+        load_connector_specs(p)
+    assert "unknown format" in str(exc.value)

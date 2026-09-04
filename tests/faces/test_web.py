@@ -11,6 +11,7 @@ the optional web stack (``faces.web`` is lazily imported).
 
 from __future__ import annotations
 
+import hashlib
 import subprocess
 import sys
 from pathlib import Path
@@ -31,30 +32,38 @@ def _init_repo(tmp_path: Path) -> Repo:
 
 
 def _write_wiki_notes(tmp_path: Path) -> None:
-    """A small navigable corpus (index + MOC + two themes) under ``wiki/`` (mirrors browse test)."""
+    """A small navigable SCHEMA-2 corpus (index + map + two concepts), mirroring the browse test.
+
+    ``_meta/taxonomy.yaml`` declares the schema: the read side derives ``kind``/``subjects`` under
+    the REPO's version (ADR-0041 D2.1/D2.2), so a kind-first tree read as v1 would yield no kinds.
+    """
+    (tmp_path / "_meta").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "_meta" / "taxonomy.yaml").write_text(
+        "schema_version: 2\ndomains: [ai-tech]\nallowed_tags: []\n", encoding="utf-8"
+    )
     (tmp_path / "index.md").write_text(
-        "---\ntype: index\nstatus: active\n---\n"
-        "# personal\n\n- [AI Tech MOC](wiki/ai-tech/ai-tech-moc.md)\n",
+        "---\nkind: index\nstatus: active\n---\n# personal\n\n- [AI Tech](wiki/maps/ai-tech.md)\n",
         encoding="utf-8",
     )
-    domain = tmp_path / "wiki" / "ai-tech"
-    domain.mkdir(parents=True, exist_ok=True)
-    (domain / "ai-tech-moc.md").write_text(
-        "---\nstatus: active\ntype: moc\n---\n# AI Tech\n\n"
-        "- [Curator concurrency](themes/curator-concurrency.md) — single-writer curator\n",
+    maps = tmp_path / "wiki" / "maps"
+    maps.mkdir(parents=True, exist_ok=True)
+    (maps / "ai-tech.md").write_text(
+        "---\nstatus: active\nkind: map\nsubjects: [ai-tech]\n---\n# AI Tech\n\n"
+        "- [Curator concurrency](../concepts/curator-concurrency.md) — single-writer curator\n",
         encoding="utf-8",
     )
-    themes = domain / "themes"
-    themes.mkdir(parents=True, exist_ok=True)
-    (themes / "curator-concurrency.md").write_text(
-        "---\nstatus: active\ntype: theme\ntags: [single-writer, concurrency]\n"
+    concepts = tmp_path / "wiki" / "concepts"
+    concepts.mkdir(parents=True, exist_ok=True)
+    (concepts / "curator-concurrency.md").write_text(
+        "---\nstatus: active\nkind: concept\nsubjects: [ai-tech]\n"
+        "tags: [single-writer, concurrency]\n"
         "title: Curator Concurrency Model\n---\n"
         "# Curator Concurrency\n\n"
         "The curator acquires a per-repo flock. See [Inbox design](inbox-design.md).\n",
         encoding="utf-8",
     )
-    (themes / "inbox-design.md").write_text(
-        "---\nstatus: active\ntype: theme\ntags: [inbox]\n---\n"
+    (concepts / "inbox-design.md").write_text(
+        "---\nstatus: active\nkind: concept\nsubjects: [ai-tech]\ntags: [inbox]\n---\n"
         "# Inbox Design\n\nThe inbox is append-only and per-writer namespaced.\n",
         encoding="utf-8",
     )
@@ -123,15 +132,17 @@ def test_api_notes_list_and_one(tmp_path: Path) -> None:
     listing = client.get("/api/notes")
     assert listing.status_code == 200
     data = listing.json()
-    assert data["domains"] == ["ai-tech"]
+    assert data["subjects"] == ["ai-tech"]
     rel_paths = [n["rel_path"] for n in data["notes"]]
     assert "index.md" in rel_paths
-    assert "wiki/ai-tech/themes/curator-concurrency.md" in rel_paths
+    assert "wiki/concepts/curator-concurrency.md" in rel_paths
 
-    one = client.get("/api/notes/wiki/ai-tech/themes/curator-concurrency.md")
+    one = client.get("/api/notes/wiki/concepts/curator-concurrency.md")
     assert one.status_code == 200
     note = one.json()
     assert note["basename"] == "curator-concurrency"
+    assert note["kind"] == "concept"
+    assert note["subjects"] == ["ai-tech"]
     assert note["body"].startswith("# Curator Concurrency")
     assert note["links"] == ["inbox-design"]
 
@@ -141,7 +152,7 @@ def test_api_note_404(tmp_path: Path) -> None:
     _write_wiki_notes(tmp_path)
     client = _client(tmp_path)
 
-    miss = client.get("/api/notes/wiki/ai-tech/themes/nope.md")
+    miss = client.get("/api/notes/wiki/concepts/nope.md")
     assert miss.status_code == 404
     # Traversal-safe: an escape path resolves to no note → 404, not a file read.
     traversal = client.get("/api/notes/../../etc/passwd")
@@ -256,6 +267,38 @@ def test_htmx_upload_non_kebab_tag_renders_error_fragment_not_500(tmp_path: Path
     assert "kebab-case" in resp.text  # the error detail is surfaced in the fragment
 
 
+def test_upload_form_domain_selector_comes_from_the_taxonomy(tmp_path: Path) -> None:
+    """The capture form's ``domain`` selector is the WRITE-side vocabulary (ADR-0041 D2.2 leg 3).
+
+    ``domain`` on this form reaches ``Inbox.write`` and survives schema 2 only as the
+    ``raw/<domain>/`` shard key, so its options are the taxonomy's declared ``domains`` — NOT the
+    read side's ``subjects`` facet. The distinction is observable: a domain that no note carries
+    yet must still be offered, which the old ``browse()``-derived list could not do.
+    """
+    _init_repo(tmp_path)
+    (tmp_path / "_meta").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "_meta" / "taxonomy.yaml").write_text(
+        "schema_version: 2\ndomains: [ai-tech, unused-domain]\nallowed_tags: []\n",
+        encoding="utf-8",
+    )
+    resp = _client(tmp_path).get("/upload")
+
+    assert resp.status_code == 200
+    assert '<option value="ai-tech">' in resp.text
+    assert '<option value="unused-domain">' in resp.text  # offered before any note uses it
+
+
+def test_upload_form_survives_an_unreadable_taxonomy(tmp_path: Path) -> None:
+    """A malformed taxonomy degrades the selector to "(let the curator decide)", never a 500."""
+    _init_repo(tmp_path)
+    (tmp_path / "_meta").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "_meta" / "taxonomy.yaml").write_text(": not : yaml :\n", encoding="utf-8")
+    resp = _client(tmp_path).get("/upload")
+
+    assert resp.status_code == 200
+    assert "(let the curator decide)" in resp.text
+
+
 # --- browse tolerance: a fenceless wiki note must not 500 the browse face ------------------------
 def test_browse_tolerates_fenceless_note(tmp_path: Path) -> None:
     """A single foreign / un-normalized note lacking a frontmatter fence must NOT 500 the browse UI.
@@ -337,6 +380,132 @@ def test_api_upload_oversize_file_is_413(tmp_path: Path) -> None:
     assert Inbox(Repo.resolve(tmp_path).layout).depth() == before
 
 
+# --- ADR-0041 D4.2: the upload keeps the original bytes, not just the text read out of them ------
+def test_api_upload_file_stages_the_original_bytes_as_an_attachment(tmp_path: Path) -> None:
+    """The uploaded file's bytes survive the capture, content-addressed beside the event.
+
+    ADR-0020 deferred the binary half of the upload write path; this is it. The markdown extracted
+    from the file is still the event BODY (nothing about the read path changes), but the bytes it
+    was extracted from are no longer discarded at the end of the request: they are staged in the
+    writer's own inbox namespace under their own sha256, which is the name APPLY will later
+    materialise them by in ``raw/_blob/``. The round trip asserted here — sent bytes → staged file
+    → identical bytes, at the digest the receipt names — is the whole integrity claim.
+    """
+    _init_repo(tmp_path)
+    client = _client(tmp_path, user="alice")
+    payload = b"# Upload\n\nKeep the original bytes.\n"
+
+    resp = client.post("/api/upload", files={"file": ("upload.md", payload, "text/markdown")})
+
+    assert resp.status_code == 200, resp.text
+    digest = hashlib.sha256(payload).hexdigest()
+    receipt = resp.json()
+    assert receipt["attachments"] == [
+        {
+            "sha256": digest,
+            "bytes": len(payload),
+            "filename": "upload.md",
+            "media_type": "text/markdown",
+        }
+    ]
+    item = _read_only_inbox_item(tmp_path)
+    assert item["attachments"] == [
+        {
+            "sha256": digest,
+            "ext": "md",
+            "filename": "upload.md",
+            "media_type": "text/markdown",
+            "bytes": len(payload),
+        }
+    ]
+    # The extracted markdown is still the body — the bytes ride BESIDE it, they do not replace it.
+    assert "Keep the original bytes." in str(item["body"])
+    layout = Repo.resolve(tmp_path).layout
+    staged = layout.inbox_attachment_path("web", digest, "md")
+    assert staged.read_bytes() == payload
+
+
+def test_the_receipt_describes_what_was_PERSISTED_not_what_was_submitted(tmp_path: Path) -> None:
+    """The receipt's display fields go through the same normalisers the stored record does.
+
+    ``filename``/``media_type`` are untrusted strings a browser handed us. The event record
+    sanitises the name and strips the media type's parameters (``Attachment``'s own validators), so
+    a receipt echoing the raw request back would make the JSON API, the event frontmatter and the
+    eventual ``raw/_blob/`` sidecar disagree about the same file — and would report a name for an
+    attachment that in fact carries none.
+    """
+    _init_repo(tmp_path)
+    client = _client(tmp_path, user="alice")
+    payload = b"# Upload\n\nNormalised metadata.\n"
+
+    resp = client.post(
+        "/api/upload",
+        files={"file": ("weird name (final).MD", payload, "text/markdown; charset=utf-8")},
+    )
+
+    assert resp.status_code == 200, resp.text
+    (receipt,) = resp.json()["attachments"]
+    (record,) = _read_only_inbox_item(tmp_path)["attachments"]  # type: ignore[misc]
+    assert receipt["filename"] == record["filename"] != "weird name (final).MD"
+    assert receipt["media_type"] == record["media_type"] == "text/markdown"
+    assert receipt["sha256"] == record["sha256"] == hashlib.sha256(payload).hexdigest()
+
+
+def test_api_upload_text_and_url_attach_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A pasted body IS its own bytes, and a fetched page is the remote server's rendering.
+
+    Only the FILE branch has an artefact the user handed us, so only it attaches one. Asserted so
+    that "every capture now writes a blob" can never become true by accident — every attachment is
+    a future ``raw/_blob/`` entry the curator must materialise and lint must find.
+    """
+    _init_repo(tmp_path)
+    from agora_kb.faces.web import app as web_app
+    from agora_kb.ingest.extractors import ExtractedDoc
+
+    client = _client(tmp_path, user="alice")
+    resp = client.post("/api/upload", data={"text": "A finding worth remembering."})
+    assert resp.status_code == 200
+    assert resp.json()["attachments"] == []
+
+    monkeypatch.setattr(
+        web_app,
+        "extract",
+        lambda **kwargs: ExtractedDoc(
+            markdown="# Fetched\n\nBody.",
+            source_url="https://example.com/post",
+            content_sha256="0" * 64,
+            extractor="url",
+        ),
+    )
+    resp = client.post("/api/upload", data={"url": "https://example.com/post"})
+    assert resp.status_code == 200
+    assert resp.json()["attachments"] == []
+    assert not list((Repo.resolve(tmp_path).layout.inbox_dir).glob("*/_attach/*"))
+
+
+def test_api_upload_over_cap_file_stages_no_bytes(tmp_path: Path) -> None:
+    """The cap refusal happens BEFORE anything is staged — no orphan bytes, no half-capture.
+
+    An attachment written for an event that was then refused would leave bytes in the inbox that no
+    event cites and no drain will ever move. The oversize path must therefore leave the writer's
+    namespace exactly as it found it.
+    """
+    _init_repo(tmp_path)
+    from agora_kb.faces.web.app import MAX_UPLOAD_BYTES
+
+    client = _client(tmp_path)
+    layout = Repo.resolve(tmp_path).layout
+    resp = client.post(
+        "/api/upload", files={"file": ("big.txt", b"x" * (MAX_UPLOAD_BYTES + 1), "text/plain")}
+    )
+
+    assert resp.status_code == 413, resp.text
+    assert Inbox(layout).depth() == 0
+    assert not list(layout.inbox_dir.glob("*/_attach/*"))
+
+
 # --- HTMX upload fragment -----------------------------------------------------------------------
 def test_htmx_upload_returns_receipt_fragment(tmp_path: Path) -> None:
     _init_repo(tmp_path)
@@ -405,11 +574,11 @@ def test_note_render_rewrites_intra_wiki_links(tmp_path: Path) -> None:
     _write_wiki_notes(tmp_path)
     client = _client(tmp_path)
 
-    resp = client.get("/note/wiki/ai-tech/themes/curator-concurrency.md")
+    resp = client.get("/note/wiki/concepts/curator-concurrency.md")
     assert resp.status_code == 200
     html = resp.text
     # The body link [Inbox design](inbox-design.md) is rewritten to the resolved web route.
-    assert 'href="/note/wiki/ai-tech/themes/inbox-design.md"' in html
+    assert 'href="/note/wiki/concepts/inbox-design.md"' in html
     # The bare relative .md target is not left in place.
     assert 'href="inbox-design.md"' not in html
 
@@ -601,3 +770,68 @@ def _tiny_pdf(text: str = "Hello Agora PDF") -> bytes:
         xref_pos,
     )
     return out
+
+
+# --- ADR-0041 D3.3: people notes are outside the [[basename]] identity space ---------------------
+def test_note_links_never_resolve_into_the_people_tree(tmp_path: Path) -> None:
+    """A human-owned note must not capture a link the curator wrote at an explicit path.
+
+    ``_rewrite_wiki_links`` resolves a body link by BASENAME over the browse rows, which are sorted
+    by rel_path — and ``wiki/people/...`` sorts BEFORE ``wiki/summaries/...``, so without the D3.3
+    exclusion the human note wins ``setdefault`` for every summary basename and the reader is sent
+    to the private note instead. The collision is legal by construction (D3.3 keeps people out of
+    lint's L1-1 duplicate rule), so the resolver is what has to hold the line.
+    """
+    _init_repo(tmp_path)
+    _write_wiki_notes(tmp_path)
+    summaries = tmp_path / "wiki" / "summaries"
+    summaries.mkdir(parents=True, exist_ok=True)
+    (summaries / "dup.md").write_text(
+        "---\nstatus: active\nkind: summary\nsubjects: [ai-tech]\n---\n# Dup\n\nCurated.\n",
+        encoding="utf-8",
+    )
+    people = tmp_path / "wiki" / "people" / "hando"
+    people.mkdir(parents=True, exist_ok=True)
+    (people / "dup.md").write_text(
+        "---\nstatus: active\n---\n# Dup\n\nHuman-owned, same basename.\n", encoding="utf-8"
+    )
+    (tmp_path / "wiki" / "concepts" / "src.md").write_text(
+        "---\nstatus: active\nkind: concept\n---\n# Src\n\nSee [Dup](../summaries/dup.md).\n",
+        encoding="utf-8",
+    )
+    client = _client(tmp_path)
+
+    html = client.get("/note/wiki/concepts/src.md").text
+    assert "/note/wiki/summaries/dup.md" in html
+    assert "/note/wiki/people/hando/dup.md" not in html
+    # Read stays first class: the people note is still browsable at its own path.
+    assert client.get("/note/wiki/people/hando/dup.md").status_code == 200
+
+
+def test_a_stray_schema_1_note_does_not_report_its_filename_as_a_subject(tmp_path: Path) -> None:
+    """ADR-0014 D1's tolerant read must not INVENT a subject for a file it tolerates.
+
+    A schema-1 note sitting directly under ``wiki/`` (``wiki/README.md``, an un-normalized vault
+    file) has no domain DIRECTORY, so it has no subject. Deriving one from the ``>= 2``-segment
+    reading hands back the FILENAME, which then becomes a heading on ``/``, a chip on ``/graph``
+    and a member of ``GET /api/notes``' ``subjects`` union — a value no note actually declares.
+    """
+    _init_repo(tmp_path)  # `repo.init()` writes a schema-1 repo unless asked otherwise
+    (tmp_path / "wiki").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "wiki" / "stray.md").write_text(
+        "---\ntype: theme\nstatus: active\n---\n# Stray\n\nbody.\n", encoding="utf-8"
+    )
+    client = _client(tmp_path)
+
+    listing = client.get("/api/notes").json()
+    row = next(n for n in listing["notes"] if n["rel_path"] == "wiki/stray.md")
+    assert row["subjects"] == []
+    assert "stray.md" not in listing["subjects"]
+    # A note under a real domain directory still carries that domain as its one v1 subject.
+    (tmp_path / "wiki" / "finance").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "wiki" / "finance" / "budget.md").write_text(
+        "---\ntype: theme\nstatus: active\n---\n# Budget\n\nbody.\n", encoding="utf-8"
+    )
+    listing = _client(tmp_path).get("/api/notes").json()
+    row = next(n for n in listing["notes"] if n["rel_path"] == "wiki/finance/budget.md")
+    assert row["subjects"] == ["finance"]
