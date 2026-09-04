@@ -12,6 +12,13 @@ lives under ``wiki/`` already, so the path predicate reduces to: an exact match 
 top-level files, or a path under one of the allowed directory prefixes. ``_agora_scratch/`` (the
 backend's writable scratch, §3) is git-ignored in the worktree's own ``.gitignore`` and must produce
 ZERO tracked changes — it is NOT in the allowlist.
+
+Schema 2 (ADR-0041 D4.1) subtracts ONE prefix from that set rather than adding a second check:
+``wiki/people/**`` is a HUMAN-owned namespace (D3.3) that the curator may never write, so the
+predicate becomes *prefix-allow MINUS the exclusion*. Expressing it as an exclusion inside this one
+function is the whole point — the PLAN check and the final-diff assertion then both acquire it
+without either one being edited, which is what ADR-0011 §4.0's "defined once and referenced by
+every check" buys.
 """
 
 from __future__ import annotations
@@ -22,6 +29,15 @@ ALLOWLIST_FILES: frozenset[str] = frozenset({"index.md", "log.md"})
 # Directory prefixes (POSIX, trailing slash) under which any added/modified path is allowed. A
 # ``<domain>-moc.md`` is under ``wiki/`` so it is covered by the ``wiki/`` prefix.
 ALLOWLIST_DIR_PREFIXES: tuple[str, ...] = ("wiki/", "assets/")
+
+# Directory prefixes CARVED OUT of the allowlist above: they sit under an allowed prefix but are
+# NEVER a legal curator write (ADR-0041 D4.1). Today there is exactly one — ``wiki/people/``, the
+# human-owned namespace of D3.3: "the curator never writes ``wiki/people/**``… any add, modify,
+# rename or delete under it in a curated diff FAILS the run". The exclusion is stated as a
+# directory prefix, and the bare path (a FILE literally named ``wiki/people``) is denied with it:
+# that file would occupy the directory's own name, so admitting it would let a run take the
+# namespace hostage while nominally writing "just a note".
+ALLOWLIST_DENY_PREFIXES: tuple[str, ...] = ("wiki/people/",)
 
 # The git-ignored backend scratch dir (ADR-0011 §3 / §4.3): writable inside the worktree mount but
 # allowlist-EXCLUDED — the final-diff assertion requires it to produce ZERO tracked changes.
@@ -58,11 +74,30 @@ DEFAULT_MAX_CANDIDATES_PER_RUN = 32
 def is_allowlisted_path(rel_path: str) -> bool:
     """True iff ``rel_path`` (POSIX, repo-relative) is within the canonical §4.0 ALLOWLIST.
 
-    A path is allowed iff it is one of :data:`ALLOWLIST_FILES` exactly, or it lives under one of
-    :data:`ALLOWLIST_DIR_PREFIXES`. Everything else (``_kb/``, ``_meta/``, ``_templates/``,
-    ``raw/``, git internals, hooks, the schema doc + its symlinks, ``_agora_scratch/``) is rejected
-    — the final-diff assertion fails the whole run on any such add/modify/rename (ADR-0011 §4.0).
+    A path is allowed iff it carries no ``..`` segment, is not under one of
+    :data:`ALLOWLIST_DENY_PREFIXES`, and is either one of :data:`ALLOWLIST_FILES` exactly or lives
+    under one of :data:`ALLOWLIST_DIR_PREFIXES`. Everything else (``_kb/``, ``_meta/``,
+    ``_templates/``, ``raw/``, git internals, hooks, the schema doc + its symlinks,
+    ``_agora_scratch/``) is rejected — the final-diff assertion fails the whole run on any such
+    add/modify/rename (ADR-0011 §4.0).
+
+    Two rules beyond the plain prefix test, and both are load-bearing:
+
+    * **No ``..`` segment.** The test below is a ``startswith``, so the literal string
+      ``wiki/../_kb/index/x`` has the ``wiki/`` prefix and would otherwise be *allowlisted while
+      naming a path outside the allowlist*. Git's ``--name-status`` output is normalized and would
+      not produce that spelling, and the write sites resolve + containment-check independently
+      (``apply._contained``) — which is exactly why this had never fired. It is closed here anyway,
+      because a gate whose safety rests on "the only caller happens to pass normalized input" stops
+      being a gate the moment a second caller appears (ADR-0041 D4.1).
+    * **The ``wiki/people/`` carve-out** (ADR-0041 D3.3/D4.1). It is checked BEFORE the allow test,
+      so the subtraction cannot be defeated by ordering.
     """
+    if ".." in rel_path.split("/"):
+        return False
+    for denied in ALLOWLIST_DENY_PREFIXES:
+        if rel_path == denied.rstrip("/") or rel_path.startswith(denied):
+            return False
     if rel_path in ALLOWLIST_FILES:
         return True
     return any(rel_path.startswith(prefix) for prefix in ALLOWLIST_DIR_PREFIXES)

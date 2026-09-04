@@ -12,15 +12,18 @@ import json
 import pytest
 from pydantic import ValidationError
 
+from agora_kb.curator.constants import is_allowlisted_path
 from agora_kb.curator.plan import (
     Disposition,
     Plan,
     PlanError,
     PlanParseError,
+    _implied_note_path,
     validate_plan,
 )
 
 RUN_ID = "2026-06-13T03-00-00.000Z--7f31ab"
+RUN_DATE = RUN_ID[:10]  # the deterministic curator-owned fact schema-2 dailies are named by
 E1 = "2026-06-13T02-40-10.000Z--a1b2c3"
 E2 = "2026-06-13T02-41-00.000Z--d4e5f6"
 E3 = "2026-06-13T02-42-00.000Z--beef01"
@@ -608,7 +611,7 @@ def test_basename_missing_target_fails() -> None:
 
 def test_basename_merge_target_non_theme_fails() -> None:
     # ``ai-tech-moc`` is in LIVE but is a MOC, NOT a theme (not in THEMES). MERGE_INTO_THEME may
-    # only target a theme (apply._resolve_target_path theme_only=True), so naming the MOC is a
+    # only target a theme (apply._resolve_target_path sourced_only=True), so naming the MOC is a
     # BASENAME rejection — otherwise validate_plan would accept a plan that crashes APPLY.
     plan = _plan(
         _disp(
@@ -673,10 +676,14 @@ def test_basename_merge_target_theme_passes() -> None:
 
 def test_basename_daily_exempt_from_uniqueness() -> None:
     # Two APPEND_DAILY dispositions sharing the same daily basename do NOT trip BASENAME (§3.1).
+    # Schema 2 basenames the journal with the bare run date (ADR-0041 D2.6) — and ADR-0011 §4.1
+    # check 5's daily exemption must SURVIVE that change: one journal per run_date removes
+    # cross-domain collisions but not the second `agora curate` of the same day, whose
+    # APPEND_DAILY names a basename that is by then already on disk.
     plan = _plan(
         _disp(
             op="APPEND_DAILY",
-            basename="ai-tech-2026-06-13",
+            basename=RUN_DATE,
             tags=(),
             aliases=(),
             links=(),
@@ -686,7 +693,7 @@ def test_basename_daily_exempt_from_uniqueness() -> None:
             event_ids=(E2,),
             op="APPEND_DAILY",
             domain="ai-tech",
-            basename="ai-tech-2026-06-13",  # same daily basename — exempt
+            basename=RUN_DATE,  # same daily basename — exempt
             title="Daily",
             summary="day",
             tags=(),
@@ -752,6 +759,308 @@ def test_path_allowlist_separator_in_domain_fails() -> None:
 def test_path_allowlist_leading_dot_basename_fails() -> None:
     errors = _validate(_plan(_disp(basename=".git", links=())))
     assert "PATH-ALLOWLIST" in _checks(errors)
+
+
+# --- check 5 (schema 2): the mintable MAP basename reservation, ADR-0041 D1.3 -------------------
+
+
+def test_basename_equal_to_a_declared_domain_is_reserved_for_its_map() -> None:
+    """A concept may not take a name the lazily-minted ``wiki/maps/<subject>.md`` will need.
+
+    D1.3 drops v1's ``-moc`` filename suffix, so the map's basename is the bare subject and shares
+    ONE namespace with every concept. The map does not exist until the first concept of that
+    subject is filed, so it can never be in ``live_basenames`` — the gate has to come from the
+    declared domain set instead. Without it APPLY materializes an L1-1 duplicate basename out of a
+    plan this gate called valid.
+    """
+    errors = _validate(_plan(_disp(basename="ai-tech", links=())))
+    assert "BASENAME" in _checks(errors)
+    assert any("wiki/maps/ai-tech.md" in e.message for e in errors)
+
+
+def test_the_reservation_covers_a_domain_other_than_the_dispositions_own() -> None:
+    """The CROSS-RUN wedge, which is the reachable shape.
+
+    Run 1 files a concept named ``economy`` under subject ``ai-tech`` and publishes clean; from
+    then on the FIRST run that classifies anything under subject ``economy`` mints
+    ``wiki/maps/economy.md`` and every run touching that subject fails L1-1 forever — on an error
+    naming neither the concept nor the disposition that triggered it. The reservation is over ALL
+    declared domains, not just the disposition's own, so run 1 is rejected instead.
+    """
+    errors = _validate(_plan(_disp(domain="ai-tech", basename="economy", links=())))
+    assert "BASENAME" in _checks(errors)
+
+
+def test_the_reservation_reports_once_when_the_map_already_exists() -> None:
+    """An already-materialized map is in ``live_basenames``; one collision, one error."""
+    errors = validate_plan(
+        _plan(_disp(basename="ai-tech-moc", links=())),
+        manifest_event_ids={E1},
+        allowed_tags=ALLOWED_TAGS,
+        domains=DOMAINS | {"ai-tech-moc"},
+        live_basenames=LIVE,
+        theme_basenames=THEMES,
+        gated_candidate_ids=set(),
+    )
+    basename_errors = [e for e in errors if e.check == "BASENAME"]
+    assert len(basename_errors) == 1
+    assert "already exists in the live worktree tree" in basename_errors[0].message
+
+
+def test_a_basename_outside_the_domain_set_is_still_accepted() -> None:
+    """The reservation is exactly the declared domains — it does not narrow ordinary naming."""
+    assert _validate(_plan(_disp(basename="curator-concurrency"))) == []
+
+
+# --- check 6 (schema 2): the kind-first path grammar, ADR-0041 D1 -------------------------------
+
+
+def test_implied_path_create_theme_is_kind_first() -> None:
+    """CREATE_THEME → ``wiki/concepts/<basename>.md``: the DIRECTORY is the kind (D1/D2.5).
+
+    The subject has left the path entirely, which is the whole axis flip. Asserted on the composer
+    rather than only through the validator because the shape is what APPLY has to agree with.
+    """
+    assert _implied_note_path(_disp()) == "wiki/concepts/curator-concurrency.md"
+
+
+def test_implied_path_create_theme_needs_no_domain() -> None:
+    """A subject is no longer a precondition for HAVING a path (ADR-0022 §A leg 1, retired).
+
+    In v1 the note's path needed a domain, which is why the no-loss floor had to assert a possibly
+    FALSE one. Schema 2 gives every concept a path regardless, so the floor's path leg is gone —
+    the remaining ``domain`` requirement in check 5 is APPLY's, not the path's.
+    """
+    assert _implied_note_path(_disp(domain=None)) == "wiki/concepts/curator-concurrency.md"
+
+
+def test_implied_path_append_daily_is_date_sharded_from_the_run_date() -> None:
+    """APPEND_DAILY → ``wiki/notes/<yyyy>/<mm>/<run_date>.md`` (D2.6): shard AND basename from one
+    curator-owned fact, never parsed back out of model output."""
+    disp = _disp(op="APPEND_DAILY", basename=RUN_DATE)
+    assert _implied_note_path(disp, run_date=RUN_DATE) == f"wiki/notes/2026/06/{RUN_DATE}.md"
+
+
+def test_implied_path_daily_shard_ignores_a_model_supplied_basename() -> None:
+    """The injected run_date WINS: a model basename can never move the note into another month."""
+    disp = _disp(op="APPEND_DAILY", basename="1999-01-01")
+    assert _implied_note_path(disp, run_date=RUN_DATE).startswith("wiki/notes/2026/06/")
+
+
+def test_append_daily_basename_must_be_the_run_date_when_injected() -> None:
+    """D2.6: one journal per run_date, repo-wide, BASENAMED by it — a mismatch is a PLAN reject."""
+    plan = _plan(_disp(op="APPEND_DAILY", basename="ai-tech-2026-06-13", tags=(), links=()))
+    errors = validate_plan(
+        plan,
+        manifest_event_ids={E1},
+        allowed_tags=ALLOWED_TAGS,
+        domains=DOMAINS,
+        live_basenames=LIVE,
+        theme_basenames=THEMES,
+        gated_candidate_ids=set(),
+        run_date=RUN_DATE,
+    )
+    assert "PATH-ALLOWLIST" in _checks(errors)
+    assert any("is not the run date" in e.message for e in errors)
+
+
+def test_append_daily_basename_equal_to_the_run_date_passes() -> None:
+    plan = _plan(_disp(op="APPEND_DAILY", basename=RUN_DATE, tags=(), links=()))
+    errors = validate_plan(
+        plan,
+        manifest_event_ids={E1},
+        allowed_tags=ALLOWED_TAGS,
+        domains=DOMAINS,
+        live_basenames=LIVE,
+        theme_basenames=THEMES,
+        gated_candidate_ids=set(),
+        run_date=RUN_DATE,
+    )
+    assert errors == [], errors
+
+
+# --- check 6 (schema 2): the pathsafe swap, ADR-0041 D4.4 ---------------------------------------
+#
+# The escape cases above (traversal, separator, leading dot) MUST stay red under the new rule —
+# they are the reason the old regex existed. These add what the swap changes: what it now ADMITS
+# (non-Latin scripts) and what it now REJECTS that the ASCII regex allowed (a leading underscore,
+# a Windows device stem).
+
+
+@pytest.mark.parametrize(
+    "basename",
+    [
+        "한국어-메모",  # the widening the swap exists for (#57)
+        "日本語",
+        "Привет",
+        "café",
+        "my.note_v2-1",  # pathsafe's literal extras, unchanged from the ASCII regex
+        "note-abc12345",  # the #57 hash floor's own output
+    ],
+)
+def test_path_allowlist_admits_unicode_basenames(basename: str) -> None:
+    """A Korean (or Japanese, or Cyrillic) note can now be NAMED, not just titled (#57/D4.4)."""
+    assert _validate(_plan(_disp(basename=basename, links=()))) == []
+
+
+@pytest.mark.parametrize(
+    "basename",
+    [
+        "../../_kb/escape",
+        "a/b",
+        "a\\b",
+        ".git",
+        "..",
+        ".",
+        "a\x00b",
+        "a\x1fb",
+        "a\u202eb",  # bidi override
+        "a\u200bb",  # zero-width space
+        "a\uff0fb",  # fullwidth solidus
+        'a"b',
+        "a|b",
+        "a?b",
+        "a*b",
+        "a:b",
+        "",
+        "   ",
+        "!!!",
+    ],
+)
+def test_path_allowlist_still_rejects_every_escape_shape(basename: str) -> None:
+    """The closed-set property survives the widening: pathsafe is a CATEGORY allowlist, so every
+    separator/control/invisible/Windows-hostile character is unreachable without being enumerated.
+    """
+    errors = _validate(_plan(_disp(basename=basename, links=())))
+    assert "PATH-ALLOWLIST" in _checks(errors)
+
+
+@pytest.mark.parametrize("basename", ["_blob", "_pages", "_kb", "_anything"])
+def test_path_allowlist_rejects_a_leading_underscore_basename(basename: str) -> None:
+    """ADR-0041 D4.4, NORMATIVE: the ONE character on which the swap is a LOOSENING.
+
+    ``core.pathsafe`` puts ``_`` in its allowed extras and rejects only a leading ``.``, so
+    ``is_safe_component('_blob')`` is True — while the deleted ASCII regex rejected it by its
+    leading character class. That exclusion was the only thing stopping a plan token named
+    ``_blob``, which shares a namespace with ``raw/_blob/``, so the rejection has to be explicit.
+    """
+    errors = _validate(_plan(_disp(basename=basename, links=())))
+    assert "PATH-ALLOWLIST" in _checks(errors)
+    assert any("_blob" in e.message for e in errors if e.check == "PATH-ALLOWLIST")
+
+
+@pytest.mark.parametrize("basename", ["CON", "con.md", "COM1", "lpt9", "nul", "com¹"])
+def test_path_allowlist_rejects_windows_reserved_device_stems(basename: str) -> None:
+    """The tightening shipped WITH the widening: the ASCII regex admitted every one of these, and
+    a repo cloned to Windows silently fails to check such a file out."""
+    assert "PATH-ALLOWLIST" in _checks(_validate(_plan(_disp(basename=basename, links=()))))
+
+
+def test_path_allowlist_rejects_an_over_long_basename() -> None:
+    """The 180-UTF-8-byte cap (pathsafe's default) keeps a component inside POSIX NAME_MAX."""
+    assert "PATH-ALLOWLIST" in _checks(_validate(_plan(_disp(basename="a" * 300, links=()))))
+
+
+def test_path_allowlist_domain_is_graded_by_the_note_composers_rule() -> None:
+    """The DOMAIN token is graded by ``_is_safe_basename``, the SAME rule as the basename.
+
+    Under schema 2 the domain does not merely shard ``raw/``: ``apply._update_map`` composes
+    ``wiki/maps/<subject>.md`` from it through ``RepoLayout.note_path_for`` (D1.3), so it names a
+    NOTE. Grading it with a second, looser rule is how a plan this gate calls valid goes on to
+    crash APPLY: the v1 ASCII regex admitted ``con`` (a Windows reserved device stem) and
+    ``foo.md`` (an extension the composer appends itself), both of which the composer hard-rejects.
+    """
+    for domain in ("con", "foo.md", "a/b", ".."):
+        errors = _validate(_plan(_disp(domain=domain, tags=())))
+        assert "PATH-ALLOWLIST" in _checks(errors), domain
+
+
+def test_path_allowlist_domain_admits_a_korean_token() -> None:
+    """The other half of one-rule-one-spelling: the composer accepts ``wiki/maps/한국어.md``, so the
+    PLAN gate must too. Rejecting it here (as the v1 ASCII rule did) wedges a Korean-domain repo —
+    every CREATE_THEME/APPEND_DAILY in that domain fails forever — which is the exact shape
+    #56/#57 exist to fix. TAXONOMY (check 4) still governs whether the domain is DECLARED.
+    """
+    errors = _validate(_plan(_disp(domain="한국어", tags=())))
+    assert "PATH-ALLOWLIST" not in _checks(errors)
+    assert "TAXONOMY" in _checks(errors), "undeclared is a taxonomy failure, not a path one"
+
+
+def test_path_allowlist_grades_the_domain_on_a_merge_too() -> None:
+    """MERGE/MARK_CONTESTED carry a domain and it composes ``raw/<domain>/<event_id>.md`` too.
+
+    Grading only the two basename ops leaves the shard key of the two claim-bearing ops ungraded,
+    which is how an escaping token still reaches a write.
+    """
+    merge = _disp(
+        candidate_id="c1",
+        op="MERGE_INTO_THEME",
+        domain="../assets",
+        basename=None,
+        target_basename="cqrs",
+        title=None,
+        tags=(),
+        aliases=(),
+        links=(),
+        needs_prose=False,
+    )
+    errors = _validate(_plan(merge))
+    assert "PATH-ALLOWLIST" in _checks(errors)
+
+
+def test_path_allowlist_domain_rejects_a_leading_underscore() -> None:
+    """``_blob``/``_pages`` are RESERVED raw/ prefixes (D1.4). The taxonomy loader is the other
+    layer over the other input; neither substitutes for the other."""
+    assert "PATH-ALLOWLIST" in _checks(_validate(_plan(_disp(domain="_blob", tags=()))))
+
+
+# --- check 6 (schema 2): the ONE allowlist constant, ADR-0041 D4.1 ------------------------------
+
+
+def test_allowlist_constant_denies_the_people_carve_out() -> None:
+    """D4.1/D3.3: ``wiki/people/**`` is human-owned — under ``wiki/`` and NOT allowlisted.
+
+    Asserted on the shared predicate, not on a plan, because the point of D4.1 is that ONE
+    constant serves both the PLAN check and the final-diff assertion: a test that only exercised
+    the plan side would leave the worker side free to drift.
+    """
+    assert is_allowlisted_path("wiki/concepts/x.md") is True
+    assert is_allowlisted_path("wiki/maps/x.md") is True
+    assert is_allowlisted_path("index.md") is True
+    assert is_allowlisted_path("log.md") is True
+    assert is_allowlisted_path("assets/a.png") is True
+    assert is_allowlisted_path("wiki/people/hando/x.md") is False
+    assert is_allowlisted_path("wiki/people/x.md") is False
+    # A FILE literally named `wiki/people` would occupy the directory's own name.
+    assert is_allowlisted_path("wiki/people") is False
+
+
+def test_allowlist_constant_rejects_a_traversal_segment() -> None:
+    """A bare ``startswith`` allowlisted ``wiki/../_kb/index/x`` — a path with the right PREFIX
+    naming a location outside the allowlist. Git's normalized output never spells it that way,
+    which is exactly why it never fired; a gate that is safe only because its one caller happens
+    to pass normalized input stops being a gate when a second caller appears.
+    """
+    assert is_allowlisted_path("wiki/../_kb/index/x") is False
+    assert is_allowlisted_path("wiki/concepts/../../_meta/taxonomy.yaml") is False
+    assert is_allowlisted_path("assets/../.git/config") is False
+    # ".." INSIDE a component is a legal filename, not traversal.
+    assert is_allowlisted_path("wiki/concepts/a..b.md") is True
+
+
+def test_allowlist_constant_still_rejects_everything_outside_it() -> None:
+    for path in (
+        "_kb/index/notes.json",
+        "_meta/taxonomy.yaml",
+        "_templates/theme.md",
+        "raw/ai-tech/e1.md",
+        ".git/config",
+        ".git/hooks/pre-commit",
+        "AGENTS.md",
+        "CLAUDE.md",
+        "_agora_scratch/plan.json",
+    ):
+        assert is_allowlisted_path(path) is False, path
 
 
 # --- check 7: LINK RESOLVABILITY ----------------------------------------------------------------

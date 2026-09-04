@@ -32,6 +32,7 @@ import io
 import json
 import os
 import re
+import string
 import sys
 import urllib.error
 import urllib.request
@@ -41,6 +42,7 @@ from typing import Any
 
 from agora_kb.core import frontmatter
 from agora_kb.core.hashing import content_sha256
+from agora_kb.core.pathsafe import safe_slug_component
 from agora_kb.curator.apply import body_sentinels
 from agora_kb.curator.plan import GATE_ALLOWED_OPS, OPS
 from agora_kb.curator.subprocess_backend import (
@@ -114,9 +116,19 @@ _SOURCE_BLOCK_RE = re.compile(
     re.DOTALL,
 )
 
-# Slug shape (must match plan.py PATH/ALLOWLIST safe-token expectations: alnum-led, slug-safe).
-_SLUG_OK_RE = re.compile(r"\A[a-z0-9][a-z0-9-]*\Z")
-_SLUG_MAX_LEN = 60
+# Slug size cap, in UTF-8 BYTES (ADR-0041 D4.4). It was 60 CHARACTERS, which was only ever
+# byte-safe because the old slugger's output was ASCII by construction; a Korean syllable is 3
+# bytes, so the cap has to be counted in the unit the filesystem counts in. 60 is kept rather than
+# pathsafe's 180-byte default so an ASCII slug is byte-identical to the pre-swap output — the cap
+# is the one place where "same rule, different unit" would otherwise change existing filenames.
+_SLUG_MAX_BYTES = 60
+
+# ASCII-ONLY case folding, applied before the slugger. ``str.lower()`` would also fold non-ASCII,
+# which pathsafe deliberately does not do: folding is lossy and locale-sensitive off the ASCII
+# range (Turkish dotless ı, Greek final sigma) and buys no collision safety on the
+# case-insensitive filesystems that matter. Folding A-Z only keeps every ASCII slug identical to
+# the pre-swap output while leaving Korean, Cyrillic and Greek exactly as written.
+_ASCII_LOWER = str.maketrans(string.ascii_uppercase, string.ascii_lowercase)
 
 # Statuses a CREATE/MERGE disposition may legitimately carry (never 'contested', which is reserved
 # for MARK_CONTESTED by plan.py §4.1.9).
@@ -311,7 +323,7 @@ def related_theme_basenames(related_docs: list[dict]) -> set[str]:
 
     The THEME-only subset of :func:`related_basenames`: MERGE_INTO_THEME / MARK_CONTESTED resolve
     their target (and a contest's competing notes) to a theme at APPLY
-    (``apply._resolve_target_path`` ``theme_only=True``), and the §4.1 BASENAME/PROVENANCE checks
+    (``apply._resolve_target_path`` ``sourced_only=True``), and the §4.1 BASENAME/PROVENANCE checks
     now require those targets to be THEME notes. The shim mirrors that so it never EMITS a merge/
     contest naming a MOC/index/daily (e.g. contesting the domain MOC) — a defensive-quality
     narrowing; the worker re-grades regardless. Malformed/missing entries are skipped.
@@ -339,29 +351,54 @@ def related_theme_basenames(related_docs: list[dict]) -> set[str]:
 
 
 def _slugify(text: str) -> str:
-    """Lowercase + non-alnum→'-' slug (collapsed, trimmed, ≤60) or ``""`` if nothing usable."""
-    lowered = str(text).lower()
-    slug = re.sub(r"[^a-z0-9]+", "-", lowered)
-    slug = re.sub(r"-+", "-", slug).strip("-")
-    if len(slug) > _SLUG_MAX_LEN:
-        slug = slug[:_SLUG_MAX_LEN].rstrip("-")
-    if not slug or not _SLUG_OK_RE.match(slug):
-        return ""
+    """Unicode-preserving path-component slug, or ``""`` when nothing safe survives (ADR-0041 D4.4).
+
+    The slugger is now :func:`agora_kb.core.pathsafe.safe_slug_component` — a closed Unicode
+    CATEGORY allowlist (letters, numbers, combining marks, plus ``-``, ``_``, ``.``) with NFC
+    normalization, separator-run collapsing, edge trimming to a fixed point, Windows reserved-device
+    rejection and a codepoint-safe UTF-8 byte cap. Two things are done around it and both are
+    deliberate:
+
+    * **ASCII-only lowercasing first** (:data:`_ASCII_LOWER`), so an ASCII seed produces the exact
+      pre-swap slug while a Korean seed is left alone rather than case-folded by a locale-sensitive
+      rule pathsafe refuses to apply.
+    * **A leading ``_`` is stripped, then the result re-verified.** pathsafe admits ``_``
+      literally, so a title like ``"_blob notes"`` would slug to ``_blob-notes`` — and ADR-0041
+      D4.4 makes a leading underscore a hard PLAN rejection (the ``raw/_blob`` / ``raw/_pages``
+      reservation). A producer must never emit what the validator rejects, so the reservation is
+      honoured HERE by stripping, not by failing the run. The re-verify is what makes the output
+      canonical again after the strip (``"_-x"`` → ``"-x"`` → ``"x"``), and it is also the fix for
+      the divergence the import-side mirror carried.
+
+    **Two behaviour changes, both intended, both #57.** A purely non-ASCII seed now yields a slug
+    in its own script instead of ``""`` (so the ``note-<sha8>`` floor fires far more rarely, and a
+    Korean alias is now PRESERVED rather than skipped-and-counted), and ``_``/``.`` survive
+    literally instead of collapsing to ``-`` (``"Foo__Bar"`` → ``"foo__bar"``, ``"v1.2"`` →
+    ``"v1.2"``). A Windows device stem (``CON``, ``COM1``…) now slugs to ``""`` and takes the hash
+    floor — a tightening the ASCII regex never had.
+    """
+    slug = safe_slug_component(str(text).translate(_ASCII_LOWER), max_bytes=_SLUG_MAX_BYTES)
+    if slug.startswith("_"):
+        slug = safe_slug_component(slug.lstrip("_"), max_bytes=_SLUG_MAX_BYTES)
     return slug
 
 
 def _hash_fallback_basename(candidate: dict, text: str) -> str:
     """Deterministic ``note-<sha8>`` basename for an un-slugifiable CREATE_THEME seed (#57).
 
-    A purely non-ASCII seed (e.g. a Korean title) slugifies to ``""``; instead of silently DROPping
-    the capture, the note is named ``note-`` + the first 8 hex chars of the candidate's canonical
-    ``content_sha256`` (DATA-MODEL §11.2 — the hash ``bundle.py`` already stamps into
-    ``candidates.json``, reused verbatim so it is never computed twice). When the field is
-    absent/malformed (hand-built candidates, older bundles) the SAME canonical hash is recomputed
-    from the candidate ``text`` via :func:`agora_kb.core.hashing.content_sha256`, so the fallback is
-    byte-identical either way. The result is ASCII slug-safe by construction (``_SLUG_OK_RE`` and
-    plan.py's PATH/ALLOWLIST safe-token regex both pass, so the path-safety regex never widens);
-    the non-ASCII meaning lives in ``title:``/``summary:`` (arbitrary strings), never the filename.
+    **Still the last resort, and still needed** (ADR-0041 D4.4): after the pathsafe swap a Korean
+    title slugifies to a Korean component, so this fires far more rarely — but a seed of pure
+    punctuation, emoji, control characters or a Windows reserved device stem still reduces to
+    ``""``, and :func:`agora_kb.core.pathsafe.safe_slug_component` returns that empty string
+    *precisely so this floor stays reachable*. Instead of silently DROPping the capture, the note
+    is named ``note-`` + the first 8 hex chars of the candidate's canonical ``content_sha256``
+    (DATA-MODEL §11.2 — the hash ``bundle.py`` already stamps into ``candidates.json``, reused
+    verbatim so it is never computed twice). When the field is absent/malformed (hand-built
+    candidates, older bundles) the SAME canonical hash is recomputed from the candidate ``text``
+    via :func:`agora_kb.core.hashing.content_sha256`, so the fallback is byte-identical either way.
+    The result passes plan.py's PATH/ALLOWLIST basename rule by construction (lowercase ASCII, no
+    leading ``_``, not a reserved stem); the original meaning lives in ``title:``/``summary:``
+    (arbitrary strings), never the filename.
     """
     sha = candidate.get("content_sha256")
     if not (isinstance(sha, str) and _SHA256_HEX_RE.match(sha)):
@@ -497,10 +534,11 @@ def normalize_plan(
       MERGE/CONTEST target not in the live THEME registry — ``live_theme_basenames``, since those
       ops may only target a theme; a MARK_CONTESTED with no resolvable competing THEME link — which
       validate_plan / apply._apply_contested reject);
-    * an un-slugifiable CREATE_THEME seed (purely non-ASCII, e.g. Korean — #57) no longer DROPs:
-      it takes the deterministic ``note-<sha8>`` hash fallback (:func:`_hash_fallback_basename`)
-      and rides the same uniqueness suffixing, with the original-language meaning preserved in
-      ``title:``/``summary:``;
+    * an un-slugifiable CREATE_THEME seed (nothing survives the closed character allowlist — pure
+      punctuation, emoji, or a Windows device stem; a Korean seed now slugifies in its own script,
+      ADR-0041 D4.4) no longer DROPs: it takes the deterministic ``note-<sha8>`` hash fallback
+      (:func:`_hash_fallback_basename`) and rides the same uniqueness suffixing, with the
+      original-language meaning preserved in ``title:``/``summary:``;
     * tags filtered to ``allowed_tags``; domain ∈ ``domains``; status in the C1 enum (never
       ``contested`` outside MARK_CONTESTED); basenames slugified + made unique; links filtered to
       resolvable basenames; aliases slugified + de-collided against basenames ∪ aliases (so the
@@ -579,9 +617,10 @@ def normalize_plan(
         used_hash_fallback = False
         if op == "CREATE_THEME":
             # Try EACH seed in order (model basename → model title → capture text) and take the
-            # first that slugifies non-empty — a Korean basename alongside an ASCII title must
-            # yield the meaningful title slug, not fall straight through to the opaque hash name.
-            # First-candidate success is byte-identical to the historical first-truthy chain.
+            # first that slugifies non-empty, so a seed the character allowlist empties out (pure
+            # punctuation/emoji) yields the next MEANINGFUL seed's slug rather than falling
+            # straight through to the opaque hash name. Since ADR-0041 D4.4 a Korean basename
+            # slugifies to a Korean component, so the chain usually stops at the first seed.
             slug = ""
             for seed in (md.get("basename"), md.get("title"), text):
                 if not seed:
@@ -590,14 +629,20 @@ def normalize_plan(
                 if slug:
                     break
             if not slug:
-                # #57 no-loss fallback: when EVERY seed is un-slugifiable (e.g. purely Korean) the
-                # capture no longer downgrades to DROP — the note takes a deterministic ASCII hash
-                # name and keeps its original-language title/summary/body intact (the meaning never
-                # lived in the filename).
+                # #57 no-loss fallback: when EVERY seed is un-slugifiable (nothing survives the
+                # closed allowlist) the capture no longer downgrades to DROP — the note takes a
+                # deterministic ASCII hash name and keeps its original-language title/summary/body
+                # intact (the meaning never lived in the filename).
                 slug = _hash_fallback_basename(candidate, text)
                 used_hash_fallback = True
             unique = slug
-            taken = live_basenames | within_plan_new
+            # `domains` joins the taken set because ADR-0041 D1.3 RESERVES every declared domain
+            # for the `wiki/maps/<domain>.md` map APPLY mints lazily — a map that is invisible to
+            # `live_basenames` until the run that creates it. Domain names are ordinary nouns
+            # ("general", "economy", "ai-tech"), so a model titling a concept after its own subject
+            # is routine; without this the gate's BASENAME reservation would fail the WHOLE batch
+            # instead of the suffixing loop below resolving it into `<domain>-2`.
+            taken = live_basenames | within_plan_new | domains
             n = 2
             while unique in taken:
                 unique = f"{slug}-{n}"
@@ -606,9 +651,13 @@ def normalize_plan(
             within_plan_new.add(unique)
         elif op == "APPEND_DAILY":
             # domain is guaranteed valid here (step 3); daily is exempt from uniqueness.
-            basename = f"{domain}-{run_date}"
+            # Schema 2 writes ONE journal per run_date, BASENAMED by that date (ADR-0041 D2.6) —
+            # the domain no longer travels in the filename, it travels in `domain`/`subjects:`.
+            # `validate_plan` enforces exactly this (check 5, keyed on the injected `run_date`), so
+            # the v1 `<domain>-<run_date>` shape would hard-fail PASS-1 for the whole batch.
+            basename = run_date
         elif op in _TARGET_OPS:
-            # MERGE/CONTEST may only target a THEME (apply._resolve_target_path theme_only=True;
+            # MERGE/CONTEST may only target a THEME (apply._resolve_target_path sourced_only=True;
             # validate_plan now requires target ∈ theme_basenames), so a non-theme target downgrades
             # to DROP exactly like an unknown target would.
             md_target = md.get("target_basename")
@@ -680,10 +729,11 @@ def normalize_plan(
             for raw_alias in _as_str_list(md.get("aliases")):
                 alias = _slugify(raw_alias)
                 if not alias:
-                    # #57: an un-slugifiable alias (e.g. purely non-ASCII/Korean, or symbol junk)
-                    # is SKIPPED, not hash-substituted — a hash alias has zero search/link value —
-                    # but COUNTED so the loss is visible (run_plan debug dump + one stderr
-                    # warning), never silent.
+                    # #57: an un-slugifiable alias (symbol junk — a Korean alias is PRESERVED
+                    # since ADR-0041 D4.4, which is why this counter is now a residual rather than
+                    # the common path) is SKIPPED, not hash-substituted — a hash alias has zero
+                    # search/link value — but COUNTED so the loss is visible (run_plan debug dump
+                    # + one stderr warning), never silent.
                     aliases_skipped_unslugifiable += 1
                     continue
                 if alias in forbidden:

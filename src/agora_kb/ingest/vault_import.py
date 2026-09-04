@@ -32,6 +32,7 @@ from __future__ import annotations
 import datetime as _dt
 import os.path
 import re
+import string
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
@@ -42,6 +43,7 @@ from agora_kb.core import frontmatter
 from agora_kb.core.frontmatter import FrontmatterError
 from agora_kb.core.hashing import content_sha256
 from agora_kb.core.layout import RepoLayout
+from agora_kb.core.pathsafe import safe_slug_component
 from agora_kb.core.repo import GitError, Repo
 from agora_kb.schema import Taxonomy, emit_schema, lint
 from agora_kb.schema.lint import LintResult
@@ -57,6 +59,14 @@ __all__ = ["ImportReport", "NoteRecord", "import_vault"]
 # OKF v0.1 bundle-root version (ADR-0014 D2) — mirrors the curator's ``apply._OKF_VERSION`` and the
 # seed index emitted by ``Repo.init``. Emitted on the bundle-root ``index.md`` ONLY.
 _OKF_VERSION = "0.1"
+
+# The KB WIKI SCHEMA this importer emits. Named rather than repeated as a literal `1`, because it is
+# ONE fact with two consumers that must never disagree: the `Taxonomy` the emitted repo declares,
+# and the destination guard (`_assert_importable_destination`) that refuses to write this layout
+# into a repo declaring a different one. The vault normalizer still writes the schema-1 layout
+# (`wiki/<domain>/themes/<slug>.md`); the kind-first layout arrives with the
+# `agora import --from-kb` converter (ADR-0041 D6), and this constant is what that unit flips.
+IMPORTER_SCHEMA_VERSION = 1
 
 # STRUCTURAL / non-knowledge files that the DEST emits its OWN copy of, so importing them AS notes
 # only produces junk themes (ADR-0014 D5 v2 change A). They are NOT knowledge content:
@@ -116,6 +126,12 @@ _H1_RE = re.compile(r"^#[ \t]+(?P<title>.+?)[ \t]*$", re.MULTILINE)
 # A summary is the first non-empty body paragraph collapsed to ONE line, truncated to this many
 # characters (ADR-0010 §2.1 ``summary`` is a one-line precis).
 _SUMMARY_MAX_CHARS = 200
+
+# Slug cap (UTF-8 BYTES) and ASCII-only case folding — the exact pair
+# :mod:`agora_kb.adapters.ollama_brain` uses, mirrored here so the import lane and the curator lane
+# derive the same basename from the same text (ADR-0041 D4.4). See :func:`_slugify`.
+_SLUG_MAX_BYTES = 60
+_ASCII_LOWER = str.maketrans(string.ascii_uppercase, string.ascii_lowercase)
 
 
 @dataclass(frozen=True)
@@ -301,10 +317,25 @@ def _kebab_to_title(stem: str) -> str:
 
 
 def _slugify(text: str) -> str:
-    """Lowercase + non-alnum→'-' kebab slug (collapsed, trimmed). Mirrors the adapters' slugger."""
-    lowered = str(text).lower()
-    slug = re.sub(r"[^a-z0-9]+", "-", lowered)
-    return re.sub(r"-+", "-", slug).strip("-")
+    """Unicode-preserving path-component slug, or ``""`` when nothing safe survives (ADR-0041 D4.4).
+
+    An EXACT mirror of :func:`agora_kb.adapters.ollama_brain._slugify` — same
+    :func:`agora_kb.core.pathsafe.safe_slug_component` call, same ASCII-only lowercasing, same
+    60-byte cap, same leading-underscore strip and re-verify — so the import lane and the curator
+    lane name the same note the same way. It is a mirror rather than an import because the two
+    layers do not depend on each other (``ingest`` must not import ``adapters``), which is exactly
+    why the shared rule lives in ``core.pathsafe`` and only the wrapper is duplicated.
+
+    This closes a PRE-EXISTING divergence, not just a charset one: the v1 import slugger had **no
+    length cap** (a long vault filename could exceed the filesystem's 255-byte NAME_MAX) and **no
+    re-verification** of its own output, while the curator slugger had both. Both lanes now emit a
+    component that is canonical by construction — and a purely Korean filename yields a Korean
+    slug instead of falling through to :func:`_hash_basename`.
+    """
+    slug = safe_slug_component(str(text).translate(_ASCII_LOWER), max_bytes=_SLUG_MAX_BYTES)
+    if slug.startswith("_"):
+        slug = safe_slug_component(slug.lstrip("_"), max_bytes=_SLUG_MAX_BYTES)
+    return slug
 
 
 def _hash_basename(text: str) -> str:
@@ -874,6 +905,40 @@ def _basename_from_child_path(path: str) -> str:
 # --- the public entry point --------------------------------------------------------------------
 
 
+def _assert_importable_destination(dest: Path) -> None:
+    """Refuse an import into a destination whose declared KB schema this importer cannot write.
+
+    The vault normalizer is a DIRECT ``wiki/`` writer — it composes paths itself and never goes
+    through ``Inbox.write`` — so it inherits none of the ADR-0041 D6 write refusal. It also still
+    emits the SCHEMA-1 layout (``wiki/<domain>/themes/<slug>.md``); teaching it the kind-first
+    layout is the ``agora import --from-kb`` converter's work, a separate unit.
+
+    Until then this is the boundary guard: importing into an EXISTING schema-2 repo would commit
+    ``wiki/<domain>/themes/…`` beside ``wiki/concepts/`` — two layouts in one repo, verbatim the
+    state D6's refusal exists to prevent — and the importer would not even SEE it, because it lints
+    its own output with its own hard-coded schema-1 ``Taxonomy``. Reproduced live before this guard
+    existed: exit 0, a committed mixed-layout tree, and two misleading ``L1-17`` header findings.
+
+    A FRESH destination (nothing declared) and a schema-1 destination both pass: the importer's own
+    output is schema 1, which is exactly what it can write. That such a repo is then READ-ONLY for
+    this build is said out loud by the caller (``agora import`` prints it), not enforced here — the
+    import itself is a legitimate, non-destructive act.
+    """
+    from agora_kb.config import ConfigError, read_canonical_kb_schema_version
+
+    layout = RepoLayout(Path(dest))
+    try:
+        declared = read_canonical_kb_schema_version(layout)
+    except ConfigError:
+        return  # an unreadable/absent taxonomy is not this guard's failure to report
+    if declared is not None and declared != IMPORTER_SCHEMA_VERSION:
+        raise ValueError(
+            f"{layout.root} is a schema-{declared} KB and 'agora import' writes the "
+            f"schema-{IMPORTER_SCHEMA_VERSION} layout — importing would leave TWO layouts in one "
+            f"repo. Import into a NEW directory instead (ADR-0041 D6)"
+        )
+
+
 def import_vault(
     src: Path,
     dest: Path,
@@ -942,6 +1007,7 @@ def import_vault(
         raise NotADirectoryError(f"source vault is not a directory: {src}")
     if not domains:
         raise ValueError("import_vault requires at least one domain (the move target)")
+    _assert_importable_destination(dest)
 
     first_domain = domains[0]
     src = src.resolve()
@@ -1049,7 +1115,7 @@ def import_vault(
     # ADR-0010 D6 / ADR-0014 D5: ``allowed_tags`` is exactly what the operator passed via ``--tag``;
     # the importer keeps a source tag only when it is already in this set and strips the rest.
     taxonomy = Taxonomy(
-        schema_version=1,
+        schema_version=IMPORTER_SCHEMA_VERSION,
         taxonomy_policy="open",
         allowed_tags=tuple(tags or ()),
         domains=tuple(domains),
@@ -1096,7 +1162,11 @@ def import_vault(
     emit_schema(layout, taxonomy=taxonomy)
     repo = Repo(layout)
     when = datetime.fromisoformat(f"{import_date}T00:00:00+00:00").astimezone(UTC)
-    repo.init(when=when)
+    # EXPLICIT, never the default: `Repo.init`'s `schema_version` default is a library choice
+    # that may move, and the importer's output layout is fixed by `_infer_layout`. Passing the
+    # constant keeps the DECLARED version and the WRITTEN tree one fact — a repo declaring 2
+    # over a schema-1 tree is the exact half-migration ADR-0041 D6 refuses.
+    repo.init(when=when, schema_version=IMPORTER_SCHEMA_VERSION)
     try:
         repo.commit_all("chore: import external vault (agora import)", when=when)
     except GitError:

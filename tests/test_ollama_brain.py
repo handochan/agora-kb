@@ -21,6 +21,7 @@ from agora_kb.curator.plan import Plan, validate_plan
 RUN_ID = "2026-06-13T03-00-00.000Z--7f31ab"
 E1 = "2026-06-13T02-40-10.000Z--a1b2c3"
 E2 = "2026-06-13T02-41-00.000Z--d4e5f6"
+E3 = "2026-06-13T02-42-00.000Z--091a2b"
 
 ALLOWED_TAGS = {"curator", "concurrency", "architecture"}
 DOMAINS = {"ai-tech", "economy", "general"}
@@ -159,6 +160,10 @@ def test_normalize_plan_passes_validator() -> None:
         _candidate(
             "c2", text="A harvested low-conf claim", event_id=E2, gated=True, domain="ai-tech"
         ),
+        # c3 exercises the PRODUCER/GATE contract for the schema-2 journal: `validate_plan` is only
+        # keyed on the run date when `run_date` is injected (as `curator/worker.py` does), so the
+        # APPEND_DAILY basename shape is only locked when BOTH halves are exercised here.
+        _candidate("c3", text="A daily log line", event_id=E3, gated=False, domain="general"),
     ]
     live_basenames = {"existing-note"}
     raw = {
@@ -180,6 +185,12 @@ def test_normalize_plan_passes_validator() -> None:
                 "target_basename": "existing-note",
                 "reason": "corroborates",
             },
+            {
+                "candidate_id": "c3",
+                "op": "APPEND_DAILY",
+                "domain": "general",
+                "reason": "ephemeral",
+            },
         ]
     }
     plan_dict = ob.normalize_plan(
@@ -194,18 +205,19 @@ def test_normalize_plan_passes_validator() -> None:
     plan = Plan.from_json(json.dumps(plan_dict))
     errors = validate_plan(
         plan,
-        manifest_event_ids={E1, E2},
+        manifest_event_ids={E1, E2, E3},
         allowed_tags=ALLOWED_TAGS,
         domains=DOMAINS,
         live_basenames=live_basenames,
         theme_basenames=live_basenames,
         gated_candidate_ids={"c2"},
+        run_date=RUN_ID[:10],
     )
     assert errors == [], errors
 
     # event_ids exactly partition the manifest.
     all_events = [e for d in plan.dispositions for e in d.event_ids]
-    assert sorted(all_events) == sorted([E1, E2])
+    assert sorted(all_events) == sorted([E1, E2, E3])
     assert len(all_events) == len(set(all_events))
 
     by_id = {d.candidate_id: d for d in plan.dispositions}
@@ -217,6 +229,9 @@ def test_normalize_plan_passes_validator() -> None:
     assert by_id["c1"].links == ("existing-note",)
     # gated candidate never CREATE_THEME.
     assert by_id["c2"].op == "MERGE_INTO_THEME"
+    # ADR-0041 D2.6: the day's ONE journal is basenamed by the run date, not `<domain>-<date>`.
+    assert by_id["c3"].op == "APPEND_DAILY"
+    assert by_id["c3"].basename == RUN_ID[:10]
 
 
 def test_normalize_plan_gated_create_downgraded_to_drop() -> None:
@@ -477,7 +492,8 @@ def test_normalize_plan_append_daily_floors_to_catch_all() -> None:
     disp = plan_dict["dispositions"][0]
     assert disp["op"] == "APPEND_DAILY"  # not dropped
     assert disp["domain"] == "general"
-    assert disp["basename"].startswith("general-")
+    # The floored domain travels in `domain:`/`subjects:`, NOT in the filename (ADR-0041 D2.6).
+    assert disp["basename"] == RUN_ID[:10]
 
 
 def test_normalize_plan_merge_unknown_target_downgraded_to_drop() -> None:
@@ -524,7 +540,7 @@ def test_normalize_plan_merge_non_theme_target_downgraded_to_drop() -> None:
     """A MERGE_INTO_THEME whose target is a live note but NOT a theme (e.g. the MOC) becomes DROP.
 
     The target IS in ``live_basenames`` but absent from ``live_theme_basenames`` — MERGE/CONTEST may
-    only target a theme (apply._resolve_target_path theme_only=True / validate_plan), so the shim
+    only target a theme (apply._resolve_target_path sourced_only=True / validate_plan), so the shim
     downgrades exactly like an unknown target rather than emitting a plan APPLY would crash on.
     """
     candidates = [_candidate("c1", text="claim", event_id=E1, gated=False, domain="ai-tech")]
@@ -687,6 +703,51 @@ def test_normalize_plan_create_basename_uniqueness() -> None:
         live_basenames={"mutex-guards"},
         theme_basenames={"mutex-guards"},
         gated_candidate_ids=set(),
+    )
+    assert errors == [], errors
+
+
+def test_normalize_plan_title_equal_to_a_domain_suffixes_instead_of_failing_the_gate() -> None:
+    """ADR-0041 D1.3 RESERVES every declared domain for its lazily-minted wiki/maps/<domain>.md.
+
+    Domain names are ordinary nouns, so a model titling a concept after its own subject is routine.
+    The producer must AVOID the reservation (suffix it) rather than emit a basename the gate then
+    rejects — a plan error fails the WHOLE batch, so one such capture would take the run down.
+    """
+    candidates = [_candidate("c1", text="AI Tech", event_id=E1, gated=False, domain="ai-tech")]
+    raw = {
+        "dispositions": [
+            {
+                "candidate_id": "c1",
+                "op": "CREATE_THEME",
+                "domain": "ai-tech",
+                "title": "AI Tech",
+                "reason": "x",
+            }
+        ]
+    }
+    plan_dict = ob.normalize_plan(
+        raw,
+        candidates=candidates,
+        allowed_tags=ALLOWED_TAGS,
+        domains=DOMAINS,
+        live_basenames=set(),
+        live_theme_basenames=set(),
+        run_id=RUN_ID,
+    )
+    disp = plan_dict["dispositions"][0]
+    assert disp["op"] == "CREATE_THEME"  # not dropped, not left dirty
+    assert disp["basename"] == "ai-tech-2"
+    plan = Plan.from_json(json.dumps(plan_dict))
+    errors = validate_plan(
+        plan,
+        manifest_event_ids={E1},
+        allowed_tags=ALLOWED_TAGS,
+        domains=DOMAINS,
+        live_basenames=set(),
+        theme_basenames=set(),
+        gated_candidate_ids=set(),
+        run_date=RUN_ID[:10],
     )
     assert errors == [], errors
 
@@ -887,8 +948,20 @@ def _normalize_one(
     return plan_dict
 
 
-def test_normalize_plan_korean_seed_survives_with_hash_fallback() -> None:
-    """(#57 a) A purely-Korean CREATE_THEME seed is NOT dropped: note-<sha8> fallback basename."""
+def test_normalize_plan_korean_seed_now_keeps_its_meaning_in_the_basename() -> None:
+    """(#57 a, RE-DECIDED by ADR-0041 D4.4) A Korean seed slugifies IN KOREAN — no hash floor.
+
+    This test previously pinned the opposite: a purely-Korean seed slugified to ``""`` and took
+    the deterministic ``note-<sha8>`` floor, which was no-loss but opaque. The pathsafe swap
+    replaces the ASCII slug charset with a closed Unicode-CATEGORY allowlist, so Hangul survives
+    and the note is named in its own script. The floor is NOT gone — see the symbol-junk test
+    below — it is simply no longer the common path for non-Latin knowledge, which is the whole
+    point of D4.4 (and the reason ADR-0022's #57 addendum could keep transliteration rejected).
+
+    The second half is the load-bearing half: the REAL §4.1 validator accepts the Korean basename.
+    Producer and gate were swapped together, so a Korean name can never be emitted by one and
+    rejected by the other.
+    """
     text = "한국어 지식은 큐레이션 중에 소실되면 안 된다"
     candidates = [_candidate("c1", text=text, event_id=E1, gated=False, domain="ai-tech")]
     raw = {
@@ -906,12 +979,12 @@ def test_normalize_plan_korean_seed_survives_with_hash_fallback() -> None:
     plan_dict = _normalize_one(raw, candidates)
     disp = plan_dict["dispositions"][0]
     assert disp["op"] == "CREATE_THEME"  # NOT DROP (the pre-#57 behavior)
-    assert disp["basename"] == f"note-{content_sha256(text)[:8]}"
-    # The Korean meaning is preserved in title:/summary: (arbitrary strings), never the filename.
+    assert disp["basename"] == "한국어-지식-보존"
+    assert not disp["basename"].startswith("note-")  # the floor did not fire
     assert disp["title"] == "한국어 지식 보존"
     assert disp["summary"] == "한국어 요약."
 
-    # The fallback basename passes the REAL §4.1 validator — path-safety regex untouched.
+    # The Korean basename passes the REAL §4.1 validator (the pathsafe swap, both ends).
     plan = Plan.from_json(json.dumps(plan_dict))
     errors = validate_plan(
         plan,
@@ -925,10 +998,111 @@ def test_normalize_plan_korean_seed_survives_with_hash_fallback() -> None:
     assert errors == [], errors
 
 
+def test_normalize_plan_unslugifiable_seed_still_takes_the_hash_floor() -> None:
+    """(#57 a) The ``note-<sha8>`` floor survives D4.4 — for seeds with NO admissible character.
+
+    ``safe_slug_component`` returns ``""`` on total rejection precisely so this floor stays
+    reachable (ADR-0041 D4.4). Symbol/punctuation junk is the shape that reaches it now, and the
+    capture is still curated rather than DROPped.
+    """
+    text = "!!! ??? ***"
+    candidates = [_candidate("c1", text=text, event_id=E1, gated=False, domain="ai-tech")]
+    raw = {
+        "dispositions": [
+            {
+                "candidate_id": "c1",
+                "op": "CREATE_THEME",
+                "domain": "ai-tech",
+                "summary": "junk seed, real capture.",
+                "reason": "새 테마",
+            }
+        ]
+    }
+    plan_dict = _normalize_one(raw, candidates)
+    disp = plan_dict["dispositions"][0]
+    assert disp["op"] == "CREATE_THEME"
+    assert disp["basename"] == f"note-{content_sha256(text)[:8]}"
+
+    plan = Plan.from_json(json.dumps(plan_dict))
+    errors = validate_plan(
+        plan,
+        manifest_event_ids={E1},
+        allowed_tags=ALLOWED_TAGS,
+        domains=DOMAINS,
+        live_basenames=set(),
+        theme_basenames=set(),
+        gated_candidate_ids=set(),
+    )
+    assert errors == [], errors
+
+
+def test_normalize_plan_windows_device_stem_seed_takes_the_hash_floor() -> None:
+    """(ADR-0041 D4.4) ``CON`` is a Windows DEVICE, not a filename — the ASCII regex admitted it.
+
+    The swap is a net tightening here: a title of ``CON`` used to slugify to ``con`` and produce a
+    file a Windows clone could not check out. It now empties out and takes the same no-loss floor.
+    """
+    text = "CON"
+    candidates = [_candidate("c1", text=text, event_id=E1, gated=False, domain="ai-tech")]
+    raw = {
+        "dispositions": [
+            {
+                "candidate_id": "c1",
+                "op": "CREATE_THEME",
+                "domain": "ai-tech",
+                "basename": "CON",
+                "title": "COM1",
+                "reason": "x",
+            }
+        ]
+    }
+    disp = _normalize_one(raw, candidates)["dispositions"][0]
+    assert disp["basename"] == f"note-{content_sha256(text)[:8]}"
+
+
+def test_normalize_plan_leading_underscore_seed_never_reaches_the_gate() -> None:
+    """(ADR-0041 D4.4, NORMATIVE) A ``_``-led seed is stripped by the PRODUCER, not by the gate.
+
+    ``pathsafe`` admits ``_`` literally, so ``"_blob 노트"`` would slug to ``_blob-노트`` — which
+    the PLAN validator rejects outright (the ``raw/_blob`` / ``raw/_pages`` reservation). A
+    producer that emitted it would turn a harmless title into a failed run, so the slugger strips
+    the leading underscore and re-verifies. Both ends are asserted here: what the producer emits,
+    and that the gate accepts it.
+    """
+    candidates = [_candidate("c1", text="본문", event_id=E1, gated=False, domain="ai-tech")]
+    raw = {
+        "dispositions": [
+            {
+                "candidate_id": "c1",
+                "op": "CREATE_THEME",
+                "domain": "ai-tech",
+                "basename": "_blob notes",
+                "reason": "x",
+            }
+        ]
+    }
+    plan_dict = _normalize_one(raw, candidates)
+    disp = plan_dict["dispositions"][0]
+    assert disp["basename"] == "blob-notes"
+    assert not disp["basename"].startswith("_")
+
+    errors = validate_plan(
+        Plan.from_json(json.dumps(plan_dict)),
+        manifest_event_ids={E1},
+        allowed_tags=ALLOWED_TAGS,
+        domains=DOMAINS,
+        live_basenames=set(),
+        theme_basenames=set(),
+        gated_candidate_ids=set(),
+    )
+    assert errors == [], errors
+
+
 def test_normalize_plan_hash_fallback_reuses_candidate_content_sha256() -> None:
     """(#57 a) The candidates.json ``content_sha256`` field is the single hash source."""
     sha = "ab" * 32  # a well-formed 64-hex canonical hash, deliberately != content_sha256(text)
-    candidate = _candidate("c1", text="한글", event_id=E1, gated=False, domain="ai-tech")
+    # The seed must be one nothing safe survives — since ADR-0041 D4.4 "한글" slugifies to "한글".
+    candidate = _candidate("c1", text="+++", event_id=E1, gated=False, domain="ai-tech")
     candidate["content_sha256"] = sha
     raw = {
         "dispositions": [
@@ -941,7 +1115,7 @@ def test_normalize_plan_hash_fallback_reuses_candidate_content_sha256() -> None:
 
 def test_normalize_plan_hash_fallback_same_text_twice_gets_suffix() -> None:
     """(#57 b) Same text twice → same fallback slug + the existing -2 uniqueness suffix."""
-    text = "같은 한국어 본문"
+    text = "!!! ???"  # un-slugifiable under D4.4's allowlist, so the hash floor is what collides
     candidates = [
         _candidate("c1", text=text, event_id=E1, gated=False, domain="ai-tech"),
         _candidate("c2", text=text, event_id=E2, gated=False, domain="ai-tech"),
@@ -959,8 +1133,14 @@ def test_normalize_plan_hash_fallback_same_text_twice_gets_suffix() -> None:
 
 
 def test_normalize_plan_hash_fallback_title_falls_back_to_text_not_hash() -> None:
-    """(#57 a) With no model title, the fallback title derives from the TEXT, not note-<sha8>."""
-    text = "한국어 문장 하나"
+    """(#57 a) With no model title, the fallback title derives from the TEXT, not note-<sha8>.
+
+    The seed is symbol junk so the BASENAME takes the hash floor; the title must still come from
+    the capture text, because ``note-<sha8>`` is meaningless as a title and the meaning has to
+    survive somewhere. (Under D4.4 a Korean text would name the file itself, so the shape that
+    still separates "basename" from "title" is the un-slugifiable one.)
+    """
+    text = "→→→ ←←←"
     candidates = [_candidate("c1", text=text, event_id=E1, gated=False, domain="ai-tech")]
     raw = {
         "dispositions": [
@@ -969,7 +1149,8 @@ def test_normalize_plan_hash_fallback_title_falls_back_to_text_not_hash() -> Non
     }
     disp = _normalize_one(raw, candidates)["dispositions"][0]
     assert disp["basename"].startswith("note-")
-    assert disp["title"] == "한국어 문장 하나"  # _title_from(text); capitalize() is a Hangul no-op
+    assert disp["title"] == ob._title_from(text)  # derived from the TEXT
+    assert "note-" not in disp["title"]
 
 
 def test_normalize_plan_ascii_seed_path_byte_identical() -> None:
@@ -995,8 +1176,14 @@ def test_normalize_plan_ascii_seed_path_byte_identical() -> None:
     assert not disp["basename"].startswith("note-")
 
 
-def test_normalize_plan_korean_basename_ascii_title_uses_title_slug() -> None:
-    """(#57 review) A Korean basename + ASCII title takes the TITLE slug, not the hash fallback."""
+def test_normalize_plan_model_basename_wins_when_it_slugifies() -> None:
+    """(#57 review, RE-DECIDED by D4.4) The model's OWN basename now survives in Korean.
+
+    Previously a Korean ``basename`` emptied out and the chain fell through to the ASCII title;
+    the model's naming decision was silently discarded for non-Latin scripts. With the Unicode
+    allowlist the first seed slugifies, so the chain stops there — the model's choice is honoured
+    in whatever script it was written in.
+    """
     candidates = [_candidate("c1", text="한글 본문", event_id=E1, gated=False, domain="ai-tech")]
     raw = {
         "dispositions": [
@@ -1011,12 +1198,18 @@ def test_normalize_plan_korean_basename_ascii_title_uses_title_slug() -> None:
         ]
     }
     disp = _normalize_one(raw, candidates)["dispositions"][0]
-    assert disp["basename"] == "clean-ascii-title"  # next seed in the chain, not note-<sha8>
+    assert disp["basename"] == "한글이름"  # first seed, no longer discarded for being non-ASCII
     assert disp["title"] == "Clean Ascii Title"
 
 
-def test_normalize_plan_korean_basename_and_title_falls_to_ascii_text() -> None:
-    """(#57 review) With Korean basename AND title, the capture TEXT is the last slug seed."""
+def test_normalize_plan_seed_chain_falls_through_an_unslugifiable_basename() -> None:
+    """(#57 review) The seed chain still WALKS: basename → title → text, first non-empty wins.
+
+    The chain is what keeps an un-nameable model basename from costing the note its meaning. Since
+    D4.4 the seed that empties out is symbol junk rather than "any non-ASCII", so the chain is
+    exercised with that shape — and the title it falls through to is Korean, which the old ASCII
+    slugger would have skipped as well, dropping the note all the way to the hash floor.
+    """
     candidates = [
         _candidate("c1", text="Mutexes guard state", event_id=E1, gated=False, domain="ai-tech")
     ]
@@ -1026,19 +1219,25 @@ def test_normalize_plan_korean_basename_and_title_falls_to_ascii_text() -> None:
                 "candidate_id": "c1",
                 "op": "CREATE_THEME",
                 "domain": "ai-tech",
-                "basename": "한글이름",
+                "basename": "***",
                 "title": "한글 제목",
                 "reason": "x",
             }
         ]
     }
     disp = _normalize_one(raw, candidates)["dispositions"][0]
-    assert disp["basename"] == "mutexes-guard-state"
+    assert disp["basename"] == "한글-제목"  # the TITLE seed, reached by falling through "***"
     assert not disp["basename"].startswith("note-")
 
 
-def test_normalize_plan_mixed_korean_ascii_seed_keeps_residual_ascii_slug() -> None:
-    """(#57 review) A MIXED Korean/ASCII seed keeps its residual-ASCII slug (pre-#57 path lock)."""
+def test_normalize_plan_mixed_korean_ascii_seed_keeps_both_scripts() -> None:
+    """(#57 review, RE-DECIDED by D4.4) A MIXED seed keeps BOTH scripts, not the ASCII residue.
+
+    The pre-swap slugger reduced ``"에이전트 Memory 설계"`` to ``"memory"`` — a name that keeps
+    the one word carrying the least meaning and silently discards the rest. That was the shape
+    #57 could only mitigate (its floor fires only when NOTHING survives, and here something
+    did). The Unicode allowlist is what actually fixes it.
+    """
     candidates = [_candidate("c1", text="한글 본문", event_id=E1, gated=False, domain="ai-tech")]
     raw = {
         "dispositions": [
@@ -1052,7 +1251,7 @@ def test_normalize_plan_mixed_korean_ascii_seed_keeps_residual_ascii_slug() -> N
         ]
     }
     disp = _normalize_one(raw, candidates)["dispositions"][0]
-    assert disp["basename"] == "memory"  # residual ASCII survives _slugify — no hash fallback
+    assert disp["basename"] == "에이전트-memory-설계"  # ASCII lowercased, Hangul left alone
     assert not disp["basename"].startswith("note-")
 
 
@@ -1082,8 +1281,14 @@ def test_normalize_plan_brain_summary_over_limit_is_never_truncated() -> None:
     assert len(disp["summary"]) > 200
 
 
-def test_normalize_plan_unslugifiable_alias_skipped_and_counted() -> None:
-    """(#57 d) A Korean alias is skipped (no hash alias) and counted via the stats out-param."""
+def test_normalize_plan_korean_alias_is_preserved_not_skipped() -> None:
+    """(#57 d, RE-DECIDED by ADR-0041 D4.4) A Korean alias is now KEPT, not skipped-and-counted.
+
+    ADR-0022's #57 addendum §2 chose skip-and-count explicitly because *"preserving Korean aliases
+    verbatim would require widening the closed alias/basename token grammar"*. D4.4 widens exactly
+    that grammar, so the intended behaviour is preservation and this test inverts on purpose. Its
+    other rejection — transliteration tables — is untouched and still not adopted.
+    """
     candidates = [
         _candidate("c1", text="Foo Thing", event_id=E1, gated=False, domain="ai-tech"),
     ]
@@ -1101,7 +1306,35 @@ def test_normalize_plan_unslugifiable_alias_skipped_and_counted() -> None:
     }
     stats: dict[str, int] = {}
     disp = _normalize_one(raw, candidates, stats=stats)["dispositions"][0]
-    assert disp["aliases"] == ["clean-alias"]  # Korean aliases skipped, ASCII alias kept
+    assert disp["aliases"] == ["한글별칭", "또다른한글", "clean-alias"]
+    assert stats["aliases_skipped_unslugifiable"] == 0  # nothing was lost, so nothing is counted
+
+
+def test_normalize_plan_unslugifiable_alias_skipped_and_counted() -> None:
+    """(#57 d) The skip-and-COUNT channel survives — for aliases with no admissible character.
+
+    ``aliases_skipped_unslugifiable`` becomes a RESIDUAL counter after D4.4 (rarely non-zero)
+    rather than the common path, but the loss it reports must still never be silent: a hash alias
+    has zero search/link value, so an un-slugifiable alias is dropped and counted.
+    """
+    candidates = [
+        _candidate("c1", text="Foo Thing", event_id=E1, gated=False, domain="ai-tech"),
+    ]
+    raw = {
+        "dispositions": [
+            {
+                "candidate_id": "c1",
+                "op": "CREATE_THEME",
+                "domain": "ai-tech",
+                "title": "Foo Thing",
+                "aliases": ["!!!", "+++", "Clean Alias"],
+                "reason": "x",
+            }
+        ]
+    }
+    stats: dict[str, int] = {}
+    disp = _normalize_one(raw, candidates, stats=stats)["dispositions"][0]
+    assert disp["aliases"] == ["clean-alias"]
     assert stats["aliases_skipped_unslugifiable"] == 2
 
 
@@ -1124,7 +1357,13 @@ def test_normalize_plan_alias_stats_zero_when_all_slugifiable() -> None:
 
 
 def test_run_plan_e2e_korean_candidate_reports_skipped_alias(tmp_path, monkeypatch, capsys) -> None:
-    """(#57 a+d e2e) run_plan: Korean capture survives; skipped-alias count hits stderr + debug."""
+    """(#57 a+d e2e, re-decided by D4.4) Korean capture survives IN KOREAN; junk alias is counted.
+
+    Two things at once, because they travel together through ``run_plan``: the Korean title now
+    names the note (no ``note-<sha8>`` floor, no discarded meaning) while the Korean ALIAS is kept
+    rather than skipped — and the skip-and-count channel is still wired, proved by the symbol-junk
+    alias alongside it reaching stderr and the debug dump.
+    """
     debug_path = tmp_path / "debug.jsonl"
     monkeypatch.setenv("AGORA_BRAIN_DEBUG", str(debug_path))
     text = "순수 한글 캡처"
@@ -1162,7 +1401,7 @@ def test_run_plan_e2e_korean_candidate_reports_skipped_alias(tmp_path, monkeypat
                         "op": "CREATE_THEME",
                         "domain": "general",
                         "title": "한글 제목",
-                        "aliases": ["한글별칭"],
+                        "aliases": ["한글별칭", "!!!"],
                         "reason": "새 지식",
                     }
                 ],
@@ -1172,8 +1411,8 @@ def test_run_plan_e2e_korean_candidate_reports_skipped_alias(tmp_path, monkeypat
     plan = json.loads(ob.run_plan(tmp_path, "", infer=infer))
     disp = plan["dispositions"][0]
     assert disp["op"] == "CREATE_THEME"
-    assert disp["basename"] == f"note-{content_sha256(text)[:8]}"
-    assert disp["aliases"] == []
+    assert disp["basename"] == "한글-제목"  # the Korean title names the note (D4.4)
+    assert disp["aliases"] == ["한글별칭"]  # the Korean alias is PRESERVED; only "!!!" was dropped
     # one stderr warning line, count in the debug dump — the plan schema itself never widens.
     assert "skipped 1 un-slugifiable alias" in capsys.readouterr().err
     record = json.loads(debug_path.read_text(encoding="utf-8").splitlines()[0])
@@ -1258,11 +1497,60 @@ def test_normalize_plan_fallback_summary_cuts_on_boundary() -> None:
 # --- _slugify ---------------------------------------------------------------------------------
 
 
-def test_slugify_basic() -> None:
+def test_slugify_ascii_is_byte_identical_to_the_pre_swap_output() -> None:
+    """(ADR-0041 D4.4) The swap must not rename existing ASCII notes.
+
+    ASCII-only lowercasing before the call and a 60-BYTE cap (not pathsafe's 180-byte default) are
+    what make this true: for ASCII input, 60 bytes is 60 characters and the edge-trim is the old
+    ``[:60].rstrip("-")``.
+    """
     assert ob._slugify("Hello, World!") == "hello-world"
-    assert ob._slugify("  --Foo__Bar--  ") == "foo-bar"
+    assert ob._slugify("  --Foo Bar--  ") == "foo-bar"
     assert ob._slugify("???") == ""
     assert ob._slugify("a" * 100) == "a" * 60
+
+
+def test_slugify_admits_the_pathsafe_extras() -> None:
+    """``_`` and ``.`` are admitted LITERALLY now (pathsafe's ``_EXTRA_ALLOWED``), not collapsed.
+
+    A deliberate, recorded divergence from the pre-swap ASCII slugger, which mapped every
+    non-alphanumeric to ``-``: ``"Foo__Bar"`` was ``foo-bar`` and is now ``foo__bar``, and a
+    version-shaped title keeps its dot. Both remain single safe path components.
+    """
+    assert ob._slugify("  --Foo__Bar--  ") == "foo__bar"
+    assert ob._slugify("v1.2 release") == "v1.2-release"
+
+
+def test_slugify_preserves_unicode_scripts() -> None:
+    """The widening the whole swap exists for (#57): a non-Latin title names its own file."""
+    assert ob._slugify("한국어 지식") == "한국어-지식"
+    assert ob._slugify("日本語") == "日本語"
+    assert ob._slugify("Привет Мир") == "Привет-Мир"  # NOT case-folded off the ASCII range
+    assert ob._slugify("에이전트 Memory 설계") == "에이전트-memory-설계"
+
+
+def test_slugify_caps_on_a_utf8_byte_boundary() -> None:
+    """The cap counts BYTES, and truncation never splits a codepoint (a Hangul syllable is 3)."""
+    out = ob._slugify("가" * 100)
+    assert len(out.encode("utf-8")) <= 60
+    assert out == "가" * 20  # 60 bytes exactly, on a character boundary
+
+
+def test_slugify_rejects_the_reserved_and_the_hostile() -> None:
+    """The tightenings that shipped WITH the widening (D4.4), each with its own reason.
+
+    Windows device stems would produce a file a Windows clone cannot check out; a leading ``_`` is
+    the ``raw/_blob`` / ``raw/_pages`` reservation and is stripped by the producer so the PLAN gate
+    never has to fail a run over it; separators and traversal never survive the allowlist.
+    """
+    assert ob._slugify("CON") == ""
+    assert ob._slugify("com1.md") == ""
+    assert ob._slugify("_blob") == "blob"  # the prefix is stripped, the word survives
+    assert ob._slugify("_blob notes") == "blob-notes"
+    assert ob._slugify("___") == ""
+    assert ob._slugify("../etc/passwd") == ""
+    assert ob._slugify(".hidden") == ""
+    assert ob._slugify("a/b") == "a-b"
 
 
 # --- sanitize_prose ---------------------------------------------------------------------------

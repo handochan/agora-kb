@@ -925,9 +925,11 @@ def test_no_source_note_is_overwritten_by_a_colliding_destination(tmp_path: Path
 
     Two ways two notes used to collapse into one file while the run still reported ``lint: clean``:
 
-    * a purely non-ASCII stem slugified to ``""`` and took the literal name ``note``, so EVERY
-      Korean-titled note in a vault overwrote the previous one. The curator path had already fixed
-      exactly this with the deterministic ``note-<sha8>`` name (#57); the importer had not;
+    * a stem the slugger emptied out took the literal name ``note``, so every such note in a vault
+      overwrote the previous one. The curator path had already fixed exactly this with the
+      deterministic ``note-<sha8>`` name (#57); the importer had not. Korean stems used to be the
+      common shape here; since ADR-0041 D4.4 they slugify in their own script (asserted below) and
+      the floor is reached only by a stem with no admissible character at all;
     * two distinct stems that slugify alike (``projects/Setup.md`` / ``archive/setup.md``) both
       inferred ``wiki/<domain>/themes/setup.md``.
 
@@ -941,15 +943,20 @@ def test_no_source_note_is_overwritten_by_a_colliding_destination(tmp_path: Path
     _write(src, "골드 팩.md", "# 골드 팩\n\n세 번째 한국어 노트.\n")
     _write(src, "projects/Setup.md", "# Setup A\n\nfirst setup note.\n")
     _write(src, "archive/setup.md", "# Setup B\n\nsecond setup note.\n")
+    _write(src, "+++.md", "# +++\n\nsymbol-only stem, nothing safe survives.\n")
 
     report = import_vault(src, dest, domains=["general"], import_date=_IMPORT_DATE)
 
     themes = sorted(p.name for p in (dest / "wiki" / "general" / "themes").glob("*.md"))
-    assert len(themes) == 5, themes
-    assert len({n.rel_path for n in report.notes if "/themes/" in n.rel_path}) == 5
-    # The un-slugifiable stems take the #57 content-keyed name, never the literal "note".
+    assert len(themes) == 6, themes
+    assert len({n.rel_path for n in report.notes if "/themes/" in n.rel_path}) == 6
+    # The Korean stems keep their meaning in the filename (ADR-0041 D4.4) — the import lane and
+    # the curator lane run the same slugger, so they agree by construction.
+    assert {"큐레이터-설계.md", "하베스터-안전.md", "골드-팩.md"} <= set(themes)
+    # The one stem nothing survives from takes the #57 content-keyed name, never the literal
+    # "note" — the floor is intact, it is just no longer where non-Latin knowledge lands.
     assert "note.md" not in themes
-    assert sum(name.startswith("note-") for name in themes) == 3
+    assert sum(name.startswith("note-") for name in themes) == 1
     # The slug collision is disambiguated rather than overwritten, and says so out loud.
     assert "setup.md" in themes
     assert sum(name.startswith("setup-") for name in themes) == 1
@@ -959,5 +966,122 @@ def test_no_source_note_is_overwritten_by_a_colliding_destination(tmp_path: Path
     bodies = {
         (dest / "wiki" / "general" / "themes" / name).read_text(encoding="utf-8") for name in themes
     }
-    assert len(bodies) == 5
+    assert len(bodies) == 6
     assert report.lint.ok is True, [(f.code, f.path, f.message) for f in report.lint.findings]
+
+
+# --- the slugger mirror (ADR-0041 D4.4) ---------------------------------------------------------
+
+
+# Inputs chosen to separate the two lanes wherever they COULD disagree: the byte cap (the import
+# lane had none), the re-verify (the import lane had none), the reserved prefix, the Windows device
+# stems, traversal, and the scripts the swap exists to admit.
+_MIRROR_CORPUS = [
+    "Hello, World!",
+    "  --Foo__Bar--  ",
+    "v1.2 release",
+    "한국어 지식",
+    "에이전트 Memory 설계",
+    "日本語",
+    "Привет Мир",
+    "가" * 100,
+    "a" * 100,
+    "_blob",
+    "_blob notes",
+    "___",
+    "CON",
+    "com1.md",
+    "../etc/passwd",
+    ".hidden",
+    "a/b",
+    "???",
+    "",
+]
+
+
+@pytest.mark.parametrize("raw", _MIRROR_CORPUS, ids=lambda v: repr(v)[:32])
+def test_import_slugger_mirrors_the_curator_slugger(raw: str) -> None:
+    """The two lanes must name the same note identically (ADR-0041 D4.4's "producers mirror it").
+
+    ADR-0022 §A's no-loss floor turns on the import lane and the curator lane agreeing, and before
+    this swap they did NOT: the import ``_slugify`` had no length cap and never re-verified its own
+    output, so a long or reserved stem produced a different basename in each lane. Asserting the
+    equality directly is what stops that divergence from re-opening — a copied implementation with
+    no test between them is exactly how it opened the first time.
+    """
+    from agora_kb.adapters.ollama_brain import _slugify as curator_slugify
+    from agora_kb.ingest.vault_import import _slugify as import_slugify
+
+    assert import_slugify(raw) == curator_slugify(raw)
+
+
+def test_import_slugger_caps_at_60_utf8_bytes() -> None:
+    """The cap the import lane never had: a long stem must stay inside a filesystem component."""
+    from agora_kb.ingest.vault_import import _slugify as import_slugify
+
+    assert import_slugify("a" * 300) == "a" * 60
+    assert len(import_slugify("가" * 300).encode("utf-8")) <= 60
+
+
+# --- the ADR-0041 D6 destination boundary --------------------------------------------------------
+
+
+def test_import_into_a_schema2_repo_is_refused_and_writes_nothing(tmp_path: Path) -> None:
+    """The importer is a DIRECT ``wiki/`` writer, so it inherits none of D6's write refusal.
+
+    It still emits the schema-1 layout (``wiki/<domain>/themes/<slug>.md``); the kind-first layout
+    arrives with the ``agora import --from-kb`` converter. Until then, importing into a repo that
+    declares schema 2 would commit v1 paths beside ``wiki/concepts/`` — two layouts in one repo,
+    verbatim what D6's refusal exists to prevent — and the importer would never SEE it, because it
+    lints its own output with its own schema-1 taxonomy.
+    """
+    from agora_kb.core.layout import RepoLayout
+    from agora_kb.core.repo import Repo
+    from agora_kb.schema.emit import Taxonomy, emit_schema
+
+    src = tmp_path / "vault"
+    dest = tmp_path / "kb2"
+    _write(src, "wiki/general/themes/alpha.md", "# Alpha\n\nProse.\n")
+
+    layout = RepoLayout(dest)
+    dest.mkdir(parents=True, exist_ok=True)
+    (layout.wiki_dir / "concepts").mkdir(parents=True, exist_ok=True)
+    emit_schema(
+        layout,
+        taxonomy=Taxonomy(
+            schema_version=2, taxonomy_policy="open", allowed_tags=(), domains=("general",)
+        ),
+        schema_version=2,
+    )
+    Repo(layout)  # not initialized; the guard runs before any git work
+
+    with pytest.raises(ValueError, match="schema-2 KB"):
+        import_vault(src, dest, domains=["general"], import_date=_IMPORT_DATE)
+
+    assert not (dest / "wiki" / "general").exists(), "refused BEFORE any note is written"
+
+
+def test_import_into_a_schema1_repo_is_allowed(tmp_path: Path) -> None:
+    """The guard is about a MISMATCH, not about re-importing: schema 1 is what this writer emits."""
+    src = tmp_path / "vault"
+    dest = tmp_path / "out"
+    _write(src, "wiki/general/themes/alpha.md", "# Alpha\n\nProse.\n")
+    import_vault(src, dest, domains=["general"], import_date=_IMPORT_DATE)
+    # A second import into the repo the first one produced still works.
+    report = import_vault(src, dest, domains=["general"], import_date=_IMPORT_DATE)
+    assert report.summary["notes"] >= 1
+
+
+def test_a_fresh_import_declares_the_schema_the_importer_writes(tmp_path: Path) -> None:
+    """The declared version and the written tree are ONE fact — never a half-migration."""
+    from agora_kb.config import read_canonical_kb_schema_version
+    from agora_kb.core.layout import RepoLayout
+    from agora_kb.ingest.vault_import import IMPORTER_SCHEMA_VERSION
+
+    src = tmp_path / "vault"
+    dest = tmp_path / "out"
+    _write(src, "wiki/general/themes/alpha.md", "# Alpha\n\nProse.\n")
+    import_vault(src, dest, domains=["general"], import_date=_IMPORT_DATE)
+
+    assert read_canonical_kb_schema_version(RepoLayout(dest)) == IMPORTER_SCHEMA_VERSION
+    assert (dest / "wiki" / "general" / "themes" / "alpha.md").is_file()
