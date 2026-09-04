@@ -17,6 +17,15 @@ discards the left operand, which a purely textual check would miss), and a symli
 name a character rule cannot possibly judge) — plus the glob-widening variant of the same bug in
 ``_resolve_target_path``, where a metacharacter in ``target_basename`` used to retarget the write
 onto an unrelated note rather than escape the tree.
+
+**KB wiki schema 2 (ADR-0041) narrows the attack surface and this suite records where.** Two of the
+three tokens that used to compose a wiki path no longer do: a note basename now passes through
+:meth:`~agora_kb.core.layout.RepoLayout.note_path_for`\'s validator (the D4.4 pathsafe component
+check plus the reserved leading-``_`` rejection) BEFORE any path is joined, and the journal path is
+composed entirely from the curator-owned ``run_date`` so a model-supplied ``basename`` reaches no
+filesystem call at all (D2.6). What is left for ``_contained`` to catch is the residue that no
+charset rule can judge — a symlinked kind directory, and the ``raw/`` shard/event tokens that come
+from PROVENANCE rather than from the plan — and those are the cases below that still assert on it.
 """
 
 from __future__ import annotations
@@ -25,6 +34,7 @@ from pathlib import Path
 
 import pytest
 
+from agora_kb.config import KbIdentity, write_kb_identity
 from agora_kb.core.layout import RepoLayout
 from agora_kb.curator.apply import ApplyError, _contained, apply_plan
 from agora_kb.curator.plan import Disposition, Plan
@@ -34,8 +44,10 @@ RUN_ID = "2026-09-03T03-00-00.000Z--7f31ab"
 RUN_DATE = "2026-09-03"
 E1 = "2026-09-03T02-40-10.000Z--a1b2c3"
 
+KB_ID = "01J8ZQ3M4N5P6Q7R8S9T0V1W2X"
+
 TAXONOMY = Taxonomy(
-    schema_version=1,
+    schema_version=2,
     taxonomy_policy="open",
     allowed_tags=("curator", "concurrency", "architecture"),
     domains=("ai-tech", "economy", "general"),
@@ -57,6 +69,10 @@ def _worktree(tmp_path: Path) -> Path:
     root.mkdir()
     layout = RepoLayout(root)
     emit_schema(layout, taxonomy=TAXONOMY)
+    # APPLY writes KB wiki schema 2 and refuses a repo with no identity to stamp into `kb:`
+    # (ADR-0041 D1.5) — without this the containment assertions below would all pass for the WRONG
+    # reason, on an error raised before any path was ever composed.
+    write_kb_identity(layout, KbIdentity(kb_id=KB_ID, name="agora-test", declared_kind="personal"))
     return root
 
 
@@ -170,21 +186,19 @@ def test_contained_rejects_a_symlinked_directory_pointing_out(tmp_path: Path) ->
 # --- CREATE_THEME / APPEND_DAILY: the plan gate bypassed --------------------------------------
 
 
-@pytest.mark.parametrize("op", ["CREATE_THEME", "APPEND_DAILY"])
 @pytest.mark.parametrize(
     "basename_kind",
     [
         "deep-relative",  # ../../../../tmp/agora-escape — the §12.4 named case
-        # Four levels is what it TAKES: the note sits at repo/wiki/<domain>/themes/, so "../x" only
-        # climbs to the domain directory and stays (wrongly, but harmlessly) inside the tree. The
-        # escape budget is a property of the layout, and this case lands squarely in tmp_path where
-        # the assertions below can see it.
+        # Four levels is what it TAKES: the note sits at repo/wiki/concepts/, so "../x" only climbs
+        # inside the tree. The escape budget is a property of the layout, and this case lands
+        # squarely in tmp_path where the assertions below can see it.
         "relative",  # ../../../../agora-escape
         "absolute",  # absolute path — pathlib DISCARDS the worktree operand entirely
     ],
 )
 def test_escaping_basename_raises_and_writes_nothing_outside(
-    tmp_path: Path, op: str, basename_kind: str
+    tmp_path: Path, basename_kind: str
 ) -> None:
     wt = _worktree(tmp_path)
     before = _outside(tmp_path, wt)
@@ -198,7 +212,12 @@ def test_escaping_basename_raises_and_writes_nothing_outside(
         "absolute": str(tmp_path / "agora-escape"),
     }[basename_kind]
 
-    plan = _plan(_disp(op=op, basename=basename))
+    # Under schema 2 this is refused one step EARLIER than it used to be — by the pathsafe
+    # component check inside `note_path_for` (ADR-0041 D4.4), before any path is joined — and the
+    # error is still the same PATH/ALLOWLIST class, because `_note_path` translates the composer\'s
+    # ValueError into ApplyError rather than letting it escape as the uncaught traceback ADR-0011
+    # §4 forbids. `_contained` remains the backstop for the tokens a charset rule cannot judge.
+    plan = _plan(_disp(basename=basename))
     with pytest.raises(ApplyError, match="PATH/ALLOWLIST"):
         apply_plan(plan, worktree=wt, run_date=RUN_DATE, provenance=_provenance("c1", E1))
 
@@ -208,30 +227,70 @@ def test_escaping_basename_raises_and_writes_nothing_outside(
     assert not (tmp_path / "agora-escape.md").exists()
 
 
+@pytest.mark.parametrize("basename", ["../../../../agora-escape", "_blob", "2026-09-04"])
+def test_append_daily_basename_is_never_a_path_token(tmp_path: Path, basename: str) -> None:
+    # ADR-0041 D2.6: the journal path is composed ENTIRELY from the injected `run_date` — both the
+    # `<yyyy>/<mm>` shard and the basename — so a model-supplied `basename` is not a path input at
+    # all any more. That is a stronger property than "the escaping one is rejected": an escaping
+    # basename, a RESERVED one (`_blob`), and a merely WRONG-BUT-VALID one (another date) all land
+    # the journal at exactly the same canonical path, and none of them reaches a filesystem call.
+    # Parsing the shard back out of a model-supplied basename is the inversion D2.6 forbids.
+    wt = _worktree(tmp_path)
+    before = _outside(tmp_path, wt)
+
+    plan = _plan(_disp(op="APPEND_DAILY", basename=basename))
+    apply_plan(plan, worktree=wt, run_date=RUN_DATE, provenance=_provenance("c1", E1))
+
+    journal = wt / "wiki" / "notes" / RUN_DATE[:4] / RUN_DATE[5:7] / f"{RUN_DATE}.md"
+    assert journal.is_file()
+    assert _outside(tmp_path, wt) == before
+    assert not (tmp_path / "agora-escape.md").exists()
+
+
 def test_escaping_domain_raises_and_writes_nothing_outside(tmp_path: Path) -> None:
-    # The domain token composes the DIRECTORY half of the path, so it is the mkdir(parents=True)
-    # vector specifically: an escape here creates directories outside the repo even if the final
-    # write then fails.
+    # The domain token has left the WIKI path entirely under schema 2 (ADR-0041 D2.2) — it survives
+    # in exactly one place, as the `raw/<domain>/<event_id>.md` SHARD KEY (leg 3), because `raw/`
+    # never moves. So it is still the mkdir(parents=True) vector, just for a different tree: an
+    # escape here creates directories outside the repo even if the final write then fails. A body
+    # on the provenance tuple is what makes the engine actually materialize that raw/ file.
     wt = _worktree(tmp_path)
     before = _outside(tmp_path, wt)
 
     plan = _plan(_disp(domain="../../escaped-domain"))
     with pytest.raises(ApplyError, match="PATH/ALLOWLIST"):
-        apply_plan(plan, worktree=wt, run_date=RUN_DATE, provenance=_provenance("c1", E1))
+        apply_plan(
+            plan,
+            worktree=wt,
+            run_date=RUN_DATE,
+            provenance=_provenance("c1", E1, body="planted body"),
+        )
 
     assert _outside(tmp_path, wt) == before
     assert not (tmp_path / "escaped-domain").exists()
 
 
-def test_symlinked_domain_directory_is_refused(tmp_path: Path) -> None:
+def test_reserved_underscore_domain_cannot_compose_a_map(tmp_path: Path) -> None:
+    # ADR-0041 D1.4/D4.4 layer 1: `raw/<domain>/` and `raw/_blob/` share ONE namespace, and the
+    # pathsafe swap REMOVES the leading-`_` rejection the old ASCII token regex gave for free. A
+    # subject named `_blob` would otherwise compose `wiki/maps/_blob.md` here — and the same class
+    # of token composes into `raw/`. The composer refuses it, and no map is left behind.
+    wt = _worktree(tmp_path)
+    plan = _plan(_disp(domain="_blob"))
+    with pytest.raises(ApplyError, match="PATH/ALLOWLIST"):
+        apply_plan(plan, worktree=wt, run_date=RUN_DATE, provenance=_provenance("c1", E1))
+    assert not (wt / "wiki" / "maps" / "_blob.md").exists()
+
+
+def test_symlinked_kind_directory_is_refused(tmp_path: Path) -> None:
     # Regex-clean tokens end-to-end; the escape is an inode, planted in the worktree before the run
     # (a prior run, a harvested repo, a hostile clone). A character rule cannot reach this case at
-    # all, which is exactly the claim plan.py's comment used to make and no longer does.
+    # all, which is exactly the claim plan.py's comment used to make and no longer does. Under
+    # schema 2 the vulnerable directory is the KIND directory: the subject no longer names one.
     wt = _worktree(tmp_path)
     outside_dir = tmp_path / "elsewhere"
     outside_dir.mkdir()
     (wt / "wiki").mkdir(exist_ok=True)
-    (wt / "wiki" / "ai-tech").symlink_to(outside_dir, target_is_directory=True)
+    (wt / "wiki" / "concepts").symlink_to(outside_dir, target_is_directory=True)
 
     plan = _plan(_disp())
     with pytest.raises(ApplyError, match="PATH/ALLOWLIST"):
@@ -283,7 +342,7 @@ def test_escaping_event_id_in_provenance_raises_before_probing_the_filesystem(
 
 
 def _seed_two_themes(tmp_path: Path) -> Path:
-    """A worktree holding two real themes, so a WIDENED lookup would have something to hit."""
+    """A worktree holding two real concepts, so a WIDENED lookup would have something to hit."""
     wt = _worktree(tmp_path)
     apply_plan(
         _plan(
@@ -306,8 +365,8 @@ def test_glob_metacharacters_in_target_basename_cannot_widen_the_search(
     # onto an unrelated note — a wrong-file write, not an escape, and invisible to any containment
     # check. Exact-name matching makes all four of these simply not found.
     wt = _seed_two_themes(tmp_path)
-    alpha = wt / "wiki" / "ai-tech" / "themes" / "alpha-note.md"
-    beta = wt / "wiki" / "ai-tech" / "themes" / "beta-note.md"
+    alpha = wt / "wiki" / "concepts" / "alpha-note.md"
+    beta = wt / "wiki" / "concepts" / "beta-note.md"
     before = (alpha.read_bytes(), beta.read_bytes())
 
     plan = _plan(
@@ -349,7 +408,7 @@ def test_an_exact_target_basename_still_resolves(tmp_path: Path) -> None:
     # The negative tests above would all pass on a lookup that found NOTHING ever. This is the
     # positive control: exact-name matching still resolves a real target and merges into it.
     wt = _seed_two_themes(tmp_path)
-    alpha = wt / "wiki" / "ai-tech" / "themes" / "alpha-note.md"
+    alpha = wt / "wiki" / "concepts" / "alpha-note.md"
     before = alpha.read_bytes()
 
     plan = _plan(

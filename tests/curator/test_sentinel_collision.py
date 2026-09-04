@@ -23,6 +23,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from agora_kb.config import KbIdentity, write_kb_identity
 from agora_kb.core import frontmatter
 from agora_kb.core.layout import RepoLayout
 from agora_kb.curator.apply import (
@@ -45,8 +46,17 @@ RUN_DATE_B = RUN_ID_B[:10]
 E1 = "2026-06-13T02-40-10.000Z--a1b2c3"
 E2 = "2026-06-14T02-41-00.000Z--d4e5f6"
 
+#: The fixture `_meta/kb.yaml` identity (ADR-0041 D1.5) — APPLY refuses to write without one.
+KB_ID = "01J8ZQ3M4N5P6Q7R8S9T0V1W2X"
+
+#: A SECOND run on the SAME calendar day as run A. ADR-0041 D2.6 makes the journal one-per-
+#: `run_date` REPO-WIDE, so "two runs append into the same journal" is now a same-day fact — which
+#: is exactly the shape that produces the cross-run id collision this module exists to catch (the
+#: second `agora curate` of the same day is the commonest run there is).
+RUN_ID_B_SAME_DAY = "2026-06-13T21-00-00.000Z--bbbbbb"
+
 TAXONOMY = Taxonomy(
-    schema_version=1,
+    schema_version=2,
     taxonomy_policy="open",
     allowed_tags=("curator", "concurrency", "architecture"),
     domains=("ai-tech", "economy", "general"),
@@ -54,9 +64,11 @@ TAXONOMY = Taxonomy(
 
 
 def _worktree(tmp_path: Path) -> Path:
-    """A repo worktree with the emitted schema + taxonomy and populated raw/ for source refs."""
+    """A schema-2 worktree with the emitted schema + taxonomy and populated raw/ for source refs."""
     layout = RepoLayout(tmp_path)
-    emit_schema(layout, taxonomy=TAXONOMY)
+    layout.root.mkdir(parents=True, exist_ok=True)
+    write_kb_identity(layout, KbIdentity(kb_id=KB_ID, name="agora-fixture"))
+    emit_schema(layout, taxonomy=TAXONOMY, schema_version=2)
     for event in (E1, E2):
         raw = tmp_path / "raw" / "ai-tech" / f"{event}.md"
         raw.parent.mkdir(parents=True, exist_ok=True)
@@ -103,7 +115,7 @@ def _author_region(path: Path, sentinel_id: str, prose: str) -> None:
 
 def test_cross_run_merge_keeps_distinct_ids_and_preserves_prior_prose(tmp_path: Path) -> None:
     wt = _worktree(tmp_path)
-    theme = wt / "wiki" / "ai-tech" / "themes" / "curator-concurrency.md"
+    theme = wt / "wiki" / "concepts" / "curator-concurrency.md"
 
     # RUN A: CREATE_THEME for candidate c1, authored with REAL prose.
     create = Disposition(
@@ -175,7 +187,7 @@ def test_cross_run_merge_keeps_distinct_ids_and_preserves_prior_prose(tmp_path: 
     old = text
     _author_region(theme, id_b, "Acquiring the flock is non-blocking; a held lock exits early.")
     new = theme.read_text(encoding="utf-8")
-    rel = "wiki/ai-tech/themes/curator-concurrency.md"
+    rel = "wiki/concepts/curator-concurrency.md"
     errors = validate_author_diff(
         changed_paths=[rel],
         per_file_old={rel: old},
@@ -190,12 +202,20 @@ def test_cross_run_merge_keeps_distinct_ids_and_preserves_prior_prose(tmp_path: 
     assert lint(RepoLayout(wt), taxonomy=TAXONOMY, run_date=RUN_DATE_B).ok
 
 
-# --- (b) cross-run APPEND_DAILY into the same daily file ----------------------------------------
+# --- (b) cross-run APPEND_DAILY into the same journal -------------------------------------------
 
 
 def test_cross_run_append_daily_same_file_keeps_distinct_ids(tmp_path: Path) -> None:
+    """Two RUNS, one journal, two distinct region ids — the ADR-0041 D2.6 shape of the collision.
+
+    The journal is one per ``run_date``, repo-wide, so the two runs that share a file are the two
+    runs that share a DAY (the second ``agora curate`` of the same day — the commonest run there
+    is). That is also precisely why ADR-0011 §4.1 check 5 keeps its ``(daily exempt)`` clause: the
+    second run names a basename already on disk, and without the exemption every same-day re-run
+    would be a hard BASENAME failure.
+    """
     wt = _worktree(tmp_path)
-    daily = wt / "wiki" / "ai-tech" / "daily" / f"ai-tech-{RUN_DATE_A}.md"
+    daily = wt / "wiki" / "notes" / "2026" / "06" / f"{RUN_DATE_A}.md"
 
     def _append(run_id: str, run_date: str, event_id: str) -> None:
         disp = Disposition(
@@ -203,7 +223,7 @@ def test_cross_run_append_daily_same_file_keeps_distinct_ids(tmp_path: Path) -> 
             event_ids=(event_id,),
             op="APPEND_DAILY",
             domain="ai-tech",
-            basename=f"ai-tech-{RUN_DATE_A}",  # SAME daily file across runs (date-named, exempt)
+            basename=run_date,  # D2.6: the journal IS basenamed by its run date
             summary="Daily capture.",
             status="active",
             tags=(),
@@ -219,12 +239,12 @@ def test_cross_run_append_daily_same_file_keeps_distinct_ids(tmp_path: Path) -> 
             provenance=_provenance("c1", event_id),
         )
 
-    # RUN A creates the daily with a c1 region; RUN B (also "c1") appends INTO the same file.
+    # RUN A creates the journal with a c1 region; RUN B (also "c1") appends INTO the same file.
     _append(RUN_ID_A, RUN_DATE_A, E1)
     id_a = region_sentinel_id(RUN_ID_A, "c1")
     _author_region(daily, id_a, "Run A: a curator advanced the branch.")
-    _append(RUN_ID_B, RUN_DATE_B, E2)
-    id_b = region_sentinel_id(RUN_ID_B, "c1")
+    _append(RUN_ID_B_SAME_DAY, RUN_DATE_A, E2)
+    id_b = region_sentinel_id(RUN_ID_B_SAME_DAY, "c1")
 
     body = daily.read_text(encoding="utf-8")
     assert id_a != id_b
@@ -241,20 +261,33 @@ def test_cross_run_append_daily_same_file_keeps_distinct_ids(tmp_path: Path) -> 
 
 
 def _write_theme(wt: Path, basename: str, body: str) -> Path:
+    """Write a WELL-FORMED schema-2 concept — the note L1-20 is exercised against.
+
+    The repo is schema 2, so the note has to be too: a ``type: theme`` note with no ``kind:`` and
+    no ``kb:`` is an INVALID schema-2 note (L1-11 + L1-4), and the pass-case below would then be
+    claiming "well-formed" about a fixture that could not survive the write path it stands in for.
+    The failure cases keep their L1-20-scoped filters — the point there is the sentinel rule, not
+    the note — but they too now start from a note whose only defect is the one under test.
+    """
     fm = {
         "title": basename,
-        "type": "theme",
+        "kind": "concept",
+        "type": "concept",
+        "kb": KB_ID,
+        "subjects": ["ai-tech"],
         "aliases": [],
         "tags": ["architecture"],
         "created": RUN_DATE_A,
         "updated": RUN_DATE_A,
         "status": "active",
         "summary": "seed",
+        "derived": False,
+        "provenance": {"writers": [], "agents": []},
         "sources": [f"raw/ai-tech/{E1}.md"],
         "related": [],
         "confidence": "high",
     }
-    path = wt / "wiki" / "ai-tech" / "themes" / f"{basename}.md"
+    path = wt / "wiki" / "concepts" / f"{basename}.md"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(frontmatter.render(fm, body), encoding="utf-8")
     return path
@@ -273,7 +306,7 @@ def test_lint_l1_20_fails_duplicate_sentinel_id(tmp_path: Path) -> None:
     dup = [
         f
         for f in result.findings
-        if f.code == "L1-20" and f.path == "wiki/ai-tech/themes/dup-sentinels.md"
+        if f.code == "L1-20" and f.path == "wiki/concepts/dup-sentinels.md"
     ]
     assert dup, f"expected an L1-20 duplicate-sentinel finding, got {result.findings}"
     assert "duplicated" in dup[0].message
@@ -292,6 +325,8 @@ def test_lint_l1_20_passes_well_formed_multi_region_note(tmp_path: Path) -> None
     result = lint(RepoLayout(wt), taxonomy=TAXONOMY, run_date=RUN_DATE_A)
     l1_20 = [f for f in result.findings if f.code == "L1-20"]
     assert l1_20 == [], f"unexpected L1-20 findings on a well-formed note: {l1_20}"
+    errors = [f for f in result.findings if f.severity == "error"]
+    assert errors == [], f"the fixture really is a well-formed schema-2 note: {errors}"
 
 
 def test_lint_l1_20_fails_unmatched_start(tmp_path: Path) -> None:
