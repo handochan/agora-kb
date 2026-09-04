@@ -54,10 +54,15 @@ import argparse
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from agora_kb.config import guard_repo_schema_version, load_backend_registry, load_repo_config
+from agora_kb.config import (
+    MAX_SUPPORTED_KB_SCHEMA_VERSION,
+    guard_repo_schema_version,
+    load_backend_registry,
+    load_repo_config,
+)
 from agora_kb.core import Inbox, Repo, StateStore, Wiki, failed_event_count
 from agora_kb.core.inbox import assert_writable_repo_schema
-from agora_kb.core.layout import CLAIM_BEARING_KINDS
+from agora_kb.core.layout import CLAIM_BEARING_KINDS, RepoLayout
 from agora_kb.curator.constants import DEFAULT_BODY_BYTE_BOUND
 from agora_kb.curator.subprocess_backend import (
     RoutedBackend,
@@ -334,8 +339,13 @@ class AgoraHandlers:
         is unmanaged BY DESIGN (D3.3) and counting it would turn the anomaly signal into noise;
         the people population is reported instead as ``by_kind['person']``.
         ``contested`` counts notes whose frontmatter ``status == 'contested'``;
-        ``last_consolidation`` is from :meth:`status`. This panel runs lint() + a full note scan,
-        so it is the heavy one — refreshed on load + a manual button, not a poll.
+        ``last_consolidation`` is from :meth:`status`. ``kb_schema_version`` /
+        ``writable_schema`` / ``writable_schema_version`` are the ADR-0041 D6 WRITE verdict, read
+        from the canonical declaration ``Inbox.write`` itself consults so the panel and the write
+        path cannot disagree: a repo on the older layout reads and lints perfectly while refusing
+        every capture, and a health panel that reported only ``lint_ok`` showed it as green.
+        This panel runs lint() + a full note scan, so it is the heavy one — refreshed on load + a
+        manual button, not a poll.
         """
         from agora_kb.config import load_repo_config
         from agora_kb.curator.worker import is_curator_written
@@ -412,7 +422,18 @@ class AgoraHandlers:
             1 for n in notes if not _is_ungraded_people_note(n) and not is_curator_written(n)
         )
 
+        # The WRITABILITY verdict, keyed on the canonical declaration `Inbox.write` itself consults
+        # (`read_canonical_kb_schema_version`), so the panel and the write path provably cannot
+        # disagree. Without it the dashboard showed a green KB — `lint_ok: true`, zero findings —
+        # whose every upload comes back as a receipt error, the same true-statement/false-impression
+        # the CLI's READ-ONLY line exists to prevent (ADR-0041 D6). `None` for a directory that
+        # declares nothing determinable; `writable_schema` is then False on the same honest ground
+        # `agora doctor` fails an unreadable version on.
+        kb_schema_version = _canonical_schema_version(self._repo.layout)
         return {
+            "kb_schema_version": kb_schema_version,
+            "writable_schema": kb_schema_version == MAX_SUPPORTED_KB_SCHEMA_VERSION,
+            "writable_schema_version": MAX_SUPPORTED_KB_SCHEMA_VERSION,
             "note_total": note_total,
             "by_kind": by_kind,
             "concepts": concepts,
@@ -1124,6 +1145,26 @@ class AgoraHandlers:
 #: ``tests/core/test_layout.py::test_the_claim_bearing_kind_set_is_one_object_in_all_three_modules``
 #: pins the three-way equality as well.
 ORPHAN_KINDS: frozenset[str] = CLAIM_BEARING_KINDS
+
+
+def _canonical_schema_version(layout: RepoLayout) -> int | None:
+    """The repo's CANONICAL declared KB wiki schema, or ``None`` when it is not determinable.
+
+    The narrow read — ``_meta/taxonomy.yaml`` alone, through
+    :func:`~agora_kb.config.read_canonical_kb_schema_version` — that
+    :func:`~agora_kb.core.inbox.assert_writable_repo_schema` makes before it refuses a capture, and
+    that ``agora doctor``'s write verdict is keyed on. Deliberately NOT the broader
+    ``read_kb_schema_version``, which falls back to the git-ignored ``_kb/repo.yaml`` mirror and
+    defaults a bare directory to ``1``: a writability claim on a read surface must be true of the
+    write refusal, not of a lookalike. Never raises — an unreadable or unparseable declaration is
+    reported as ``None`` (and therefore as not writable), which is what it is.
+    """
+    from agora_kb.config import read_canonical_kb_schema_version
+
+    try:
+        return read_canonical_kb_schema_version(layout)
+    except (OSError, ValueError):
+        return None
 
 
 def _is_orphan(note: object, referenced: set[str]) -> bool:

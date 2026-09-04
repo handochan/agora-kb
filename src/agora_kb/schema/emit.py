@@ -38,8 +38,9 @@ from pydantic import BaseModel, ConfigDict
 
 from agora_kb.core.atomicio import atomic_write_text
 from agora_kb.core.layout import RepoLayout
+from agora_kb.schema.notes import DIRECTORY_BY_KIND
 
-__all__ = ["Taxonomy", "emit_schema"]
+__all__ = ["Taxonomy", "emit_schema", "materialize_kind_directories"]
 
 # The schema doc's canonical basename and its symlink aliases (ADR-0010 §1 / §4). All four agent
 # guides resolve to the same emitted schema doc, so any tool that reads CLAUDE/QWEN/GEMINI sees the
@@ -341,3 +342,45 @@ def emit_schema(
     templates_dir = layout.root / "_templates"
     for filename, text in _TEMPLATES_BY_VERSION[version].items():
         _write_text(templates_dir / filename, text, force=force)
+
+
+def materialize_kind_directories(layout: RepoLayout) -> None:
+    """Create the six schema-2 ``wiki/<kind>/`` directories with a ``.gitkeep``, idempotently.
+
+    **Empty directories ARE materialized, and the reason is not tidiness.** Under schema 2 the
+    directory IS the kind (ADR-0041 D3.1) and the vocabulary is closed AT THE DIRECTORY LEVEL — an
+    unknown ``wiki/`` segment is a hard lint reject (L1-22). So the tree is the schema's own
+    statement of what kinds exist, and it has three readers that a lazily-created tree would fail:
+
+    * a **human** filing into ``wiki/people/**``, which the curator may NEVER create for them
+      (D3.3). With no directory they must invent the path, and a typo lands ``wiki/Peoples/`` — an
+      L1-22 reject for a tree that was supposed to be theirs.
+    * the **summary and entity tiers**, which ADR-0041 OD-7/OD-8 say ship EMPTY on purpose:
+      "shipping the container before the contract avoids a second migration". A container that does
+      not exist on disk is not shipped.
+    * anyone reading the repo in Obsidian or a file browser, for whom the kind set is otherwise
+      invisible until the first note of each kind happens to exist.
+
+    Git cannot track an empty directory, hence one ``.gitkeep`` each — the standard, tool-neutral
+    placeholder. It is inert: ``parse_all_notes`` and the lint scan both glob ``*.md``, so a
+    ``.gitkeep`` is never a note, never a link target, and never graded.
+
+    This lives here, next to :func:`emit_schema`, because it is the SAME statement of the schema and
+    it has THREE producers of a schema-2 repo that must agree byte-for-byte: ``agora repo init``,
+    the ADR-0041 D6 converter (:mod:`agora_kb.ingest.kb_convert`) and the vault importer
+    (:mod:`agora_kb.ingest.vault_import`). When the two ingest lanes had their own bare ``mkdir``
+    the containers they created were invisible to git — an empty ``wiki/summaries/`` is not a tree
+    entry — so a converted or imported repo and an init'd one were DIFFERENT trees at the same
+    schema, and the containers vanished on the first ``agora sync`` + clone. One producer, one
+    shape.
+
+    The directory NAMES come from :data:`agora_kb.schema.notes.DIRECTORY_BY_KIND` — the same mapping
+    lint reads for L1-22 — so this seed can never create a directory the linter would then reject.
+    It is NOT called from :func:`emit_schema`: emit serves schema 1 as well, and a schema-1 repo has
+    no kind directories at all. Every caller states the schema it is writing.
+    """
+    for directory in sorted(DIRECTORY_BY_KIND.values()):
+        keep = layout.wiki_dir / directory / ".gitkeep"
+        keep.parent.mkdir(parents=True, exist_ok=True)
+        if not keep.exists():
+            keep.write_text("", encoding="utf-8")

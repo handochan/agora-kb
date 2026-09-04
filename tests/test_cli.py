@@ -40,6 +40,7 @@ from agora_kb.curator.claim import curator_lock
 from agora_kb.curator.isolation import SandboxUnavailable
 from agora_kb.curator.worker import RunFailure, RunReport
 from agora_kb.schema import lint
+from tests.support.kb_builder import NoteSpec, build_kb
 
 requires_git = pytest.mark.skipif(shutil.which("git") is None, reason="git not available")
 
@@ -888,13 +889,101 @@ def test_reads_keep_working_on_the_repo_the_writes_refuse(
 
     A build that dropped 1 would STRAND the owner's two live KBs. Reads are what make the refusal
     survivable: the operator can still see the repo they are being told to convert.
+
+    The reads SUCCEED (rc 0 for status and index build) — that is the property. They are no longer
+    silent about the posture, though: ``status`` and ``doctor`` each say the repo is read-only,
+    which is the second half of the same contract and is asserted in its own tests below.
     """
     target = _init_schema_1_repo(tmp_path, capsys)
 
     assert main(["status", "--repo", str(target)]) == 0
     assert main(["doctor", "--repo", str(target), "--skip-probe"]) in (0, 1)
     assert main(["index", "build", "--repo", str(target)]) == 0
-    assert "READ-ONLY" not in capsys.readouterr().err
+
+
+@requires_git
+def test_status_reports_the_read_only_schema_with_a_value_line_and_a_remedy(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`agora status` is where an operator looks when captures "are not arriving" (ADR-0041 D6).
+
+    On a schema-1 repo they never will, so status has to say so. Two channels, deliberately: the
+    STDOUT line keeps status's ``key: <machine-readable value>`` grammar (a `grep '^schema:'`
+    answers "can this be written?"), and the REMEDY — a sentence with no value slot — goes to
+    stderr, exactly where ``repo init`` puts the same sentence.
+    """
+    target = _init_schema_1_repo(tmp_path, capsys)
+
+    assert main(["status", "--repo", str(target)]) == 0
+
+    captured = capsys.readouterr()
+    assert "schema: 1 (READ-ONLY — writes refuse)" in captured.out
+    assert "READ-ONLY" in captured.err
+    assert f"agora import --from-kb {target} <new-repo>" in captured.err
+
+
+@requires_git
+def test_status_on_a_writable_repo_prints_no_schema_line(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The read-only line must not become noise on every run of the ordinary case."""
+    target = tmp_path / "kb"
+    assert main(["repo", "init", str(target), "--domain", "general"]) == 0
+    capsys.readouterr()
+
+    assert main(["status", "--repo", str(target)]) == 0
+
+    captured = capsys.readouterr()
+    assert "schema:" not in captured.out
+    assert "READ-ONLY" not in captured.out + captured.err
+
+
+@requires_git
+def test_doctor_reports_a_read_only_repo_as_unhealthy_with_the_one_crossing(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Doctor answers the question the other commands refuse on — including "can I WRITE it?".
+
+    ``SUPPORTED_KB_SCHEMA_VERSIONS`` stays ``{1, 2}`` so reads keep working, which makes
+    ``schema: repo=1 supported=[1, 2]`` a PASSING line over a repo whose curator can never run
+    again. The ``write:`` line is the missing half, and it FAILS the verdict on the same judgement
+    ``test_doctor_offers_requeue_...`` already pins for an unrunnable curator: reporting
+    ``healthy`` for a repo that cannot curate is issue #96's opening complaint, and a launchd
+    health check that greens on a frozen hub hides it indefinitely.
+    """
+    target = _init_schema_1_repo(tmp_path, capsys)
+
+    rc = main(["doctor", "--repo", str(target), "--skip-probe"])
+
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "  schema: repo=1 supported=[1, 2]" in out
+    assert "write: READ-ONLY" in out
+    assert "reads KB schema 1 and refuses to write it" in out
+    assert f"'agora import --from-kb {target} <new-repo>'" in out
+    assert "status: unhealthy" in out
+
+
+@requires_git
+def test_doctor_says_nothing_about_writability_on_a_schema_2_repo(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The ordinary case is silent, and a NON-repo directory is silent too.
+
+    The second half is the reason the line is keyed on the CANONICAL declaration: the broader
+    reader ``doctor``'s ``schema:`` line uses defaults a bare directory to ``1``, so a banner keyed
+    on it would tell every operator running ``agora doctor`` in the wrong cwd that their writes
+    are refused.
+    """
+    target = tmp_path / "kb"
+    assert main(["repo", "init", str(target), "--domain", "general"]) == 0
+    capsys.readouterr()
+
+    main(["doctor", "--repo", str(target), "--skip-probe"])
+    assert "write: READ-ONLY" not in capsys.readouterr().out
+
+    main(["doctor", "--repo", str(tmp_path / "not-a-repo"), "--skip-probe"])
+    assert "write: READ-ONLY" not in capsys.readouterr().out
 
 
 # --- curate -------------------------------------------------------------------------------------
@@ -4318,7 +4407,7 @@ def test_tick_failure_detail_is_one_bounded_line() -> None:
     assert cli_mod._tick_failure_detail(RuntimeError()) == "RuntimeError: <no message>"
 
 
-# --- import (the opt-in Obsidian/markdown vault normalizer, ADR-0014 D5) ------------------------
+# --- import (the vault normalizer, ADR-0014 D5 — now emitting KB wiki schema 2) ------------------
 @requires_git
 def test_import_happy_path_creates_dest_and_prints_digest(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
@@ -4344,7 +4433,14 @@ def test_import_happy_path_creates_dest_and_prints_digest(
 def test_import_defaults_to_general_domain(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """With --domain omitted, an off-layout note lands under wiki/general/themes/ (the default)."""
+    """With --domain omitted, an off-layout note lands in the schema-2 CONCEPT directory.
+
+    The v1 assertion was ``wiki/general/themes/loose-idea.md`` — domain-first, ``themes`` naming
+    the kind. Under ADR-0041 the directory IS the kind and the domain has left the path for
+    ``subjects:``, so the same note lands in ``wiki/concepts/`` and the default domain survives as
+    a subject rather than as a folder. The digest also names the navigation tier the importer
+    SYNTHESIZES (D5), which has no counterpart in the source vault.
+    """
     src = tmp_path / "vault"
     dest = tmp_path / "out"
     note = src / "Loose Idea.md"
@@ -4354,8 +4450,11 @@ def test_import_defaults_to_general_domain(
     rc = main(["import", str(src), str(dest)])
 
     assert rc == 0
-    capsys.readouterr()
-    assert (dest / "wiki" / "general" / "themes" / "loose-idea.md").is_file()
+    assert "synthesized_maps=" in capsys.readouterr().out
+    imported = dest / "wiki" / "concepts" / "loose-idea.md"
+    assert imported.is_file()
+    assert not (dest / "wiki" / "general").exists()
+    assert "kind: concept" in imported.read_text(encoding="utf-8")
 
 
 @requires_git
@@ -4396,14 +4495,16 @@ def test_import_with_warnings_still_exits_0_and_prints_them(
 
 
 @requires_git
-def test_import_says_out_loud_that_the_repo_it_produced_is_read_only(
+def test_import_produces_a_repo_this_build_can_actually_write(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """A ``lint: clean`` line over a repo the operator cannot curate leaves a false impression.
+    """The inverse of the note this replaces: an imported repo is CURATE-ABLE the moment it exists.
 
-    The importer emits the schema-1 layout while this build WRITES schema 2 (ADR-0041 D6), so the
-    repo it just produced accepts reads and refuses every write. Not an error exit — the import
-    itself succeeded and is non-destructive — but the operator has to be told.
+    While the importer emitted schema 1, ``agora import`` minted a repo that was read-only the
+    moment it was created and had to say so out loud — a ``lint: clean`` line over a repo the
+    operator cannot curate is a true statement that leaves a false impression. The importer now
+    emits schema 2 (ADR-0041 D6), so the warning must be GONE and its absence must be earned: the
+    proof is that the write path, which refuses a schema-1 repo, accepts this one.
     """
     src = tmp_path / "vault"
     dest = tmp_path / "out"
@@ -4414,30 +4515,309 @@ def test_import_says_out_loud_that_the_repo_it_produced_is_read_only(
     rc = main(["import", str(src), str(dest)])
 
     assert rc == 0
-    err = capsys.readouterr().err
-    assert "READ but not WRITE" in err
-    # And the claim is TRUE: the write refusal really does fire on the repo just produced.
-    assert main(["curate", "--repo", str(dest)]) == 1
+    combined = capsys.readouterr()
+    assert "READ but not WRITE" not in combined.err
+    assert "READ-ONLY" not in combined.err + combined.out
+    # The claim is TRUE, not merely unstated: the ADR-0041 D6 write refusal does NOT fire here.
+    Inbox(RepoLayout(dest)).write(text="A captured fact.", writer="test", source="manual")
+    assert main(["status", "--repo", str(dest)]) == 0
+    assert "READ-ONLY" not in capsys.readouterr().out
 
 
 @requires_git
-def test_import_into_a_schema2_repo_exits_1_and_writes_nothing(
+def test_import_into_a_schema1_repo_exits_1_and_writes_nothing(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """Two layouts in one repo is the state D6's refusal exists to prevent."""
+    """Two layouts in one repo is the state D6's refusal exists to prevent.
+
+    The guard flipped with the importer: it now emits schema 2, so the destination it must refuse
+    is a schema-**1** repo (importing there would commit ``wiki/concepts/…`` beside
+    ``wiki/<domain>/themes/…``). The remedy on the message is the one crossing that exists.
+    """
     src = tmp_path / "vault"
-    dest = tmp_path / "kb2"
+    dest = tmp_path / "kb1"
     note = src / "wiki" / "general" / "themes" / "topic.md"
     note.parent.mkdir(parents=True)
     note.write_text("# Topic\n\nA body paragraph.\n", encoding="utf-8")
-    assert main(["repo", "init", str(dest), "--domain", "general"]) == 0
+    assert main(["repo", "init", str(dest), "--schema", "1", "--domain", "general"]) == 0
     capsys.readouterr()
 
     rc = main(["import", str(src), str(dest)])
 
     assert rc == 1
-    assert "schema-2 KB" in capsys.readouterr().err
-    assert not (dest / "wiki" / "general").exists()
+    err = capsys.readouterr().err
+    assert "schema-1 KB" in err
+    assert "import --from-kb" in err
+    assert not (dest / "wiki" / "concepts").exists()
+
+
+# --- import --from-kb (the schema-1 → schema-2 CONVERTER, ADR-0041 D6) ---------------------------
+def _schema_1_kb(root: Path) -> Path:
+    """A small but SHAPE-COMPLETE schema-1 KB: a map per domain, two themes, two same-date dailies.
+
+    Every D6 rule that produces visible output is exercised by this one corpus: the ``-moc`` rename
+    (rule 3), the two dailies of DIFFERENT domains sharing a date (rule 4's merge), the path domain
+    that must survive as a subject (rule 2) and the ``raw/`` the builder materializes for each
+    concept's ``sources:`` (rule 5).
+    """
+    return build_kb(
+        root,
+        [
+            NoteSpec(
+                kind="theme",
+                domain="ai-tech",
+                title="Retrieval Augmented Generation",
+                body="Retrieval augmented generation grounds an answer in retrieved documents.",
+            ),
+            NoteSpec(
+                kind="theme",
+                domain="ml",
+                title="Gradient Descent",
+                body="Gradient descent walks a loss surface downhill one step at a time.",
+            ),
+            NoteSpec(
+                kind="daily",
+                domain="ai-tech",
+                title="ai-tech 2026-01-12",
+                body="Captured one note about retrieval.",
+                extra_frontmatter={"date": "2026-01-12"},
+            ),
+            NoteSpec(
+                kind="daily",
+                domain="ml",
+                title="ml 2026-01-12",
+                body="Captured one note about gradients.",
+                extra_frontmatter={"date": "2026-01-12"},
+            ),
+        ],
+        schema_version=1,
+        domains=["ai-tech", "ml"],
+    )
+
+
+def _snapshot(root: Path) -> dict[str, bytes]:
+    """Every file under ``root`` by repo-relative path → bytes. The "src is never touched" proof."""
+    return {
+        p.relative_to(root).as_posix(): p.read_bytes()
+        for p in sorted(root.rglob("*"))
+        if p.is_file()
+    }
+
+
+@requires_git
+def test_import_from_kb_converts_a_schema_1_repo_and_prints_the_report(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The D6 crossing, end to end: a schema-1 repo in, a WRITABLE schema-2 repo out.
+
+    Four claims, and the last one is the point of the whole wave: the destination has the
+    kind-first shape, the report enumerates the renames and the merge (a converter that renames
+    silently is one that loses ``[[basename]]`` edges), the SOURCE is byte-for-byte untouched, and
+    the destination accepts the capture that the source refuses.
+    """
+    src = _schema_1_kb(tmp_path / "v1")
+    dest = tmp_path / "v2"
+    before = _snapshot(src)
+
+    rc = main(["import", "--from-kb", str(src), str(dest)])
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "converted 6 note(s)" in out  # 7 v1 notes in, two dailies merged into one journal
+    assert "source_notes=7" in out
+    assert "kb_id: " in out
+    # The COUNT and the LIST are different quantities (a merged journal is one destination note but
+    # two basename pairs), so they are labelled apart rather than both printed as "renamed".
+    assert "renamed_notes=" in out
+    assert "renamed basenames (" in out
+    assert "ai-tech-moc -> ai-tech" in out
+    assert "merges (1):" in out
+    assert "2026-01-12 <- " in out
+    assert "lint: clean" in out
+    # The kind-first shape: the map lost its `-moc` suffix, the concepts left their domain folder,
+    # and the two same-date dailies became ONE journal sharded under <yyyy>/<mm>.
+    assert (dest / "wiki" / "maps" / "ai-tech.md").is_file()
+    assert (dest / "wiki" / "concepts" / "retrieval-augmented-generation.md").is_file()
+    assert (dest / "wiki" / "notes" / "2026" / "01" / "2026-01-12.md").is_file()
+    assert not (dest / "wiki" / "ai-tech").exists()
+    assert (dest / "_meta" / "kb.yaml").is_file()
+    # The source is untouched — not "still lints", but the same bytes in the same files.
+    assert _snapshot(src) == before
+    # ...and the destination is the half this build can write, while the source still is not.
+    with pytest.raises(ReadOnlySchemaVersionError):
+        Inbox(RepoLayout(src)).write(text="A captured fact.", writer="test", source="manual")
+    Inbox(RepoLayout(dest)).write(text="A captured fact.", writer="test", source="manual")
+    assert main(["status", "--repo", str(dest)]) == 0
+    assert "READ-ONLY" not in capsys.readouterr().out
+
+
+@requires_git
+def test_import_from_kb_refuses_the_vault_import_flags(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``--domain`` / ``--tag`` are the VAULT path's flags and are refused, never ignored.
+
+    The converter carries the source repo's taxonomy across unchanged, so accepting ``--domain``
+    silently would let an operator believe they had re-shaped a taxonomy that in fact came over as
+    it was. Exit 2 (the argparse usage code) and NOTHING written.
+    """
+    src = _schema_1_kb(tmp_path / "v1")
+    dest = tmp_path / "v2"
+
+    rc = main(["import", "--from-kb", str(src), str(dest), "--domain", "other"])
+
+    assert rc == 2
+    assert "--domain/--tag are vault-import flags" in capsys.readouterr().err
+    assert not dest.exists()
+
+
+@requires_git
+def test_import_from_kb_refuses_a_destination_inside_the_source(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``agora import --from-kb <kb> <kb>/converted`` is refused, and the source is untouched.
+
+    The CLI closes every successful conversion with ``<src> was NOT modified``. A destination
+    nested in the source made that line false — the run planted a whole schema-2 repo, its own
+    ``.git`` included, inside the tree it had just read — so the pairing is refused outright rather
+    than the note being softened into a maybe.
+    """
+    src = _schema_1_kb(tmp_path / "v1")
+    before = _snapshot(src)
+
+    rc = main(["import", "--from-kb", str(src), str(src / "converted")])
+
+    assert rc == 1
+    assert "inside the source repo" in capsys.readouterr().err
+    assert not (src / "converted").exists()
+    assert _snapshot(src) == before
+
+
+@requires_git
+def test_import_into_an_existing_repo_is_refused_naming_the_inbox(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The VAULT lane writes a NEW repo too: an already-initialized destination is refused.
+
+    Before the guard, a second ``agora import`` into a live schema-2 KB exited 0 and printed
+    ``lint: clean`` while re-minting ``_meta/kb.yaml`` with a fresh ``kb_id`` the existing notes did
+    not carry (D1.5 mints one ONCE) and rebuilding the root map from that vault alone.
+    """
+    dest = tmp_path / "kb"
+    assert main(["repo", "init", str(dest), "--domain", "general"]) == 0
+    before = _snapshot(dest)
+    vault = tmp_path / "vault"
+    (vault / "general").mkdir(parents=True)
+    (vault / "general" / "alpha.md").write_text("# Alpha\n\nProse.\n", encoding="utf-8")
+
+    rc = main(["import", str(vault), str(dest), "--domain", "general"])
+
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "already a schema-2 KB" in err
+    assert "kb_remember" in err  # ...and it names the way to ADD to an existing KB
+    assert _snapshot(dest) == before
+
+
+@requires_git
+def test_import_from_kb_refuses_a_source_that_is_not_schema_1(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """There is exactly ONE crossing and it runs in exactly one direction (ADR-0041 D6)."""
+    src = tmp_path / "kb2"
+    assert main(["repo", "init", str(src), "--domain", "general"]) == 0
+    capsys.readouterr()
+
+    rc = main(["import", "--from-kb", str(src), str(tmp_path / "out")])
+
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "is not a KB wiki schema-1 repo" in err
+    assert "Traceback" not in err
+
+
+@requires_git
+def test_import_from_kb_refuses_an_occupied_destination(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Converting INTO a populated tree is the two-layouts-in-one-repo state D6 prevents."""
+    src = _schema_1_kb(tmp_path / "v1")
+    dest = tmp_path / "v2"
+    dest.mkdir()
+    (dest / "occupied.md").write_text("mine\n", encoding="utf-8")
+
+    rc = main(["import", "--from-kb", str(src), str(dest)])
+
+    assert rc == 1
+    assert "never converts in place" in capsys.readouterr().err
+    assert (dest / "occupied.md").read_text(encoding="utf-8") == "mine\n"
+
+
+@requires_git
+def test_import_from_kb_names_every_colliding_basename_and_writes_nothing(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """D6 rule 7: a collision the flip INTRODUCES is a hard failure with a named list.
+
+    Two v1 concepts of different domains may share a basename — the domain was in the path. Under
+    schema 2 both want ``wiki/concepts/<slug>.md``, and a converter that silently renamed one would
+    break every ``[[basename]]`` edge pointing at it. Exit 1, the names printed, dest untouched.
+    """
+    src = _schema_1_kb(tmp_path / "v1")
+    twin = src / "wiki" / "ml" / "themes" / "retrieval-augmented-generation.md"
+    twin.write_bytes(
+        (src / "wiki" / "ai-tech" / "themes" / "retrieval-augmented-generation.md").read_bytes()
+    )
+    dest = tmp_path / "v2"
+
+    rc = main(["import", "--from-kb", str(src), str(dest)])
+
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "retrieval-augmented-generation" in err
+    assert "Traceback" not in err
+    assert not dest.exists()
+
+
+@requires_git
+def test_import_from_kb_missing_src_exits_1_with_stderr(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A missing source is a HARD error on this path too — exit 1, one line, no traceback."""
+    rc = main(["import", "--from-kb", str(tmp_path / "nope"), str(tmp_path / "out")])
+
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "import --from-kb:" in err
+    assert "Traceback" not in err
+
+
+def test_import_help_names_the_schema_it_writes_and_the_one_crossing(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """``agora import --help`` must answer "which layout do I get?" without reading an ADR.
+
+    Whitespace-normalized, and every asserted phrase is HYPHEN-FREE: argparse re-wraps help to the
+    terminal width and ``textwrap`` will break a word at a hyphen, so "no in-place migrator" is not
+    a substring of its own rendered help at 80 columns.
+    """
+    with pytest.raises(SystemExit):
+        main(["import", "--help"])
+
+    out = " ".join(capsys.readouterr().out.split())
+    assert "KB wiki schema 2" in out
+    assert "--from-kb" in out
+    assert "the only crossing between the two schemas" in out
+
+
+def test_top_level_help_lists_import_as_a_schema_2_producer(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The subcommand table is where an operator first meets ``import``; it must not be neutral."""
+    with pytest.raises(SystemExit):
+        main(["--help"])
+
+    assert "new KB schema-2 Agora repo" in " ".join(capsys.readouterr().out.split())
 
 
 # --- --version (issue #101) ----------------------------------------------------------------------

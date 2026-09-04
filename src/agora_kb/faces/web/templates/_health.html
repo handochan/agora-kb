@@ -45,11 +45,31 @@
       {%- else %}ok{% endif %}
     </span>
   </div>
+  {# The WRITE verdict (ADR-0041 D6). A schema-1 repo reads and lints perfectly while refusing
+     every capture, so a panel that showed only `lint_ok` reported a green KB whose next upload
+     comes back as a receipt error. Keyed on the same canonical declaration `Inbox.write` reads. #}
+  <div class="stat">
+    <span class="label">Write</span>
+    <span class="value {{ 'ok' if health.writable_schema else 'warn' }}">
+      {% if health.writable_schema %}schema {{ health.kb_schema_version }}
+      {%- elif health.kb_schema_version %}READ-ONLY · schema {{ health.kb_schema_version }}
+      {%- else %}READ-ONLY · schema unknown{% endif %}
+    </span>
+  </div>
   <div class="stat">
     <span class="label">Last consolidation</span>
     <span class="value mono">{{ health.last_consolidation or "—" }}</span>
   </div>
 </div>
+{% if not health.writable_schema %}
+<p class="empty">
+  This build writes KB wiki schema {{ health.writable_schema_version }} and refuses to write this
+  repo, so every capture — <code>kb_remember</code>, an upload here, <code>agora curate</code> — is
+  rejected. Convert once into a NEW repo with
+  <code>agora import --from-kb &lt;this-repo&gt; &lt;new-repo&gt;</code>; the source is never
+  modified.
+</p>
+{% endif %}
 
 <h3>By kind</h3>
 {# The ADR-0041 kind census. `summaries`/`entities` ship empty (OD-7/OD-8) and `people` is the

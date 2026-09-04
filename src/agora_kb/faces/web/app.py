@@ -66,6 +66,7 @@ from starlette.datastructures import Headers, MutableHeaders
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from agora_kb.config import (
+    ReadOnlySchemaVersionError,
     WebConfig,
     WebIdentityConfig,
     guard_repo_schema_version,
@@ -552,7 +553,9 @@ def build_app(*, repo_path: Path, writer: str = "web", user: str = "local") -> F
         capture disabled by the operator (``web.upload.url_enabled: false``) → 403, oversize → 413,
         malformed/garbage input — incl. an SSRF-blocked URL (issue #66) or a decompression-bomb
         archive (issue #53) → 422 (:class:`ExtractorError`), a missing ``ingest`` dependency → 503
-        (:class:`ExtractorUnavailable`, with the install remedy).
+        (:class:`ExtractorUnavailable`, with the install remedy). A repo whose KB wiki schema this
+        build reads but will not write also → 422, carrying the ADR-0041 D6 verdict and the one
+        crossing (``agora import --from-kb``) as its ``detail``; nothing is queued.
         """
         req_user, identity_source = _resolve_upload_user(
             request, identity=web_config.identity, process_user=user
@@ -592,6 +595,11 @@ def build_app(*, repo_path: Path, writer: str = "web", user: str = "local") -> F
         is read, stopping + reporting on the first overflow). The stamped user is per-request when
         ``web.identity.trusted_header`` is configured (issue #67; an invalid header value → 400
         BEFORE any write), else the process ``--user``.
+
+        A read-only KB wiki schema (ADR-0041 D6) refuses every file, and it refuses them THROUGH
+        this shape: the request still answers 200 and each :class:`FileReceipt` carries the verdict
+        in its ``error``. It is a repo-level state rather than a per-file one, so every receipt says
+        the same thing — but a batch that 500s would discard the outcomes of files already read.
         """
         req_user, identity_source = _resolve_upload_user(
             request, identity=web_config.identity, process_user=user
@@ -1175,6 +1183,28 @@ def _remember_markdown(
             domain=dom,
             tags=parsed_tags,
         )
+    except ReadOnlySchemaVersionError as exc:
+        # ADR-0041 D6, made EXPLICIT rather than incidental. `Inbox.write` refuses a capture into a
+        # repo whose KB wiki schema this build will not write, and the refusal is a `ConfigError`
+        # (hence a `ValueError`), so the broad arm below would already catch it — by accident. Three
+        # things make that accident worth replacing with a named arm:
+        #
+        # * the arm below exists for MALFORMED INPUT and prefixes its detail accordingly ("could not
+        #   capture upload: …"), which frames a repo-level schema verdict as a bad file. The
+        #   operator's file is fine; their REPO is the old half, and the message must say so
+        #   unprefixed — it already carries the one remedy (`agora import --from-kb`).
+        # * narrowing that defensive arm later (the obvious tidy-up: catch `ValidationError` only)
+        #   would silently turn every schema-1 capture into an unhandled 500. The refusal is a
+        #   documented, permanent state of a supported repo, not defense in depth.
+        # * `_do_upload_batch` turns an `HTTPException` into that file's own `FileReceipt(error=…)`,
+        #   so raising one HERE — at the single write seam both paths share — is what makes the
+        #   verdict a per-file receipt in the batch/drag-and-drop lane instead of a 500 that
+        #   discards the whole batch's outcomes.
+        #
+        # 422 is deliberate: the same status the route already uses for every other per-file
+        # capture failure, so a client branching on the code needs no new case (the JSON `detail`
+        # and the per-file `error` string carry the verdict).
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     except ValueError as exc:
         # Defense in depth: any inbox-model validation that slips past the face's own pre-checks
         # (a malformed domain/target, etc.) surfaces as a clean 422 here rather than a raw 500 out

@@ -321,9 +321,12 @@ def test_criterion_5_a_repo_with_no_schema_declaration_is_unchanged(
 ) -> None:
     """Absent taxonomy file, absent key, and empty key all keep reading as 1 — zero regression."""
     # (a) nothing at all — not even an Agora repo. The guard must be SILENT here, not a complaint
-    #     about a schema in a directory that has none.
+    #     about a schema in a directory that has none. So must the ADR-0041 D6 read-only note that
+    #     `agora status` grew: it is keyed on the CANONICAL declaration, which a bare directory
+    #     does not have, precisely so "wrong cwd" never surfaces as a schema verdict.
     guard_repo_schema_version(RepoLayout(tmp_path))
     assert main(["status", "--repo", str(tmp_path)]) == 0
+    assert capsys.readouterr().err == ""
 
     # (b) a taxonomy.yaml with every key EXCEPT schema_version.
     meta = tmp_path / "_meta"
@@ -338,7 +341,14 @@ def test_criterion_5_a_repo_with_no_schema_declaration_is_unchanged(
     _write_repo_yaml(tmp_path, "name: r\ndomains: [general]\n")
     guard_repo_schema_version(RepoLayout(tmp_path))
     assert main(["status", "--repo", str(tmp_path)]) == 0
-    assert capsys.readouterr().err == ""
+    # The GUARD stays silent — that is this test's subject. Once a `_meta/taxonomy.yaml` exists,
+    # though, a missing `schema_version:` key reads as 1 (a pre-#98 repo), so `agora status` now
+    # adds the D6 read-only note. That is not a regression but the same verdict `Inbox.write` would
+    # give this repo, from the same canonical reader — it just arrives before the refusal instead
+    # of after it. Asserting the absence of the guard's own complaint keeps the two apart.
+    err = capsys.readouterr().err
+    assert "not supported by this agora build" not in err
+    assert "READ-ONLY for this agora build" in err
 
 
 def test_criterion_5_an_unreadable_config_is_not_the_guards_verdict(
@@ -729,7 +739,11 @@ def test_reads_still_work_on_a_schema_1_repo(
     _repo_at_schema(tmp_path, 1)
 
     assert main(["status", "--repo", str(tmp_path)]) == 0
-    assert capsys.readouterr().err == ""
+    # The read SUCCEEDS (rc 0) — the property this test owns. It is not silent: `agora status`
+    # names the read-only posture and the one crossing, because the command an operator runs when
+    # captures "are not arriving" is where that has to be said (asserted in `tests/test_cli.py`).
+    # What must be absent is the GUARD's refusal, which would mean the repo could not be read.
+    assert "not supported by this agora build" not in capsys.readouterr().err
     guard_repo_schema_version(RepoLayout(tmp_path))  # the entry-point guard stays silent
 
 
