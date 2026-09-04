@@ -7,11 +7,20 @@ from pathlib import Path
 import pytest
 
 from agora_kb.core.layout import (
+    ATTACHMENT_DIRNAME,
+    DEFAULT_ATTACHMENT_EXT,
     KIND_DIRECTORIES,
     WIKI_KINDS,
+    InvalidAttachmentError,
+    InvalidAttachmentExtError,
     InvalidNoteBasenameError,
     InvalidWriterError,
     RepoLayout,
+    attachment_basename,
+    attachment_dir,
+    attachment_ext_for,
+    validate_attachment_digest,
+    validate_attachment_ext,
     validate_writer,
 )
 from agora_kb.core.pathsafe import is_safe_component
@@ -313,3 +322,76 @@ def test_the_claim_bearing_kind_set_is_one_object_in_all_three_modules() -> None
     # would make every one of them an orphan and turn the signal into noise.
     assert "entity" not in CLAIM_BEARING_KINDS
     assert "person" not in CLAIM_BEARING_KINDS
+
+
+# --- attachment addressing (ADR-0041 D4.2 transport, D1.4 destination grammar) -------------------
+def test_attachment_paths(tmp_path: Path) -> None:
+    lo = RepoLayout(tmp_path)
+    sha = "a" * 64
+    assert lo.inbox_attachment_dir("dochan") == tmp_path / "_kb" / "inbox" / "dochan" / "_attach"
+    assert (
+        lo.inbox_attachment_path("dochan", sha, "pdf")
+        == tmp_path / "_kb" / "inbox" / "dochan" / "_attach" / f"{sha}.pdf"
+    )
+    # The sidecar directory name is CONSTANT wherever the event has moved to, so a reader with an
+    # event path can always find the bytes beside it.
+    events = tmp_path / "_kb" / "processing" / "run-1" / "events"
+    assert attachment_dir(events) == events / ATTACHMENT_DIRNAME
+
+
+def test_an_attachment_path_needs_a_valid_writer(tmp_path: Path) -> None:
+    lo = RepoLayout(tmp_path)
+    with pytest.raises(InvalidWriterError):
+        lo.inbox_attachment_path("../evil", "a" * 64, "pdf")
+
+
+@pytest.mark.parametrize(
+    "bad",
+    ["", "PDF", "tar.gz", ".pdf", "_pdf", "pd/f", "p f", "a" * 17, "meta", "pdf\n"],
+)
+def test_rejected_attachment_extensions(bad: str) -> None:
+    with pytest.raises(InvalidAttachmentExtError):
+        validate_attachment_ext(bad)
+
+
+@pytest.mark.parametrize("good", ["pdf", "md", "7z", "yaml", "a", "0123456789abcdef"])
+def test_accepted_attachment_extensions(good: str) -> None:
+    assert validate_attachment_ext(good) == good
+
+
+@pytest.mark.parametrize(
+    "bad",
+    ["", "A" * 64, "a" * 63, "a" * 65, "../../../wiki/PWNED", "g" * 64],
+)
+def test_rejected_attachment_digests(bad: str) -> None:
+    with pytest.raises(InvalidAttachmentError):
+        validate_attachment_digest(bad)
+
+
+def test_an_attachment_basename_is_never_a_sidecar_name() -> None:
+    """lint L1-8b is a pure `.meta.yaml` suffix test, so no artefact may ever produce that name."""
+    for ext in ("pdf", "yaml", "md"):
+        assert not attachment_basename("b" * 64, ext).endswith(".meta.yaml")
+    with pytest.raises(InvalidAttachmentExtError):
+        attachment_basename("b" * 64, "meta.yaml")
+
+
+@pytest.mark.parametrize(
+    ("filename", "expected"),
+    [
+        ("report.pdf", "pdf"),
+        ("REPORT.PDF", "pdf"),
+        ("a.tar.gz", "gz"),
+        ("noext", DEFAULT_ATTACHMENT_EXT),
+        ("", DEFAULT_ATTACHMENT_EXT),
+        (None, DEFAULT_ATTACHMENT_EXT),
+        (".hidden", "hidden"),
+        ("x.meta", DEFAULT_ATTACHMENT_EXT),
+        ("보고서.pdf", "pdf"),
+        ("x.pd f", DEFAULT_ATTACHMENT_EXT),
+    ],
+)
+def test_attachment_ext_for_is_total(filename: str | None, expected: str) -> None:
+    """Whatever a browser or a shell hands over, the result is a valid single component."""
+    assert attachment_ext_for(filename) == expected
+    assert validate_attachment_ext(attachment_ext_for(filename))

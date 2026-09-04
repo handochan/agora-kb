@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from agora_kb.core.repo import GitError, Repo
+from agora_kb.core.repo import GITATTRIBUTES_NAME, GitError, Repo, blob_bytes_are_pinned
 
 pytestmark = pytest.mark.skipif(shutil.which("git") is None, reason="git not available")
 
@@ -136,6 +136,83 @@ def test_kb_is_gitignored_and_content_is_tracked(repo: Repo) -> None:
     assert ".gitignore" in tracked
     assert "index.md" in tracked  # curated content IS tracked (ADR-0001)
     assert _git(repo.root, "show", "HEAD:index.md").startswith("---")
+
+
+def test_init_seeds_the_gitattributes_that_pins_raw_blob_bytes(repo: Repo) -> None:
+    """`raw/_blob/` names its files by their own sha256, so git must never rewrite their EOLs.
+
+    ADR-0041 D1.4: without the rule a CRLF, NUL-free artefact (CSV/TXT/HTML/JSON) is classified
+    TEXT and normalised to LF on commit under `core.autocrlf`, after which the committed blob no
+    longer hashes to its own basename and every later re-cite fails permanently.
+    """
+    assert GITATTRIBUTES_NAME in _git(repo.root, "ls-files").split()
+    assert "raw/_blob/** -text" in (repo.root / GITATTRIBUTES_NAME).read_text(encoding="utf-8")
+    assert blob_bytes_are_pinned(repo.root)
+
+
+def test_blob_bytes_are_pinned_reports_a_repo_created_before_the_seed(tmp_path: Path) -> None:
+    """The diagnostic `agora doctor` prints for an older repo — and it accepts a hand-written rule.
+
+    Not a byte comparison with the seed: an operator may reasonably have their own rules around it,
+    and a doctor line that flagged a hand-edited but CORRECT file would train them to ignore the
+    channel.
+    """
+    root = tmp_path / "older"
+    root.mkdir()
+    assert not blob_bytes_are_pinned(root)  # not even a git repo
+    _git(root, "init", "-q", "-b", "main")
+    assert not blob_bytes_are_pinned(root)  # no file at all
+    (root / GITATTRIBUTES_NAME).write_text("*.md text\n", encoding="utf-8")
+    assert not blob_bytes_are_pinned(root)  # a file without the rule
+    (root / GITATTRIBUTES_NAME).write_text("raw/_blob/** binary\n", encoding="utf-8")
+    assert blob_bytes_are_pinned(root)  # `binary` implies `-text`
+
+
+def test_blob_bytes_are_pinned_honours_last_match_wins(tmp_path: Path) -> None:
+    """A later broad rule OVERRIDES the blob rule, and the predicate has to say so.
+
+    gitattributes(5) resolves the LAST matching pattern, and an explicit `text` attribute outranks
+    `core.autocrlf` — so a `.gitattributes` that carries the blob line and then `* text=auto`
+    re-normalises exactly the CRLF, NUL-free artefact D1.4 protects, while a first-match presence
+    test would still report the repo healthy. Asking `git check-attr` is what makes ordering (and
+    a per-extension override the seed never mentions) part of the answer.
+    """
+    root = tmp_path / "override"
+    root.mkdir()
+    _git(root, "init", "-q", "-b", "main")
+    attrs = root / GITATTRIBUTES_NAME
+    attrs.write_text("raw/_blob/** -text -diff -merge\n", encoding="utf-8")
+    assert blob_bytes_are_pinned(root)
+    attrs.write_text("raw/_blob/** -text -diff -merge\n* text=auto\n", encoding="utf-8")
+    assert not blob_bytes_are_pinned(root)
+    # And a single-extension override under the blob tree: the `.bin` probe alone would miss it.
+    attrs.write_text("raw/_blob/** -text -diff -merge\n*.csv text\n", encoding="utf-8")
+    assert not blob_bytes_are_pinned(root)
+
+
+def test_reinit_appends_the_blob_rule_and_keeps_operator_edits(tmp_path: Path) -> None:
+    """`repo init` is re-runnable and doctor tells the operator to APPEND — so it must not truncate.
+
+    The remedy `agora doctor` prints is `printf '…' >> .gitattributes`. A seed written
+    unconditionally would make the next `agora repo init` delete exactly that edit, along with any
+    rule of the operator's own. Appending also puts our line LAST, where last-match-wins needs it.
+    """
+    root = tmp_path / "older"
+    root.mkdir()
+    _git(root, "init", "-q", "-b", "main")
+    (root / GITATTRIBUTES_NAME).write_text("*.ipynb -diff\n* text=auto\n", encoding="utf-8")
+
+    Repo.resolve(root).init(when=WHEN)
+
+    text = (root / GITATTRIBUTES_NAME).read_text(encoding="utf-8")
+    assert "*.ipynb -diff" in text  # the operator's rule survived
+    assert text.rstrip().endswith("raw/_blob/** -text -diff -merge")  # ours landed last
+    assert blob_bytes_are_pinned(root)  # and therefore beats the `* text=auto` above it
+
+    # A second init writes nothing more: the rule is already in force.
+    before = (root / GITATTRIBUTES_NAME).read_bytes()
+    Repo.resolve(root).init(when=WHEN)
+    assert (root / GITATTRIBUTES_NAME).read_bytes() == before
 
 
 # --- worktree lifecycle -----------------------------------------------------------------------

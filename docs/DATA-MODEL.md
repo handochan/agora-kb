@@ -26,6 +26,12 @@ confidence: high | medium | low           # low for harvested candidates (gated 
 event_key: <optional caller-scoped key>    # retries with the same writer+key create no new event
 content_sha256: <hex>                      # content equivalence; never discards new provenance
 raw_ref: raw/ai-tech/2026-06-13-foo.pdf    # optional: link to an immutable source (uploads)
+attachments:                               # optional: original bytes staged beside this event (below)
+  - sha256: <hex of the raw bytes>         # content address; names the staged file AND its raw/_blob/ twin
+    ext: pdf                               # one component, [a-z0-9]{1,16}, never `meta` (ADR-0041 D1.4)
+    filename: 2026-q3-report.pdf           # DISPLAY only, sanitised; omitted when nothing safe survives
+    media_type: application/pdf            # optional, bare `type/subtype`
+    bytes: 481920
 ---
 <the knowledge text to remember, or an extraction summary of raw_ref>
 ```
@@ -36,6 +42,37 @@ by location: `_kb/inbox/` (pending) → `_kb/processing/<run-id>/` (claimed) →
 in the processing directory. `event_key` provides delivery idempotency; identical `content_sha256`
 values are equivalent content whose distinct sources/writers must still be preserved and merged into
 provenance.
+
+**Attachments — the original bytes of a captured artefact** ([ADR-0041](adr/0041-stratum-kind-first-layout.md)
+D4.2). A face that extracts a PDF to markdown captures the *text* in the event body; the PDF itself
+rides along as an attachment. The bytes are staged **inside the writer's own namespace** at
+`_kb/inbox/<writer>/_attach/<sha256>.<ext>` and written **before** the event that names them, so one
+capture stays one delivery and an event is never visible citing bytes that are not on disk (the
+rejected alternative — a staging area outside the inbox that APPLY reads by `raw_ref` — splits it
+into two independently-failing writes). The staged file is content-addressed and immutable, like the
+event: several events naming identical bytes share one file, `sha256` is the digest of the **raw
+bytes** (never the §11.2 normalised-text `content_sha256`, which would not identify a binary), and
+re-staging the same bytes is a no-op. `ext` is the ADR-0041 D1.4 grammar — exactly one component,
+`[a-z0-9]{1,16}`, never `meta` — and a filename carrying none usable yields `bin`. Per-file size is
+capped at the same bound as a web upload (`web.upload.max_bytes`, default 25 MiB) — the operator's
+configured value, read by **both** capture surfaces (INGEST-CONTRACT §0.1 rule 3).
+
+The attachment travels with its event through the spool (`_attach/` beside the event at each stage).
+The move is a **rename when this is the last event citing the file**, and a **copy** while a sibling
+event left behind still cites it — content-addressing means several events can name one staged file,
+and taking it away from an event that still needs it is the one error that is not reversible. The
+copy leaves no residue: once the last citing event has moved, the source is released.
+
+APPLY — the sole writer of `raw/` — is what materialises the bytes into `raw/_blob/` (§2), **and it
+does so only for a candidate the curator KEEPS.** A `DROP` (or `NOOP`) writes no note, so nothing
+cites the artefact and nothing is materialised; the bytes drain to `_kb/processed/<date>/_attach/`
+with their event, where they are never pruned but also never committed — `_kb/` is git-ignored, so
+`agora sync` does not push them. This is the same rule a free-text capture has always followed (a
+DROPped `kb_remember` writes no `raw/<domain>/<event_id>.md`), and it is stated here because handing
+over a *file* reads as a stronger promise than typing a sentence into a tool.
+
+The bytes themselves are opaque: they are never scanned, never redacted and never shown to a curator
+brain, which sees only the `filename`/`media_type`/`bytes`/`sha256` summary.
 
 **The `source` vocabulary.** `source` records *what kind of thing produced the capture*, and it is
 deliberately open at the edges — the engine must never hold a blessed list of agent names
@@ -100,7 +137,11 @@ preserved event is still counted by `failed_events` and still retrievable with `
 ## 2. Raw source — `raw/<domain>/<date>-<slug>.<ext>` (+ sidecar for binaries)
 
 Immutable original captured by an upload/harvest. Markdown sources carry frontmatter; binaries get a
-`<file>.meta.yaml` sidecar:
+`<file>.meta.yaml` sidecar. The five keys below are the **`raw/<domain>/` binary** sidecar — a
+*re-ingest drift* record for a file that has a `source_url` and can be fetched again. The
+content-addressed `raw/_blob/` sidecar is a different record with its own closed key set, given
+further down ([ADR-0041](adr/0041-stratum-kind-first-layout.md) D1.4 addendum); which shape applies
+is decided by which tree the file is in, and neither has ever been written into the other's.
 
 ```yaml
 source_url: https://example.com/article    # if applicable
@@ -123,13 +164,40 @@ Two prefixes are **reserved inside `raw/`** and share its namespace with `<domai
 
 | path | status today |
 |---|---|
-| `raw/_blob/<ab>/<sha256>.<ext>` + `<file>.meta.yaml` | **Reserved, no writer.** The destination for a captured artefact's original bytes — content-addressed (`<ab>` = the first two hex chars of the digest), immutable, and admissible only by membership in the APPLY `raw_writes` set *with matching bytes* (content-addressing is an extra self-check, never a substitute for that authorship check). `RepoLayout.blob_dir` resolves the path; nothing writes it, and the transport ADR-0041 D4.2 specifies (an optional attachment beside the inbox event) is unbuilt — `Inbox.write` still takes `text: str` + an optional `raw_ref: str` and no bytes. The sidecar name is the **full filename plus** `.meta.yaml`, which keeps L1-8b ("cite the artefact, not its sidecar") working unmodified. |
+| `raw/_blob/<ab>/<sha256>.<ext>` + `<file>.meta.yaml` | A captured artefact's original bytes — content-addressed (`<ab>` = the first two hex chars of the digest), immutable, and written **only** by the deterministic APPLY pass: admission is membership in the APPLY `raw_writes` set *with matching bytes* (content-addressing is an extra self-check, **never** a substitute for that authorship check — a planted file whose name correctly hashes its own bytes still fails). `RepoLayout.blob_dir` resolves the path. The bytes reach APPLY as an **inbox attachment** (§1), which re-hashes them on the way in; a digest already present under `raw/_blob/` is cited, not rewritten. The sidecar name is the **full filename plus** `.meta.yaml`, which keeps L1-8b ("cite the artefact, not its sidecar") working unmodified, and a note cites the **blob**, never the sidecar. |
 | `raw/_pages/` | **Reserved prefix only.** No writer, and the reservation grants no gate exception — a file appearing there fails the final diff like any other unauthored `raw/` path. It exists so the long-document contract (reserved ADR-0040, **unauthored**) can populate it later. |
+
+The `raw/_blob/` sidecar has its **own closed key set** — the CAPTURE facts (which bytes, how many,
+from whom, when, under which event), and never the extracted text (that lives in the event body and,
+after curation, in the note). It is closed against *additions*; an absent optional is omitted rather
+than emitted empty. It is deliberately NOT the five-key `raw/<domain>/` shape above: a captured
+artefact has no `source_url` to re-fetch and is immutable by construction, so a drift record would
+have nothing to detect drift against ([ADR-0041](adr/0041-stratum-kind-first-layout.md) D1.4
+addendum, which supersedes D1.4's *"unchanged"* sentence for `raw/_blob/` only):
+
+```yaml
+sha256: <hex of the blob's bytes>           # == the basename: the integrity self-check
+ext: pdf
+media_type: application/pdf                 # optional; bare `type/subtype`
+bytes: 481920
+filename: 2026-q3-report.pdf                # optional; DISPLAY only, sanitised
+captured_at: 2026-06-13T10:22:33Z
+writer: dochan
+source: web:dochan
+event_id: 2026-06-13T10-22-33.481Z--a1b2c3  # the inbox event that delivered the bytes
+```
 
 Because both share one namespace with `raw/<domain>/`, a `_meta/taxonomy.yaml` `domains` entry
 beginning with `_` is rejected by lint **L1-23** (schema 2 only), and the plan-side path composer
 rejects a leading `_` in a path component independently — two layers over two different inputs,
 neither covering the other.
+
+A blob is written only where a note **cites** it, so a candidate the curator DROPs leaves nothing
+under `raw/_blob/` (§1). And because a blob's filename *is* the hash of its bytes, git must never
+rewrite them: `agora repo init` seeds a `.gitattributes` carrying `raw/_blob/** -text -diff -merge`
+and every engine git call pins `core.autocrlf=false`, without which a CRLF, NUL-free
+artefact (CSV/TXT/HTML/JSON) would be normalised to LF on commit and stop hashing to its own name.
+`agora doctor` reports a repo created before that seed and prints the one-line remedy.
 
 ## 2a. Wiki note & KB identity (KB wiki schema 2)
 

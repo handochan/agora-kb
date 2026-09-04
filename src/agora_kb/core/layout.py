@@ -22,8 +22,17 @@ __all__ = [
     "RepoLayout",
     "InvalidWriterError",
     "InvalidNoteBasenameError",
+    "InvalidAttachmentError",
+    "InvalidAttachmentExtError",
     "validate_writer",
     "safe_path_component",
+    "validate_attachment_digest",
+    "validate_attachment_ext",
+    "attachment_ext_for",
+    "attachment_basename",
+    "attachment_dir",
+    "ATTACHMENT_DIRNAME",
+    "DEFAULT_ATTACHMENT_EXT",
     "KIND_DIRECTORIES",
     "WIKI_KINDS",
     "CLAIM_BEARING_KINDS",
@@ -42,6 +51,38 @@ class InvalidWriterError(ValueError):
 
 class InvalidNoteBasenameError(ValueError):
     """Raised when a note basename cannot be composed into a schema-2 wiki path (ADR-0041 D4.4)."""
+
+
+class InvalidAttachmentError(ValueError):
+    """Raised when an attachment's content digest cannot address a file (ADR-0041 D1.4/D4.2)."""
+
+
+class InvalidAttachmentExtError(InvalidAttachmentError):
+    """Raised when an attachment extension violates the D1.4 ``<ext>`` grammar."""
+
+
+#: The per-writer attachment staging directory name, and the SAME name beside an event wherever the
+#: spool has moved it (``_kb/inbox/<writer>/_attach/`` → ``processing/<run-id>/events/_attach/`` →
+#: ``processed/<date>/_attach/``). One name, so a reader that has an event path can always find its
+#: bytes by looking beside it (:func:`attachment_dir`); the leading ``_`` keeps it out of the
+#: ``<id>.md`` event namespace, which every spool glob addresses by extension.
+ATTACHMENT_DIRNAME = "_attach"
+
+#: The extension used when a filename carries none this grammar accepts. ADR-0041 D1.4's own
+#: example (``raw/_blob/ab/<correct-sha>.bin``) uses it, and it is the no-loss choice: the display
+#: ``filename`` is preserved verbatim on the attachment record and in the ``raw/_blob/`` sidecar, so
+#: falling back here loses nothing a reader needs, while REFUSING would make ``agora capture
+#: --file`` reject a perfectly capturable artefact over its name.
+DEFAULT_ATTACHMENT_EXT = "bin"
+
+# ADR-0041 D1.4, normative: an attachment/blob extension is EXACTLY ONE component —
+# `[a-z0-9]{1,16}`, lowercase, containing no `.`. A dotted compound (`tar.gz`, `meta.yaml`) is
+# forbidden so the composer can never mint a `<sha256>.meta.yaml`-shaped artefact name, which lint
+# L1-8b (a pure `endswith(".meta.yaml")` suffix test) would then permanently refuse to let anything
+# cite. `meta` is excluded outright by the same rule.
+_ATTACHMENT_EXT_RE = re.compile(r"\A[a-z0-9]{1,16}\Z")
+_RESERVED_ATTACHMENT_EXTS = frozenset({"meta"})
+_SHA256_RE = re.compile(r"\A[0-9a-f]{64}\Z")
 
 
 # KB WIKI SCHEMA 2 (ADR-0041 D1): the FIRST path segment under ``wiki/`` IS the note's kind, and
@@ -110,6 +151,99 @@ def safe_path_component(value: str) -> str:
     :class:`InvalidWriterError` on an unsafe component (the same guard the inbox namespace uses).
     """
     return validate_writer(value)
+
+
+# --- attachment addressing (ADR-0041 D4.2 transport; D1.4 destination grammar) -------------------
+def validate_attachment_digest(sha256: str) -> str:
+    """Return ``sha256`` unchanged if it is 64 lowercase hex characters, else raise.
+
+    The digest is the attachment's NAME — in the staging area and, later, in
+    ``raw/_blob/<ab>/<sha256>.<ext>`` — so validating it here is a path-escape control, not a
+    formatting nicety: without it a caller-supplied ``../../../wiki/PWNED`` reaches a filesystem
+    join. It is the same 64-hex shape :class:`agora_kb.core.models.Attachment` validates on the
+    model, checked again at the composition site because character filtering at one layer is not a
+    substitute for it at the other (``core/pathsafe.py``'s "what this module is NOT").
+    """
+    if not isinstance(sha256, str) or not _SHA256_RE.match(sha256):
+        raise InvalidAttachmentError(
+            f"attachment digest must be 64 lowercase hex characters, got {sha256!r}"
+        )
+    return sha256
+
+
+def validate_attachment_ext(ext: str) -> str:
+    """Return ``ext`` unchanged if it satisfies the ADR-0041 D1.4 ``<ext>`` grammar, else raise.
+
+    Exactly one component: ``[a-z0-9]{1,16}``, lowercase, no ``.``, and never ``meta``. The dot-free
+    rule is what makes ``<sha256>.<ext>`` and its ``<sha256>.<ext>.meta.yaml`` sidecar structurally
+    distinguishable, so lint L1-8b ("cite the artefact, not its sidecar") keeps working unmodified;
+    the ``meta`` exclusion is the ADR's own belt to that braces. No leading ``.`` and no ``_`` can
+    survive the character class, so an attachment can neither become a dotfile nor claim one of the
+    ``raw/`` reserved prefixes.
+    """
+    if not isinstance(ext, str) or not _ATTACHMENT_EXT_RE.match(ext):
+        raise InvalidAttachmentExtError(
+            f"attachment extension {ext!r} must be 1-16 lowercase letters/digits with no '.' "
+            "(ADR-0041 D1.4)"
+        )
+    if ext in _RESERVED_ATTACHMENT_EXTS:
+        raise InvalidAttachmentExtError(
+            f"attachment extension {ext!r} is reserved: it would collide with the "
+            "'<file>.meta.yaml' sidecar naming rule (ADR-0041 D1.4)"
+        )
+    return ext
+
+
+def attachment_ext_for(filename: str | None) -> str:
+    """Derive an attachment extension from a DISPLAY filename, or :data:`DEFAULT_ATTACHMENT_EXT`.
+
+    Total by construction — it never raises and never invents a path component: whatever the caller
+    was handed by a browser, a shell or an untrusted upload, the result is a valid
+    :func:`validate_attachment_ext` token. A filename with no extension, a compound one
+    (``a.tar.gz`` → ``gz``, i.e. the LAST component only), an over-long or non-``[a-z0-9]`` one, and
+    the reserved ``meta`` all fall back to ``bin`` rather than being rejected or mangled into a new
+    string. The original name survives verbatim on the attachment record, so the fallback loses
+    nothing but the guess.
+
+    **Deliberately NOT narrowed to the extractor's accepted extension set**, which is what ADR-0041
+    D1.4 first said. ``agora capture --file`` exists precisely so an artefact nobody can extract
+    today can be kept until somebody can; a composer restricted to that list would rename every one
+    of those files to ``bin`` and throw away the only type information the operator had. The
+    GRAMMAR is what carries the safety property (no ``.``, no leading ``_``, no dotfile, never
+    ``meta``, so ``<sha256>.<ext>`` and its ``.meta.yaml`` sidecar stay structurally
+    distinguishable and lint L1-8b keeps working); the extractor's list never was. What a FACE will
+    accept remains the operator's ``web.extensions.allowed`` gate, one layer up (ADR-0025). See the
+    ADR-0041 addendum *"as-built: the capture transport and the ``raw/_blob/`` sidecar"* §3.
+    """
+    if not filename:
+        return DEFAULT_ATTACHMENT_EXT
+    suffix = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+    try:
+        return validate_attachment_ext(suffix)
+    except InvalidAttachmentExtError:
+        return DEFAULT_ATTACHMENT_EXT
+
+
+def attachment_basename(sha256: str, ext: str) -> str:
+    """``<sha256>.<ext>`` — the content-addressed filename, with both halves validated.
+
+    ONE spelling for the staging file, the ``raw/_blob/`` destination and every mover in between,
+    so the three can never disagree about what an attachment is called.
+    """
+    return f"{validate_attachment_digest(sha256)}.{validate_attachment_ext(ext)}"
+
+
+def attachment_dir(event_dir: Path) -> Path:
+    """The ``_attach/`` directory holding the staged bytes of the events in ``event_dir``.
+
+    Pure path resolution, deliberately taking a DIRECTORY rather than a :class:`RepoLayout`: the
+    attachment travels WITH its event through the spool (``inbox/<writer>/`` →
+    ``processing/<run-id>/events/`` → ``processed/<date>/`` or ``failed/<date>/<run-id>/``), and
+    every one of those directories addresses its events as ``<id>.md`` children. Keeping the
+    sidecar directory name constant means a reader with an event path can always find the bytes
+    beside it without knowing which lifecycle stage it is in.
+    """
+    return event_dir / ATTACHMENT_DIRNAME
 
 
 @dataclass(frozen=True)
@@ -364,6 +498,26 @@ class RepoLayout:
     def inbox_item_path(self, writer: str, event_id: str) -> Path:
         """Path of one inbox event ``_kb/inbox/<writer>/<event_id>.md`` (writer validated)."""
         return self.inbox_writer_dir(writer) / f"{event_id}.md"
+
+    def inbox_attachment_dir(self, writer: str) -> Path:
+        """Attachment staging directory ``_kb/inbox/<writer>/_attach/`` (ADR-0041 D4.2).
+
+        INSIDE the writer's own namespace, so an attachment inherits the tenant-isolation boundary
+        the event already has (invariant 5): one ``validate_writer`` covers both halves of one
+        delivery. It is not a second spool — the bytes are drained with their event, and the whole
+        of ``_kb/`` stays git-ignored.
+        """
+        return attachment_dir(self.inbox_writer_dir(writer))
+
+    def inbox_attachment_path(self, writer: str, sha256: str, ext: str) -> Path:
+        """Path of one staged attachment ``_kb/inbox/<writer>/_attach/<sha256>.<ext>``.
+
+        Content-addressed, so two events carrying identical bytes under the same extension name one
+        file. Writer, digest and extension are ALL validated before the join
+        (:func:`validate_writer`, :func:`attachment_basename`) — the digest and extension arrive
+        from the same untrusted upload the bytes did.
+        """
+        return self.inbox_attachment_dir(writer) / attachment_basename(sha256, ext)
 
     # --- harvester cursor addressing ------------------------------------------------------------
     def harvest_cursor_path(self, connector: str) -> Path:

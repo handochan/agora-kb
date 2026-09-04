@@ -44,7 +44,7 @@ from pathlib import Path
 
 from .layout import RepoLayout
 
-__all__ = ["Repo", "GitError"]
+__all__ = ["Repo", "GitError", "GITATTRIBUTES_NAME", "blob_bytes_are_pinned"]
 
 _DEFAULT_BRANCH = "main"
 _DEFAULT_AUTHOR_NAME = "Agora Curator"
@@ -52,6 +52,106 @@ _DEFAULT_AUTHOR_EMAIL = "curator@agora.local"
 _GITIGNORE = (
     "# Agora operational spool — rebuildable, never canonical (ADR-0001).\n_kb/\n.DS_Store\n"
 )
+
+# The `.gitattributes` seeded beside `.gitignore`. `raw/_blob/<ab>/<sha256>.<ext>` holds a captured
+# artefact's ORIGINAL bytes, and its whole admission story is `hash(bytes) == basename` (ADR-0041
+# D1.4, normative). git's EOL translation is the one thing in the publish path that rewrites file
+# content behind the writer's back: with `core.autocrlf` set (Git-for-Windows installs `true`;
+# `input` is a common macOS/Linux setting), a CRLF artefact with no NUL in it — CSV, TXT, HTML,
+# JSON — is classified TEXT and normalised to LF on commit. The committed blob then no longer
+# hashes to its own filename, and the NEXT run that re-cites that digest fails permanently in
+# `_materialize_one_blob`'s re-verification. `-text` turns the translation off; `-diff -merge` say
+# the file is binary for the two other tools that would try to read it as lines.
+#
+# This is BELT-AND-BRACES with the `-c core.autocrlf=false` pin on `Repo._git`: attributes beat
+# config, so the file also protects a plain `git add` an operator runs by hand, while the argv pin
+# protects a repo that has no `.gitattributes` yet (every repo created before this change —
+# `agora doctor` reports those and names the one-line remedy).
+#: The seeded attributes file's name.
+GITATTRIBUTES_NAME = ".gitattributes"
+
+_GITATTRIBUTES = (
+    "# Agora: content-addressed originals are OPAQUE BYTES named by their own sha256 "
+    "(ADR-0041 D1.4).\n"
+    "# Never let git translate line endings here: a rewritten byte breaks "
+    "hash(bytes) == basename.\n"
+    "raw/_blob/** -text -diff -merge\n"
+)
+
+
+# The paths :func:`blob_bytes_are_pinned` asks git about. Neither needs to exist — ``check-attr``
+# answers about a PATH, not a file. TWO extensions rather than one because the property being
+# checked is "every artefact in the blob tree is out of EOL translation": a `*.csv text` line
+# placed after the blob rule re-normalises exactly the CRLF, NUL-free shape D1.4 is about, and a
+# `.bin`-only probe would report that repo healthy.
+_BLOB_ATTRIBUTE_PROBES = (
+    f"raw/_blob/ab/{'0' * 64}.bin",
+    f"raw/_blob/ab/{'0' * 64}.csv",
+)
+
+
+def blob_bytes_are_pinned(root: Path) -> bool:
+    """True if git resolves ``text`` to *unset* for ``raw/_blob/`` paths in the repo at ``root``.
+
+    The diagnostic half of ``_GITATTRIBUTES``: :meth:`Repo.init` seeds the file, but a repo created
+    before that change has none, and `agora doctor` needs a yes/no it can report with a one-line
+    remedy.
+
+    ASKS GIT rather than parsing ``.gitattributes``, because the question is not "does the seed's
+    line appear" but "what does git actually do to these bytes", and those differ in ways a reader
+    of the file cannot see. gitattributes(5) resolves LAST match wins, so a broad ``* text=auto``
+    written BELOW the blob rule silently overrides it — and an explicit ``text`` attribute outranks
+    ``core.autocrlf``, so the argv pin on :meth:`_git` cannot save that repo either. ``check-attr``
+    also accounts for ``.git/info/attributes``, a global ``core.attributesFile``, and any
+    hand-written rule of the operator's own — which is the other half of the contract: a doctor
+    line that flagged a hand-edited but CORRECT file would train the operator to ignore the channel.
+
+    One subprocess on a diagnostic-only path (doctor, and the seeding decision in :meth:`init`).
+    A directory that is not a git repo, or a host with no ``git``, answers ``False``: nothing is
+    pinned there, which is the honest reading and the one that prints the remedy.
+    """
+    try:
+        cp = subprocess.run(  # noqa: S603,S607 (argv list, no shell; `git` off PATH as everywhere)
+            ["git", "check-attr", "-z", "text", "--", *_BLOB_ATTRIBUTE_PROBES],
+            cwd=str(root),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="surrogateescape",
+        )
+    except OSError:
+        return False
+    if cp.returncode != 0:
+        return False
+    # `-z` emits NUL-separated <path> <attr> <value> triplets (and a trailing NUL, hence the final
+    # empty field, which the stride skips). `unset` is what `-text` — or `binary`, which implies it
+    # — resolves to; `set`, `auto`, `unspecified` all mean git may still translate these bytes.
+    values = cp.stdout.split("\0")[2::3]
+    return len(values) == len(_BLOB_ATTRIBUTE_PROBES) and all(v == "unset" for v in values)
+
+
+def _ensure_blob_attributes(root: Path) -> None:
+    """Put ``raw/_blob/** -text`` in force in ``root`` without discarding the operator's own rules.
+
+    `agora repo init` is documented and implemented as RE-RUNNABLE, and `agora doctor` tells the
+    operator to APPEND the blob rule to this very file — so an unconditional ``write_text`` of the
+    seed would be one command silently deleting the edit another command asked for, along with any
+    ``*.pdf binary`` / ``*.ipynb -diff`` of the operator's own. Seed when the file is absent,
+    APPEND when it exists, and write nothing when git already resolves ``text`` to unset here.
+
+    Appending (rather than prepending, or rewriting) is also what makes the rule WIN: gitattributes
+    resolves last match wins, so a rule added at the end beats a broad ``* text=auto`` the operator
+    put above it. Bytes in, bytes out — the existing file is never decoded, so a non-UTF-8 rule
+    survives untouched.
+    """
+    if blob_bytes_are_pinned(root):
+        return
+    path = root / GITATTRIBUTES_NAME
+    existing = path.read_bytes() if path.exists() else b""
+    separator = b"" if (not existing or existing.endswith(b"\n")) else b"\n"
+    path.write_bytes(existing + separator + _GITATTRIBUTES.encode("utf-8"))
+
+
 # A schema-compliant root index.md (the ADR-0010 `index` note frontmatter) so a freshly-initialized
 # repo lints clean (schema.lint L1-4); the curator's APPLY later fills children/updated, preserving
 # these keys. {date} is the init date (YYYY-MM-DD).
@@ -217,7 +317,27 @@ class Repo:
         # ``timeout`` (seconds; default unbounded — every local call is fast) exists for the one
         # network-touching operation, :meth:`push_backup`: on expiry the child is killed and the
         # hang surfaces as a plain :class:`GitError`, never an uncaught TimeoutExpired.
-        cmd = ["git", "-c", f"core.hooksPath={os.devnull}", *args]
+        # core.autocrlf pinned on EVERY call so the deterministic publish can never rewrite the
+        # bytes it just wrote: an argv `-c` outranks the system/global/local config files, which
+        # `_commit_env`'s GIT_CONFIG_GLOBAL/SYSTEM devnull cannot reach for a per-repo
+        # `.git/config`. `false` is git's own default — this pins it, it does not change behaviour
+        # on a host that never set it (ADR-0041 D1.4; see `_GITATTRIBUTES`).
+        #
+        # `core.eol` is deliberately NOT pinned, though it looks like the matching half. Its
+        # default is `native`, NOT `lf` — so pinning it would be a real behaviour change on
+        # Windows (#85): `sync_worktree`'s `read-tree -m -u` writes the working tree, and under an
+        # operator's own `* text=auto` agora would check out LF where the operator's git checks out
+        # CRLF, leaving every text file dirty in their `git status` after a recovery. It also
+        # protects nothing here: `core.eol` applies only to paths whose `text` attribute is SET,
+        # and `raw/_blob/**` carries `-text`.
+        cmd = [
+            "git",
+            "-c",
+            f"core.hooksPath={os.devnull}",
+            "-c",
+            "core.autocrlf=false",
+            *args,
+        ]
         try:
             cp = subprocess.run(  # noqa: S603 (argv list, no shell)
                 cmd,
@@ -323,6 +443,9 @@ class Repo:
         self.root.mkdir(parents=True, exist_ok=True)
         self._git("init", "-b", self._branch)
         (self.root / ".gitignore").write_text(_GITIGNORE, encoding="utf-8")
+        # AFTER `git init` (the predicate asks git, which needs a repo) and never unconditionally:
+        # see :func:`_ensure_blob_attributes` for why a re-init must not truncate this file.
+        _ensure_blob_attributes(self.root)
         when_resolved = when or datetime.now(UTC)
         index = self.layout.index_file
         if not index.exists():
