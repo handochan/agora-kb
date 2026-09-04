@@ -61,6 +61,7 @@ from pydantic import ValidationError
 
 from . import __version__
 from .config import (
+    MAX_SUPPORTED_KB_SCHEMA_VERSION,
     SUPPORTED_KB_SCHEMA_VERSIONS,
     ConfigError,
     KbIdentity,
@@ -91,6 +92,7 @@ from .core import (
     failed_event_count,
 )
 from .core.ids import new_ulid
+from .core.inbox import assert_writable_repo_schema
 from .core.repo import GitError
 from .core.state import CuratorState
 from .curator import evaluate
@@ -191,12 +193,12 @@ def build_parser() -> argparse.ArgumentParser:
         choices=(1, 2),
         default=None,
         help=(
-            "KB wiki schema version to initialize (default: 1 for a NEW repo; a re-init KEEPS the "
+            "KB wiki schema version to initialize (default: 2 for a NEW repo; a re-init KEEPS the "
             "existing repo's version). 2 = the ADR-0041 kind-first layout (wiki/<kind>/, "
-            "subjects: in frontmatter, _meta/kb.yaml identity). 2 is OPT-IN and NOT YET "
-            "CURATE-ABLE in this release: the write path still emits schema-1 paths, so "
-            "'agora curate' on a schema-2 repo fails its lint gate. Init/read/lint work today. "
-            "There is no in-place migrator: cross with 'agora import --from-kb' (ADR-0041 D6)"
+            "subjects: in frontmatter, _meta/kb.yaml identity) and is what this build's curator "
+            "WRITES. 1 is READ-ONLY: query/status/browse/doctor keep working on a schema-1 repo, "
+            "but curate/watch/requeue and every inbox capture refuse. There is no in-place "
+            "migrator: cross with 'agora import --from-kb' (ADR-0041 D6)"
         ),
     )
     # Positional repo path — declared so the #98 guard covers a RE-init onto an existing repo.
@@ -520,63 +522,30 @@ def _schema_version_guard(args: argparse.Namespace) -> int | None:
 
 
 # --- `repo init --schema 2` seeding (ADR-0041 D1/D1.2/D1.5) --------------------------------------
-# The schema-2 root map. Same OKF posture as the schema-1 seed in `core/repo.py` (bundle root, so it
-# carries `okf_version`, `description` mirroring `summary`, and a DETERMINISTIC `timestamp`), with
-# the schema-2 common base: `kind` (the DIRECTORY-mirroring kind, ADR-0041 D2.1), `kb` (the
-# `_meta/kb.yaml` ULID, D1.5) and `subjects: []` — a legal, honest empty subject list on a note that
-# genuinely has no subject (D2.2). `children: []` with an empty body is an EMPTY ROOT MAP: L1-6
-# compares the declared set against the body child-bullet set, and both are empty.
-#
-# `type: index` is the OKF MIRROR of `kind`, not the kind authority (ADR-0041 D2.5 / OD-3): it is
-# emitted for the same reason `description` mirrors `summary`, so an OKF/Obsidian consumer that keys
-# on `type` still sees one. Nothing in Agora reads it under schema 2.
-_SEED_INDEX_V2 = (
-    "---\n"
-    "title: Index\n"
-    "kind: index\n"
-    "type: index\n"
-    "kb: {kb_id}\n"
-    "okf_version: '0.1'\n"
-    "subjects: []\n"
-    "aliases: []\n"
-    "tags: []\n"
-    "created: '{date}'\n"
-    "updated: '{date}'\n"
-    "timestamp: '{date}T00:00:00Z'\n"
-    "status: active\n"
-    "summary: Knowledge base index.\n"
-    "description: Knowledge base index.\n"
-    "children: []\n"
-    "---\n\n# Knowledge base\n"
-)
+def _seed_schema2_repo(layout: RepoLayout, *, name: str, kind: str) -> KbIdentity:
+    """Mint/read ``_meta/kb.yaml`` and materialize the kind tree; return the KB identity.
 
+    Called BEFORE ``Repo.init`` because the identity is what the root map needs: ``Repo.init``
+    seeds ``index.md`` (schema 1 or 2 by its ``schema_version`` argument) and the schema-2 seed
+    mirrors this ``kb_id`` into the note's ``kb:`` field, so the id must exist first. The root map
+    itself is deliberately NOT written here — one seed template, in ``core/repo.py``, beside the
+    schema-1 one it replaces, so the two cannot drift into different OKF postures.
 
-def _seed_schema2_repo(layout: RepoLayout, *, name: str, kind: str, date: str) -> None:
-    """Materialize the schema-2 skeleton: ``_meta/kb.yaml``, the root map, and the kind tree.
-
-    Called BEFORE ``Repo.init`` so the seed lands in the initial commit exactly as the schema-1
-    seed index does — ``Repo.init`` writes its own ``index.md`` only ``if not index.exists()``, so
-    pre-writing the v2 one composes with it instead of racing it. Every step is guarded on absence,
-    so a re-init never rewrites an existing repo's identity or root map.
+    Every step is guarded on absence, so a re-init never rewrites an existing repo's identity.
 
     ``kb_id`` is minted here and NOWHERE else in the CLI: it is a ULID stamped once at repo
-    creation and never rewritten (ADR-0041 D1.5), so it must be minted before the first note that
-    mirrors it into ``kb:``. ``declared_kind`` records ``--kind`` as ADVISORY metadata; the
-    ENFORCING repo kind stays in git-ignored ``_kb/repo.yaml``, which is what the harvester scope
-    lock reads — a git-tracked enforcing value would let an upstream author's declaration unlock a
-    downstream operator's personal-scope connectors.
+    creation and never rewritten (ADR-0041 D1.5). ``declared_kind`` records ``--kind`` as ADVISORY
+    metadata; the ENFORCING repo kind stays in git-ignored ``_kb/repo.yaml``, which is what the
+    harvester scope lock reads — a git-tracked enforcing value would let an upstream author's
+    declaration unlock a downstream operator's personal-scope connectors.
     """
     layout.root.mkdir(parents=True, exist_ok=True)
     identity = load_kb_identity(layout)
     if identity is None:
         identity = KbIdentity(kb_id=new_ulid(), name=name, declared_kind=kind)
         write_kb_identity(layout, identity)
-
-    index = layout.index_file
-    if not index.exists():
-        index.write_text(_SEED_INDEX_V2.format(kb_id=identity.kb_id, date=date), encoding="utf-8")
-
     _materialize_kind_directories(layout)
+    return identity
 
 
 def _materialize_kind_directories(layout: RepoLayout) -> None:
@@ -624,12 +593,14 @@ def _cmd_repo_init(args: argparse.Namespace) -> int:
     git-ignored ``_kb/repo.yaml`` without a new curated commit — there is nothing new to commit, so
     the existing HEAD is re-printed (matching ``Repo.init``'s own idempotency).
 
-    ``--schema`` selects the KB wiki schema (ADR-0041 D6). ``1`` (the default for a NEW repo) is
-    byte-identical to every release before ADR-0041. ``2`` additionally mints ``_meta/kb.yaml``,
-    seeds the schema-2 root map, and materializes the six ``wiki/<kind>/`` directories
-    (:func:`_seed_schema2_repo`), then emits the schema-2 doc and templates. It stays OPT-IN in
-    this release because the curator WRITE path still targets schema 1: a schema-2 repo is
-    initializable, readable and lintable today, and becomes curate-able when the write path flips.
+    ``--schema`` selects the KB wiki schema (ADR-0041 D6). ``2`` — :data:`MAX_SUPPORTED_KB_SCHEMA_
+    VERSION`, the version this build's curator WRITES — is the default for a NEW repo: it mints
+    ``_meta/kb.yaml``, materializes the six ``wiki/<kind>/`` directories
+    (:func:`_seed_schema2_repo`), seeds the schema-2 root map (``Repo.init``), and emits the
+    schema-2 doc and templates. ``1`` is still buildable and byte-identical to every release before
+    ADR-0041, but it is READ-ONLY for this build — query/status/browse/doctor keep working while
+    ``curate``/``watch``/``requeue`` and every inbox capture refuse — so choosing it prints a note
+    saying exactly that.
 
     **Idempotency is version-preserving, and both directions are refusals, not conversions.** ADR-
     0041 D6 is explicit that "there is no in-place migrator" and that no command silently upgrades
@@ -643,9 +614,12 @@ def _cmd_repo_init(args: argparse.Namespace) -> int:
       would otherwise perform (a schema-2 ``_kb/repo.yaml`` mirror over a schema-1 canonical
       taxonomy, plus a seeded kind tree) leaves a previously healthy repo permanently
       ``L1-17``-broken with no rollback;
-    * a DECLARATION that runs ahead of the tree — ``_meta/taxonomy.yaml`` hand-bumped to 2 over a
-      schema-1 tree — where a FLAGLESS re-init would otherwise seed the schema-2 skeleton into it
-      and leave untracked residue behind a failed lint gate.
+    * a schema-1 TREE about to be seeded at 2 — either because its ``_meta/taxonomy.yaml`` was
+      hand-bumped to 2 (a DECLARATION running ahead of the tree) or because it declares nothing
+      determinable and the flipped default would run ahead of it. Both leave the same untracked
+      residue behind a failed lint gate, so the guard reads the tree's own witness
+      (``_meta/kb.yaml`` plus any existing KB content) rather than the declaration alone. An
+      initialized directory holding NO KB content is a first init and is adopted at the default.
 
     The mirrored version travels INTO :func:`write_default_repo_config` for the same reason: a
     re-init that resolved the version correctly but re-stamped the mirror from a flag default would
@@ -680,7 +654,13 @@ def _cmd_repo_init(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 1
-    schema_version = requested if requested is not None else (declared or 1)
+    # The DEFAULT for a NEW repo is the version this build WRITES (ADR-0041 D6), never a literal:
+    # a repo initialized at anything less is read-only the moment it exists, which is not a default
+    # anyone would choose. A re-init still KEEPS `declared`, so flipping this default cannot
+    # convert an existing repo — that is the guard below, and the flag-contradiction refusal above.
+    schema_version = (
+        requested if requested is not None else (declared or MAX_SUPPORTED_KB_SCHEMA_VERSION)
+    )
 
     # A repo can DECLARE a version its TREE was never built at: hand-bumping `_meta/taxonomy.yaml`
     # to `schema_version: 2` is the first thing an operator reaches for when asking "how do I
@@ -691,14 +671,43 @@ def _cmd_repo_init(args: argparse.Namespace) -> int:
     # then fails the lint gate, on this run and on every re-run. `_meta/kb.yaml` is the tree's own
     # witness of its version: `_seed_schema2_repo` mints it at creation and never rewrites it, so a
     # genuine schema-2 repo always carries one. Refused BEFORE any write, like its sibling above.
-    if requested is None and already and schema_version >= 2 and not layout.kb_meta_file.is_file():
+    # An UNDECLARED tree is the same hazard from the other side, and it is the one the flipped
+    # default creates: `read_canonical_kb_schema_version` returns `None` both for a directory that
+    # is merely git-initialized AND for one holding a schema-1 wiki whose `_meta/taxonomy.yaml` is
+    # missing or unparseable. Keying the refusal on the DECLARATION alone would adopt the second
+    # case at the default 2 — minting `_meta/kb.yaml` + the six kind directories over schema-1
+    # notes, while `Repo.init` early-returns and leaves the schema-1 `index.md` in place. The repo
+    # then DECLARES 2 (so D6 calls it writable) with schema-1 notes in `curator_paths`, failing the
+    # v2 lint gate on every run — and stickily, since `_meta/kb.yaml` now exists. So the guard
+    # keys on the TREE's own witness: an EMPTY initialized directory is a first init and is adopted
+    # at the default, while any pre-existing non-kind-first wiki content is refused. `--schema 1`
+    # stays available for the second case (no declaration means no contradiction refusal above,
+    # and schema 1 does not trip this guard) and re-emits the layout the tree is actually on.
+    has_kb_content = layout.index_file.is_file() or any(layout.wiki_dir.rglob("*.md"))
+    if (
+        requested is None
+        and already
+        and schema_version >= 2
+        and not layout.kb_meta_file.is_file()
+        and (declared is not None or has_kb_content)
+    ):
+        if declared is not None:
+            reason = (
+                f"declares KB schema {schema_version} but its tree was built at schema 1 (no "
+                f"{layout.kb_meta_file.name} identity file)"
+            )
+            remedy = "or restore the declaration in _meta/taxonomy.yaml to 'schema_version: 1'"
+        else:
+            reason = (
+                f"already holds KB content built at schema 1 (no {layout.kb_meta_file.name} "
+                f"identity file, and no schema_version declared in _meta/taxonomy.yaml)"
+            )
+            remedy = "or re-run with '--schema 1' to re-emit the existing schema-1 layout"
         print(
-            f"{_PROG} repo init: {layout.root} declares KB schema {schema_version} but its tree "
-            f"was built at schema 1 (no {layout.kb_meta_file.name} identity file); re-initializing "
-            f"would seed a schema-{schema_version} skeleton into a schema-1 repo. There is no "
-            f"in-place migrator (ADR-0041 D6): convert it once into a NEW repo with "
-            f"'agora import --from-kb {layout.root} <new-repo>', or restore the declaration in "
-            f"_meta/taxonomy.yaml to 'schema_version: 1'",
+            f"{_PROG} repo init: {layout.root} {reason}; re-initializing would seed a "
+            f"schema-{schema_version} skeleton into a schema-1 repo. There is no in-place migrator "
+            f"(ADR-0041 D6): convert it once into a NEW repo with "
+            f"'agora import --from-kb {layout.root} <new-repo>', {remedy}",
             file=sys.stderr,
         )
         return 1
@@ -717,17 +726,13 @@ def _cmd_repo_init(args: argparse.Namespace) -> int:
         )
         return 1
 
+    kb_id: str | None = None
     if schema_version >= 2:
-        # BEFORE Repo.init, so the identity + root map + kind tree land in the initial commit the
-        # same way the schema-1 seed index does (Repo.init writes its own index.md only if none
-        # exists, so this composes rather than competes).
-        _seed_schema2_repo(
-            layout,
-            name=name,
-            kind=args.kind,
-            date=now.astimezone(UTC).strftime("%Y-%m-%d"),
-        )
-    repo.init(when=now)
+        # BEFORE Repo.init, so the identity + kind tree land in the initial commit alongside the
+        # root map Repo.init seeds from the `kb_id` this returns (ADR-0041 D1.5: minted once, never
+        # rewritten — which is why it is minted before the first note that mirrors it).
+        kb_id = _seed_schema2_repo(layout, name=name, kind=args.kind).kb_id
+    repo.init(when=now, schema_version=schema_version, kb_id=kb_id)
     taxonomy = Taxonomy(
         schema_version=schema_version, taxonomy_policy="open", allowed_tags=tags, domains=domains
     )
@@ -763,14 +768,16 @@ def _cmd_repo_init(args: argparse.Namespace) -> int:
     # The adapters registry path is informational init output (the brain wiring), printed to stderr
     # so stdout stays the single machine-parseable admin-commit sha (the established init contract).
     print(f"adapters: {adapters_path}", file=sys.stderr)
-    if schema_version >= 2:
-        # Say out loud what --schema 2's help text says: the repo is readable and lintable, but the
-        # curator write path still emits schema-1 paths, so `agora curate` cannot publish into it
-        # yet (ADR-0041 D6 — the write refusal itself lands with the write-path flip).
+    if schema_version < MAX_SUPPORTED_KB_SCHEMA_VERSION:
+        # The inverse of the note this replaces: schema 2 is now the ordinary case and needs no
+        # announcement, while a repo re-emitted at the OLDER schema is READ-ONLY for this build and
+        # the operator must hear it here rather than discover it at the first refused capture
+        # (ADR-0041 D6).
         print(
-            f"note: schema {schema_version} is OPT-IN and not yet curate-able in this release — "
-            f"init, read and lint work; 'agora curate' on this repo will fail its lint gate until "
-            f"the curator write path targets schema {schema_version}",
+            f"note: schema {schema_version} is READ-ONLY for this agora build — query, status, "
+            f"browse and doctor work, but curate/watch/requeue and every inbox capture refuse. "
+            f"Convert once into a NEW repo with 'agora import --from-kb {layout.root} <new-repo>'; "
+            f"there is no in-place migrator",
             file=sys.stderr,
         )
     print(sha)
@@ -795,7 +802,7 @@ def _cmd_import(args: argparse.Namespace) -> int:
     warnings, and the final lint summary — and exits non-zero ONLY on a HARD error (e.g. ``src``
     missing), never on report warnings (a best-effort import with findings is a success; ADR-0014).
     """
-    from .ingest.vault_import import import_vault
+    from .ingest.vault_import import IMPORTER_SCHEMA_VERSION, import_vault
 
     import_date = datetime.now(UTC).strftime("%Y-%m-%d")
     domains = list(args.domain) if args.domain else ["general"]
@@ -837,6 +844,20 @@ def _cmd_import(args: argparse.Namespace) -> int:
         print(f"lint: {len(lr.findings)} finding(s) still need hands:")
         for finding in lr.findings:
             print(f"  {finding.code} {finding.path}: {finding.message}")
+    # SAY IT OUT LOUD. The importer emits the schema-1 layout while this build WRITES schema 2
+    # (ADR-0041 D6), so the repo it just produced accepts reads but refuses every write —
+    # `agora curate`, `kb_remember`, the web upload — until the `--from-kb` converter exists. A
+    # `lint: clean` line over a repo the operator cannot curate is a true statement that leaves a
+    # false impression; this is the missing half. Not an error exit: the import itself succeeded and
+    # is non-destructive.
+    if IMPORTER_SCHEMA_VERSION != MAX_SUPPORTED_KB_SCHEMA_VERSION:
+        print(
+            f"{_PROG} import: {args.dest} is a KB schema-{IMPORTER_SCHEMA_VERSION} repo, which "
+            f"this build can READ but not WRITE (it writes schema "
+            f"{MAX_SUPPORTED_KB_SCHEMA_VERSION}) — query/status/browse work, curate/remember are "
+            f"refused (ADR-0041 D6)",
+            file=sys.stderr,
+        )
     return 0
 
 
@@ -965,6 +986,15 @@ def _cmd_curate(args: argparse.Namespace) -> int:
     layout = repo.layout
     try:
         cfg = load_repo_config(layout)
+        # ADR-0041 D6, one of the five exhaustive write-path call sites. BEFORE `recover()` and
+        # before any trigger evaluation: a schema-1 repo must not have its in-flight run finalized
+        # by a build that writes schema 2 either. `assert_supported_kb_schema_version` (membership
+        # in {1, 2}) has already passed inside the loader — this is the STRICTER equality check
+        # that separates "readable" from "writable". It reads the CANONICAL declaration rather than
+        # the `cfg` in hand, and deliberately: `load_repo_config` collapses "no taxonomy file at
+        # all" to the default `schema_version: 1`, which would answer `agora curate` in the wrong
+        # directory with a schema refusal instead of its ordinary "nothing was changed".
+        assert_writable_repo_schema(layout)
     except UnsupportedSchemaVersionError as exc:
         # ORDERED FIRST on purpose, exactly as in `_guard_schema_version`: this family (and its
         # `ReadOnlySchemaVersionError` subclass — the write refusal `assert_writable_kb_schema_
@@ -1174,6 +1204,20 @@ def _cmd_requeue(args: argparse.Namespace) -> int:
     be moved; 2 from argparse for a missing/duplicated selector.
     """
     layout = RepoLayout(Path(args.repo))
+    # ADR-0041 D6, the third of the five exhaustive write-path call sites. Requeue puts events back
+    # into `_kb/inbox/`, so on a schema-1 repo it would refill a queue this build's curator refuses
+    # to drain — the same "silent data loss dressed as success" the `Inbox.write` refusal exists to
+    # prevent, reached by the one path that does NOT go through `Inbox.write` (it is a location-only
+    # `os.replace` of an already-immutable event, #99).
+    #
+    # Uses the shared `core.inbox` predicate, which reads only the canonical declaration: this
+    # command deliberately avoids `load_repo_config` (it "publishes nothing and must work when git
+    # is broken"), so it must not acquire a config dependency here either.
+    try:
+        assert_writable_repo_schema(layout)
+    except UnsupportedSchemaVersionError as exc:
+        print(f"{_PROG} requeue: {exc}", file=sys.stderr)
+        return 1
     selector = _requeue_selector(args)
     # A WARNING, never a guard (#99 §4.3): `failure_is_current` is True on 100% of legitimate
     # recoveries — `last_run` is the last successful PUBLISH and the canonical order is fix →
@@ -1412,6 +1456,17 @@ def _cmd_harvest(args: argparse.Namespace) -> int:
     reports what WOULD be harvested without writing anything (the noise-pollution preview);
     ``--connector NAME`` restricts the run to one connector. A malformed config or an unsupported
     connector type is a clean error (exit 1), as is any per-connector scan error.
+
+    **The ADR-0041 D6 write refusal reaches this command through the same one-line refusal every
+    other write path prints.** ``harvest`` is not on D6's exhaustive list of explicit call sites
+    because it writes through ``Inbox.write``, which carries the gate — but inheriting it there
+    means the refusal surfaces from *inside* :meth:`Harvester.run`, mid-scan, as an uncaught
+    :class:`~agora_kb.config.ReadOnlySchemaVersionError` traceback, which is not what an operator
+    of a read-only repo should see. Checking here instead moves the verdict BEFORE the scan, which
+    is also the privacy-correct place for it: a schema-1 repo can never accept the candidates, so
+    reading another agent's memory to build them is a side effect with no possible benefit.
+    Applied in ``--dry-run`` too — the preview describes writes this build would refuse, so
+    printing it would be a preview of a lie.
     """
     from .harvester import Harvester, build_connectors
     from .harvester.connectors import ConnectorError
@@ -1423,6 +1478,13 @@ def _cmd_harvest(args: argparse.Namespace) -> int:
         redact = load_redact_policy(layout)
         repo_name = load_repo_config(layout).name
         specs = load_connector_specs(layout.root / "adapters.yaml")
+        assert_writable_repo_schema(layout)
+    except UnsupportedSchemaVersionError as exc:
+        # ORDERED FIRST, exactly as in `_cmd_curate`: this family is a `ConfigError` (hence a
+        # `ValueError`), so the arm below would render "this KB is READ-ONLY for this agora build"
+        # as `invalid config —`, mislabelling a schema verdict as a malformed file.
+        print(f"{_PROG}: {exc}", file=sys.stderr)
+        return 1
     except ConfigError as exc:
         print(f"{_PROG} harvest: invalid config — {exc}", file=sys.stderr)
         return 1
@@ -1630,6 +1692,17 @@ def _cmd_watch(args: argparse.Namespace) -> int:
     returns 1, so an external scheduler still sees the failure in the exit code.
     """
     repo = Repo.resolve(args.repo)
+    # ADR-0041 D6, PRE-FLIGHT. The per-tick assertion below is the authority (the repo can change
+    # version under a long-running scheduler), but a schema-1 repo is a permanent condition, and
+    # reporting it only through the #97 tick channel would TRUNCATE the message at
+    # `_TICK_DETAIL_CHARS` — cutting off the one remedy the refusal exists to deliver — and then
+    # back off politely forever over a state no amount of waiting fixes. Refusing here prints the
+    # message whole, once, and exits.
+    try:
+        assert_writable_repo_schema(repo.layout)
+    except UnsupportedSchemaVersionError as exc:
+        print(f"{_PROG} watch: {exc}", file=sys.stderr)
+        return 1
     interval = max(1, args.interval)
     # Python block-buffers stdout whenever it is not a TTY, and BOTH shipped units capture it to a
     # file/journal (deploy/systemd/agora-watch.service, deploy/launchd/com.agora.watch.plist) — so
@@ -1787,6 +1860,13 @@ def _watch_tick(repo: Repo) -> bool:
     # part of what may have changed. The raise lands in the loop's own guard (#97), so it surfaces
     # as one bounded tick error rather than a crash loop.
     guard_repo_schema_version(layout)
+    # ADR-0041 D6, the second of the five exhaustive write-path call sites, and it must be its OWN
+    # call rather than a consequence of the guard above: with SUPPORTED_KB_SCHEMA_VERSIONS widened
+    # to {1, 2} the guard PASSES for a schema-1 repo (by design — reads keep working), so `watch`
+    # would otherwise happily curate schema-2 paths into a schema-1 tree once a minute, forever.
+    # Re-asserted per tick for exactly the reason the guard is: the repo underneath a long-running
+    # scheduler can change version between ticks.
+    assert_writable_repo_schema(layout)
     now = datetime.now(UTC)
     stamp = _fmt_dt(now)
 

@@ -283,7 +283,10 @@ def test_schema_and_taxonomy_copied_into_bundle(tmp_path: Path) -> None:
     layout.schema_file.write_text(schema_text, encoding="utf-8")
     meta_dir = layout.root / "_meta"
     meta_dir.mkdir(parents=True, exist_ok=True)
-    taxonomy_text = "schema_version: 1\nallowed_tags: [curator]\ndomains: [ai-tech]\n"
+    # schema_version 2: the version this build WRITES (ADR-0041 D6). A `_meta/taxonomy.yaml`
+    # declaring 1 makes the repo READ-ONLY, and `Inbox.write` below then refuses the capture this
+    # test needs — which is the refusal working, not a bundle failure.
+    taxonomy_text = "schema_version: 2\nallowed_tags: [curator]\ndomains: [ai-tech]\n"
     (meta_dir / "taxonomy.yaml").write_text(taxonomy_text, encoding="utf-8")
 
     inbox = Inbox(layout)
@@ -325,14 +328,16 @@ def _build_wiki_corpus(layout: RepoLayout) -> None:
     determinism lock below would pass vacuously.
     """
     (layout.root / "index.md").write_text(
-        "# personal\n\n- [AI Tech MOC](wiki/ai-tech/ai-tech-moc.md)\n", encoding="utf-8"
+        "# personal\n\n- [AI Tech map](wiki/maps/ai-tech.md)\n", encoding="utf-8"
     )
-    themes = layout.root / "wiki" / "ai-tech" / "themes"
+    themes = layout.root / "wiki" / "concepts"
     themes.mkdir(parents=True, exist_ok=True)
-    (layout.root / "wiki" / "ai-tech" / "ai-tech-moc.md").write_text(
+    maps = layout.root / "wiki" / "maps"
+    maps.mkdir(parents=True, exist_ok=True)
+    (maps / "ai-tech.md").write_text(
         "---\nstatus: active\n---\n# AI Tech\n\n"
-        "- [Curator concurrency](themes/curator-concurrency.md) — the single-writer curator\n"
-        "- [Inbox design](themes/inbox-design.md) — append-only per-writer inbox\n",
+        "- [Curator concurrency](../concepts/curator-concurrency.md) — the single-writer curator\n"
+        "- [Inbox design](../concepts/inbox-design.md) — append-only per-writer inbox\n",
         encoding="utf-8",
     )
     (themes / "curator-concurrency.md").write_text(
@@ -434,7 +439,7 @@ def test_related_view_is_unfiltered_by_default(tmp_path: Path) -> None:
     views = _related_with(tmp_path, "unfiltered", None)
     hits = views["c1.json"]["hits"]
     assert views["c1.json"]["status"] == "ok"
-    assert "wiki/ai-tech/themes/curator-concurrency.md" in {h["path"] for h in hits}
+    assert "wiki/concepts/curator-concurrency.md" in {h["path"] for h in hits}
 
 
 def test_mergeable_paths_withholds_a_target_the_plan_gate_would_reject(tmp_path: Path) -> None:
@@ -447,7 +452,7 @@ def test_mergeable_paths_withholds_a_target_the_plan_gate_would_reject(tmp_path:
     unfiltered = _related_with(tmp_path, "before", None)["c1.json"]
     assert unfiltered["hits"], "corpus no longer retrieves — the filter test would be vacuous"
 
-    keep = "wiki/ai-tech/themes/inbox-design.md"
+    keep = "wiki/concepts/inbox-design.md"
     filtered = _related_with(tmp_path, "after", {keep})["c1.json"]
     assert {h["path"] for h in filtered["hits"]} <= {keep}
     # Everything else about the surviving hits is untouched: this is a path-set drop, not a re-rank

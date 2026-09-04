@@ -420,7 +420,12 @@ def test_criterion_6_max_supported_is_derived_not_a_second_source_of_truth() -> 
 def test_criterion_7_a_freshly_initialized_repo_passes_the_guard(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """``agora repo init`` emits ``schema_version: 1``; every command must then run untouched."""
+    """``agora repo init`` emits the version this build writes; every command then runs untouched.
+
+    The declared version is :data:`MAX_SUPPORTED_KB_SCHEMA_VERSION` rather than a literal since
+    ADR-0041 D6 flipped the default: a fresh repo is initialized at the schema the curator WRITES,
+    so "freshly initialized" and "fully usable" stay the same state.
+    """
     target = tmp_path / "kb"
     assert main(["repo", "init", str(target)]) == 0
     capsys.readouterr()
@@ -430,9 +435,10 @@ def test_criterion_7_a_freshly_initialized_repo_passes_the_guard(
     assert capsys.readouterr().err == ""
 
     assert main(["doctor", "--repo", str(target), "--skip-probe"]) in (0, 1)
-    assert f"  schema: repo=1 supported={sorted(SUPPORTED_KB_SCHEMA_VERSIONS)}" in (
-        capsys.readouterr().out
-    )
+    assert (
+        f"  schema: repo={MAX_SUPPORTED_KB_SCHEMA_VERSION} "
+        f"supported={sorted(SUPPORTED_KB_SCHEMA_VERSIONS)}"
+    ) in capsys.readouterr().out
 
 
 @requires_git
@@ -443,7 +449,10 @@ def test_criterion_7_repo_init_is_exempt_because_it_creates_the_repo(tmp_path: P
     """
     target = tmp_path / "fresh"
     assert main(["repo", "init", str(target)]) == 0
-    assert load_repo_config(RepoLayout(target)).taxonomy.schema_version == 1
+    assert (
+        load_repo_config(RepoLayout(target)).taxonomy.schema_version
+        == MAX_SUPPORTED_KB_SCHEMA_VERSION
+    )
 
 
 # --- the faces: the guard is not CLI-only -------------------------------------------------------
@@ -784,19 +793,38 @@ def test_writable_predicate_rejects_a_non_config_non_int(bad: object) -> None:
         assert_writable_kb_schema_version(bad)  # type: ignore[arg-type]
 
 
-def test_writable_predicate_has_no_production_call_site_in_this_wave() -> None:
-    """W2.1 lands the predicate; W2.2 wires it. This test is DELETED by that wiring PR.
+def test_the_write_refusal_is_wired_at_exactly_the_modules_D6_names() -> None:
+    """ADR-0041 D6 names the write-refusal call sites EXHAUSTIVELY; this pins that they are it.
 
-    ADR-0041 D6 names the call sites exhaustively — ``agora curate`` / ``watch`` / ``requeue``,
-    ``Inbox.write`` (one call covering ``kb_remember``, the web upload route and every future
-    writer), and the ``kb_curate`` MCP handler. Landing the predicate first keeps that PR a pure
-    call-site diff, so a later failure is attributable to the wiring rather than to the predicate;
-    this assertion is what keeps the two waves from blurring into a half-wired middle state.
+    The list in the ADR: ``agora curate`` / ``watch`` / ``requeue`` in ``cli.py``, ``Inbox.write``
+    itself (ONE call covering ``kb_remember``, the web upload route and every future writer, which
+    is why it goes there rather than at each face), and the ``kb_curate`` MCP handler. Three
+    modules carry those five sites.
+
+    Two directions, and both matter. A module going MISSING is a write path that silently
+    corrupts a schema-1 repo. A module APPEARING is a face growing its own copy of the gate —
+    which is how two surfaces end up disagreeing about which repos are writable, and how the "one
+    call covers every future writer" property quietly stops being true.
+
+    The low-level predicate is checked separately: it must stay confined to the module that
+    defines it and the ONE shared wrapper, so nothing re-derives the rule (in particular the
+    "declares nothing is UNKNOWN, not schema 1" half) from the raw version.
     """
     src = Path(cli_mod.__file__).resolve().parent
-    callers = sorted(
-        path.relative_to(src).as_posix()
-        for path in src.rglob("*.py")
-        if "assert_writable_kb_schema_version" in path.read_text(encoding="utf-8")
-    )
-    assert callers == ["config.py"], callers
+
+    def modules_mentioning(symbol: str) -> list[str]:
+        return sorted(
+            path.relative_to(src).as_posix()
+            for path in src.rglob("*.py")
+            if symbol in path.read_text(encoding="utf-8")
+        )
+
+    assert modules_mentioning("assert_writable_repo_schema") == [
+        "cli.py",
+        "core/inbox.py",
+        "faces/mcp_server.py",
+    ]
+    assert modules_mentioning("assert_writable_kb_schema_version") == [
+        "config.py",
+        "core/inbox.py",
+    ]

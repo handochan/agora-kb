@@ -419,12 +419,14 @@ def assert_writable_kb_schema_version(
     so a caller that read the version through :func:`read_kb_schema_version` need not build a
     config to ask the question.
 
-    **Defined and tested but NOT CALLED by any production path in this wave.** ADR-0041 D6 names
-    its call sites exhaustively — ``agora curate`` / ``watch`` / ``requeue`` in ``cli.py``,
-    ``Inbox.write`` itself (one call covering ``kb_remember``, the web upload route and every
-    future writer), and the ``kb_curate`` MCP handler — and wiring them is the next wave. Landing
-    the predicate first keeps the wiring PR a pure call-site diff, so a later failure is
-    attributable to the wiring rather than to the predicate.
+    **WIRED.** ADR-0041 D6 names its call sites exhaustively and every one of them now reaches this
+    predicate through the ONE shared wrapper in :mod:`agora_kb.core.inbox` (which resolves the
+    repo's canonical declared version first): ``agora curate`` / ``watch`` / ``requeue`` in
+    ``cli.py``, ``Inbox.write`` itself — one call covering ``kb_remember``, the web upload route and
+    every future writer — and the ``kb_curate`` MCP handler. ``agora harvest`` is guarded too, one
+    layer earlier than it would inherit the gate, so the refusal names the repo rather than
+    surfacing per-item. READS are deliberately untouched (``status``/``query``/``browse``/``index``/
+    ``gold``), and ``agora doctor`` is exempt so the command that DIAGNOSES the skew still runs.
     """
     if isinstance(cfg_or_version, RepoConfig):
         version = cfg_or_version.taxonomy.schema_version
@@ -708,7 +710,7 @@ def write_default_repo_config(
     name: str,
     domains: list[str] | tuple[str, ...],
     kind: str = _DEFAULT_KIND,
-    schema_version: int = 1,
+    schema_version: int = MAX_SUPPORTED_KB_SCHEMA_VERSION,
 ) -> Path:
     """Emit a starter ``_kb/repo.yaml`` (DATA-MODEL §3); return its path.
 
@@ -721,10 +723,17 @@ def write_default_repo_config(
 
     ``schema_version`` is the MIRROR of the canonical ``_meta/taxonomy.yaml`` value (ADR-0010 §5.1:
     "engine-side ``_kb/repo.yaml`` is mirrored from the canonical value, not the reverse"), and it
-    is a parameter rather than a hardcoded ``1`` so the mirror is written correctly ONCE by the
+    is a parameter rather than a hardcoded literal so the mirror is written correctly ONCE by the
     writer instead of being re-stamped afterwards by whichever caller happens to remember. Lint
-    ``L1-17`` rejects any drift between the two locations, so a caller emitting a schema-2 taxonomy
-    MUST pass the same value here; the default keeps every existing caller byte-identical.
+    ``L1-17`` rejects any drift between the two locations, so a caller emitting a taxonomy at a
+    different version MUST pass the same value here.
+
+    The DEFAULT is :data:`MAX_SUPPORTED_KB_SCHEMA_VERSION` — the version this build WRITES
+    (ADR-0041 D6) — expressed as that constant rather than a literal so the two can never fall out
+    of step at the next bump. A caller emitting a schema-1 repo (a converter writing a v1 source's
+    mirror, a test pinning the legacy layout) passes ``schema_version=1`` explicitly, which is the
+    right direction for the asymmetry: writing the CURRENT schema is the unremarkable case and
+    writing an older one is the deliberate act.
     """
     triggers = TriggerConfig()
     doc: dict[str, object] = {

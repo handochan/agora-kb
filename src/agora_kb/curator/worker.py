@@ -71,10 +71,12 @@ from ..core.sentinel import BODY_START_LINE_RE as _START_SENTINEL_RE
 from ..core.state import CuratorState, LastBatch, LastFailure, StateStore
 from ..schema.emit import Taxonomy
 from ..schema.lint import lint
-from ..schema.notes import Note, parse_all_notes
+from ..schema.notes import Note, is_people_path, parse_all_notes, path_kind
 from .apply import (
+    _MERGE_TARGET_KINDS,
     ApplyError,
     _contained,
+    _note_path,
     apply_plan,
     body_sentinels,
     region_sentinel_id,
@@ -132,7 +134,7 @@ class AuthorRegion:
 
     The worker substitutes these deterministically into the PASS-2 AUTHOR prompt so the backend
     grounds its prose in the candidate's verbatim captured ``source_text`` and is OP-AWARE (a MERGE
-    region writes only the NEW claim, a CREATE writes the whole body, a daily writes the dated
+    region writes only the NEW claim, a CREATE writes the whole body, a journal writes the dated
     capture). Keyed by the run-scoped ``region_sentinel_id`` in the worker's context map; only THIS
     run's authored regions carry one (prior-run regions are not re-authored).
     """
@@ -219,18 +221,24 @@ class FakeBackend:
             path.write_text(text, encoding="utf-8")
 
 
-def _is_theme_note(note: Note) -> bool:
-    """True iff ``note`` lives at ``wiki/<domain>/themes/<basename>.md`` (a THEME note).
+def _is_mergeable_note(note: Note) -> bool:
+    """True iff ``note`` is one of the SOURCED kinds a MERGE/CONTEST may target (ADR-0041 D2.1).
 
-    Path-based, mirroring :func:`apply._resolve_target_path`'s ``theme_only`` semantics so the §4.1
-    BASENAME/PROVENANCE THEME-target check grades EXACTLY what APPLY will accept — robust to a wrong
-    or missing ``type:`` frontmatter value (the live tree's directory is authoritative).
-    MERGE/CONTEST may only target such a note; a MOC/index/daily basename must be rejected at the
-    PLAN gate rather than crash APPLY.
+    KIND-based, and the kind is the DIRECTORY: under KB wiki schema 2 the first segment under
+    ``wiki/`` IS the kind (D1/D2.1), so :attr:`~agora_kb.schema.notes.Note.kind` is derived from the
+    path by :func:`~agora_kb.schema.notes.parse_all_notes` and cannot be falsified by a brain
+    writing a ``kind:`` mirror it likes better. The admitted set is
+    :data:`~agora_kb.curator.apply._MERGE_TARGET_KINDS` — imported, never restated, so this gate
+    and :func:`apply._resolve_target_path`'s ``sourced_only`` filter grade EXACTLY the same
+    population. MERGE/CONTEST may only target such a note; a journal, a map, ``index.md`` or a
+    human-owned ``wiki/people/`` note must be rejected at the PLAN gate rather than crash APPLY.
+
+    This replaces the v1 four-segment ``wiki/<domain>/themes/<basename>.md`` path test. The
+    substitution is exact for the population that existed then — every v1 theme is a schema-2
+    concept (D2.5) — and additionally admits ``summary``, the second SOURCED kind, the day OD-7's
+    producer lands.
     """
-    parts = note.rel_path.split("/")
-    # wiki / <domain> / themes / <basename>.md  (exactly four POSIX segments)
-    return len(parts) == 4 and parts[0] == "wiki" and parts[2] == "themes"
+    return note.kind in _MERGE_TARGET_KINDS
 
 
 # --- the producer/consumer boundary inside wiki/ (issue #152, ADR-0014 D1/D4 addendum) ----------
@@ -245,12 +253,12 @@ def _is_theme_note(note: Note) -> bool:
 # alternatives (severity downgrade; git authorship).
 
 # The frontmatter keys the ENGINE — never the model, never Obsidian — materializes on a note it
-# wrote. `sources:` is written by APPLY's provenance union on every theme/daily (ADR-0011 §2: "the
-# WORKER writes sources:, never the model"); `timestamp:` is the deterministic OKF
+# wrote. `sources:` is written by APPLY's provenance union on every concept/journal (ADR-0011
+# §2: "the WORKER writes sources:, never the model"); `timestamp:` is the deterministic OKF
 # `<updated>T00:00:00Z` APPLY stamps on every note type it creates or re-renders and `_set_updated`
 # keeps in lock-step (ADR-0014 D2), including the seed `index.md` `repo init` writes. Presence of
 # EITHER is the curator's stamp. The union (not the intersection) is what makes the discriminator
-# total across the four note types and tolerant of a theme published before the OKF fields landed.
+# total across every note kind and tolerant of a concept published before the OKF fields landed.
 CURATOR_STAMP_KEYS: frozenset[str] = frozenset({"sources", "timestamp"})
 
 # The same stamp, looked for TEXTUALLY, in a frontmatter block that does not parse. A malformed
@@ -321,27 +329,31 @@ def _is_structural_curator_path(rel_path: str) -> bool:
     """True iff APPLY rewrites this path BY CONSTRUCTION, whoever last saved it (#152 follow-up).
 
     The three structural notes the deterministic APPLY step opens without ever asking the plan gate
-    for permission: the root ``index.md`` (:func:`apply._update_index`), a domain MOC
-    ``wiki/<domain>/<domain>-moc.md`` (:func:`apply._update_moc`), and a per-domain daily
-    ``wiki/<domain>/daily/<basename>.md`` (:func:`apply._apply_append_daily`). Each of those call
-    sites does an UNGUARDED ``frontmatter.parse`` of the existing file.
+    for permission: the root ``index.md`` (:func:`apply._update_index`), a subject MAP
+    ``wiki/maps/<subject>.md`` (:func:`apply._update_map`), and the run's JOURNAL
+    ``wiki/notes/<yyyy>/<mm>/<run_date>.md`` (:func:`apply._apply_append_journal`). Each of those
+    call sites does an UNGUARDED ``frontmatter.parse`` of the existing file.
 
-    THEME notes are deliberately NOT here: a MERGE/CONTEST target must clear the PLAN gate's
-    ``theme_basenames`` (built from :attr:`LiveTree.curator_paths`) before APPLY ever opens it, so a
-    malformed human theme is already rejected as a clean plan error. These three have no such gate —
-    the curator owns them by construction — so a malformed one is an integrity signal, not
-    somebody's draft, and must FAIL the run (clean, named) instead of crashing APPLY mid-batch.
+    KIND-keyed under KB wiki schema 2 (ADR-0041 D1/D2.1), which is what makes the predicate total:
+    v1 had to recognise the map by a FILENAME suffix (``<domain>-moc.md``) and the journal by a
+    ``daily/`` segment at a fixed depth, so a map or daily one directory deeper was invisible to it.
+    The kind is now the directory, so ``wiki/maps/**`` and ``wiki/notes/**`` cover every depth D1.1
+    permits — including the ``<yyyy>/<mm>`` shard, which the v1 four-segment test would have missed.
+
+    CONCEPT/SUMMARY notes are deliberately NOT here: a MERGE/CONTEST target must clear the PLAN
+    gate's ``theme_basenames`` (built from :attr:`LiveTree.curator_paths`) before APPLY ever opens
+    it, so a malformed human concept is already rejected as a clean plan error. These three have no
+    such gate — the curator owns them by construction — so a malformed one is an integrity signal,
+    not somebody's draft, and must FAIL the run (clean, named) instead of crashing APPLY mid-batch.
+
+    ``wiki/people/**`` is likewise NOT here, and that is the D3.3 guarantee in its strongest form:
+    the curator may never write it (:func:`~agora_kb.curator.constants.is_allowlisted_path` carves
+    it out), so APPLY never opens it, so a malformed people note is somebody's draft — never an
+    integrity signal that fails a run the tree has nothing to do with.
     """
     if rel_path == "index.md":
         return True
-    parts = rel_path.split("/")
-    if parts[0] != "wiki":
-        return False
-    # wiki / <domain> / <domain>-moc.md
-    if len(parts) == 3 and parts[2] == f"{parts[1]}-moc.md":
-        return True
-    # wiki / <domain> / daily / <basename>.md
-    return len(parts) == 4 and parts[2] == "daily"
+    return path_kind(rel_path) in ("map", "note")
 
 
 def _malformed_frontmatter(path: Path) -> tuple[str, str] | None:
@@ -377,7 +389,7 @@ class LiveTree:
     malformed_curator: str | None
 
 
-def scan_live_tree(layout: RepoLayout) -> LiveTree:
+def scan_live_tree(layout: RepoLayout, *, schema_version: int | None = None) -> LiveTree:
     """Parse the live tree once and split it into curator-produced vs human-written notes (#152).
 
     Replaces the strict :func:`parse_all_notes` call that used to abort the run on the FIRST
@@ -389,8 +401,18 @@ def scan_live_tree(layout: RepoLayout) -> LiveTree:
 
     Only notes whose PARSED frontmatter has no stamp are re-read, so the extra IO is bounded by the
     number of human notes (zero in a purely curated repo).
+
+    ``schema_version`` selects the KB wiki schema every :class:`~agora_kb.schema.notes.Note` is
+    DERIVED under — which decides ``kind`` (schema 2: the directory; schema 1: ``type:``) and hence
+    what :func:`_is_mergeable_note` admits. The production caller passes the repo's own version so
+    the derivation is one injected fact rather than a per-call filesystem re-resolution over a
+    WORKTREE that may not be the live repo. ``None`` (the default) keeps
+    :func:`~agora_kb.schema.notes.parse_all_notes`'s own resolution, which reads the scanned tree's
+    ``_meta/taxonomy.yaml`` — right for a caller that has no version in hand, and the reason this
+    is a keyword with a default rather than a required argument.
     """
-    notes = parse_all_notes(layout)  # TOLERANT: never aborts on somebody's draft
+    # TOLERANT: never aborts on somebody's draft (the strictness is re-scoped below).
+    notes = parse_all_notes(layout, schema_version=schema_version)
     curator: list[str] = []
     human: list[str] = []
     malformed_curator: str | None = None
@@ -406,7 +428,7 @@ def scan_live_tree(layout: RepoLayout) -> LiveTree:
             if malformed is not None:
                 text, message = malformed
                 # Stamped, OR at a path APPLY rewrites unconditionally. The second half is what
-                # keeps a fenceless `index.md` / domain MOC / daily out of APPLY's UNGUARDED
+                # keeps a fenceless `index.md` / subject map / journal out of APPLY's UNGUARDED
                 # `frontmatter.parse`: classified as a human draft it would sail past this gate and
                 # crash `run()` with a traceback, stranding the claimed batch in `_kb/processing/`
                 # while `agora status` reported `failed_events: 0` — strictly worse than the hard
@@ -709,6 +731,15 @@ def _run_locked(
     """The body of :func:`run`, executed UNDER the held curator lock (ADR-0011 §0)."""
     layout = repo.layout
     state = state_store.load()
+    # The ONE schema fact this run is graded under (ADR-0041 D6). Read from the taxonomy the caller
+    # loaded — `_meta/taxonomy.yaml` is the CANONICAL home (ADR-0010 §5.1), and lint already
+    # dispatches on this same value — so the note derivation (`kind`/`subjects`), the ruleset and
+    # the layout APPLY writes can never be resolved from three different places. The write refusal
+    # for a schema-1 repo is upstream of here, per D6's exhaustive call-site list (`agora curate`,
+    # `watch`, `requeue`, `kb_curate`, and `Inbox.write` itself); a run that reaches this point on a
+    # schema-1 repo is a caller that bypassed all five, and it still fails cleanly at the lint gate
+    # rather than publishing a two-layout tree.
+    schema_version = taxonomy.schema_version
 
     # ADR-0008 (read-after-publish, best-effort): a PRIOR run's post-publish sync may have failed
     # (owner working tree dirty/diverged), leaving HEAD behind the curated ref. Try a best-effort
@@ -767,13 +798,14 @@ def _run_locked(
     # LIVE tree, the same files `build_bundle`'s `Wiki` reads (the worktree scan below is at
     # `base_commit` and answers a different question: what this run is graded on).
     #
-    # The set is the curator's own THEMES, not merely its own notes: the plan gate accepts a
-    # MERGE/CONTEST target ONLY out of `theme_basenames` (plan.py checks 5 and 8), so a curator
-    # daily, MOC or `index.md` in the view is just as run-killing a pick as a human note. This
-    # mirrors the `theme_basenames` derivation below EXACTLY — same `_is_theme_note` over the same
-    # stamped-paths set — so the menu and the gate cannot drift apart. kb_schema.md §7.1 states
-    # this property to the model; keep the three in step.
-    live_now = scan_live_tree(layout)
+    # The set is the curator's own CONCEPTS (and, when OD-7's producer lands, SUMMARIES) — not
+    # merely its own notes: the plan gate accepts a MERGE/CONTEST target ONLY out of
+    # `theme_basenames` (plan.py checks 5 and 8), so a curator journal, map or `index.md` in the
+    # view is just as run-killing a pick as a human note. This mirrors the `theme_basenames`
+    # derivation below EXACTLY — same `_is_mergeable_note` over the same stamped-paths set — so the
+    # menu and the gate cannot drift apart. kb_schema.md §7.1 states this property to the model;
+    # keep the three in step.
+    live_now = scan_live_tree(layout, schema_version=schema_version)
     bundle = build_bundle(
         layout,
         repo,
@@ -782,7 +814,7 @@ def _run_locked(
         mergeable_paths={
             n.rel_path
             for n in live_now.notes
-            if _is_theme_note(n) and n.rel_path in live_now.curator_paths
+            if _is_mergeable_note(n) and n.rel_path in live_now.curator_paths
         },
     )
 
@@ -811,7 +843,7 @@ def _run_locked(
         # Parse the live tree ONCE, CLASSIFY it (#152), and derive BOTH registries: the
         # all-basenames set (CREATE uniqueness + LINK resolvability grade against this) and the
         # THEME-only subset (MERGE/CONTEST targets grade against this, mirroring
-        # apply._resolve_target_path theme_only).
+        # apply._resolve_target_path sourced_only).
         #
         # This used to be a strict parse_all_notes whose FrontmatterError failed the run. That was
         # already an improvement on the traceback it replaced (a claimed batch stranded in
@@ -821,7 +853,7 @@ def _run_locked(
         # `scan_live_tree` keeps the strictness where it is an integrity signal — a malformed note
         # that still carries the curator's own stamp — and downgrades a human draft to a warning
         # (#152, ADR-0014 D1/D4).
-        live_tree = scan_live_tree(wt_layout)
+        live_tree = scan_live_tree(wt_layout, schema_version=schema_version)
         if live_tree.malformed_curator is not None:
             return _fail(
                 layout,
@@ -837,12 +869,22 @@ def _run_locked(
         notes = list(live_tree.notes)
         # DELIBERATELY over ALL notes, human ones included. A human note is not a producer artifact,
         # but its basename is still TAKEN: dropping it here would let a CREATE_THEME reuse that
-        # basename, and APPLY writes `wiki/<domain>/themes/<basename>.md` unconditionally — an
-        # Obsidian note saved in a `themes/` folder would be silently overwritten. The registry that
-        # must exclude human notes is the MERGE/CONTEST target set below, and it does.
-        live_basenames = {n.basename for n in notes}
+        # basename, and APPLY writes `wiki/concepts/<basename>.md` unconditionally — an Obsidian
+        # note saved under `wiki/concepts/` would be silently overwritten. The registry that must
+        # exclude human notes is the MERGE/CONTEST target set below, and it does.
+        #
+        # `wiki/people/**` is the ONE exclusion, and it is ADR-0041 D3.3's, not a softening of the
+        # rule above: people basenames do NOT join the global `[[basename]]` identity space at all
+        # (lint's L1-1 duplicate check and L1-15 alias/basename union exclude them too). Without
+        # this, a human file at `wiki/people/hando/agora.md` would make `CREATE_THEME
+        # basename=agora` a hard PLAN failure — a human-owned tree the curator may never write
+        # acquiring VETO power over curator naming, which is the exact inverse of what D3.3 grants
+        # it. The stated consequence: a people note is addressed by path, never by `[[basename]]`.
+        live_basenames = {n.basename for n in notes if not is_people_path(n.rel_path)}
         theme_basenames = {
-            n.basename for n in notes if _is_theme_note(n) and n.rel_path in live_tree.curator_paths
+            n.basename
+            for n in notes
+            if _is_mergeable_note(n) and n.rel_path in live_tree.curator_paths
         }
         # Carried to the report (seeded into `prose_warnings` at PASS 2) so a published run says out
         # loud which notes it did not grade — the operator surface `agora doctor` mirrors.
@@ -894,6 +936,11 @@ def _run_locked(
             live_basenames=live_basenames,
             theme_basenames=theme_basenames,
             gated_candidate_ids=bundle.gated_candidate_ids,
+            # ADR-0041 D2.6: the day's single journal is basenamed by the run date and sharded by
+            # its year/month. Injected here — the curator already holds `run_date = run_id[:10]` —
+            # rather than parsed back out of `plan.run_id`, which is MODEL-supplied: deriving a
+            # curator-owned path segment from model output is the inversion D2.6 exists to forbid.
+            run_date=run_date,
         )
         if plan_errors:
             return _fail(
@@ -907,7 +954,7 @@ def _run_locked(
 
         # APPLY (deterministic, §3): the worker materializes ALL
         # structure/frontmatter/sources/links/
-        # MOC/index/sentinels. confidence is MIRRORED from the candidate worst-case (never a plan
+        # map/index/sentinels. confidence is MIRRORED from the candidate worst-case (never a plan
         # field) so the backend can never inflate it.
         confidence = {c.candidate_id: c.confidence for c in bundle.candidates if c.confidence}
         # raw_writes is the EXACT {raw_ref: bytes} set the engine materialized this run (ADR-0010
@@ -917,9 +964,12 @@ def _run_locked(
         # A containment failure (`_contained` / `_resolve_target_path` raising ApplyError) is a
         # tamper signal, not a crash: it must produce the same clean FAILED run + error.json every
         # other integrity rejection does (ADR-0011 §4 "never an uncaught traceback out of run()"),
-        # not an escaping traceback. This is latent while plan.py's ASCII PATH/ALLOWLIST regex
-        # keeps every escaping token from ever reaching APPLY — pinned here regardless, before
-        # that charset is ever widened, so a later widening cannot be blamed for this failure mode.
+        # not an escaping traceback. It is NO LONGER latent: the ASCII PATH/ALLOWLIST regex it used
+        # to be latent behind is gone (ADR-0041 D4.4 replaced it with `pathsafe.is_safe_component`
+        # plus the leading-`_` rejection), and APPLY now raises ApplyError on its own preconditions
+        # too — a map basename already taken by another note (`_assert_map_basename_free`) and a
+        # canonical source ref that is not a normalized path under `raw/`. Every one of those
+        # arrives here, as a clean FAILED run with the cause named in error.json.
         try:
             raw_writes = apply_plan(
                 plan,
@@ -940,10 +990,10 @@ def _run_locked(
         except FrontmatterError as exc:
             # DEFENCE IN DEPTH for the same contract (§4 "never an uncaught traceback out of
             # run()"). APPLY re-opens existing notes with an UNGUARDED `frontmatter.parse` in four
-            # places — `_update_index`, `_update_moc`, `_apply_append_daily`, and the
+            # places — `_update_index`, `_update_map`, `_apply_append_journal`, and the
             # `_apply_merge`/`_apply_contested` targets. `scan_live_tree`'s structural + stamp
             # classification is what SHOULD keep a malformed note from ever reaching them, and the
-            # plan gate covers the theme targets; this catch is the belt to that pair of braces, so
+            # plan gate covers the merge targets; this catch is the belt to that pair of braces, so
             # no live-tree note can ever escape `run()` as a traceback that strands the claimed
             # batch in `_kb/processing/` with `agora status` reporting `failed_events: 0`.
             return _fail(
@@ -978,8 +1028,8 @@ def _run_locked(
         # production: a PASS-2 write to any OTHER `wiki/` note passed the §4.2 gate untested and
         # then passed §4.0 too, because the final-diff allowlist admits the whole `wiki/` prefix
         # (constants.ALLOWLIST_DIR_PREFIXES). Reproduced end-to-end: an adversarial backend rewrote
-        # an unrelated theme's body AND flipped its frontmatter `status`, and the run PUBLISHED
-        # with `failure=None`; deleting that note while scrubbing its MOC references published too,
+        # an unrelated concept's body AND flipped its frontmatter `status`, and the run PUBLISHED
+        # with `failure=None`; deleting that note while scrubbing its map references published too,
         # losing the note. `_agora_scratch/` is already excluded per-worktree (above), so backend
         # scratch can never enter this baseline.
         _git(wt, "add", "-A")
@@ -1128,6 +1178,12 @@ def _run_locked(
             run_id=run_id,
             max_orphans=max_orphans,
             scope=producer_scope,
+            # Passed EXPLICITLY although `lint` would read the same value off `taxonomy`: this run
+            # already resolved the schema once (above) and every consumer of that fact must be
+            # visibly the same one. Under schema 2 the ruleset also excludes `wiki/people/**` from
+            # the graded population inside `lint()` itself (D3.3), which is what keeps a human's
+            # draft in a tree the curator may not write from hard-rejecting this run.
+            schema_version=schema_version,
         )
         if not lint_result.ok:
             # ERRORS ONLY, matching the gate's own predicate (``LintResult.ok`` is False iff an
@@ -1274,9 +1330,9 @@ def _run_locked(
         published_commit=new_commit,
     )
 
-    # ADR-0008 (readers resolve a PUBLISHED commit): the CAS moved only the curated ref; the
-    # repo-owner's MAIN working copy is still parked at base_commit, so core.Wiki/kb_query (which
-    # read the on-disk tree) would not yet see the published theme. Fast-forward the working copy to
+    # ADR-0008 (readers resolve a PUBLISHED commit): the CAS moved only the curated ref; the repo-
+    # owner's MAIN working copy is still parked at base_commit, so core.Wiki/kb_query (which read
+    # the on-disk tree) would not yet see the published concept. Fast-forward the working copy to
     # the new tip AFTER state is saved + the manifest is finalized, so the read-after-publish
     # contract holds. GUARDED: a sync failure (e.g. an owner left the working tree dirty) must NOT
     # undo a durable publish — the diff is already in git and state is finalized; we keep
@@ -2245,9 +2301,10 @@ def _needs_prose_map(
     Each ``region_id`` is the run-scoped ``region_sentinel_id`` (``{run_id}--{candidate_id}``),
     computed via the SAME helper APPLY uses to PLACE the region so the two can never drift (the bare
     candidate_id is per-run and collides across runs). CREATE_THEME →
-    ``wiki/<domain>/themes/<basename>.md``; APPEND_DAILY →
-    ``wiki/<domain>/daily/<domain>-<run_date>.md`` (multiple dispositions can share one daily file,
-    so ids accumulate); MERGE_INTO_THEME → the target theme path resolved in the live tree.
+    ``wiki/concepts/<basename>.md``; APPEND_DAILY → ``wiki/notes/<yyyy>/<mm>/<run_date>.md`` (ONE
+    journal per run date, REPO-WIDE under ADR-0041 D2.6, so dispositions from several domains share
+    it and ids accumulate); MERGE_INTO_THEME → the target concept/summary path resolved in the live
+    tree.
     """
     needs: dict[str, list[str]] = {}
     sentinels: dict[str, set[str]] = {}
@@ -2261,7 +2318,7 @@ def _needs_prose_map(
         # The PERSISTED region id is RUN-SCOPED (region_sentinel_id), computed via the SAME shared
         # helper APPLY uses to PLACE the region, so the §4.2 sentinels set can never drift from the
         # ids on disk. The bare candidate_id is per-run and would collide across runs (a MERGE /
-        # cross-run daily append into a note holding a prior-run region).
+        # cross-run journal append into a note holding a prior-run region).
         sentinel_id = region_sentinel_id(plan.run_id, disp.candidate_id)
         needs.setdefault(rel, []).append(sentinel_id)
         sentinels.setdefault(rel, set()).add(sentinel_id)
@@ -2284,11 +2341,18 @@ def _needs_prose_map(
 def _disposition_note_rel_path(disp: Disposition, worktree: Path, run_date: str) -> str | None:
     """Return the repo-relative path the disposition authors prose into, or ``None`` if none.
 
-    For APPEND_DAILY the daily basename defaults to ``<domain>-<run_date>`` when the plan omits it —
-    MIRRORING :func:`agora_kb.curator.apply._apply_append_daily`, which derives daily basenames
-    worker-side (ADR-0011 §2/§3.1, daily basenames are not a model field). Without this default a
-    §4.1-valid APPEND_DAILY that omits ``basename`` (the normal case) would build no sentinel entry,
-    leaving APPLY's authored region unfilled and failing the §4.4 lint.
+    KB WIKI SCHEMA 2 (ADR-0041 D1): CREATE_THEME → ``wiki/concepts/<basename>.md``; APPEND_DAILY →
+    ``wiki/notes/<yyyy>/<mm>/<run_date>.md``; MERGE_INTO_THEME → the live-tree path of the target
+    concept/summary. Both composed paths come from :func:`agora_kb.curator.apply._note_path` — the
+    SAME composer APPLY writes through — so this funnel cannot name a file APPLY did not create.
+
+    The APPEND_DAILY *basename* is no longer read from the plan at all. v1 defaulted it to
+    ``<domain>-<run_date>`` because there was one daily per domain; D2.6 makes it ONE journal per
+    ``run_date``, repo-wide, basenamed by that date and sharded by its year/month — a deterministic
+    curator-owned fact, never a function of model output. The PLAN gate separately asserts
+    ``disp.basename == run_date`` (plan.py's PATH/ALLOWLIST check), so a model that names the
+    journal something else is rejected there rather than silently overridden here. The domain is
+    likewise no longer a precondition: a subject-less journal still has a path (D2.2 leg 1).
 
     This is the SINGLE funnel every downstream ``needs_prose``/``sentinels`` write and read site
     goes through (:func:`_needs_prose_map`, :func:`_strip_stray_links`, :func:`_degrade_prose`,
@@ -2296,34 +2360,37 @@ def _disposition_note_rel_path(disp: Disposition, worktree: Path, run_date: str)
     (:func:`agora_kb.curator.apply._contained`, the same helper APPLY's own write sites use) is
     applied HERE, once, rather than re-derived at each call site — matching
     :func:`agora_kb.curator.apply._resolve_target_path`'s exact-name (not glob-pattern) lookup so a
-    ``target_basename`` containing a glob metacharacter cannot widen the search onto another note.
+    ``target_basename`` containing a glob metacharacter cannot widen the search onto another note,
+    and its ``sourced_only`` KIND filter so a ``[[basename]]`` that resolves to a journal, a map or
+    a human-owned ``wiki/people/`` note yields no region here either.
     """
-    candidate: Path
-    if disp.op == "CREATE_THEME" and disp.domain and disp.basename:
-        candidate = worktree / "wiki" / disp.domain / "themes" / f"{disp.basename}.md"
-    elif disp.op == "APPEND_DAILY" and disp.domain:
-        basename = disp.basename or f"{disp.domain}-{run_date}"
-        candidate = worktree / "wiki" / disp.domain / "daily" / f"{basename}.md"
-    elif disp.op == "MERGE_INTO_THEME" and disp.target_basename:
-        wanted = f"{disp.target_basename}.md"
-        matches = sorted(
-            p
-            for p in (worktree / "wiki").rglob("*.md")
-            if p.is_file() and p.name == wanted and p.parent.name == "themes"
-        )
-        if not matches:
-            return None
-        candidate = matches[0]
-    else:
-        return None
     try:
-        contained = _contained(worktree, candidate)
+        candidate: Path
+        if disp.op == "CREATE_THEME" and disp.basename:
+            candidate = _note_path(worktree, "concept", disp.basename)
+        elif disp.op == "APPEND_DAILY":
+            candidate = _note_path(worktree, "note", run_date, run_date=run_date)
+        elif disp.op == "MERGE_INTO_THEME" and disp.target_basename:
+            wanted = f"{disp.target_basename}.md"
+            matches = sorted(
+                p
+                for p in (worktree / "wiki").rglob("*.md")
+                if p.is_file()
+                and p.name == wanted
+                and path_kind(p.relative_to(worktree).as_posix()) in _MERGE_TARGET_KINDS
+            )
+            if not matches:
+                return None
+            candidate = _contained(worktree, matches[0])
+        else:
+            return None
     except ApplyError:
-        # Unreachable while plan.py's ASCII PATH/ALLOWLIST regex still gates every domain/basename
-        # token (UNIT 1 is layout-invariant); kept fail-CLOSED (treated as "no note") rather than
-        # letting a future charset widening turn this funnel into an escape.
+        # A basename plan.py's PATH/ALLOWLIST check would have rejected (a separator, a leading
+        # `_`, a Windows device stem), or a matched file reached through a symlinked directory.
+        # Kept fail-CLOSED (treated as "no note") so this funnel can never become the escape the
+        # ADR-0041 D4.4 charset widening is otherwise guarded against at the gate.
         return None
-    return contained.relative_to(worktree).as_posix()
+    return candidate.relative_to(worktree).as_posix()
 
 
 def _present_sentinel_ids(path: Path) -> set[str]:
@@ -2381,11 +2448,11 @@ def _clear_body_status(worktree: Path, needs_prose: dict[str, list[str]]) -> lis
     (unused by :func:`run` today — it exists so a test can call this directly and so a future
     counter is a one-line change).
 
-    CLEAR-ONLY: this never ADDS the key. APPLY owns placement, and an unauthored region with no
-    flag remains a legitimate state AT REST even though the curator no longer mints one: #131 made
-    region placement and the flag one decision in :func:`agora_kb.curator.apply._apply_append_daily`
+    CLEAR-ONLY: this never ADDS the key. APPLY owns placement, and an unauthored region with no flag
+    remains a legitimate state AT REST even though the curator no longer mints one: #131 made region
+    placement and the flag one decision in :func:`agora_kb.curator.apply._apply_append_journal`
     (before it, a ``needs_prose=False`` APPEND_DAILY placed an empty region that nothing would ever
-    author). The shape survives on disk in any daily whose APPEND_DAILY dispositions never flagged
+    author). The shape survives on disk in any journal whose APPEND_DAILY dispositions never flagged
     ``needs_prose`` — which the reference brain cannot emit, since ``ollama_brain.normalize_plan``
     forces the flag for this op — and in any hand-edited or imported note. Stamping a flag there
     would pin a ``pending`` this clear-only step could never retract: the flag would outlive every
@@ -2421,7 +2488,7 @@ def _plan_shape_warnings(plan: Plan) -> list[str]:
 
     APPEND_DAILY's body deliverable IS its dated section (schema §7.1: "yes (that section)"), and
     since #131 APPLY places that section only when the disposition flags ``needs_prose``. So a plan
-    that leaves the flag off publishes a daily recording the day's ``sources:`` and nothing
+    that leaves the flag off publishes a journal recording the day's ``sources:`` and nothing
     readable. That is UNDER-DELIVERY by the planner, not corruption by the engine — hence a warning
     and neither of the two louder options:
 

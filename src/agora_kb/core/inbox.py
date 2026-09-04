@@ -43,6 +43,7 @@ from .models import Confidence, InboxItem, Kind
 
 __all__ = [
     "Inbox",
+    "assert_writable_repo_schema",
     "WriteReceipt",
     "failed_event_count",
     "iter_failed_events",
@@ -67,6 +68,56 @@ class WriteReceipt:
 
     def as_dict(self) -> dict[str, object]:
         return {"id": self.id, "queued": self.queued, "inbox_depth": self.inbox_depth}
+
+
+def assert_writable_repo_schema(layout: RepoLayout) -> None:
+    """Refuse a WRITE into a repo whose KB wiki schema this build will not write (ADR-0041 D6).
+
+    The ONE spelling of D6's write refusal, called by :meth:`Inbox.write` below and imported by
+    the other four call sites D6 names exhaustively (``agora curate`` / ``watch`` / ``requeue`` in
+    ``cli.py`` and the ``kb_curate`` MCP handler), which reach the repo without going through
+    ``Inbox.write``. It lives beside the write primitive rather than in :mod:`agora_kb.config`
+    because it is the WRITE BOUNDARY's rule, and because a second copy of a three-line predicate is
+    exactly how two call sites end up disagreeing about which repos are writable.
+
+    **Why the gate is at the one write primitive rather than at each face.** With
+    ``SUPPORTED_KB_SCHEMA_VERSIONS`` widened to ``{1, 2}`` every entry-point guard
+    (:func:`~agora_kb.config.guard_repo_schema_version`, the MCP server construction, the web
+    ``build_app``) PASSES for a schema-1 repo — that is the whole point of keeping 1 in the set, so
+    reads keep working. A construction-time guard therefore structurally cannot let ``kb_query``
+    through while refusing ``kb_remember`` on the same server object. ADR-0041 D6 names this
+    function's location exactly: *"``Inbox.write`` itself — one call covers ``kb_remember``, the
+    web upload route, and every future writer, which is why it goes there rather than at each
+    face."*
+
+    **Why a capture REFUSES rather than succeeds.** The curator will not write a schema-1 tree
+    (APPLY composes schema-2 paths and frontmatter), so an event accepted here could never drain.
+    An inbox that can never drain — and that a re-import into a NEW repo would orphan — is silent
+    data loss dressed as success, which is strictly worse than a loud refusal naming the one
+    crossing that exists (``agora import --from-kb``).
+
+    **Why the CANONICAL reader, and why "declares nothing" is not a refusal.** The version comes
+    from :func:`~agora_kb.config.read_canonical_kb_schema_version` — ``_meta/taxonomy.yaml`` ALONE
+    (ADR-0010 §5.1) — never from the ``_kb/repo.yaml`` mirror the broader
+    :func:`~agora_kb.config.read_kb_schema_version` falls back to: that mirror is git-IGNORED and
+    operator-local, so letting it gate a shared repo's write path would let one machine's untracked
+    edit decide whether everybody's captures are accepted. The canonical reader returns ``None``
+    for a directory that declares nothing determinable (no ``_meta/taxonomy.yaml``, an unparseable
+    one, a non-integer version) and that is treated as UNKNOWN, never as "schema 1": an
+    uninitialized directory has no schema-1 tree to corrupt and no curator that could drain it
+    either way, so refusing there would convert "wrong cwd" into a confusing schema complaint. A
+    readable taxonomy with no ``schema_version`` key is a pre-#98 repo and correctly reads as 1.
+
+    That last rule is the reason the CLI call sites do NOT pass their loaded
+    :class:`~agora_kb.config.RepoConfig` here: ``load_repo_config`` collapses "no taxonomy file at
+    all" to the default ``schema_version: 1``, so ``agora curate`` in the wrong directory would
+    answer a lost operator with a schema refusal instead of its ordinary "nothing was changed".
+    """
+    from ..config import assert_writable_kb_schema_version, read_canonical_kb_schema_version
+
+    version = read_canonical_kb_schema_version(layout)
+    if version is not None:
+        assert_writable_kb_schema_version(version, repo=layout.root)
 
 
 class Inbox:
@@ -99,12 +150,15 @@ class Inbox:
 
         ``text`` is the knowledge body (or an extraction summary of ``raw_ref``); it must be
         non-empty.
-        ``now`` is injectable for tests. Raises ``ValueError`` for empty text and
-        ``InvalidWriterError`` for an unsafe writer.
+        ``now`` is injectable for tests. Raises ``ValueError`` for empty text,
+        ``InvalidWriterError`` for an unsafe writer, and
+        :class:`~agora_kb.config.ReadOnlySchemaVersionError` for a repo whose KB wiki schema this
+        build will not write (ADR-0041 D6 — see :func:`assert_writable_repo_schema`).
         """
         if not text or not text.strip():
             raise ValueError("inbox item text must be non-empty")
         validate_writer(writer)
+        assert_writable_repo_schema(self._layout)
 
         # Best-effort delivery idempotency (authoritative dedup is the curator at claim time,
         # ADR-0011).

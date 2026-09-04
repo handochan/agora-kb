@@ -32,6 +32,7 @@ from pathlib import Path
 import pytest
 
 import agora_kb.curator.worker as worker_mod
+from agora_kb.config import KbIdentity, write_kb_identity
 from agora_kb.core import frontmatter
 from agora_kb.core.ids import new_event_id
 from agora_kb.core.inbox import Inbox, InboxReturn, failed_event_count
@@ -56,31 +57,57 @@ from agora_kb.curator.worker import (
 )
 from agora_kb.schema.emit import Taxonomy, emit_schema
 from agora_kb.schema.lint import lint
+from agora_kb.schema.notes import Note, path_kind
 
 NOW = datetime(2026, 6, 13, 3, 0, 0, tzinfo=UTC)
 RUN_DATE = "2026-06-13"
 
+# KB WIKI SCHEMA 2 (ADR-0041): every repo this module builds is a schema-2 repo, because after
+# this wave the curator WRITES schema 2 and a schema-1 repo is READ-ONLY (D6). The taxonomy is what
+# dispatches the lint ruleset AND what `worker._run_locked` resolves its one schema fact from, so
+# bumping it here is the single lever that puts the whole file on the new layout.
 TAXONOMY = Taxonomy(
-    schema_version=1,
+    schema_version=2,
     taxonomy_policy="open",
     allowed_tags=("curator", "concurrency"),
     domains=("ai-tech", "general"),
 )
+
+#: The fixture ``_meta/kb.yaml`` identity (ADR-0041 D1.5). A FIXED, valid ULID rather than a minted
+#: one: APPLY stamps it into every note's ``kb:``, so a per-run id would make the notes this module
+#: asserts on non-reproducible. Shared with ``tests.support.kb_builder`` for the same reason.
+KB_ID = "01J8ZQ3M4N5P6Q7R8S9T0V1W2X"
+
+#: The repo-relative directories of the schema-2 kinds, in the spellings the assertions below use.
+CONCEPTS = "wiki/concepts"
+NOTES = "wiki/notes"
+MAPS = "wiki/maps"
+#: The ONE journal of ``RUN_DATE`` (D2.6: one per run_date, repo-wide, basenamed by it).
+JOURNAL_REL = f"{NOTES}/2026/06/{RUN_DATE}.md"
 
 
 # --- fixtures -----------------------------------------------------------------------------------
 
 
 def _init_repo(tmp_path: Path) -> Repo:
-    """Init a git knowledge repo with the emitted schema + taxonomy, committed at the curated tip.
+    """Init a git SCHEMA-2 knowledge repo, committed at the curated tip (ADR-0041 D1).
 
     The schema doc + ``_meta/`` + ``_templates/`` are emitted and committed so the worktree at
-    ``base_commit`` carries the read-only INGEST inputs the bundle/lint rely on.
+    ``base_commit`` carries the read-only INGEST inputs the bundle/lint rely on. ``_meta/kb.yaml``
+    and the six ``wiki/<kind>/`` directories are materialized first, exactly as ``agora repo init``
+    does: APPLY refuses to write a note when the identity file is missing (D1.5), and the closed
+    kind vocabulary is stated by the DIRECTORY tree (D3.1), so a fixture without them is not a
+    schema-2 repo at all.
     """
     layout = RepoLayout(tmp_path)
+    layout.root.mkdir(parents=True, exist_ok=True)
+    write_kb_identity(layout, KbIdentity(kb_id=KB_ID, name="agora-fixture"))
+    for directory in ("concepts", "summaries", "notes", "maps", "entities", "people"):
+        (layout.wiki_dir / directory).mkdir(parents=True, exist_ok=True)
+        (layout.wiki_dir / directory / ".gitkeep").write_text("", encoding="utf-8")
     repo = Repo(layout)
-    repo.init(when=datetime(2026, 6, 12, 0, 0, 0, tzinfo=UTC))
-    emit_schema(layout, taxonomy=TAXONOMY)
+    repo.init(when=datetime(2026, 6, 12, 0, 0, 0, tzinfo=UTC), schema_version=2, kb_id=KB_ID)
+    emit_schema(layout, taxonomy=TAXONOMY, schema_version=2)
     _commit_all(repo, "chore: emit schema")
     return repo
 
@@ -334,7 +361,7 @@ def test_happy_path_publishes_theme_advances_ref_and_finalizes(tmp_path: Path) -
     # we check out the published commit into a fresh worktree). The theme exists, the published tree
     # lints clean (the §4.4 gate the worker ran), and the authored prose landed in the sentinel.
     with repo.worktree(at=new_tip) as published:
-        theme = published / "wiki" / "ai-tech" / "themes" / "curator-concurrency.md"
+        theme = published / "wiki" / "concepts" / "curator-concurrency.md"
         assert theme.is_file()
         assert lint(RepoLayout(published), taxonomy=TAXONOMY, run_date=RUN_DATE).ok
         # The cited canonical raw/ source is committed alongside wiki/ (ADR-0010 D3) — the published
@@ -413,7 +440,7 @@ def test_finalize_rebuilds_gold_pack_after_publish(tmp_path: Path) -> None:
 
     The pack is built best-effort in finalize AFTER the owner working copy is synced to the new
     curated tip, so it is present, fresh (its sidecar stamped with the published commit), and no
-    ``gold_unbuilt`` signal is raised on the happy path. The published theme appears in the pack.
+    ``gold_unbuilt`` signal is raised on the happy path.
     """
     from agora_kb.core.gold import read_meta
 
@@ -436,8 +463,47 @@ def test_finalize_rebuilds_gold_pack_after_publish(tmp_path: Path) -> None:
     meta = read_meta(layout)
     assert meta is not None
     assert meta.curated_sha == report.published_commit
-    # The freshly-curated theme is in the pack (it is an active, non-harvest theme).
-    assert "Curator concurrency model" in pack_path.read_text(encoding="utf-8")
+    # The pack is BUILT, FRESH and sentinel-wrapped. Its SELECTION is asserted separately, as a
+    # STRICT xfail, by the test below — see it for why the split exists.
+    assert "agora:pack" in pack_path.read_text(encoding="utf-8")
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "W2.3: core/gold.py still selects by the schema-1 predicates (`type: theme` and the "
+        "shared `_is_moc_path`), so a schema-2 repo assembles an EMPTY gold pack — `_kb/gold/`, "
+        "`kb_context` and GET /api/gold/{pack} return nothing on every repo this build writes. "
+        "ADR-0041 D5 moves those predicates in wave W2.3 as ONE shared edit with core/wiki.py; "
+        "this flips to passing there. STRICT so W2.3 is told out loud when it lands, rather than "
+        "the regression being described in a comment nobody is failed by."
+    ),
+)
+def test_the_gold_pack_contains_the_published_concept(tmp_path: Path) -> None:
+    """The product claim the pack exists to make: a curated note is IN it.
+
+    Split out of the test above rather than weakened into it. A pack that is built, fresh and
+    correctly stamped but EMPTY satisfies every structural assertion while delivering nothing, so
+    the selection needs an assertion of its own — and a strict xfail is the shape that both keeps
+    the suite green today and fails the day the read side is fixed without this being revisited.
+    """
+    repo = _init_repo(tmp_path)
+    layout = repo.layout
+    e1 = _write_capture(
+        Inbox(layout), text="One curator advances the branch under a lock.", second=10
+    )
+    _seed_raw(repo, e1)
+    report = _run(
+        repo,
+        FakeBackend(
+            _create_theme_plan("ignored", "c1", e1),
+            prose={
+                region_sentinel_id("ignored", "c1"): "The single curator holds a per-repo flock."
+            },
+        ),
+    )
+    assert report.status == "published", report.failure
+    assert "Curator concurrency" in layout.gold_pack_path("default").read_text(encoding="utf-8")
 
 
 def test_routed_backend_runs_plan_and_author_on_distinct_brains(tmp_path: Path) -> None:
@@ -498,7 +564,7 @@ def test_routed_backend_runs_plan_and_author_on_distinct_brains(tmp_path: Path) 
 
     assert report.status == "published"
     with repo.worktree(at=report.published_commit) as published:
-        theme = published / "wiki" / "ai-tech" / "themes" / "curator-concurrency.md"
+        theme = published / "wiki" / "concepts" / "curator-concurrency.md"
         assert theme.is_file()  # the PLAN brain's plan created it
         # the AUTHOR brain filled the sentinel (not the plan brain, whose prose dict is empty)
         assert "Prose authored by the dedicated author brain." in theme.read_text(encoding="utf-8")
@@ -541,13 +607,13 @@ def test_happy_path_syncs_owner_working_copy_so_query_sees_published_theme(tmp_p
     # The MAIN working copy is AT the new tip (no manual git reset) — read-after-publish.
     assert repo.head_commit() == new_tip
     # The published theme is materialized on disk, so a plain Wiki over the repo root sees it.
-    theme = layout.wiki_dir / "ai-tech" / "themes" / "curator-concurrency.md"
+    theme = layout.wiki_dir / "concepts" / "curator-concurrency.md"
     assert theme.is_file()
     # PASS-2 prose actually landed in the published body (run-scoped region id matched needs_prose).
     assert "per-repo flock" in theme.read_text(encoding="utf-8")
     result = Wiki(RepoLayout(repo.root)).query("curator concurrency")
     assert result.status == "ok"
-    assert any(h.path == "wiki/ai-tech/themes/curator-concurrency.md" for h in result.hits)
+    assert any(h.path == "wiki/concepts/curator-concurrency.md" for h in result.hits)
 
 
 def test_sync_failure_after_publish_does_not_unpublish_or_unfinalize(tmp_path: Path) -> None:
@@ -592,7 +658,7 @@ def test_sync_failure_after_publish_does_not_unpublish_or_unfinalize(tmp_path: P
     # ...and what it published is a REAL note, not a placeholder (#121). The owner working copy is
     # deliberately stuck at the old tip here, so the published COMMIT is the only honest source.
     with repo.worktree(at=new_tip) as published:
-        theme = published / "wiki" / "ai-tech" / "themes" / "curator-concurrency.md"
+        theme = published / "wiki" / "concepts" / "curator-concurrency.md"
         assert "The single curator holds a per-repo flock." in theme.read_text(encoding="utf-8")
     # The stuck working copy is surfaced as an observable signal, not silently swallowed.
     assert report.counts.get("owner_working_copy_unsynced") == 1
@@ -653,7 +719,7 @@ def test_failed_run_leaves_owner_working_copy_unchanged(tmp_path: Path) -> None:
 
     assert report.status == "failed"
     assert repo.head_commit() == base  # the owner working copy never advanced
-    assert not (layout.wiki_dir / "ai-tech" / "themes" / "rogue-theme.md").exists()
+    assert not (layout.wiki_dir / "concepts" / "rogue-theme.md").exists()
 
 
 # --- (2) INVALID PLAN ---------------------------------------------------------------------------
@@ -700,7 +766,7 @@ def test_invalid_plan_fails_leaves_branch_unchanged_and_events_in_failed(tmp_pat
     # The curated branch never moved (nothing published).
     assert repo.branch_commit() == base
     # No theme was created on the published tree.
-    assert not (layout.wiki_dir / "ai-tech" / "themes" / "rogue-theme.md").exists()
+    assert not (layout.wiki_dir / "concepts" / "rogue-theme.md").exists()
     # §5.1 retry budget: on the FIRST attempt (well under curator.max_attempts=3) a non-CAS
     # validation failure returns the event UNCHANGED to inbox/ to be re-claimed next run — it does
     # NOT go terminal to failed/ on a one-off bad plan. The event is back at its writer namespace.
@@ -718,20 +784,26 @@ def test_invalid_plan_fails_leaves_branch_unchanged_and_events_in_failed(tmp_pat
     assert StateStore(layout).load().counters.failed == 0
 
 
-def test_merge_targeting_a_moc_is_rejected_by_validate_plan_not_crash_apply(tmp_path: Path) -> None:
-    """A MERGE_INTO_THEME whose target is a MOC (not a theme) FAILS at the §4.1 PLAN gate.
+def test_merge_targeting_a_map_is_rejected_by_validate_plan_not_crash_apply(tmp_path: Path) -> None:
+    """A MERGE_INTO_THEME whose target is a MAP (not a concept) FAILS at the §4.1 PLAN gate.
 
-    Regression for the integrity-core bug: live_basenames includes MOC/index/daily stems, so a
-    MERGE/CONTEST naming the domain MOC was validate_plan-ACCEPTED but apply._resolve_target_path
-    (theme_only=True) then raised ApplyError — uncaught around apply_plan — crashing the run with
-    the events stuck in processing/. With the THEME-only target check the plan is rejected cleanly
-    here: the run FAILS (nothing published, branch unchanged), never an uncaught APPLY traceback.
+    Regression for the integrity-core bug: live_basenames includes map/index/journal stems, so a
+    MERGE/CONTEST naming the subject map was validate_plan-ACCEPTED but apply._resolve_target_path
+    (``sourced_only=True``) then raised ApplyError — uncaught around apply_plan — crashing the run
+    with the events stuck in processing/. With the SOURCED-kind target check the plan is rejected
+    cleanly here: the run FAILS (nothing published, branch unchanged), never an uncaught APPLY
+    traceback.
+
+    Under ADR-0041 the map's basename is the bare subject (``ai-tech``, at ``wiki/maps/ai-tech.md``
+    — the ``-moc`` suffix was the kind marker in the FILENAME and the kind is now the DIRECTORY),
+    which makes this case STRICTER than v1's, not weaker: the illegal target is now a name a plan
+    would plausibly reach for.
     """
     repo = _init_repo(tmp_path)
     layout = repo.layout
     inbox = Inbox(layout)
 
-    # Run 1 (happy path): publish a theme so the domain MOC ``ai-tech-moc`` is materialized live.
+    # Run 1 (happy path): publish a concept so the subject map ``ai-tech`` is materialized live.
     e0 = _write_capture(inbox, text="One curator advances the branch under a lock.", second=5)
     _seed_raw(repo, e0)
     report0 = _run(
@@ -746,14 +818,14 @@ def test_merge_targeting_a_moc_is_rejected_by_validate_plan_not_crash_apply(tmp_
     assert report0.status == "published"
     # Sanity: the MOC exists in the live tree but is NOT a theme.
     with repo.worktree(at=repo.branch_commit()) as wt:
-        assert (wt / "wiki" / "ai-tech" / "ai-tech-moc.md").is_file()
-        assert not (wt / "wiki" / "ai-tech" / "themes" / "ai-tech-moc.md").exists()
+        assert (wt / "wiki" / "maps" / "ai-tech.md").is_file()
+        assert not (wt / "wiki" / "concepts" / "ai-tech.md").exists()
         # The setup publish is a real authored theme, not a placeholder one (#121) — run 2's
         # rejection has to be attributable to the MOC target, not to a half-built run 1.
-        theme = wt / "wiki" / "ai-tech" / "themes" / "curator-concurrency.md"
+        theme = wt / "wiki" / "concepts" / "curator-concurrency.md"
         assert "The single curator holds a per-repo flock." in theme.read_text(encoding="utf-8")
 
-    # Run 2: a MERGE_INTO_THEME whose target is the MOC basename — in live_basenames, NOT a theme.
+    # Run 2: a MERGE_INTO_THEME targeting the MAP basename — in live_basenames, NOT a concept.
     e1 = _write_capture(inbox, text="A claim that overlaps an existing topic.", second=10)
     _seed_raw(repo, e1)
     # Capture the curated tip AFTER seeding raw/ (which advances the branch) so the failed run's
@@ -770,7 +842,7 @@ def test_merge_targeting_a_moc_is_rejected_by_validate_plan_not_crash_apply(tmp_
                     "event_ids": [e1],
                     "op": "MERGE_INTO_THEME",
                     "domain": "ai-tech",
-                    "target_basename": "ai-tech-moc",  # a MOC, not a theme
+                    "target_basename": "ai-tech",  # a map, not a concept
                     "title": None,
                     "summary": "Overlaps the topic.",
                     "status": "active",
@@ -891,7 +963,7 @@ def test_recover_finalizes_a_published_crashed_run_without_backend(tmp_path: Pat
     # The commit the crashed run is then rewound onto is a REAL publish, prose and all (#121):
     # recovery must be shown finalizing a genuine tip, not one holding a placeholder body. The
     # owner working copy is at that tip (read-after-publish), so it is the same bytes.
-    theme = layout.wiki_dir / "ai-tech" / "themes" / "curator-concurrency.md"
+    theme = layout.wiki_dir / "concepts" / "curator-concurrency.md"
     assert "Single-writer detail." in theme.read_text(encoding="utf-8")
 
     # Simulate a crash AFTER the CAS landed but BEFORE finalize: rewind the manifest to
@@ -1025,7 +1097,7 @@ def _seed_theme_and_harvested(tmp_path: Path) -> tuple[Repo, str, str]:
     # The MERGE target is a fully-authored theme (#121). Every caller below merges a harvested
     # candidate INTO this note, so a target published with a placeholder body would leave each of
     # them asserting cursor arithmetic over a note that never held any knowledge.
-    target = repo.layout.wiki_dir / "ai-tech" / "themes" / "curator-concurrency.md"
+    target = repo.layout.wiki_dir / "concepts" / "curator-concurrency.md"
     assert "The single curator holds a per-repo flock." in target.read_text(encoding="utf-8")
 
     # Configure the connector + queue two harvested gated candidates (distinct content → c1, c2).
@@ -1123,7 +1195,7 @@ def test_phase3_exit_web_upload_becomes_a_queryable_curated_note(tmp_path: Path)
     # The exit criterion says "becomes a linked wiki NOTE", so the note has to hold the prose PASS 2
     # authored. Keyed bare, this whole chain ended on APPLY's `_summary pending_` placeholder and
     # the query hit above was the only thing anyone checked (#121).
-    theme = repo.layout.wiki_dir / "ai-tech" / "themes" / "curator-concurrency.md"
+    theme = repo.layout.wiki_dir / "concepts" / "curator-concurrency.md"
     assert "serializes every wiki write behind one flock" in theme.read_text(encoding="utf-8")
 
 
@@ -1470,7 +1542,7 @@ def test_author_failure_degrades_prose_but_run_still_publishes(
     # body_status stays pending — but the STRUCTURE is valid, so the run publishes.
     assert report.status == "published"
     with repo.worktree(at=report.published_commit) as published:  # type: ignore[arg-type]
-        theme = published / "wiki" / "ai-tech" / "themes" / "curator-concurrency.md"
+        theme = published / "wiki" / "concepts" / "curator-concurrency.md"
         fm, body = frontmatter.parse(theme.read_text(encoding="utf-8"))
         assert fm["body_status"] == "pending"
         assert "rogue" not in fm  # the out-of-region frontmatter tamper was discarded
@@ -1531,7 +1603,7 @@ def test_author_that_writes_nothing_publishes_but_reports_prose_pending(
     assert any("execvp" in w for w in report.warnings)
     assert read_manifest(manifest_path(layout, report.run_id)).prose_complete is False
     with repo.worktree(at=report.published_commit) as published:  # type: ignore[arg-type]
-        theme = published / "wiki" / "ai-tech" / "themes" / "curator-concurrency.md"
+        theme = published / "wiki" / "concepts" / "curator-concurrency.md"
         assert "_summary pending_" in theme.read_text(encoding="utf-8")
         assert lint(RepoLayout(published), taxonomy=TAXONOMY, run_date=RUN_DATE).ok
 
@@ -1553,22 +1625,22 @@ def test_unauthored_regions_grades_each_region_not_each_file() -> None:
         f"{head}\n{start_a}\nReal prose landed here.\n{end_a}\n"
         f"\n{start_b}\n> _summary pending_\n{end_b}\n"
     )
-    needs = {"wiki/d/themes/n.md": ["a", "b"]}
+    needs = {"wiki/concepts/n.md": ["a", "b"]}
 
-    pending = _unauthored_regions(needs, {"wiki/d/themes/n.md": old}, {"wiki/d/themes/n.md": new})
+    pending = _unauthored_regions(needs, {"wiki/concepts/n.md": old}, {"wiki/concepts/n.md": new})
 
-    assert pending == [("wiki/d/themes/n.md", "b")]
+    assert pending == [("wiki/concepts/n.md", "b")]
 
 
 def test_unauthored_regions_flags_an_untouched_note() -> None:
     """Byte-identical old/new (the backend never ran) is the #115 case: every region is pending."""
     start, end = body_sentinels("c1")
     text = f"---\ntitle: T\n---\n\n{start}\n_summary pending_\n{end}\n"
-    needs = {"wiki/d/themes/n.md": ["c1"]}
+    needs = {"wiki/concepts/n.md": ["c1"]}
 
-    pending = _unauthored_regions(needs, {"wiki/d/themes/n.md": text}, {"wiki/d/themes/n.md": text})
+    pending = _unauthored_regions(needs, {"wiki/concepts/n.md": text}, {"wiki/concepts/n.md": text})
 
-    assert pending == [("wiki/d/themes/n.md", "c1")]
+    assert pending == [("wiki/concepts/n.md", "c1")]
 
 
 def test_stray_wikilink_is_stripped_and_run_publishes(tmp_path: Path) -> None:
@@ -1588,7 +1660,7 @@ def test_stray_wikilink_is_stripped_and_run_publishes(tmp_path: Path) -> None:
 
     assert report.status == "published"
     with repo.worktree(at=report.published_commit) as published:  # type: ignore[arg-type]
-        theme = published / "wiki" / "ai-tech" / "themes" / "curator-concurrency.md"
+        theme = published / "wiki" / "concepts" / "curator-concurrency.md"
         text = theme.read_text(encoding="utf-8")
         assert "[[ghost]]" not in text  # delimiters stripped
         assert "See ghost for the flock detail." in text  # inner text kept
@@ -1633,20 +1705,25 @@ class _CoveringDeleteBackend(FakeBackend):
         super().author(worktree, needs_prose, context)
         (worktree / self._victim).unlink()
         stem = Path(self._victim).stem
-        for moc in (worktree / "wiki").rglob("*-moc.md"):
+        # Every MAP in the tree (schema 2: the kind is the DIRECTORY, so the `-moc` filename
+        # suffix the v1 glob keyed on is gone — `wiki/maps/**` is the whole population).
+        for map_note in (worktree / "wiki" / "maps").rglob("*.md"):
             kept = [
                 ln
-                for ln in moc.read_text(encoding="utf-8").splitlines(keepends=True)
+                for ln in map_note.read_text(encoding="utf-8").splitlines(keepends=True)
                 if stem not in ln
             ]
-            moc.write_text("".join(kept), encoding="utf-8")
+            map_note.write_text("".join(kept), encoding="utf-8")
 
 
 _VICTIM_SENTENCE = "The original, human-trusted sentence that must not change."
-_VICTIM_REL = "wiki/ai-tech/themes/victim-note.md"
+_VICTIM_REL = "wiki/concepts/victim-note.md"
 _VICTIM_TEXT = f"""---
 title: Victim note
-type: theme
+kind: concept
+type: concept
+kb: {KB_ID}
+subjects: [ai-tech]
 created: 2026-06-12
 updated: 2026-06-12
 status: active
@@ -2101,7 +2178,7 @@ def test_scratch_only_writes_do_not_break_publish(tmp_path: Path) -> None:
         assert not (published / "_agora_scratch").exists()
         # ...and the "legit prose PLUS scratch" this test names really is legit: the region the
         # backend authored is in the published body. Keyed bare, it never was (#121).
-        theme = published / "wiki" / "ai-tech" / "themes" / "curator-concurrency.md"
+        theme = published / "wiki" / "concepts" / "curator-concurrency.md"
         assert "A legitimately authored region." in theme.read_text(encoding="utf-8")
 
 
@@ -2160,13 +2237,14 @@ def test_lint_failure_reasons_carry_errors_only_not_l2_warnings(tmp_path: Path) 
     layout = repo.layout
     inbox = Inbox(layout)
 
-    themes = layout.root / "wiki" / "ai-tech" / "themes"
+    themes = layout.root / "wiki" / "concepts"
     themes.mkdir(parents=True, exist_ok=True)
     for i in range(4):
         sid = f"2026-06-13T03-00-00.000Z--legacy--c{i}"
         (themes / f"aa-legacy-{i}.md").write_text(
             "---\n"
-            f"title: Legacy {i}\ntype: theme\ndomain: ai-tech\ntags: []\naliases: []\n"
+            f"title: Legacy {i}\nkind: concept\ntype: concept\nkb: {KB_ID}\n"
+            "subjects: [ai-tech]\ntags: []\naliases: []\n"
             "created: 2026-06-12\nupdated: 2026-06-12\nstatus: stub\n"
             f"summary: A legacy note {i}.\ndescription: A legacy note {i}.\n"
             "sources: []\nrelated: []\nconfidence: high\n"
@@ -2340,7 +2418,7 @@ def test_keyed_capture_records_event_key_and_dedups_a_later_retry(tmp_path: Path
     assert report.status == "published"
     # A real publish with a real body — the dedup below is only meaningful if the FIRST delivery
     # actually became knowledge rather than a placeholder note (#121).
-    theme = layout.wiki_dir / "ai-tech" / "themes" / "curator-concurrency.md"
+    theme = layout.wiki_dir / "concepts" / "curator-concurrency.md"
     assert "One flock, one writer." in theme.read_text(encoding="utf-8")
 
     # The composite writer:event_key is persisted into state.event_keys (the blocker: this was
@@ -2414,15 +2492,19 @@ def test_held_lock_is_noop(tmp_path: Path) -> None:
 # --- (12) APPEND_DAILY needs-prose mapping (the basename + run_date contract, fix #8) -----------
 
 
-def test_append_daily_needs_prose_maps_to_the_daily_path(tmp_path: Path) -> None:
-    """``_needs_prose_map`` builds the daily sentinel entry mirroring APPLY's daily basename (§3.1).
+def test_append_daily_needs_prose_maps_to_the_journal_path(tmp_path: Path) -> None:
+    """``_needs_prose_map`` builds the journal sentinel entry at APPLY's own path (ADR-0041 D2.6).
 
     The worker's needs_prose mapping for APPEND_DAILY must resolve to the SAME
-    ``wiki/<domain>/daily/<basename>.md`` path APPLY writes — using the supplied basename, and
-    DEFAULTING to ``<domain>-<run_date>`` when omitted (mirroring apply._apply_append_daily) — so
-    PASS 2 fills the candidate-id region APPLY created (otherwise the §4.4 sentinel/lint check would
-    fail the run). Unit-level so it does not couple to the plan.run_id↔lint daily-id equality (an
-    APPLY/plan contract owned elsewhere).
+    ``wiki/notes/<yyyy>/<mm>/<run_date>.md`` path APPLY writes, so PASS 2 fills the region APPLY
+    created (otherwise the §4.4 sentinel/lint check would fail the run).
+
+    Under schema 2 the plan's ``basename`` no longer participates AT ALL: BOTH the shard and the
+    basename are composed from the injected ``run_date``, which is the inversion D2.6 exists to
+    forbid being undone. So a disposition naming ``d-x`` and one naming nothing resolve to the same
+    journal — a stray basename cannot relocate the file, it is merely rejected upstream by the
+    PLAN gate's ``basename == run_date`` assertion. Unit-level so it does not couple to the
+    plan.run_id↔lint journal-id equality (an APPLY/plan contract owned elsewhere).
     """
     from agora_kb.curator.plan import Plan
     from agora_kb.curator.worker import _disposition_note_rel_path, _needs_prose_map
@@ -2448,26 +2530,23 @@ def test_append_daily_needs_prose_maps_to_the_daily_path(tmp_path: Path) -> None
         return d
 
     with repo.worktree(at=repo.head_commit()) as wt:
-        # Explicit basename → the exact daily path.
+        # A basename the plan supplied is IGNORED by the composer: the run date owns the path.
         plan_named = Plan.model_validate(
             {"schema_version": 1, "run_id": "r", "finished": True, "dispositions": [disp("d-x")]}
         )
         rel = _disposition_note_rel_path(plan_named.dispositions[0], wt, RUN_DATE)
-        assert rel == "wiki/ai-tech/daily/d-x.md"
+        assert rel == JOURNAL_REL
 
-        # Omitted basename → defaulted to <domain>-<run_date> (mirrors apply._apply_append_daily).
+        # ...and so is an omitted one — the same journal, from the same injected fact.
         plan_default = Plan.model_validate(
             {"schema_version": 1, "run_id": "r", "finished": True, "dispositions": [disp(None)]}
         )
         d0 = plan_default.dispositions[0]
-        assert (
-            _disposition_note_rel_path(d0, wt, RUN_DATE)
-            == f"wiki/ai-tech/daily/ai-tech-{RUN_DATE}.md"
-        )
+        assert _disposition_note_rel_path(d0, wt, RUN_DATE) == JOURNAL_REL
         needs, sentinels, context = _needs_prose_map(
             plan_default, wt, RUN_DATE, {"c1": "Daily capture source facts."}
         )
-        key = f"wiki/ai-tech/daily/ai-tech-{RUN_DATE}.md"
+        key = JOURNAL_REL
         # The PERSISTED region id is run-scoped ({plan.run_id}--{candidate_id}); plan.run_id == "r".
         region_id = region_sentinel_id("r", "c1")
         assert needs == {key: [region_id]}
@@ -2587,7 +2666,7 @@ def test_recover_finalizes_via_git_ref_when_state_missing(tmp_path: Path) -> Non
     tip = report.published_commit
     assert tip is not None
     # A genuine authored publish (#121) — the git-ref recovery below is finalizing a real tip.
-    theme = layout.wiki_dir / "ai-tech" / "themes" / "curator-concurrency.md"
+    theme = layout.wiki_dir / "concepts" / "curator-concurrency.md"
     assert "One curator holds a per-repo flock." in theme.read_text(encoding="utf-8")
 
     # Simulate the §9 line "CAS succeeded but state.json wasn't recorded" row: a manifest left at
@@ -2707,7 +2786,7 @@ def test_recover_does_not_double_publish_after_crash_in_cas_success_window(
     # nothing on top of it: the prose appears EXACTLY once. Keyed bare, the body was a placeholder
     # and "no double publish" was asserted only over the ref (#121).
     with repo.worktree(at=tip) as published:
-        theme = published / "wiki" / "ai-tech" / "themes" / "curator-concurrency.md"
+        theme = published / "wiki" / "concepts" / "curator-concurrency.md"
         assert theme.read_text(encoding="utf-8").count("One curator holds a flock.") == 1
 
 
@@ -2758,7 +2837,7 @@ def test_free_text_capture_publishes_with_engine_materialized_raw_source(tmp_pat
         assert raw.is_file()
         # The raw/ artifact carries the immutable capture body (the engine wrote it from the event).
         assert raw.read_text(encoding="utf-8") == "One curator advances the branch under a lock."
-        theme = published / "wiki" / "ai-tech" / "themes" / "curator-concurrency.md"
+        theme = published / "wiki" / "concepts" / "curator-concurrency.md"
         theme_text = theme.read_text(encoding="utf-8")
         fm, _ = frontmatter.parse(theme_text)
         assert fm["sources"] == [f"raw/ai-tech/{e1}.md"]
@@ -3826,7 +3905,7 @@ def _merge_plan(run_id: str, event_id: str, target: str) -> str:
 def _published_theme_fm(repo: Repo, report: RunReport) -> dict[str, object]:
     """Parse the published `curator-concurrency` theme's frontmatter out of the published commit."""
     with repo.worktree(at=report.published_commit) as published:  # type: ignore[arg-type]
-        theme = published / "wiki" / "ai-tech" / "themes" / "curator-concurrency.md"
+        theme = published / "wiki" / "concepts" / "curator-concurrency.md"
         fm, _ = frontmatter.parse(theme.read_text(encoding="utf-8"))
     return fm
 
@@ -3852,7 +3931,7 @@ def test_body_status_cleared_when_pass2_fills_every_region(tmp_path: Path) -> No
 
     assert report.status == "published"
     with repo.worktree(at=report.published_commit) as published:  # type: ignore[arg-type]
-        theme = published / "wiki" / "ai-tech" / "themes" / "curator-concurrency.md"
+        theme = published / "wiki" / "concepts" / "curator-concurrency.md"
         fm, body = frontmatter.parse(theme.read_text(encoding="utf-8"))
         assert "body_status" not in fm
         start, end = body_sentinels(region_sentinel_id("ignored", "c1"))
@@ -3909,7 +3988,7 @@ def test_body_status_stays_when_only_some_regions_are_authored(
     assert report.status == "published", report.failure
     assert report.counts["prose_pending"] == 1  # exactly one region left unauthored (#115)
     with repo.worktree(at=report.published_commit) as published:  # type: ignore[arg-type]
-        theme = published / "wiki" / "ai-tech" / "themes" / "curator-concurrency.md"
+        theme = published / "wiki" / "concepts" / "curator-concurrency.md"
         fm, body = frontmatter.parse(theme.read_text(encoding="utf-8"))
         assert fm["body_status"] == "pending"  # the note still OWES prose — flag retained
         assert "The curator serializes every write." in body  # …while real prose is present
@@ -3992,7 +4071,7 @@ def test_body_status_survives_a_later_run_that_authors_only_its_own_region(
     assert report.status == "published"
     assert report.counts["prose_pending"] == 0  # run 2's OWN pass was a complete success…
     with repo.worktree(at=report.published_commit) as published:  # type: ignore[arg-type]
-        theme = published / "wiki" / "ai-tech" / "themes" / "curator-concurrency.md"
+        theme = published / "wiki" / "concepts" / "curator-concurrency.md"
         fm, body = frontmatter.parse(theme.read_text(encoding="utf-8"))
         assert fm["body_status"] == "pending"  # …yet the note still owes run 1's region
         assert "Corroborated by a second capture." in body
@@ -4028,7 +4107,7 @@ def test_body_status_clears_once_the_older_region_is_filled(
 
     assert report.status == "published"
     with repo.worktree(at=report.published_commit) as published:  # type: ignore[arg-type]
-        theme = published / "wiki" / "ai-tech" / "themes" / "curator-concurrency.md"
+        theme = published / "wiki" / "concepts" / "curator-concurrency.md"
         fm, body = frontmatter.parse(theme.read_text(encoding="utf-8"))
         assert "body_status" not in fm  # every region is authored now → the flag is retracted
         assert "_summary pending_" not in body
@@ -4065,7 +4144,7 @@ def test_clear_removes_exactly_the_body_status_line_and_nothing_else(
     )
 
     assert report.status == "published"
-    rel = "wiki/ai-tech/themes/curator-concurrency.md"
+    rel = "wiki/concepts/curator-concurrency.md"
     assert "body_status: pending\n" in before[rel]
     with repo.worktree(at=report.published_commit) as published:  # type: ignore[arg-type]
         after = (published / rel).read_text(encoding="utf-8")
@@ -4081,7 +4160,7 @@ def test_clear_never_writes_a_note_that_has_no_body_status(tmp_path: Path) -> No
     """
     from agora_kb.curator.worker import _clear_body_status
 
-    rel = "wiki/ai-tech/themes/no-flag.md"
+    rel = "wiki/concepts/no-flag.md"
     path = tmp_path / rel
     path.parent.mkdir(parents=True, exist_ok=True)
     text = (
@@ -4106,7 +4185,7 @@ def test_clear_is_a_noop_for_a_note_pass2_deleted(tmp_path: Path) -> None:
     clean FAILED verdict into an uncaught traceback out of run()."""
     from agora_kb.curator.worker import _clear_body_status
 
-    assert _clear_body_status(tmp_path, {"wiki/ai-tech/themes/gone.md": ["r--c1"]}) == []
+    assert _clear_body_status(tmp_path, {"wiki/concepts/gone.md": ["r--c1"]}) == []
 
 
 def test_clear_skips_a_malformed_note_instead_of_fabricating_a_fence(tmp_path: Path) -> None:
@@ -4117,7 +4196,7 @@ def test_clear_skips_a_malformed_note_instead_of_fabricating_a_fence(tmp_path: P
     """
     from agora_kb.curator.worker import _clear_body_status
 
-    rel = "wiki/ai-tech/themes/broken.md"
+    rel = "wiki/concepts/broken.md"
     path = tmp_path / rel
     path.parent.mkdir(parents=True, exist_ok=True)
     text = "no frontmatter fence at all\n<!-- agora:body:start id=r--c1 -->\np\n"
@@ -4180,7 +4259,7 @@ def test_a_rejected_pass_keeps_its_flag_even_though_prose_was_written(
 
     assert report.status == "published", report.failure
     with repo.worktree(at=report.published_commit) as published:  # type: ignore[arg-type]
-        theme = published / "wiki" / "ai-tech" / "themes" / "curator-concurrency.md"
+        theme = published / "wiki" / "concepts" / "curator-concurrency.md"
         fm, body = frontmatter.parse(theme.read_text(encoding="utf-8"))
         assert fm["body_status"] == "pending"  # the flag SURVIVED the rejected pass
         assert "rogue" not in fm  # the frontmatter tamper was discarded
@@ -4207,7 +4286,7 @@ def test_the_clear_runs_before_the_lint_that_grades_it(
     original = worker_mod.lint
 
     def lint_spy(layout, **kwargs):  # type: ignore[no-untyped-def]
-        note = layout.root / "wiki" / "ai-tech" / "themes" / "curator-concurrency.md"
+        note = layout.root / "wiki" / "concepts" / "curator-concurrency.md"
         if note.is_file():
             seen_at_lint_time.append(note.read_text(encoding="utf-8"))
         return original(layout, **kwargs)
@@ -4251,7 +4330,9 @@ _PROPERTIES_NOTE = (
 _SCHEMA_VALID_NOTE = (
     "---\n"
     "title: Hand written theme\n"
-    "type: theme\n"
+    "kind: concept\n"
+    f"kb: {KB_ID}\n"
+    "subjects: []\n"
     "aliases: []\n"
     "tags: []\n"
     "created: '2026-06-01'\n"
@@ -4266,8 +4347,8 @@ _SCHEMA_VALID_NOTE = (
 
 
 def _plant_human_note(repo: Repo, name: str, text: str) -> Path:
-    """Commit one hand-written note into `wiki/ai-tech/themes/` (the most dangerous location)."""
-    note = repo.root / "wiki" / "ai-tech" / "themes" / f"{name}.md"
+    """Commit one hand-written note into `wiki/concepts/` (the most dangerous location)."""
+    note = repo.root / "wiki" / "concepts" / f"{name}.md"
     note.parent.mkdir(parents=True, exist_ok=True)
     note.write_text(text, encoding="utf-8")
     _commit_all(repo, f"chore: a human saved {name}.md in Obsidian")
@@ -4329,7 +4410,7 @@ def test_a_hand_written_note_is_read_not_graded_and_the_run_still_publishes(
     # The human's file is BYTE-IDENTICAL — in the working copy and in the published commit.
     assert note.read_bytes() == before
     with repo.worktree(at=report.published_commit) as published:  # type: ignore[arg-type]
-        assert (published / "wiki" / "ai-tech" / "themes" / f"{name}.md").read_bytes() == before
+        assert (published / "wiki" / "concepts" / f"{name}.md").read_bytes() == before
     # Not a producer artifact: it can never be a MERGE/CONTEST target...
     assert name not in registries["theme_basenames"]
     # ...but its basename stays RESERVED, so a CREATE_THEME can never write over it.
@@ -4467,7 +4548,7 @@ def test_the_related_view_never_offers_a_hand_written_note_as_a_merge_target(
     from agora_kb.core.wiki import Wiki
 
     assert human.name.removesuffix(".md") == "human-lock-note"
-    assert "wiki/ai-tech/themes/human-lock-note.md" in {
+    assert "wiki/concepts/human-lock-note.md" in {
         h.path for h in Wiki(repo.layout).query_lexical(overlap).hits
     }
 
@@ -4482,7 +4563,7 @@ def test_the_related_view_never_offers_a_hand_written_note_as_a_merge_target(
     assert report.status == "published", report.failure
     assert backend.related, "PASS 1 was handed no related/ view — the assertion below is vacuous"
     offered = {hit["path"] for view in backend.related.values() for hit in view["hits"]}
-    assert "wiki/ai-tech/themes/human-lock-note.md" not in offered
+    assert "wiki/concepts/human-lock-note.md" not in offered
 
 
 def test_a_bom_does_not_demote_a_damaged_curator_note_to_human(tmp_path: Path) -> None:
@@ -4502,11 +4583,11 @@ def test_a_bom_does_not_demote_a_damaged_curator_note_to_human(tmp_path: Path) -
     tree = worker_mod.scan_live_tree(repo.layout)
 
     # The stamped one is a damaged PRODUCER artifact: it fails the run and names the file.
-    assert "wiki/ai-tech/themes/bom-theme.md" in tree.curator_paths
+    assert "wiki/concepts/bom-theme.md" in tree.curator_paths
     assert tree.malformed_curator is not None
     assert "bom-theme.md" in tree.malformed_curator
     # The unstamped one is still somebody's draft — a BOM does not make a human note the engine's.
-    assert "wiki/ai-tech/themes/bom-draft.md" in tree.human_paths
+    assert "wiki/concepts/bom-draft.md" in tree.human_paths
     assert damaged.read_text(encoding="utf-8").startswith("\ufeff")
     assert drafted.read_text(encoding="utf-8").startswith("\ufeff")
 
@@ -4515,8 +4596,8 @@ def test_a_bom_does_not_demote_a_damaged_curator_note_to_human(tmp_path: Path) -
 #
 # Downgrading the malformed-note gate to a classification opened a hole the strict gate had closed
 # by accident: three notes are re-opened by APPLY with an UNGUARDED `frontmatter.parse` — the root
-# `index.md` (`_update_index`), the domain MOC (`_update_moc`) and the per-domain daily
-# (`_apply_append_daily`) — and unlike a MERGE/CONTEST target none of them passes through the plan
+# `index.md` (`_update_index`), a subject MAP (`_update_map`) and the run-date JOURNAL
+# (`_apply_append_journal`) — and unlike a MERGE/CONTEST target none of them passes through the plan
 # gate first. Classified as "somebody's draft", a fenceless one of those reaches APPLY and raises
 # out of `run()`: the claimed batch is STRANDED in `_kb/processing/` while `agora status` reports
 # `failed_events: 0`, and every `agora watch` tick re-claims and re-crashes. The curator owns those
@@ -4537,8 +4618,13 @@ def _plant_at(repo: Repo, rel_path: str, text: str) -> Path:
     "rel_path",
     [
         "index.md",  # apply._update_index
-        "wiki/ai-tech/ai-tech-moc.md",  # apply._update_moc
-        "wiki/ai-tech/daily/ai-tech-2026-06-13.md",  # apply._apply_append_daily
+        "wiki/maps/ai-tech.md",  # apply._update_map
+        f"wiki/notes/2026/06/{RUN_DATE}.md",  # apply._apply_append_journal
+        # The DEPTH cases the v1 fixed-segment predicate could not see, and the reason the
+        # schema-2 predicate is kind-keyed rather than segment-counted: D1.1 lets a note sit at any
+        # depth under its kind directory, and the journal's own `<yyyy>/<mm>` shard is already one
+        # such depth. A map in a free sub-folder is APPLY's to rewrite just the same.
+        "wiki/maps/engineering/ai-tech.md",
     ],
 )
 def test_a_fenceless_structural_note_fails_the_run_cleanly_instead_of_crashing(
@@ -4575,17 +4661,17 @@ def test_a_fenceless_structural_note_fails_the_run_cleanly_instead_of_crashing(
 def test_a_hand_written_theme_is_still_only_a_draft_not_a_structural_note(tmp_path: Path) -> None:
     """The structural rule is NARROW: it must not undo #152 for the ordinary Obsidian save.
 
-    `wiki/<domain>/themes/<basename>.md` is the shape a human actually saves into, and it has a
-    gate of its own (a malformed theme never enters `theme_basenames`, so a MERGE naming it is a
-    clean PLAN rejection). Only the three ungated structural paths are reclaimed.
+    `wiki/concepts/<basename>.md` is the shape a human actually saves into, and it has a gate of
+    its own (a malformed concept never enters `theme_basenames`, so a MERGE naming it is a clean
+    PLAN rejection). Only the ungated structural kinds — `index`, `map`, `note` — are reclaimed.
     """
     repo = _init_repo(tmp_path)
     _plant_human_note(repo, "fenceless-note", _FENCELESS_NOTE)
 
-    tree = worker_mod.scan_live_tree(repo.layout)
+    tree = worker_mod.scan_live_tree(repo.layout, schema_version=2)
 
     assert tree.malformed_curator is None
-    assert "wiki/ai-tech/themes/fenceless-note.md" in tree.human_paths
+    assert "wiki/concepts/fenceless-note.md" in tree.human_paths
 
 
 def test_a_frontmatter_error_out_of_apply_is_a_failed_run_not_a_traceback(
@@ -4622,7 +4708,7 @@ def test_a_frontmatter_error_out_of_apply_is_a_failed_run_not_a_traceback(
     assert not any((d / "events").exists() for d in repo.layout.processing_dir.glob("*/"))
 
 
-def test_the_related_menu_offers_only_themes_never_the_index_or_a_moc(
+def test_the_related_menu_offers_only_concepts_never_the_index_or_a_map(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The menu and the plan gate must accept the SAME set (#152 follow-up).
@@ -4655,7 +4741,7 @@ def test_the_related_menu_offers_only_themes_never_the_index_or_a_moc(
 
     assert report.status == "published", report.failure
     mergeable = captured["mergeable_paths"]
-    assert mergeable == {"wiki/ai-tech/themes/hand-written-theme.md"}
+    assert mergeable == {"wiki/concepts/hand-written-theme.md"}
     assert "index.md" not in mergeable  # stamped, curator-owned — and NOT a legal merge target
 
 
@@ -4701,7 +4787,7 @@ class _RunIdAwareBackend(FakeBackend):
         return self._template.replace("__RUN_ID__", doc["run_id"])
 
 
-def _daily_plan(*dispositions: dict[str, object]) -> str:
+def _daily_plan(*dispositions: dict[str, object], date: str = RUN_DATE) -> str:
     """A canned APPEND_DAILY ``plan.json`` template (run id filled in by _RunIdAwareBackend)."""
     return json.dumps(
         {
@@ -4712,10 +4798,11 @@ def _daily_plan(*dispositions: dict[str, object]) -> str:
                 {
                     "op": "APPEND_DAILY",
                     "domain": "ai-tech",
-                    # §4.1 BASENAME requires it explicitly, even though APPLY would derive the same
-                    # `<domain>-<run_date>` default worker-side.
-                    "basename": f"ai-tech-{RUN_DATE}",
-                    "title": f"Daily {RUN_DATE}",
+                    # §4.1 BASENAME requires it explicitly, and ADR-0041 D2.6 additionally
+                    # requires it to BE the run date: one journal per run_date, repo-wide,
+                    # basenamed by it. PATH/ALLOWLIST rejects anything else.
+                    "basename": date,
+                    "title": f"Daily {date}",
                     "summary": "Daily consolidation.",
                     "reason": "Capture of the day.",
                     **d,
@@ -4726,9 +4813,15 @@ def _daily_plan(*dispositions: dict[str, object]) -> str:
     )
 
 
-def _published_daily(repo: Repo, report: RunReport) -> tuple[dict[str, object], str]:
+def _journal_rel_for(date: str) -> str:
+    return f"{NOTES}/{date[:4]}/{date[5:7]}/{date}.md"
+
+
+def _published_daily(
+    repo: Repo, report: RunReport, rel: str = JOURNAL_REL
+) -> tuple[dict[str, object], str]:
     with repo.worktree(at=report.published_commit) as published:  # type: ignore[arg-type]
-        daily = published / "wiki" / "ai-tech" / "daily" / f"ai-tech-{RUN_DATE}.md"
+        daily = published / rel
         return frontmatter.parse(daily.read_text(encoding="utf-8"))
 
 
@@ -4802,6 +4895,92 @@ def test_a_daily_with_no_prose_at_all_publishes_clean_and_warns(tmp_path: Path) 
 
     with repo.worktree(at=report.published_commit) as published:  # type: ignore[arg-type]
         assert lint(RepoLayout(published), taxonomy=TAXONOMY, run_date=RUN_DATE).ok
+
+
+def test_a_second_run_the_same_day_appends_to_the_journal_and_publishes(tmp_path: Path) -> None:
+    """D2.6's own re-entry case, end to end: ONE journal per run_date, TWO runs into it.
+
+    The append branch used to leave the FIRST run's ``run_id:`` in place, so the second
+    ``agora curate`` of the same day failed its own §4.4 lint gate on L1-14 (``run_id ... !=
+    injected run_id ...``) over the file it had just appended to — a note that cannot satisfy the
+    ruleset it is graded against. This is the shape ADR-0011 §4.1 check 5's ``(daily exempt)``
+    clause exists FOR, and nothing in the suite ran the second run.
+    """
+    repo = _init_repo(tmp_path)
+    inbox = Inbox(repo.layout)
+    e1 = _write_capture(inbox, text="One curator advances the branch under a lock.", second=10)
+    _seed_raw(repo, e1)
+    first = _run(
+        repo,
+        _RunIdAwareBackend(
+            _daily_plan({"candidate_id": "c1", "event_ids": [e1], "needs_prose": True}),
+            prose_by_candidate={"c1": "The morning consolidation."},
+        ),
+    )
+    assert first.status == "published", first.failure
+
+    e2 = _write_capture(inbox, text="An afternoon capture, filed the same day.", second=20)
+    _seed_raw(repo, e2)
+    second = _run(
+        repo,
+        _RunIdAwareBackend(
+            _daily_plan({"candidate_id": "c1", "event_ids": [e2], "needs_prose": True}),
+            prose_by_candidate={"c1": "The afternoon consolidation."},
+        ),
+        now=datetime(2026, 6, 13, 9, 0, 0, tzinfo=UTC),
+    )
+    assert second.status == "published", second.failure
+
+    fm, body = _published_daily(repo, second)
+    assert str(fm["date"]) == RUN_DATE
+    assert fm["run_id"] == second.run_id, "re-stamped to the LAST run that touched the journal"
+    assert "The morning consolidation." in body, "the first run's section survives"
+    assert "The afternoon consolidation." in body
+    assert fm["sources"] == [f"raw/ai-tech/{e1}.md", f"raw/ai-tech/{e2}.md"]
+
+
+def test_a_run_on_a_later_day_does_not_fail_on_yesterdays_journal(tmp_path: Path) -> None:
+    """The other half of the same defect: an EARLIER day's journal is not this run's to grade.
+
+    The curator lints its whole PRODUCER SCOPE — every path it ever stamped — so a published
+    journal stays in scope forever. Grading it against today's ``run_date``/``run_id`` made the
+    FIRST journal a repo publishes fail every subsequent run, permanently.
+    """
+    repo = _init_repo(tmp_path)
+    inbox = Inbox(repo.layout)
+    e1 = _write_capture(inbox, text="One curator advances the branch under a lock.", second=10)
+    _seed_raw(repo, e1)
+    first = _run(
+        repo,
+        _RunIdAwareBackend(
+            _daily_plan({"candidate_id": "c1", "event_ids": [e1], "needs_prose": True}),
+            prose_by_candidate={"c1": "Yesterday's consolidation."},
+        ),
+    )
+    assert first.status == "published", first.failure
+
+    next_date = "2026-06-14"
+    e2 = _write_capture(inbox, text="A capture belonging to the following day.", second=20)
+    _seed_raw(repo, e2)
+    second = _run(
+        repo,
+        _RunIdAwareBackend(
+            _daily_plan(
+                {"candidate_id": "c1", "event_ids": [e2], "needs_prose": True}, date=next_date
+            ),
+            prose_by_candidate={"c1": "Today's consolidation."},
+        ),
+        now=datetime(2026, 6, 14, 3, 0, 0, tzinfo=UTC),
+    )
+    assert second.status == "published", second.failure
+
+    with repo.worktree(at=second.published_commit) as published:  # type: ignore[arg-type]
+        assert (published / JOURNAL_REL).is_file(), (
+            "yesterday's journal is untouched, not rewritten"
+        )
+        assert (published / _journal_rel_for(next_date)).is_file()
+        yesterday, _ = frontmatter.parse((published / JOURNAL_REL).read_text(encoding="utf-8"))
+        assert yesterday["run_id"] == first.run_id, "an earlier day keeps its own run"
 
 
 def test_a_well_formed_daily_plan_emits_no_plan_shape_warning(tmp_path: Path) -> None:
@@ -4896,3 +5075,160 @@ def test_plan_shape_warning_names_every_under_specified_candidate_on_one_line() 
         )
         == []
     )
+
+
+# --- (22) ADR-0041: the kind-first layout, at the three worker seams that read it -----------------
+
+
+@pytest.mark.parametrize(
+    ("rel_path", "mergeable"),
+    [
+        ("wiki/concepts/a.md", True),
+        # D1.1: a concept in a free sub-folder is still a concept — the kind is segment 1, and
+        # nothing below it is read. The v1 four-segment path test could not express this.
+        ("wiki/concepts/engineering/team/a.md", True),
+        # The second SOURCED kind. `wiki/summaries/` ships EMPTY (OD-7 has no producer), so this
+        # row pins the ADMISSION rather than a population — the day OD-7 lands, nothing here moves.
+        ("wiki/summaries/a.md", True),
+        ("wiki/notes/2026/06/2026-06-13.md", False),  # a dated journal: navigational, not sourced
+        ("wiki/maps/ai-tech.md", False),  # navigation
+        ("wiki/entities/acme.md", False),  # registered-then-filled, not a claim to merge into
+        ("wiki/people/hando/agora.md", False),  # human-owned (D3.3) — the curator may not write it
+        ("index.md", False),  # the root map, cardinality one
+    ],
+)
+def test_only_the_sourced_kinds_are_a_merge_target(rel_path: str, mergeable: bool) -> None:
+    """`_is_mergeable_note` admits EXACTLY apply's `_MERGE_TARGET_KINDS` (ADR-0041 D2.1).
+
+    The worker-side half of the MERGE/CONTEST contract: the plan gate accepts a target only out of
+    `theme_basenames`, APPLY resolves one only out of `_MERGE_TARGET_KINDS`, and the two must grade
+    the same population or a plan the gate passes crashes APPLY (the bug #152's predecessor fixed).
+    Kind is derived from the DIRECTORY here exactly as `parse_all_notes` derives it under schema 2,
+    so a `kind:` frontmatter lie cannot widen the set — asserted directly below.
+    """
+    note = Note(
+        rel_path=rel_path,
+        basename=Path(rel_path).stem,
+        type=None,
+        kind=path_kind(rel_path),
+        schema_version=2,
+    )
+    assert worker_mod._is_mergeable_note(note) is mergeable
+
+
+def test_a_kind_frontmatter_lie_cannot_make_a_map_a_merge_target(tmp_path: Path) -> None:
+    """The DIRECTORY is authoritative (ADR-0041 D2.1) — `kind:` only mirrors it.
+
+    A brain cannot write itself a merge target by claiming `kind: concept` in a note that lives
+    under `wiki/maps/`: `parse_all_notes` derives `kind` from the path and only falls back to the
+    frontmatter when the path declares NO kind. Without this the whole "the model never picks the
+    write target" property would rest on a field the model writes.
+    """
+    repo = _init_repo(tmp_path)
+    liar = repo.root / "wiki" / "maps" / "liar.md"
+    liar.parent.mkdir(parents=True, exist_ok=True)
+    liar.write_text(
+        "---\n"
+        "title: Liar\n"
+        "kind: concept\n"  # the lie
+        f"kb: {KB_ID}\n"
+        "subjects: []\naliases: []\ntags: []\n"
+        "created: '2026-06-12'\nupdated: '2026-06-12'\n"
+        "status: active\nsummary: A map claiming to be a concept.\nchildren: []\n"
+        "sources: []\n"  # the curator STAMP, so it is graded as producer output
+        "---\n\n# Liar\n",
+        encoding="utf-8",
+    )
+    _commit_all(repo, "chore: plant a map that claims to be a concept")
+
+    tree = worker_mod.scan_live_tree(repo.layout, schema_version=2)
+    note = next(n for n in tree.notes if n.rel_path == "wiki/maps/liar.md")
+
+    assert note.kind == "map"  # the directory won
+    assert not worker_mod._is_mergeable_note(note)
+
+
+def test_a_people_note_basename_does_not_veto_a_curator_create(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ADR-0041 D3.3: people basenames are OUTSIDE the global `[[basename]]` identity space.
+
+    The failure this closes is specific and bad: `live_basenames` feeds PLAN check 5, which rejects
+    a CREATE whose basename already exists. Left in, one human file at
+    `wiki/people/hando/curator-concurrency.md` would make a `CREATE_THEME` of that basename
+    a hard PLAN failure FOREVER — a tree the curator may never write acquiring veto power over
+    curator naming, which is the exact inverse of what D3.3 grants it. So the run must publish, and
+    the human's bytes must be untouched.
+    """
+    repo = _init_repo(tmp_path)
+    person = repo.root / "wiki" / "people" / "hando" / "curator-concurrency.md"
+    person.parent.mkdir(parents=True, exist_ok=True)
+    person.write_text("# My own notes on curator concurrency\n", encoding="utf-8")
+    _commit_all(repo, "chore: a human files a note in their own namespace")
+    before = person.read_bytes()
+    registries = _registry_spy(monkeypatch)
+
+    e1 = _write_capture(Inbox(repo.layout), text="One curator advances the branch.", second=10)
+    _seed_raw(repo, e1)
+    report = _run(
+        repo,
+        FakeBackend(
+            _create_theme_plan("ignored", "c1", e1),
+            prose={region_sentinel_id("ignored", "c1"): "The single curator holds a lock."},
+        ),
+    )
+
+    # The CREATE_THEME basename collides with the people note's basename and publishes anyway.
+    assert report.status == "published", report.failure
+    assert "curator-concurrency" not in registries["live_basenames"]
+    assert person.read_bytes() == before
+    with repo.worktree(at=report.published_commit) as published:  # type: ignore[arg-type]
+        assert (published / "wiki" / "concepts" / "curator-concurrency.md").is_file()
+        assert (published / "wiki" / "people" / "hando" / "curator-concurrency.md").is_file()
+
+
+class _PeopleWritingBackend(FakeBackend):
+    """Authors its region, then writes into the human-owned `wiki/people/` tree."""
+
+    def author(
+        self,
+        worktree: Path,
+        needs_prose: dict[str, list[str]],
+        context: dict[str, AuthorRegion],
+    ) -> None:
+        super().author(worktree, needs_prose, context)
+        planted = worktree / "wiki" / "people" / "hando" / "planted.md"
+        planted.parent.mkdir(parents=True, exist_ok=True)
+        planted.write_text("# Not yours to write\n", encoding="utf-8")
+
+
+def test_a_write_under_wiki_people_fails_the_final_diff_gate(
+    tmp_path: Path, prose_pending_is_the_point: None
+) -> None:
+    """ADR-0041 D3.3/D4.1: `wiki/people/**` is CARVED OUT of the §4.0 allowlist.
+
+    `wiki/people/` sits under an allowed prefix, so before the carve-out this write would have been
+    admitted by the plain `wiki/` prefix test and published — the curator silently editing a tree
+    it is defined never to touch. The exclusion lives in the ONE allowlist constant, so the PLAN
+    check and this final-diff assertion acquired it together; this pins the diff half end-to-end.
+    """
+    repo = _init_repo(tmp_path)
+    inbox = Inbox(repo.layout)
+    e1 = _write_capture(inbox, text="One curator advances the branch under a lock.", second=10)
+    _seed_raw(repo, e1)
+    base = repo.branch_commit()
+
+    report = _run(
+        repo,
+        _PeopleWritingBackend(
+            _create_theme_plan("ignored", "c1", e1),
+            prose={region_sentinel_id("ignored", "c1"): "A legitimately authored region."},
+        ),
+    )
+
+    assert report.status == "failed"
+    assert repo.branch_commit() == base  # nothing published
+    assert report.failure is not None
+    assert any(
+        "FINAL-DIFF" in r and "wiki/people/hando/planted.md" in r for r in report.failure.reasons
+    ), report.failure.reasons

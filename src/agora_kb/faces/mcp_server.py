@@ -56,6 +56,7 @@ from typing import TYPE_CHECKING
 
 from agora_kb.config import guard_repo_schema_version, load_backend_registry, load_repo_config
 from agora_kb.core import Inbox, Repo, StateStore, Wiki, failed_event_count
+from agora_kb.core.inbox import assert_writable_repo_schema
 from agora_kb.curator.constants import DEFAULT_BODY_BYTE_BOUND
 from agora_kb.curator.subprocess_backend import (
     RoutedBackend,
@@ -871,7 +872,23 @@ class AgoraHandlers:
         for signature stability (DESIGN §5.1 ``kb_curate(target, force?)``); the worker itself
         no-ops an empty/all-deduped inbox, so a forced call over an empty inbox simply reports
         ``noop``. ``target`` defaults to ``"personal"`` (the only repo until multi-tenancy lands).
+
+        RAISES :class:`~agora_kb.config.ReadOnlySchemaVersionError` on a repo whose KB wiki schema
+        this build will not write (ADR-0041 D6) — the fourth of D6's five exhaustive write-path
+        call sites. It is a RAISE rather than a ``{"status": ...}`` dict on purpose: the
+        ``no_backend`` shape reports a repo that is fine but unconfigured, whereas this is a
+        refusal to touch the repo at all, and the FastMCP tool error carries the one remedy
+        (``agora import --from-kb``) to the calling agent verbatim. It sits BEFORE the backend
+        build so a schema-1 repo refuses identically whether or not a brain is wired — the verdict
+        is about the repo, never about ``adapters.yaml``. The server-construction guard
+        (:func:`~agora_kb.config.guard_repo_schema_version`, ``build_server``) cannot cover this:
+        with ``SUPPORTED_KB_SCHEMA_VERSIONS`` widened to ``{1, 2}`` it passes for a schema-1 repo
+        by design, so ``kb_query`` keeps working on the same server object that must refuse here.
+        The predicate is the SAME one ``Inbox.write`` applies to ``kb_remember`` on this very
+        server, imported rather than restated so the two admin/capture surfaces cannot disagree
+        about which repos are writable.
         """
+        assert_writable_repo_schema(self._repo.layout)
         cfg = load_repo_config(self._repo.layout)
         backend = self._build_backend(
             default_backend=cfg.default_backend,

@@ -171,7 +171,7 @@ run_id: <run_id>
 sources: []
 ---
 
-## <run_date>
+## <run_date> · <domain>
 
 <!-- agora:body:start id=<candidate_id> -->
 <what was consolidated this run; link into the concepts it fed, e.g. [[some-concept]].>

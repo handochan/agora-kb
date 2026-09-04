@@ -303,12 +303,24 @@ run_id: 2026-09-04T03-00-00.000Z--7f31ab
 sources: []
 ---
 
-## 2026-09-04
+## 2026-09-04 · ai-tech
 
 <!-- agora:body:start id=... -->
 … what was consolidated, linking into the concepts it fed.
 <!-- agora:body:end id=... -->
+
+## 2026-09-04 · economy
+
+<!-- agora:body:start id=... -->
+… the next contributor's section, in the same journal.
+<!-- agora:body:end id=... -->
 ```
+
+> **The journal heading NAMES ITS CONTRIBUTOR: `## <run_date> · <domain>`.** One journal per
+> `run_date` means several dispositions append to the SAME note, so a bare `## <run_date>` repeated
+> N times would be N byte-identical headings (and N ambiguous anchors) with nothing saying which
+> subject each came from. A disposition with no domain keeps the bare `## <run_date>` form. The
+> section COUNT rule is unchanged: one `## ` section per `needs_prose` disposition.
 
 > **Body links are markdown links, frontmatter links are wikilinks (ADR-0014 D3).** The body child
 > bullets use `[Title](relative.md)` (git + Obsidian + OKF native); `children:` / `related:` stay
@@ -738,7 +750,7 @@ never GRADES `wiki/people/**` (§3.9). Two tiers.
 | L1-11 | Unknown `kind`/`status`, or `kind` ≠ directory | `status ∉ {active,stub,contested,deprecated}`; `kind ∉ {concept,summary,note,map,entity,index}`; or `kind:` contradicts the note's kind DIRECTORY, which is authoritative (§2.1) |
 | L1-12 | Invalid / future date format | `created` / `updated` / `date` not `YYYY-MM-DD`, OR any of them `> run_date` (no future dates) |
 | L1-13 | Second note named `index` | only root `index.md` may have basename `index` |
-| L1-14 | Journal date / shard mismatch | `kind: note` and ANY of: basename ≠ `YYYY-MM-DD`, OR `date` ≠ basename, OR the path ≠ `wiki/notes/<yyyy>/<mm>/<basename>.md` for that date, OR `date` ≠ `run_date`, OR `run_id` ≠ the injected `run_id` |
+| L1-14 | Journal date / shard mismatch | `kind: note` and ANY of: basename ≠ `YYYY-MM-DD`, OR `date` ≠ basename, OR the path ≠ `wiki/notes/<yyyy>/<mm>/<basename>.md` for that date. The run-relative half — `date` ≠ `run_date`, OR `run_id` ≠ the injected `run_id` — applies ONLY to THIS run's own journal (the one whose date IS `run_date`); a journal from an earlier day is a finished artifact of an earlier run and is graded structurally only |
 | L1-15 | Alias / basename collision | the union of all basenames + all `aliases:` is not globally unique (§3.1); `wiki/people/**` is outside that union (§3.9) |
 | L1-16 | Bad encoding / line endings | file is not UTF-8-no-BOM with LF endings (§4.1); `wiki/people/**` exempt |
 | L1-17 | `schema_version` drift | `_kb/repo.yaml` or the schema-doc header ≠ `_meta/taxonomy.yaml: schema_version` (§5.1) |
@@ -833,10 +845,13 @@ def lint_l1(worktree: Path, taxonomy: Taxonomy, run_date: str, run_id: str,
             if n.fm.status == "contested" and not contested_shape_ok(n, run_date): # L1-10 (§3.8)
                 errors.append(MalformedContested(n.path))
         if n.kind == "note":                                                      # L1-14
-            if not (n.fm.date == n.basename == run_date
-                    and n.path == f"wiki/notes/{run_date[:4]}/{run_date[5:7]}/{n.basename}.md"
-                    and n.fm.run_id == run_id):
+            d = n.fm.date or n.basename          # the note's OWN date
+            if not (is_yyyy_mm_dd(n.basename) and n.fm.date == n.basename
+                    and n.path == f"wiki/notes/{d[:4]}/{d[5:7]}/{n.basename}.md"):
                 errors.append(JournalDateMismatch(n.path))
+            elif d == run_date:                  # run-relative half: THIS run's journal only
+                if n.fm.date != run_date or n.fm.run_id != run_id:
+                    errors.append(JournalDateMismatch(n.path))
     errors += validate_write_allowlist(diff)         # L1-9 (diff-scoped; raw/, _meta/, wiki/people/ not writable)
     errors += check_schema_version(worktree, taxonomy)          # L1-17
     errors += check_reserved_domains(taxonomy)                  # L1-23

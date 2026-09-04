@@ -636,17 +636,48 @@ def test_l1_14_date_ne_basename_fails(tmp_path: Path) -> None:
 
 
 def test_l1_14_run_relative_halves_are_gated_on_run_date(tmp_path: Path) -> None:
+    """The run-relative half fires only when the run injects its facts — on THIS run's journal."""
     layout = _valid_repo(tmp_path)
-    (layout.root / f"wiki/notes/2026/06/{RUN_DATE}.md").unlink()
+    _write(
+        layout,
+        f"wiki/notes/2026/06/{RUN_DATE}.md",
+        _note_fm(run_id="2026-06-14T09-00-00.000Z--aaaa"),
+        "## x",
+    )
+    assert _lint(layout).ok  # no run_date: structural halves only
+    assert "L1-14" in _codes(
+        _lint(layout, run_date=RUN_DATE, run_id=RUN_ID), f"wiki/notes/2026/06/{RUN_DATE}.md"
+    )
+
+
+def test_l1_14_an_earlier_days_journal_is_graded_structurally_only(tmp_path: Path) -> None:
+    """A journal from an EARLIER day is a finished artifact of an earlier run, not this run's.
+
+    The curator lints its whole PRODUCER SCOPE — every path it ever stamped, not just the paths
+    this run touched — so yesterday's journal is graded on today's run. Comparing it to today's
+    ``run_date``/``run_id`` is a guaranteed failure on a file the run never opened, which would
+    make the FIRST published journal fail every subsequent run in perpetuity. It is still graded
+    structurally (basename == ``date:`` == shard), which is what actually catches a mis-dated note.
+    """
+    layout = _valid_repo(tmp_path)
     _write(
         layout,
         "wiki/notes/2026/06/2026-06-13.md",
         _note_fm(title="Yesterday", date="2026-06-13", run_id="2026-06-13T03-00-00.000Z--aaaa"),
         "## x",
     )
-    assert _lint(layout).ok  # no run_date: structural halves only
+    result = _lint(layout, run_date=RUN_DATE, run_id=RUN_ID)
+    assert "L1-14" not in _codes(result, "wiki/notes/2026/06/2026-06-13.md")
+
+    # The structural half still bites: a `date:` that disagrees with the basename/shard fails.
+    _write(
+        layout,
+        "wiki/notes/2026/06/2026-06-12.md",
+        _note_fm(title="Mis-dated", date="2026-06-11", run_id="2026-06-12T03-00-00.000Z--bbbb"),
+        "## x",
+    )
     assert "L1-14" in _codes(
-        _lint(layout, run_date=RUN_DATE, run_id=RUN_ID), "wiki/notes/2026/06/2026-06-13.md"
+        _lint(layout, run_date=RUN_DATE, run_id=RUN_ID), "wiki/notes/2026/06/2026-06-12.md"
     )
 
 

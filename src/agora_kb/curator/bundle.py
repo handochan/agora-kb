@@ -148,9 +148,12 @@ def build_bundle(
     wiki file is written.
 
     ``mergeable_paths`` (issue #152) is the set of repo-relative note paths that MAY legally be a
-    MERGE/CONTEST target — the curator's own THEME notes, exactly what the plan gate's
-    ``theme_basenames`` accepts (a curator daily, MOC or ``index.md`` is as illegal a target as a
-    human note). ``None`` (the default) filters nothing and is byte-identical to before. When given,
+    MERGE/CONTEST target — the curator's own CONCEPT (and, when ADR-0041 OD-7's producer lands,
+    SUMMARY) notes: the two SOURCED kinds, exactly what the plan gate's ``theme_basenames`` accepts
+    (a curator journal, a map, ``index.md`` or a human-owned ``wiki/people/`` note is as illegal a
+    target as any other human note). The KIND is the DIRECTORY under KB wiki schema 2 (ADR-0041
+    D1/D2.1), so the caller derives this set from the same ``kind`` the APPLY-side resolver filters
+    on. ``None`` (the default) filters nothing and is byte-identical to before. When given,
     a ``related/`` hit outside the set is dropped from the view the planning brain reads: PASS 1 is
     told to pick ``target_basename`` out of these hits, so offering an ineligible one is handing the
     model a menu with a poisoned item — the plan gate rejects the pick, which fails the WHOLE run.

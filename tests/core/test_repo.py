@@ -57,6 +57,76 @@ def test_init_with_fixed_when_is_reproducible(tmp_path: Path) -> None:
     assert a == b
 
 
+# --- ADR-0041 D1.2: the seed root map, in the schema the caller asks for ------------------------
+
+
+def test_init_seeds_the_schema_2_root_map_when_given_an_identity(tmp_path: Path) -> None:
+    """``schema_version=2`` seeds ADR-0041 D1.2's root map, mirroring the ``_meta/kb.yaml`` id.
+
+    Three properties in one, because a root map that gets any of them wrong fails the FIRST lint
+    of the FIRST run: ``kind: index`` (the D2.1 mirror of a path the directory rule cannot name —
+    ``index.md`` lives at the ROOT, not under ``wiki/maps/``), the ``kb:`` ULID every schema-2 note
+    carries so a copied note still names its origin (D1.5), and ``children: []`` over an empty body
+    — an EMPTY root map, which is what L1-6's set equality demands of a repo with no maps yet.
+    """
+    kb_id = "01J8ZQ3M4N5P6Q7R8S9T0V1W2X"
+    r = Repo.resolve(tmp_path / "kb")
+    r.init(when=WHEN, schema_version=2, kb_id=kb_id)
+
+    seed = (r.root / "index.md").read_text(encoding="utf-8")
+    assert "kind: index" in seed
+    assert f"kb: {kb_id}" in seed
+    assert "subjects: []" in seed
+    assert "children: []" in seed
+    # `type:` survives ONLY as the OKF mirror of `kind` (D2.5 / OD-3), exactly as `description`
+    # mirrors `summary` — never as the kind authority.
+    assert "type: index" in seed
+
+
+def test_init_defaults_to_the_schema_1_seed_so_existing_callers_are_unchanged(
+    tmp_path: Path,
+) -> None:
+    """The default is 1 because ``Repo.init`` cannot MINT a ``kb_id`` (ADR-0041 D1.5).
+
+    The id is stamped once by ``agora repo init``, which writes ``_meta/kb.yaml`` and then passes
+    the id down. Defaulting this method to a version it cannot serve unaided would turn every
+    existing caller into a crash, so "seed schema 2" stays the deliberate, identity-carrying act.
+    """
+    r = Repo.resolve(tmp_path / "kb")
+    r.init(when=WHEN)
+    seed = (r.root / "index.md").read_text(encoding="utf-8")
+    assert "type: index" in seed
+    assert "kind: index" not in seed
+    assert "kb:" not in seed
+
+
+def test_init_refuses_schema_2_without_an_identity(tmp_path: Path) -> None:
+    """No ``kb_id``, no schema-2 seed: a note that names no knowledge base is what D1.5 forbids.
+
+    Refused BEFORE ``git init`` so a rejected call leaves no half-made repo behind.
+    """
+    r = Repo.resolve(tmp_path / "kb")
+    with pytest.raises(ValueError, match="kb_id"):
+        r.init(when=WHEN, schema_version=2)
+    assert not r.is_initialized()
+
+
+def test_a_re_init_never_rewrites_an_existing_root_map(tmp_path: Path) -> None:
+    """A plain re-run must never restamp the schema mirror of a repo built at the other version.
+
+    Two guards compose here and the test pins both: ``init`` returns early on an already-
+    initialized repo, and the seed itself is written only when ``index.md`` is absent. Together
+    they mean a schema-1 repo re-inited by a schema-2-default build keeps its own root map — the
+    half-migration ADR-0041 D6 refuses to perform.
+    """
+    r = Repo.resolve(tmp_path / "kb")
+    head = r.init(when=WHEN)
+    before = (r.root / "index.md").read_bytes()
+
+    assert r.init(when=WHEN, schema_version=2, kb_id="01J8ZQ3M4N5P6Q7R8S9T0V1W2X") == head
+    assert (r.root / "index.md").read_bytes() == before
+
+
 def test_kb_is_gitignored_and_content_is_tracked(repo: Repo) -> None:
     inbox_item = repo.layout.inbox_writer_dir("dochan") / "e.md"
     inbox_item.parent.mkdir(parents=True, exist_ok=True)

@@ -78,6 +78,49 @@ _SEED_INDEX = (
     "children: []\n"
     "---\n\n# Knowledge base\n"
 )
+# The KB WIKI SCHEMA 2 root map (ADR-0041 D1.2). Same OKF posture as the schema-1 seed above — it
+# is still the bundle root — plus the D2 common base: `kind` (the DIRECTORY-mirroring kind, D2.1),
+# `kb` (the `_meta/kb.yaml` ULID, D1.5) and `subjects: []`, a legal, honest empty subject list on a
+# note that genuinely has no subject (D2.2). `children: []` with an empty body is an EMPTY ROOT MAP:
+# L1-6 compares the declared set against the body child-bullet set and both are empty.
+#
+# `index.md` sits at the repo ROOT, not under `wiki/maps/`, so the directory rule cannot name it —
+# which is exactly why it carries the `kind:` mirror and why `RepoLayout.note_path_for('index', …)`
+# returns the root path. It is the root OF the map tier, not a member of it.
+#
+# `type: index` is retained as the OKF MIRROR of `kind`, not as the kind authority (D2.5 / OD-3):
+# emitted for the same reason `description` mirrors `summary`, so an OKF/Obsidian consumer that
+# keys on `type` still sees one. Nothing in Agora reads it under schema 2.
+_SEED_INDEX_V2 = (
+    "---\n"
+    "title: Index\n"
+    "kind: index\n"
+    "type: index\n"
+    "kb: {kb_id}\n"
+    "okf_version: '0.1'\n"
+    "subjects: []\n"
+    "aliases: []\n"
+    "tags: []\n"
+    "created: '{date}'\n"
+    "updated: '{date}'\n"
+    "timestamp: '{date}T00:00:00Z'\n"
+    "status: active\n"
+    "summary: Knowledge base index.\n"
+    "description: Knowledge base index.\n"
+    # `derived` + `provenance` complete the D2 common base, in D2's own key order. They are here
+    # rather than left to APPLY's first re-render because `_common_frontmatter`'s contract is that
+    # the seed and a re-rendered note read IDENTICALLY in a diff: without them the first curate run
+    # appended both keys AFTER `children`, so the bundle root was the one note whose frontmatter was
+    # not the shape D2 states — and it stayed that way silently, since lint grades `provenance:`
+    # only when present. `writers` is empty and honest (no authn plane before Phase 4); `agents` is
+    # empty because nothing has contributed to a freshly seeded index.
+    "derived: false\n"
+    "provenance:\n"
+    "  writers: []\n"
+    "  agents: []\n"
+    "children: []\n"
+    "---\n\n# Knowledge base\n"
+)
 # A full git object id: 40 hex (sha-1) or 64 hex (sha-256). Used to reject names/short-shas and,
 # crucially, the all-zero oid that `git update-ref` would interpret as a ref DELETE.
 _SHA_RE = re.compile(r"\A[0-9a-f]{40}\Z|\A[0-9a-f]{64}\Z")
@@ -245,12 +288,38 @@ class Repo:
             return False
         return self._git("rev-parse", "--verify", "HEAD", check=False).returncode == 0
 
-    def init(self, *, when: datetime | None = None) -> str:
+    def init(
+        self, *, when: datetime | None = None, schema_version: int = 1, kb_id: str | None = None
+    ) -> str:
         """Initialize a knowledge repo: ``git init`` on the curated branch, ignore ``_kb/``, and
         make the initial commit (so a curated ref + HEAD exist for worktrees and CAS). Idempotent —
-        returns the current commit if already initialized. ``when`` pins the commit's date."""
+        returns the current commit if already initialized. ``when`` pins the commit's date.
+
+        ``schema_version`` selects the KB wiki schema the seed ``index.md`` is written in: ``1`` is
+        ADR-0010's root index, ``2`` is ADR-0041 D1.2's root map. Anything ``>= 2`` REQUIRES
+        ``kb_id`` — the ``_meta/kb.yaml`` ULID every schema-2 note mirrors into ``kb:`` (D1.5) —
+        and raises :class:`ValueError` without one.
+
+        **That is why the default is 1 rather than the version this build writes.** ``Repo.init``
+        cannot MINT a ``kb_id``: D1.5 says it is stamped once at repo creation and never rewritten,
+        which makes it the init COMMAND's fact (``agora repo init`` writes ``_meta/kb.yaml`` before
+        calling this, then passes the id down). Defaulting to a version this method cannot serve
+        unaided would turn every existing caller into a crash; defaulting to 1 keeps them
+        byte-identical and makes "seed schema 2" the deliberate, identity-carrying act it is.
+
+        Both seeds are written ONLY when ``index.md`` is absent, and the whole method returns early
+        on an already-initialized repo — so a re-init can never rewrite a root map, and in
+        particular can never restamp the ``kind:``/``type:`` schema mirror of a repo built at the
+        other version.
+        """
         if self.is_initialized():
             return self.head_commit()
+        if schema_version >= 2 and not kb_id:
+            raise ValueError(
+                f"seeding a KB wiki schema {schema_version} repo requires kb_id: the "
+                f"_meta/kb.yaml ULID is minted ONCE at repo creation and every note mirrors it "
+                f"into `kb:` (ADR-0041 D1.5/D2)"
+            )
         self.root.mkdir(parents=True, exist_ok=True)
         self._git("init", "-b", self._branch)
         (self.root / ".gitignore").write_text(_GITIGNORE, encoding="utf-8")
@@ -258,7 +327,12 @@ class Repo:
         index = self.layout.index_file
         if not index.exists():
             seed_date = when_resolved.astimezone(UTC).strftime("%Y-%m-%d")
-            index.write_text(_SEED_INDEX.format(date=seed_date), encoding="utf-8")
+            seed = (
+                _SEED_INDEX_V2.format(date=seed_date, kb_id=kb_id)
+                if schema_version >= 2
+                else _SEED_INDEX.format(date=seed_date)
+            )
+            index.write_text(seed, encoding="utf-8")
         env = self._commit_env(
             name=_DEFAULT_AUTHOR_NAME, email=_DEFAULT_AUTHOR_EMAIL, when=when_resolved
         )

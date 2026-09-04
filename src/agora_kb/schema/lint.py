@@ -790,7 +790,18 @@ def _check_note_shard(note: Note, run_date: str | None, run_id: str | None) -> l
       shard is DERIVED from ``run_date`` by the path composer, never parsed out of a model-supplied
       basename, and this is the at-rest assertion of that);
     * and, when the run injects them, ``date == run_date`` and ``run_id`` matches byte-for-byte —
-      both carried over from v1 verbatim.
+      both carried over from v1 verbatim, but scoped (see below) to THIS run's own journal.
+
+    **The run-relative half grades only the journal whose own date IS the injected ``run_date``.**
+    The structural half above is a property of the note alone and is always graded; the run-relative
+    half is a property of the note *and this run*, and the curator's lint scope is every path the
+    curator ever stamped (``curator/worker.py``'s ``producer_scope``), not just the paths this run
+    touched. Grading YESTERDAY's journal against TODAY's run is therefore a guaranteed failure —
+    ``date '2026-06-13' != run_date '2026-06-14'`` — on a file the run never opened, which would
+    make the first published journal fail every subsequent run in perpetuity. Nothing is lost by
+    the scoping: a journal whose ``date:`` is wrong is already caught by the structural half (the
+    basename must equal ``date:`` and the shard must equal both), and the curator composes both from
+    the injected ``run_date``.
     """
     fm = note.frontmatter
     base = note.basename
@@ -813,7 +824,9 @@ def _check_note_shard(note: Note, run_date: str | None, run_id: str | None) -> l
         if note.rel_path != expected:
             problems.append(f"path {note.rel_path!r} != {expected!r}")
 
-    if run_date is not None:
+    # `shard_key` is the note's own date (its `date:`, else its basename). A journal from an earlier
+    # day is a legitimate, finished artifact of an earlier run, so it is graded structurally only.
+    if run_date is not None and (shard_key is None or shard_key == run_date):
         if date_value is not None and date_value != run_date:
             problems.append(f"date {date_value!r} != run_date {run_date!r}")
         if isinstance(run_id_value, str):
