@@ -1789,6 +1789,8 @@ def _ordered_fm(fm: dict[str, object]) -> dict[str, object]:
         "derived",
         "provenance",
         "sources",
+        # The #169 derived Obsidian mirror, at the position APPLY puts it (right after `sources`).
+        "source_links",
         "related",
         "children",
         "date",

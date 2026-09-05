@@ -146,6 +146,7 @@ if TYPE_CHECKING:  # the read verbs import this LAZILY at call time (DRILLDOWN-1
 
     from .config import ConnectorSpec
     from .faces.mcp_server import AgoraHandlers
+    from .schema.lint import LintResult
     from .schema.notes import Note
 
 __all__ = ["main", "build_parser"]
@@ -929,6 +930,32 @@ def _cmd_repo_missing(args: argparse.Namespace) -> int:
     return 2
 
 
+def _print_import_lint(lr: LintResult) -> None:
+    """Print the lint half of an import receipt — the ONE renderer both importers share.
+
+    Three cases, not two. ``LintResult.ok`` is ``not any(severity == "error")``, so branching on it
+    alone prints ``lint: clean`` over a report that HAS findings, and every warning-severity rule
+    goes silent on the receipt: L2-1 orphans, and — the reason this renderer exists — L1-25, whose
+    stated justification for being a warning (ADR-0041's ``source_links:`` addendum) is precisely
+    that "the notes it fires on are hand edits and VAULT IMPORTS" which need REPORTING rather than
+    rejecting. This surface is where those notes arrive, so the reporting half has to reach it.
+
+    ``clean`` is kept for the zero-finding case, because that is the word both importers' tests and
+    the operator-facing docs use for "nothing to do". A warnings-only run still says ``clean`` —
+    the repo IS publishable and no exit code changes — but it says how many, and then lists them in
+    the same shape the error case uses.
+    """
+    if not lr.findings:
+        print("lint: clean")
+        return
+    if lr.ok:
+        print(f"lint: clean ({len(lr.findings)} warning(s)):")
+    else:
+        print(f"lint: {len(lr.findings)} finding(s) still need hands:")
+    for finding in lr.findings:
+        print(f"  {finding.code} {finding.path}: {finding.message}")
+
+
 def _cmd_import(args: argparse.Namespace) -> int:
     """``agora import <src> <dest>``: normalize an external vault into a new Agora repo (ADR-0014).
 
@@ -1005,13 +1032,7 @@ def _cmd_import(args: argparse.Namespace) -> int:
             if note.unresolved_links:
                 print(f"    - unresolved links: {', '.join(note.unresolved_links)}")
 
-    lr = report.lint
-    if lr.ok:
-        print("lint: clean")
-    else:
-        print(f"lint: {len(lr.findings)} finding(s) still need hands:")
-        for finding in lr.findings:
-            print(f"  {finding.code} {finding.path}: {finding.message}")
+    _print_import_lint(report.lint)
     # SAY IT OUT LOUD, still — but the branch is now DORMANT, not dead. The importer emits schema 2
     # (ADR-0041 D6), so an imported repo is curate-able the moment it exists and needs no
     # announcement. The guard survives against the NEXT bump: the day
@@ -1104,13 +1125,7 @@ def _cmd_import_from_kb(args: argparse.Namespace, *, import_date: str) -> int:
             for warning in note.warnings:
                 print(f"    - {warning}")
 
-    lr = report.lint
-    if lr.ok:
-        print("lint: clean")
-    else:
-        print(f"lint: {len(lr.findings)} finding(s) still need hands:")
-        for finding in lr.findings:
-            print(f"  {finding.code} {finding.path}: {finding.message}")
+    _print_import_lint(report.lint)
     # The counterpart of the schema-1 note `repo init` prints: the operator has just been handed a
     # SECOND repo and needs to know which of the two their faces should now point at, and that the
     # first one is still intact (a converter that leaves any doubt about the source is a converter
