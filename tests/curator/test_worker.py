@@ -5223,3 +5223,50 @@ def test_a_write_under_wiki_people_fails_the_final_diff_gate(
     assert any(
         "FINAL-DIFF" in r and "wiki/people/hando/planted.md" in r for r in report.failure.reasons
     ), report.failure.reasons
+
+
+# --- #169 D18/D20: the derived `source_links:` mirror survives a whole run ----------------------
+
+
+def test_a_published_concept_carries_the_source_links_mirror(tmp_path: Path) -> None:
+    """A full run publishes the mirror, and every gate between APPLY and the commit admits it.
+
+    The unit tests in ``test_apply.py`` pin the bytes at each stamping site; this pins that the key
+    reaches a COMMIT. Four gates sit in between and each one could have rejected it: the §4.2
+    AUTHOR-diff (the mirror is stamped BEFORE the PASS-2 snapshot, so check 2 freezes it rather
+    than flagging it), the §4.4 lint gate over the produced tree, the §4.0 final-diff allowlist,
+    and the CAS publish. Asserting the published bytes — not the worktree — is what makes that
+    end-to-end rather than a restatement of APPLY.
+    """
+    repo = _init_repo(tmp_path)
+    inbox = Inbox(repo.layout)
+    e1 = _write_capture(inbox, text="One curator advances the branch under a lock.", second=10)
+    _seed_raw(repo, e1)
+
+    report = _run(
+        repo,
+        FakeBackend(
+            _create_theme_plan("ignored", "c1", e1),
+            prose={
+                region_sentinel_id("ignored", "c1"): "The single curator holds a per-repo flock."
+            },
+        ),
+    )
+
+    assert report.status == "published"
+    fm = _published_theme_fm(repo, report)
+    assert fm["sources"] == [f"raw/ai-tech/{e1}.md"]
+    assert fm["source_links"] == [f"[[raw/ai-tech/{e1}.md]]"]
+
+    with repo.worktree(at=report.published_commit) as published:  # type: ignore[arg-type]
+        text = (published / CONCEPTS / "curator-concurrency.md").read_text(encoding="utf-8")
+        # Adjacent, in the published bytes — a reader diffing the note sees one hunk, not two.
+        assert (
+            f"sources:\n- raw/ai-tech/{e1}.md\nsource_links:\n- '[[raw/ai-tech/{e1}.md]]'\n"
+        ) in text
+        # The mirror is DERIVED: the cited artefact it points at is in the same commit (L1-8), and
+        # the ruleset that grades the note — L1-25 included — has nothing to say about it.
+        assert (published / "raw" / "ai-tech" / f"{e1}.md").is_file()
+        result = lint(RepoLayout(published), taxonomy=TAXONOMY, run_date=RUN_DATE)
+        assert result.ok, [f"{f.code} {f.path}: {f.message}" for f in result.findings]
+        assert [f for f in result.findings if f.code == "L1-25"] == []
