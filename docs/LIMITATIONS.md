@@ -7,8 +7,8 @@
 > an issue number that was checked against the tree at commit `a8906bf` (`agora 0.1.0b1`). Where a
 > claim needed a run to prove it, the run is reproduced in §7.
 >
-> **§6a–§6c are newer than that commit** and were checked against the KB wiki schema 2 work on
-> `feat/stratum-unit2-schema2` (ADR-0041, Accepted) rather than against `a8906bf`.
+> **§6 and §6a–§6c are newer than that commit** and were checked against the KB wiki schema 2 work
+> now on `main` (`e9ba6bb`, ADR-0041 Accepted 2026-09-05) rather than against `a8906bf`.
 
 Related, and deliberately not duplicated here:
 
@@ -317,29 +317,45 @@ temporary worktree and has no network, so a read alone cannot leave the machine
 
 ---
 
-## 6. An upload's original bytes are not kept
+## 6. An upload's original bytes are kept — but nothing serves them back
 
-**What is true.** An upload is extracted to markdown and that markdown — plus a provenance header
-and a content hash — becomes the inbox capture. The original binary is not stored verbatim, and the
-re-ingest drift sidecar that would let you diff a re-extraction against the source bytes is absent
-(`docs/adr/0020-web-upload-write-path.md:69-72`). `raw/` holds the curator-materialized markdown
-source; the curator alone writes it (ADR-0002/0020).
+**What is true.** Since the schema-2 work (ADR-0041 D1.4/D4.2, Stratum wave W2.5 — commits
+`37dd56e` · `d244e5e` · `7a30124`), an upload's original bytes travel with its inbox event as a
+content-addressed attachment (`Inbox.write(..., attachments=[(filename, media_type, data)])` stages
+`_kb/inbox/<writer>/_attach/<sha256>.<ext>` *before* the event that names it), and APPLY — the
+curator's deterministic pass, never the brain — materialises them as `raw/_blob/<ab>/<sha256>.<ext>`
+plus a `<file>.meta.yaml` sidecar, immutable and git-tracked (`.gitattributes` pins
+`raw/_blob/** -text -diff -merge` so EOL translation can never move a file off its own content
+address). The derived note cites the **blob** in `sources:` beside the extracted-markdown evidence; a
+DROPped or NOOPed candidate still gets its blob (the model's judgement never discards the user's
+artefact); an identical re-upload is re-cited, never rewritten. `agora capture --file PATH` is the
+no-server way in. The bundle the brain sees carries a text summary only — a test asserts no bytes
+reach it. The extracted markdown remains the searchable body; the blob is evidence, not corpus.
 
-**A named destination is not a feature.** ADR-0041 D1.4/D4.2 gave the original bytes a home —
-`raw/_blob/<ab>/<sha256>.<ext>` plus a `<file>.meta.yaml` sidecar, content-addressed and immutable —
-and `RepoLayout.blob_dir` resolves that path. **Nothing writes it.** The transport the ADR specifies
-(an optional attachment written beside the inbox event and materialized by APPLY at claim time) does
-not exist: `Inbox.write` still takes `text: str` and an optional `raw_ref: str`, and carries no
-bytes. So the limitation below is unchanged; only its future shape is now decided.
+**When it bites.**
+1. **You cannot get the file back through Agora.** No web route serves `raw/` or `raw/_blob/`
+   (`faces/web/app.py` mounts `/static` only; `/note/raw/…` and `/api/notes/raw/…` answer 404 because
+   `Wiki.get_note` resolves `index.md` + `wiki/**` and nothing else), `kb_read` returns `not_found`
+   for a `raw/` path, and the web note page renders `sources:` as plain text, not links. The PDF is
+   in git; reaching it means the filesystem, Obsidian's file explorer, or `git show`.
+2. **One size tier, one cap.** Every attachment is stored inline in git and refused above
+   `web.upload.max_bytes` — one constant, shared by the web upload and `agora capture`. There is no
+   large-file pointer/LFS tier, so a repo that receives big originals grows its git history by
+   exactly that much.
+3. **No drift tooling.** The sidecar records the digest; nothing re-fetches a `source_url` or diffs
+   a re-extraction against the kept bytes.
+4. **Retention is unchanged.** An artefact kept forever in git history meets the unwritten
+   right-to-delete ADR-0031 head-on (#42) — §2 applies to blobs exactly as to notes.
 
-**When it bites.** You upload a PDF, delete your copy, and later want the PDF — or want to
-re-extract it with a better extractor and compare. Neither is possible from the KB.
+**What you can do now.** Upload freely — the bytes are kept and cited. To retrieve one, open the path
+the note's `sources:` names (`raw/_blob/<ab>/<sha256>.<ext>`) in the repo directly. Keep your own copy
+of anything large or sensitive until (2) and (4) are decided.
 
-**What you can do now.** Keep your originals. Agora is the memory of what a document *said*, not an
-archive of the document.
-
-**Tracking.** [#48](https://github.com/handochan/agora-kb/issues/48) — never-lossy original-asset
-preservation (curator-side binary staging); the destination and admission rule are ADR-0041 D1.4.
+**Tracking.** The read-side gap (1) is [#169](https://github.com/handochan/agora-kb/issues/169) —
+source drill-down: a web `raw/` route, linked `sources:`, `kb_read` over `raw/`, and curator-emitted
+footnote citations so Obsidian can click through. [#48](https://github.com/handochan/agora-kb/issues/48)
+keeps its remainder — the size-tier/LFS policy and the dedup-union rule, co-designed with ADR-0031
+(#42).
 
 ---
 

@@ -67,7 +67,8 @@ Goal: humans contribute and observe via the browser.
       XSS-safe) and intra-wiki links rewritten to `/note/...`. New core read helpers
       `Wiki.list_notes`/`get_note` + `AgoraHandlers.browse`/`note`; upload write-path (ADR-0020)
       extracts then `Inbox.write`s a gated capture (curator remains sole writer of `raw/`; storing the
-      original binary verbatim + its drift sidecar is a deliberate deferral). CLI `agora web` (lazy,
+      original binary verbatim + its drift sidecar was a deliberate deferral — the bytes land as
+      `raw/_blob/` since Stratum wave W2.5). CLI `agora web` (lazy,
       optional `web` extra += jinja2/python-multipart/markdown-it-py); localhost, no auth.
 - [x] Dashboard: KB health + curator status + harvester status (reads existing metadata). Shipped
       (PR #16): a read-only dashboard over `AgoraHandlers.health()`/`curator_status()`/`harvester_status()`,
@@ -112,27 +113,29 @@ below is landing on `feat/stratum-unit2-schema2`, not on `main`, and acceptance 
 | W2.3 | gold packs, the MCP face and the web face on `kind` + `subjects`; `wiki/people/**` never leaves through a pack; `browse`/`note`/`graph` payloads change shape | `853d774` |
 | W2.3 | the pre-flip golden pinned (`golden_v1*`) and the post-flip golden recorded (`golden_v2*`), discharging the ADR-0041 D5 diff obligation | `c1c3d9e`, `9a5bab6` |
 | W2.4 | `agora import <vault> <dest>` writes the schema-2 layout (`IMPORTER_SCHEMA_VERSION = 2`) and refuses a destination that is ALREADY a knowledge base — of either schema, since the importer mints `_meta/kb.yaml` and composes the root map from the vault alone, so re-importing into a live KB would re-stamp its `kb_id` and rebuild its index; pre-existing body markdown links are re-targeted at where each note actually landed; `agora import --from-kb <old-repo> <dest>` converts a repo off the old layout by the D6 rules 1-7, printing a conversion report (note/rename/merge/`raw/` counts, the renamed basenames, the merges, and everything in the source tree it did not carry over) and failing loudly with the NAMED basename collisions rather than renaming; `agora doctor` / `agora status` print a READ-ONLY line naming `--from-kb` on a schema-1 repo (and doctor's overall verdict on one is `status: unhealthy`, exit 1); the web upload turns `ReadOnlySchemaVersionError` into a per-file receipt error instead of a 500, and the dashboard health panel + `/metrics` (`agora_kb_schema_version`, `agora_kb_schema_writable`) carry the same write verdict so a read-only repo cannot show as green | this wave |
+| W2.5 | `raw/_blob` capture, end to end (`37dd56e` · `d244e5e` · `7a30124` · `b3a5853`): `Inbox.write(..., attachments=[(filename, media_type, data)])` stages the original bytes content-addressed under `_kb/inbox/<writer>/_attach/` *before* the event that names them; APPLY — never the brain — materialises `raw/_blob/<ab>/<sha256>.<ext>` + the `<file>.meta.yaml` sidecar under the bytes-mode gate, records both in `raw_writes` so the final-diff gate admits exactly them, and cites the blob (never the sidecar) in the note's `sources:`; a DROPped/NOOPed candidate still gets its blob; the web upload and `agora capture --file` attach on the same `web.upload.max_bytes` cap; an opt-in live-brain e2e sits behind the `live` marker. `raw/_pages/` stays a reserved prefix with no writer and no gate exception | this wave |
 
-**Remaining before ADR-0041 can be Accepted:**
+**ADR-0041 was Accepted on 2026-09-05** — OD-1..OD-10 ratified as recommended, OD-10 as a deliberate
+deferral; the acceptance record is the second paragraph of the ADR. **Still open after acceptance:**
 
-- **W2.5 — `raw/_blob` capture.** The destination and admission rule are decided (D1.4/D4.2) and
-  `RepoLayout.blob_dir` resolves the path, but nothing writes it: `Inbox.write` still carries no
-  bytes, so the D4.2 attachment transport is unbuilt. `raw/_pages/` stays a reserved prefix with no
-  writer and no gate exception.
 - **The two empty tiers.** `wiki/summaries/` and `wiki/entities/` ship with directories, frontmatter
   shapes and lint rules and **no producer** (OD-7 / OD-8, deliberate). `summaries/` waits on
   **ADR-0040**, which is reserved and **unauthored**.
 - **The `people/` fences ADR-0041 specifies but no code implements.** The `file:`-connector rule
   ("a repo-internal glob may cover `wiki/people/**` and nothing else") has no counterpart in
-  `harvester/connectors.py`, which guards only the gold directory; and the pull-surface control for
-  people content reaching `kb_query`/`kb_read`/`kb_neighbors` is named and left undesigned
-  (residual risk R1).
+  `harvester/connectors.py`, which guards only the gold directory (#165); and the pull-surface control
+  for people content reaching `kb_query`/`kb_read`/`kb_neighbors` is named and left undesigned
+  (residual risk R1, #166 — which ADR-0037 must answer for `role: reader` KBs before federation).
 - **The open sub-decisions.** OD-1..OD-10 are recorded in the ADR. Two are consequential to read as
   "not shipped" rather than "decided": **OD-9** (the plan wire keeps a singular `domain`; 0..n
   subjects are an APPLY-and-human capability, and widening it bumps the plan-envelope version) and
   **OD-10** (D2.2's classification leg — a producer that actually emits `subjects: []` — is not
   reachable end to end, because PLAN check 5 still rejects a domain-less op and the reference brain
-  still substitutes the ADR-0022 catch-all).
+  still substitutes the ADR-0022 catch-all — #168 tracks the three coupled changes that close it;
+  #167 tracks OD-6's cache-stem follow-up).
+- **Source drill-down.** Provenance is recorded and lint-verified, but no face can follow it: the web
+  serves no `raw/`, `kb_read` refuses `raw/` paths, `sources:` renders as plain text, and the curator
+  emits no inline citation — #169.
 
 ## 0.1.0-beta — release cutline (next; the first tagged, installable release) — epic #93
 
@@ -663,8 +666,10 @@ Gated on / co-developed with Phase-4 multi-tenancy where a source is team/shared
       alone.
 
 ### Explicitly deferred from the backlog (with evidence-triggers)
-- **Image-OCR / audio extractors** (#29) and **binary-staging on multi-upload** — defer until a concrete
-  format need + an OSS-pure engine (ADR-0005); multi-upload ships text/markdown + existing extractors first.
+- **Image-OCR / audio extractors** (#29) — defer until a concrete format need + an OSS-pure engine
+  (ADR-0005). *Binary staging on upload is no longer deferred*: since Stratum wave W2.5 every upload's
+  original bytes land as `raw/_blob/` (ADR-0041 D4.2); what #48 still owes is the size-tier/LFS policy
+  and the dedup-union rule, and serving the bytes back is #169.
 - **Intra-repo multi-writer** (#27) — defer pending an ADR **and** measured single-curator saturation on a
   real repo (sharding is by-repo only until then).
 - **Semantic/vector search** (#26) — already on the global deferred list; revisit only if FTS5 + the

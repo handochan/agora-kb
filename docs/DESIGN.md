@@ -96,8 +96,8 @@ repo's own `AGENTS.md`/`SCHEMA.md`, tool-agnostic via symlinks `CLAUDE.md`/`QWEN
   raw/                                 Layer 1: immutable sources — NEVER MOVED by schema 2
     <domain>/                          (+ sha256 sidecar for binaries); <domain> is a SHARD KEY only
                                        — no code reads a subject out of it
-    _blob/                             RESERVED: content-addressed original bytes (ADR-0041 D1.4) —
-                                       the path accessor exists; nothing writes it yet (wave W2.5)
+    _blob/                             content-addressed original bytes (ADR-0041 D1.4/D4.2) — written
+                                       by APPLY from inbox attachments since wave W2.5, never by a brain
     _pages/                            RESERVED PREFIX ONLY (ADR-0040, unauthored) — no writer, no
                                        gate exception; `_`-prefixed domain names are rejected (L1-23)
   wiki/                                the FIRST segment under wiki/ IS the note's KIND (ADR-0041 D1)
@@ -311,13 +311,13 @@ write path the MCP face uses — the web face never reads or mutates `wiki/` / g
   dispatch seam — image/OCR/audio stay deferred behind their own opt-in extra + ADR-0005 license
   vetting. The **curator remains the sole writer of `raw/`** (ADR-0002): it materializes `raw/` from
   each capture body during consolidation; the *face* never writes `raw/`. (ADR-0020.) Staging the
-  **original binary** verbatim still does not happen: ADR-0041 D1.4 gave it a *destination* —
-  `raw/_blob/<ab>/<sha256>.<ext>` plus a `<file>.meta.yaml` sidecar, content-addressed and immutable
-  — and `RepoLayout.blob_dir` resolves it, but **nothing writes it yet**. The transport the ADR
-  specifies (an optional attachment beside the inbox event, materialized by APPLY at claim time) is
-  unbuilt: `Inbox.write` still takes `text: str` and an optional `raw_ref: str`, no bytes. So a
-  reserved path is all that exists today; image/OCR extraction likewise remains a deferred
-  follow-up. Per-batch max-files / total-bytes caps shipped with the
+  **original binary** verbatim now happens (Stratum wave W2.5, ADR-0041 D1.4/D4.2): the face
+  attaches the bytes to the inbox event (`Inbox.write(..., attachments=[...])`, staged
+  content-addressed under `_kb/inbox/<writer>/_attach/` before the event that names them), and APPLY
+  materialises `raw/_blob/<ab>/<sha256>.<ext>` plus its `<file>.meta.yaml` sidecar under the
+  bytes-mode gate — the brain's bundle carries a text summary and never the bytes. The derived note
+  cites the blob in `sources:`. What is still deferred: serving the bytes back through any face
+  (#169), a size-tier/LFS policy (#48), and image/OCR extraction. Per-batch max-files / total-bytes caps shipped with the
   multi-upload surface (**ADR-0025**, Accepted); the untrusted-input hardening landed as the
   extractor-layer SSRF guard (#66) + zip decompression-bomb cap (#53) — see the ADR-0025 appendix —
   while SVG/HTML XSS stays covered at render time (markdown-it `html=False`).

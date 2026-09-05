@@ -57,8 +57,27 @@ a public issue.
 
 ## [Unreleased]
 
-Nothing since the `0.1.0b1` notes below — the work in flight is the release-gate list above, not
-new capability.
+**KB wiki schema 2 — "Stratum" (ADR-0041, Accepted 2026-09-05; PR #164, 29 commits, on `main`
+since `4291d97`).** The first change since the `v0.1.0b1` tag and, per the tag convention above, it
+ships as **`0.1.0b2`**. The wiki's two axes flip: the first directory under `wiki/` is the note's
+**kind** (`concepts/` · `summaries/` · `notes/<yyyy>/<mm>/` · `maps/` · `entities/` · `people/`) and
+the topic moves out of the path into a `subjects:` list (0..n). `raw/` does not move, so every
+`sources:` string written under schema 1 still resolves. What a user sees:
+
+- **A schema-1 repo is read-only under this build** — reads keep working, every write path refuses
+  with one message, `agora doctor` reports `status: unhealthy`; the sanctioned crossing is
+  `agora import --from-kb <old> <new>`, a conversion into a NEW repo, never in place. Known
+  limitation 12 below and [`docs/LIMITATIONS.md`](docs/LIMITATIONS.md) §6a.
+- **An upload's original bytes are now kept** (wave W2.5): they travel with the inbox event as a
+  content-addressed attachment and APPLY materialises `raw/_blob/<ab>/<sha256>.<ext>` + a sidecar;
+  `agora capture --file` is the no-server capture. Nothing serves them back yet —
+  [`docs/LIMITATIONS.md`](docs/LIMITATIONS.md) §6 and #169.
+- Korean/Unicode filenames (`core/pathsafe.py`); a human-owned `wiki/people/**` the curator can never
+  write; `kb_id` in `_meta/kb.yaml`; `agora eval` plus the ranking golden that proves the flip moved no
+  seed (`tests/rank_golden/FLIP-DIFF.md`); `?domain=` → `?subject=` on the web/graph routes (the old
+  parameter is silently ignored). Search itself is unchanged: the same deterministic BM25F.
+
+The per-wave commit table is [`docs/ROADMAP.md`](docs/ROADMAP.md) → "Stratum".
 
 ## [0.1.0b1] - unreleased
 
@@ -285,6 +304,7 @@ against the code. The normative version lives in
     which never modifies the source; there is no `agora repo upgrade` (#63/#98) and no dual-layout
     reader. Expanded in [`docs/LIMITATIONS.md`](docs/LIMITATIONS.md) §6a.
 
-<!-- No version-compare link definitions here on purpose: Keep a Changelog's footer links point at
-     git tags, and this repo has none yet (see "Release status"). They get added with the first tag,
-     not before — a link to a ref that does not resolve is worse than no link. -->
+<!-- No version-compare link definitions here yet, on purpose: Keep a Changelog's footer links point
+     at git tags. `v0.1.0b1` exists (see "Release status") but has no counterpart to compare against
+     until `v0.1.0b2` is cut; both links get added then — a link to a ref that does not resolve is
+     worse than no link. -->
