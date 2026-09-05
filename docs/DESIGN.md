@@ -468,13 +468,16 @@ External editors are read/browse tools by default. Direct edits to `wiki/` are u
 curator owns the branch; human contributions use `kb_remember`/upload, or a review-mode PR that the
 repo owner imports. This preserves the single-writer invariant.
 
-**Personal + team compose at read time, not by merging** ([ADR-0030](adr/README.md) — reserved,
-not yet authored; Phase-4-coupled).
+**Personal + team compose at read time, not by merging** (the local read profile + declaration-order
+bands = [ADR-0037](adr/0037-local-multi-kb-federation.md), Proposed; outbound team-audience *pack*
+composition = [ADR-0030](adr/README.md) — reserved, not yet authored, Phase-4-coupled).
 Connecting to a team does not spin up a second Agora or merge repos: personal and team stay separate
 git repos, each with its own single-writer curator. A client-side scope profile
-(`~/.agora/profile.yaml`, outside every repo) lists the repos the caller reads, and queries/gold packs
-are *composed* at read time — team sections plus a personal overlay — so the agent experiences one
-memory while writes never cross a tenant boundary.
+(`$AGORA_HOME/profile.yaml`, default `~/.agora/`, outside every repo) lists the repos the caller
+reads, and **queries** are *composed* at read time as declaration-order bands (ADR-0037, Proposed) —
+so the agent experiences one memory while writes never cross a tenant boundary. Outbound
+**gold-pack** composition across an audience remains ADR-0030's and is not part of the local read
+profile.
 
 **Deployment topology (V12).** Exactly **one curation home per repo** — the machine or always-on host
 that runs its curator/`watch`; every other environment (laptops, cloud sessions, CI) is a *face* that
