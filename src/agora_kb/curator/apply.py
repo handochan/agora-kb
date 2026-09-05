@@ -70,7 +70,13 @@ from agora_kb.core.inbox import (
     parse_attachments,
     read_attachment,
 )
-from agora_kb.core.layout import KIND_DIRECTORIES, RepoLayout, attachment_basename
+from agora_kb.core.layout import (
+    KIND_DIRECTORIES,
+    SIDECAR_SUFFIX,
+    RepoLayout,
+    attachment_basename,
+    blob_ref,
+)
 from agora_kb.core.models import Attachment
 from agora_kb.core.pathsafe import is_safe_component
 
@@ -380,12 +386,14 @@ def _sources_union(
         if ref is not None and ref not in seen:
             seen.add(ref)
             sources.append(ref)
-        for blob_ref in _materialize_attachments(
+        # Named ``captured_ref``, not ``blob_ref``: the composer of that name is now imported from
+        # ``core.layout`` and a loop variable would shadow it.
+        for captured_ref in _materialize_attachments(
             tup, worktree=worktree, attachments_dir=attachments_dir, raw_writes=raw_writes
         ):
-            if blob_ref not in seen:
-                seen.add(blob_ref)
-                sources.append(blob_ref)
+            if captured_ref not in seen:
+                seen.add(captured_ref)
+                sources.append(captured_ref)
     return sources
 
 
@@ -445,25 +453,13 @@ def _materialize_raw_source(
 
 
 # --- raw/_blob/: the ORIGINAL BYTES of a captured artefact (ADR-0041 D1.4 / D4.2) ---------------
-
-#: The reserved ``raw/`` prefix the content-addressed originals live under (ADR-0041 D1.4). A
-#: literal, not a token, so nothing model-supplied can ever reach this path segment.
-_BLOB_PREFIX = "raw/_blob"
-
-#: The ``.meta.yaml`` sidecar suffix. It is appended to the FULL blob filename (``<sha256>.<ext>``),
-#: never substituted for its extension — that is what keeps lint L1-8b (a pure ``endswith``
-#: sidecar test) working unmodified while ``.yaml`` stays a legal artefact extension (D1.4).
-_SIDECAR_SUFFIX = ".meta.yaml"
-
-
-def _blob_ref(record: Attachment) -> str:
-    """``raw/_blob/<ab>/<sha256>.<ext>`` for one attachment — the ONE composition of that path.
-
-    ``<ab>`` is the first two hex characters of the digest (a fan-out shard, ADR-0041 D1.4). Both
-    halves of the basename are re-validated by :func:`~agora_kb.core.layout.attachment_basename`, so
-    a record that reached here from a hand-edited spool file still cannot compose a path segment.
-    """
-    return f"{_BLOB_PREFIX}/{record.sha256[:2]}/{attachment_basename(record.sha256, record.ext)}"
+#
+# The prefix, the sidecar suffix and the ``<ab>``-sharded composer used to be private to this
+# module. They now live in :mod:`agora_kb.core.layout` (``BLOB_PREFIX`` / ``SIDECAR_SUFFIX`` /
+# :func:`~agora_kb.core.layout.blob_ref`) because the read face resolves a ``sources:`` citation
+# back to the same path (#169, DRILLDOWN-169 D2) and ``core`` may not import ``curator``. The
+# composed bytes are unchanged: ``blob_ref`` validates the basename first and slices the shard off
+# it, which is the same string this module built. ONE spelling for writer and readers.
 
 
 def _materialize_attachments(
@@ -532,8 +528,8 @@ def _materialize_one_blob(
     correct self-hash is still rejected, and content-addressing must never be offered as a reason
     to relax that (D1.4, normative).
     """
-    ref = _blob_ref(record)
-    sidecar_ref = f"{ref}{_SIDECAR_SUFFIX}"
+    ref = blob_ref(record.sha256, record.ext)
+    sidecar_ref = f"{ref}{SIDECAR_SUFFIX}"
     path = _contained(worktree, worktree / ref)
     sidecar = _contained(worktree, worktree / sidecar_ref)
 

@@ -16,7 +16,7 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
-from .pathsafe import is_safe_component
+from .pathsafe import DEFAULT_MAX_BYTES, is_safe_component, is_safe_filename_stem
 
 __all__ = [
     "RepoLayout",
@@ -33,6 +33,9 @@ __all__ = [
     "attachment_dir",
     "ATTACHMENT_DIRNAME",
     "DEFAULT_ATTACHMENT_EXT",
+    "BLOB_PREFIX",
+    "SIDECAR_SUFFIX",
+    "blob_ref",
     "KIND_DIRECTORIES",
     "WIKI_KINDS",
     "CLAIM_BEARING_KINDS",
@@ -244,6 +247,38 @@ def attachment_dir(event_dir: Path) -> Path:
     beside it without knowing which lifecycle stage it is in.
     """
     return event_dir / ATTACHMENT_DIRNAME
+
+
+# --- raw/_blob/ addressing: the ORIGINAL BYTES of a captured artefact (ADR-0041 D1.4 / D4.2) -----
+#
+# These three names came DOWN from ``curator/apply.py``, where they were private, when the read face
+# gained a ``raw/`` door (#169, DRILLDOWN-169 D2). ``core`` may not import ``curator``
+# (ADR-0001/0003), so the composer has to live below both: one spelling of the destination path for
+# the single writer that materializes it and for every reader that resolves a ``sources:`` citation
+# back to it. Two spellings would be two chances for a reader to look somewhere the writer never
+# wrote.
+
+#: The reserved ``raw/`` prefix the content-addressed originals live under (ADR-0041 D1.4). A
+#: literal, not a token, so nothing model-supplied can ever reach this path segment.
+BLOB_PREFIX = "raw/_blob"
+
+#: The ``.meta.yaml`` sidecar suffix. It is appended to the FULL blob filename (``<sha256>.<ext>``),
+#: never substituted for its extension — that is what keeps lint L1-8b (a pure ``endswith`` sidecar
+#: test) working unmodified while ``.yaml`` stays a legal artefact extension (D1.4).
+SIDECAR_SUFFIX = ".meta.yaml"
+
+
+def blob_ref(sha256: str, ext: str) -> str:
+    """``raw/_blob/<ab>/<sha256>.<ext>`` for one attachment — the ONE composition of that path.
+
+    ``<ab>`` is the first two hex characters of the digest (a fan-out shard, ADR-0041 D1.4). Both
+    halves of the basename are re-validated by :func:`attachment_basename` BEFORE the shard is
+    sliced off it, so a record that reached here from a hand-edited spool file still cannot compose
+    a path segment — and the shard is taken from the validated basename rather than from the raw
+    argument, which makes it structurally impossible for the two to disagree.
+    """
+    basename = attachment_basename(sha256, ext)
+    return f"{BLOB_PREFIX}/{basename[:2]}/{basename}"
 
 
 @dataclass(frozen=True)
@@ -536,14 +571,22 @@ class RepoLayout:
     def index_notes_path(self, repo: str | None = None) -> Path:
         """Path of the parsed-note cache ``_kb/index/<repo>.notes.json`` (ADR-0012 §2, issue #26).
 
-        ``repo`` defaults to the repo directory name (the ``SearchHit.repo`` identity). It is run
-        through :func:`safe_path_component` BEFORE the extension is appended, so an unusual repo dir
-        name can never escape ``_kb/index/`` (the same traversal guard the inbox/harvest namespaces
-        use, DESIGN §7). A name that is not a safe component raises :class:`InvalidWriterError`; the
-        read path treats that as "no cache" and falls back to a full scan (query never crashes).
+        ``repo`` defaults to the repo directory name (the ``SearchHit.repo`` identity). It is
+        checked with :func:`agora_kb.core.pathsafe.is_safe_filename_stem` BEFORE the extension is
+        appended, so an unusual repo dir name can never escape ``_kb/index/`` (DESIGN §7). A name
+        that is not a safe stem raises :class:`InvalidWriterError`; the read path treats that as
+        "no cache" and falls back to a full scan (query never crashes).
 
-        A repo directory named e.g. ``My Knowledge`` or ``내지식`` is perfectly legal on disk but is
-        NOT a safe component, so no cache file can be addressed for it (issue #108). The raise
+        The predicate is the pathsafe **union** rule, not :func:`safe_path_component` (DRILLDOWN-169
+        D17, issue #167): a derived cache filename is not a write namespace, so a non-ASCII repo
+        directory such as ``내지식`` addresses ``_kb/index/내지식.notes.json`` rather than silently
+        losing its cache, while every stem the legacy writer charset admits (``con``, ``foo-``,
+        ``foo.``) keeps the cache it has today. ``safe_path_component`` itself is untouched — it
+        remains the inbox/harvest tenant guard. The predicate never REWRITES, so the guard still
+        refuses to invent a stem for a name it rejects.
+
+        A repo directory named e.g. ``My Knowledge`` is perfectly legal on disk but is still NOT a
+        safe stem (no whitespace), so no cache file can be addressed for it (issue #108). The raise
         carries an OPERATOR-facing message — what did not happen, why, and what still works — so
         every call site (read fallbacks, ``agora index status``/``clear``, and the ``build_cache``
         write path) can surface the same explanation verbatim instead of a bare regex mismatch.
@@ -554,21 +597,30 @@ class RepoLayout:
         directory name (``repo is None``); an explicit stem is the caller's to fix.
         """
         name = repo if repo is not None else self.root.name
-        try:
-            stem = safe_path_component(name)
-        except InvalidWriterError as exc:
+        if not is_safe_filename_stem(name):
             remedy = (
                 "rename the repo directory to a safe name to enable the cache"
                 if repo is None
                 else "pass a cache stem that is a safe component to enable the cache"
             )
+            # The rule sentence states the UNION predicate, not the legacy writer charset it
+            # inherited: after D17 widened `is_safe_filename_stem`, a message naming only ASCII
+            # would tell an operator that `내지식` is unusable — the exact belief #167 exists to
+            # fix, in the one place they ever read the rule. The ASCII half keeps its POSITIONAL
+            # constraint ("starts with a letter or digit") because neither half of the union
+            # admits a leading '-': dropping the clause would promise that `-foo` is accepted
+            # when `index_notes_path('-foo')` in fact raises. Remedy clause deliberately unchanged
+            # so `cli.py` / `core/wiki.py` operator output stays recognisable.
             raise InvalidWriterError(
-                f"repo name {name!r} is not usable as a cache filename component: it must start "
-                f"with a letter or digit and contain only letters, digits, '.', '_' or '-', up to "
-                f"{_WRITER_MAX} characters. No cache file can be addressed for this repo, so "
-                f"search/query fall back to a full scan; {remedy}"
-            ) from exc
-        return self.index_cache_dir / f"{stem}.notes.json"
+                f"repo name {name!r} is not usable as a cache filename component: it must be a "
+                f"single filename component with no path separator, no leading dot and no "
+                f"whitespace. Letters, digits, '.', '_' and '-' are always accepted up to "
+                f"{_WRITER_MAX} characters when the name starts with a letter or digit, and "
+                f"other scripts up to {DEFAULT_MAX_BYTES} UTF-8 "
+                f"bytes. No cache file can be addressed for this repo, so search/query fall back "
+                f"to a full scan; {remedy}"
+            )
+        return self.index_cache_dir / f"{name}.notes.json"
 
     # --- KB wiki schema 2: note path composition (ADR-0041 D1/D1.1/D2.6) -------------------------
     def note_path_for(
