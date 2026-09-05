@@ -57,6 +57,10 @@ curator:
     max_candidates_per_run: 64    # 큐레이션 1회 처리 후보 상한 (#60) — 팀 유입량에 맞춰 조정
 
 web:
+  features:
+    raw_enabled: false            # 소스 드릴다운 킬스위치 (§2.1, #169) — 기본 true.
+                                  # false면 /raw·/api/raw 가 404이고 노트의 sources: 는 다시
+                                  # 평문이 된다. 위키는 검토된 산출물이지만 raw/ 캡처는 아니다.
   security:
     allowed_hosts:                # Host 허용목록 (§2, #94) — 명시하면 기본값을 확장이 아니라
                                   # **대체**하므로, 필요한 호스트를 빠짐없이 적는다
@@ -102,6 +106,35 @@ doctor가 표면화하지 않는 값(curator 캡 등)은 실제로 달라졌는�
 (4) **`/metrics`·`/dashboard`·`/api/dashboard` 경로 차단**(운영 내부 전용 — Prometheus
 스크레이프와 운영자 대시보드, 그리고 대시보드 패널의 JSON 쌍둥이 라우트
 `/api/dashboard/*`는 허브 로컬에서만)을 더한다.
+
+### 2.1 소스 드릴다운 킬스위치 — `web.features.raw_enabled` (#169)
+
+**위키는 검토된 산출물이지만 `raw/` 캡처는 아니다.** `GET /raw/{path}`·`GET /api/raw/{path}`와
+노트 페이지의 링크된 `sources:` 는 원본 캡처를 그대로 돌려준다 — 큐레이터의 PLAN/APPLY 채점을
+하나도 거치지 않았고 lint도 그 내용을 채점하지 않는다. 리댁션은 **비대칭**이다: `raw/` 에 텍스트를
+쓰는 다섯 생산자 중 ADR-0023 `session:` 커넥터 하나만 리댁션하고, `file:` 커넥터·웹 업로드·
+`kb_remember`·`agora capture` 는 리댁터를 통과한 적이 없다. 내보내는 쪽 리댁션도 없다.
+
+팀 허브에서 그 표면이 부담스러우면 §1 종합 예시의 `web.features.raw_enabled: false` 한 줄로 끈다
+(기본값은 `true`). 끄면 `/raw`·`/api/raw` 둘 다 **404**(`raw feature is disabled (web.features.raw_enabled)`)이고,
+노트의 `sources:` 는 다시 평문으로, 본문의 `raw/` 링크는 원문 그대로 남는다. 주의 세 가지:
+
+- **이 플래그는 웹 face만 막는다.** `kb_read` 와 `agora read` 는 그대로 모든 캡처를 돌려준다 —
+  MCP/CLI 킬스위치는 없고, MCP face를 노출하지 않는 선택만 있다(§4는 허브가 모든 키 보유자에게
+  MCP 툴 7개를 등록한다고 전제한다).
+- **이것은 킬스위치이지 접근 제어가 아니다.** 웹 face에는 인증이 전혀 없다(Phase 4 / ADR-0036).
+  위 §2의 규칙이 그대로 유효하다 — 루프백 바인드를 유지하고, **인증 reverse proxy를 반드시 앞에
+  세우고**, 프록시를 보안 경계로 취급한다. 노출 여부를 결정하는 것은 이 플래그가 아니라 프록시다.
+- **오타는 조용히 무시된다.** `web.features` 블록은 fail-loud 대상이 아니다(§1 마지막 문단) —
+  `raw_enabld: false` 는 에러 없이 기본값 `true`로 남는다. **부재 경로도 404**이므로 확인은
+  반드시 실제로 존재하는 인용으로 한다 — 노트의 `sources:` 문자열 하나(예:
+  `raw/general/foo.md`)에서 `raw/` 접두를 떼고
+  `curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8000/api/raw/general/foo.md` 가
+  켜져 있을 때 200, 끈 뒤 404가 되는지 비교한다.
+
+`raw/` 는 애초에 git 추적 대상이고 `agora sync` 가 백업 리모트로 이미 push한다. 즉 이 라우트는
+노출을 **만드는** 게 아니라 기존 git 수준 노출을 HTTP로 도달 가능하게 만든다 — 미러 리모트를 누가
+읽을 수 있는지(§4)도 같은 기준으로 함께 판단한다.
 
 ### Host 표준 — 프록시는 **원 Host를 보존**한다 (#94)
 

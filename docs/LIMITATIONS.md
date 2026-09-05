@@ -149,10 +149,12 @@ Everything else that would let you retract something is also absent:
 - The inbox is append-only ([`DESIGN.md`](DESIGN.md):104, §2.2; ADR-0002) and events are immutable:
   their lifecycle is represented by *location*, never by mutation
   ([`DATA-MODEL.md`](DATA-MODEL.md):33-37).
-- No face offers a delete. `agora --help` lists `repo · import · status · curate · requeue ·
-  harvest · index · gold · eval · sync · watch · serve · web · doctor`. The MCP face exposes
+- No face offers a delete. `agora --help` lists `repo · import · capture · status · query · read ·
+  neighbors · curate · requeue · harvest · index · gold · eval · sync · watch · serve · web ·
+  doctor`. The MCP face exposes
   `kb_remember`, `kb_query`, `kb_read`, `kb_neighbors`, `kb_context`, `kb_status`, `kb_curate`
-  (`faces/mcp_server.py:1022-1134`). The web face has no delete route.
+  (the `@mcp.tool` registrations in `faces/mcp_server.py`'s `build_server`). The web face has no
+  delete route.
 - `wiki/` is git history. Retracting a published note means rewriting that history by hand, on
   every clone and every backup remote that already has it.
 - ADR-0031 (retention and right-to-delete) is **unwritten**: there is no `docs/adr/0031-*.md`.
@@ -317,7 +319,7 @@ temporary worktree and has no network, so a read alone cannot leave the machine
 
 ---
 
-## 6. An upload's original bytes are kept — but nothing serves them back
+## 6. An upload's original bytes are kept — and now reachable, ungraded and unevenly redacted
 
 **What is true.** Since the schema-2 work (ADR-0041 D1.4/D4.2, Stratum wave W2.5 — commits
 `37dd56e` · `d244e5e` · `7a30124`), an upload's original bytes travel with its inbox event as a
@@ -332,30 +334,99 @@ artefact); an identical re-upload is re-cited, never rewritten. `agora capture -
 no-server way in. The bundle the brain sees carries a text summary only — a test asserts no bytes
 reach it. The extracted markdown remains the searchable body; the blob is evidence, not corpus.
 
+**The read side landed (#169 wave A).** A `sources:` string is now followable on every read face,
+through one shared seam (`AgoraHandlers.raw()`), so the three faces cannot describe one capture
+differently:
+
+- **Web** — `GET /raw/{path}` (a page) and `GET /api/raw/{path}` (JSON), where `{path}` is the
+  citation with its stored `raw/` prefix dropped: `sources: raw/general/psa-hca.md` →
+  `/raw/general/psa-hca.md`. A note page's `sources:` rows are now anchors — but only the ones the
+  route would actually serve; the server computes each row with the same predicate the route
+  enforces, so a link that is offered always opens and anything else stays the plain text it was.
+- **MCP** — `kb_read` takes a `sources:` string as well as a note path; the tool count is still
+  seven. A `raw/` answer is marked by a `resource: "raw"` key and carries
+  `raw_kind` (`"text"` | `"blob"`), `path`, `bytes`, and either `text` + `truncated` or `meta`.
+- **CLI** — `agora read <path>` prints the same payload (`--json` prints it verbatim, byte-identical
+  to what the MCP tool returns), alongside the two other new read verbs `agora query` and
+  `agora neighbors`.
+- **Kill switch** — `web.features.raw_enabled` (default `true`, `_kb/repo.yaml`). Off → both routes
+  404, `sources:` render as plain text again, and a body link into `raw/` is left verbatim rather
+  than pointed at a disabled route. It is a switch, not an access control: the face still has no
+  authentication of any kind (§8).
+
 **When it bites.**
-1. **You cannot get the file back through Agora.** No web route serves `raw/` or `raw/_blob/`
-   (`faces/web/app.py` mounts `/static` only; `/note/raw/…` and `/api/notes/raw/…` answer 404 because
-   `Wiki.get_note` resolves `index.md` + `wiki/**` and nothing else), `kb_read` returns `not_found`
-   for a `raw/` path, and the web note page renders `sources:` as plain text, not links. The PDF is
-   in git; reaching it means the filesystem, Obsidian's file explorer, or `git show`.
-2. **One size tier, one cap.** Every attachment is stored inline in git and refused above
+1. **What you now reach is ungraded content.** `raw/` is the capture, not the curated answer: it
+   passed none of the curator's PLAN/APPLY grading, no lint rule grades its content (L1-8 only
+   checks that a cited path *exists*), and the read faces hand it to you exactly as stored.
+   Concretely, the web page renders a text capture into an **escaped `<pre>`** and deliberately
+   *not* through the markdown renderer, so the
+   pre-flip relative links these captures carry stay inert instead of being rewritten into `/note/`
+   hrefs — plain text now is reversible, enrolling uncurated text in the site's link graph is not.
+2. **Redaction is asymmetric, and reaching `raw/` makes that visible.** Of the five producers that
+   put text into `raw/`, exactly **one** redacts: the `session:` harvest connector, which runs
+   `core/redact.py` at its connector boundary before the fact is hashed or persisted
+   (`harvester/session_connector.py`). The `file:` connector never redacts (byte-identical write
+   path, #39), and the web upload, `kb_remember` and `agora capture` never pass a redactor at all —
+   `Inbox.write` has no redaction step. The `redact` call in `harvester/harvester.py` is
+   `_redaction_preview`, reached only on the `--dry-run` branch. Nothing redacts on the way *out*
+   either, and nothing will: the redactor is one-way with no reverse map, so read-time redaction
+   would make the served bytes disagree with the digest the note cites. **Never read "`raw/` has
+   already been redacted" into anything here.**
+3. **Blob bytes never leave over MCP, by decision.** `kb_read("raw/_blob/…")` returns the sidecar's
+   capture facts (`meta`: `sha256`, `ext`, `media_type`, `bytes`, `filename`, `captured_at`,
+   `writer`, `source`, `event_id` — only the keys the sidecar actually has) and a note pointing at
+   the web face. There is no base64 channel and no `bytes: true` parameter. The download is the web
+   route, which serves every blob as `application/octet-stream` + `X-Content-Type-Options: nosniff`
+   + `Content-Disposition: attachment` + `Content-Security-Policy: default-src 'none';
+   frame-ancestors 'none'`, **never** as the `media_type` the sidecar records — that field and the
+   stored `<ext>` are both uploader-chosen, so an uploaded `.html` or `.svg` is a download, never a
+   same-origin document. A PDF or an image therefore does not preview in the browser; that is the
+   trade, taken deliberately.
+   A `*.meta.yaml` sidecar is also not addressable on its own (404 naming the artefact instead) —
+   the URL space matches the citation space, where lint L1-8b already refuses a sidecar citation.
+4. **A large text capture is truncated on read.** Both faces cap a text read at
+   `core.rawstore.MAX_RAW_TEXT_BYTES` (1 MiB) and report `truncated: true` with the artefact's true
+   on-disk `bytes`; the rest is in the repo, not in the response.
+5. **`raw/` authorship is weaker than it looks.** The curator being "the sole writer of `raw/`" is a
+   property of *one curator run* — `raw_writes` is that run's FINAL-DIFF allowlist
+   (`curator/apply.py`), not a repo-wide invariant. A human can commit into `raw/` (including
+   `raw/_blob/`) directly, and nothing detects it. Note also what the route does and does not do:
+   `raw/` is git-tracked and `agora sync` already pushes it to the backup remote, so `/raw` does not
+   *create* an exposure — it makes an existing git-level one reachable over HTTP, which matters the
+   moment the face is behind anything more than loopback.
+6. **`assets/` is still unserved.** `assets/` is a curator-writable prefix
+   (`curator/constants.py` `ALLOWLIST_DIR_PREFIXES = ("wiki/", "assets/")`) that the schema template
+   tells authors to use, but no face serves it and the body-link rewriter skips image embeds by
+   construction, so a relative `<img src>` into `assets/` renders broken. Same defect shape as this
+   section had, and explicitly out of scope for #169 — it has no issue of its own yet.
+7. **One size tier, one cap.** Every attachment is stored inline in git and refused above
    `web.upload.max_bytes` — one constant, shared by the web upload and `agora capture`. There is no
    large-file pointer/LFS tier, so a repo that receives big originals grows its git history by
    exactly that much.
-3. **No drift tooling.** The sidecar records the digest; nothing re-fetches a `source_url` or diffs
+8. **No drift tooling.** The sidecar records the digest; nothing re-fetches a `source_url` or diffs
    a re-extraction against the kept bytes.
-4. **Retention is unchanged.** An artefact kept forever in git history meets the unwritten
+9. **Retention is unchanged.** An artefact kept forever in git history meets the unwritten
    right-to-delete ADR-0031 head-on (#42) — §2 applies to blobs exactly as to notes.
 
-**What you can do now.** Upload freely — the bytes are kept and cited. To retrieve one, open the path
-the note's `sources:` names (`raw/_blob/<ab>/<sha256>.<ext>`) in the repo directly. Keep your own copy
-of anything large or sensitive until (2) and (4) are decided.
+**What you can do now.** Upload freely — the bytes are kept, cited, and now followable: click a
+`sources:` row on the note page, or run `agora read <the sources: string>`. Read (1)–(3) before you
+expose the face to anyone: a capture is evidence, not a reviewed artefact, and it is the least
+filtered content in the repo. `web.features.raw_enabled: false` turns the **web** surface off for a
+team deployment — both routes, the linked `sources:` rows, and the body-link rewrite
+([`DEPLOY-TEAM.md`](DEPLOY-TEAM.md)). It does **not** gate `kb_read` or `agora read`: there is no
+MCP/CLI kill switch, only the choice not to expose the MCP face. Keep your own copy of anything large or
+sensitive until (7) and (9) are decided.
 
-**Tracking.** The read-side gap (1) is [#169](https://github.com/handochan/agora-kb/issues/169) —
-source drill-down: a web `raw/` route, linked `sources:`, `kb_read` over `raw/`, and curator-emitted
-footnote citations so Obsidian can click through. [#48](https://github.com/handochan/agora-kb/issues/48)
-keeps its remainder — the size-tier/LFS policy and the dedup-union rule, co-designed with ADR-0031
-(#42).
+**Tracking.** The read-side gap is closed by
+[#169](https://github.com/handochan/agora-kb/issues/169) wave A — the `/raw` + `/api/raw` routes,
+linked `sources:`, the `kb_read` bridge, and the `agora query`/`read`/`neighbors` verbs. What #169
+still owes is **wave B**: a curator-*emitted* inline citation so Obsidian can click through from the
+note body (today `sources:` is a plain frontmatter list, which Obsidian does not linkify). The
+undesigned control over what these read paths may emit is ADR-0041 residual risk R1
+([#166](https://github.com/handochan/agora-kb/issues/166)); the unimplemented repo-internal `file:`
+connector fence is [#165](https://github.com/handochan/agora-kb/issues/165) (§6b).
+[#48](https://github.com/handochan/agora-kb/issues/48) keeps its remainder — the size-tier/LFS
+policy and the dedup-union rule, co-designed with ADR-0031 (#42).
 
 ---
 
@@ -465,15 +536,17 @@ is a default, not a permanent rule; lifting it needs the boundary design, not a 
 
 **The gap this does NOT close, stated rather than papered over.** The exclusion covers the **push**
 surface only. `kb_query`, `kb_read` and `kb_neighbors` will return people content to an agent on
-demand — a pull-shaped, agent-initiated read — and the control for that surface is **distinct and
-still undesigned** (ADR-0041 residual risk R1; it amends ADR-0027 §8's scope sentence rather than
-claiming the push exclusion covers it).
+demand — a pull-shaped, agent-initiated read — and since #169 wave A so will the `raw/` bridge on
+the same surface: `/raw`, `/api/raw` and `agora read` (§6). The control for that surface is
+**distinct and still undesigned** (ADR-0041 residual risk R1; it amends ADR-0027 §8's scope
+sentence rather than claiming the push exclusion covers it).
 
 **Two further fences ADR-0041 specifies are NOT implemented yet.** (a) The `file:` connector fence —
 "a connector glob on a path inside the repo may cover `wiki/people/**` and nothing else" — has no
 code: `harvester/connectors.py` guards only the gold directory (`_is_within_gold`). Until it lands,
-do not point a `file:` connector at a glob inside your own KB, or the curator's own output can be
-fed back to it as candidates. (b) `raw/_pages/` is a reserved prefix with no writer and no gate
+do not point a `file:` connector at a glob inside your own KB: the curator's own output can be fed
+back to it as candidates, and a glob that covers `wiki/people/**` carries human-owned content into
+the inbox and thence into `raw/`, where the #169 read bridge will serve it (§6). (b) `raw/_pages/` is a reserved prefix with no writer and no gate
 exception.
 
 **When it bites.** You file something personal under `wiki/people/you/` expecting it to stay out of

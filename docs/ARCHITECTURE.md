@@ -31,8 +31,14 @@ core/                 The single internal API. Everything else is a face or adap
   layout.py           pure path resolution: the ADR-0041 KIND_DIRECTORIES vocabulary, the
                       note_path_for(kind, basename, run_date) schema-2 composer, _meta/kb.yaml and
                       the reserved raw/_blob + raw/_pages accessors
+  rawstore.py         READ primitive over raw/ (#169): resolve() runs three separate gates — a
+                      textual raw/ prefix+normpath allowlist, containment against raw_dir (NOT the
+                      worktree root), and symlink refusal by IDENTITY on every component below
+                      raw/ — then classifies text | blob | sidecar; read_text is capped at
+                      MAX_RAW_TEXT_BYTES (1 MiB) and reports truncation. Creates nothing.
   pathsafe.py         the closed Unicode-CATEGORY component/slug allowlist (replaced the ASCII
-                      plan-token regex; Windows device stems rejected, NFC, 180-byte cap)
+                      plan-token regex; Windows device stems rejected, NFC, 180-byte cap) +
+                      is_safe_filename_stem, the union predicate for derived cache stems (#167)
   ids.py              event ids + the inline ULID minted once as _meta/kb.yaml kb_id (OD-1)
   repo.py             Repo/tenant model: resolve repo, git ops (commit, push, PR), layout
   state.py            curator state (_kb/state.json): counters, event keys, published runs
@@ -78,17 +84,23 @@ ingest/               INPUT adapters: uploads → markdown in raw/.
 
 faces/                The faces over core.
   mcp_server.py       FastMCP: kb_remember / kb_query / kb_read / kb_neighbors / kb_context /
-                      kb_status / kb_curate (kb_read/kb_neighbors reuse the note()/graph() read
-                      handlers, #58) + the agora://gold/{pack} resource and gold_context prompt —
-                      all three gold channels wrap the same gold_pack() handler, serving the built
-                      _kb/gold/ pack byte-identically (ADR-0027 Phase C, #40)
+                      kb_status / kb_curate (SEVEN tools — kb_read/kb_neighbors reuse the
+                      note()/graph() read handlers, #58, and kb_read also bridges a sources: string
+                      into raw/ via the shared raw() seam: resource:"raw" + raw_kind text|blob,
+                      blob BYTES never over MCP, #169 D4/D5) + the agora://gold/{pack} resource and
+                      gold_context prompt — all three gold channels wrap the same gold_pack()
+                      handler, serving the built _kb/gold/ pack byte-identically (ADR-0027 Phase C,
+                      #40)
   web/                FastAPI web face (ADR-0019): API-first JSON API (GET /api/{status,search,notes,
-                      notes/{path},graph,gold/{pack}}, POST /api/upload) + server-rendered
-                      HTMX/Jinja2 UI (browse, search, upload, knowledge graph, read-only dashboard);
-                      localhost no-auth
+                      notes/{path},raw/{path},graph,gold/{pack}}, POST /api/upload) + server-rendered
+                      HTMX/Jinja2 UI (browse, search, upload, raw capture, knowledge graph,
+                      read-only dashboard); localhost no-auth
     app.py            build_app: the JSON API + HTMX routes; markdown-it-py render (XSS-safe), upload
                       extract→inbox write path (ADR-0020 — curator stays sole raw/ writer); GET /graph
-                      + /api/graph + per-note local ego-graph (ADR-0021)
+                      + /api/graph + per-note local ego-graph (ADR-0021); GET /raw/{path} +
+                      /api/raw/{path} + server-computed linkable sources: rows, behind
+                      web.features.raw_enabled (#169) — text as escaped <pre> (never markdown), a
+                      blob as an octet-stream/nosniff/attachment FileResponse stream
     static/           vendored MIT JS (no Node/CDN): htmx.min.js, force-graph.min.js + graph.js (the
                       knowledge-graph viz, ADR-0021), app.css
     metrics.py        Prometheus /metrics exporter — cheap per-scrape operational metrics (NEVER runs
@@ -109,7 +121,7 @@ schema/               KB wiki schema emitted into each knowledge repo.
   templates/kb_schema.md      the AGENTS.md schema template — KB wiki schema 1
   templates/kb_schema_v2.md   the AGENTS.md schema template — KB wiki schema 2 (ADR-0041)
 
-cli.py                `agora` entry point: repo init · import · status · curate · harvest · index · gold · eval · sync · watch · serve · web · doctor
+cli.py                `agora` entry point: repo init · import · capture · status · query · read · neighbors · curate · requeue · harvest · index · gold · eval · sync · watch · serve · web · doctor (--agents)
 config.py             load config (adapters.yaml backends/routing + connectors, repo.yaml, triggers, harvest policy)
 ```
 

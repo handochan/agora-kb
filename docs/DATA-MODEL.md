@@ -420,7 +420,8 @@ web:                                # WIRED operator-local policy (ADR-0025; loa
               max_uncompressed_bytes: 262144000,   # zip decompression-bomb cap (#53)
               url_enabled: true }                  # operator off-switch for the url extractor (#66)
   extensions: { allowed: [.md, .txt, .pdf, .docx, .html] }  # absent ⇒ extractor's built-in set
-  features: { graph_enabled: true }
+  features: { graph_enabled: true,
+              raw_enabled: true }               # /raw + /api/raw + linked sources: kill switch (#169)
   identity: { trusted_header: X-Remote-User,   # opt-in reverse-proxy identity → web:<user> (#67)
               strip_domain: false }            # fail-loud block — these two are its ONLY accepted keys
 ```

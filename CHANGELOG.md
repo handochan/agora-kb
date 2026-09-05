@@ -70,14 +70,67 @@ the topic moves out of the path into a `subjects:` list (0..n). `raw/` does not 
   limitation 12 below and [`docs/LIMITATIONS.md`](docs/LIMITATIONS.md) §6a.
 - **An upload's original bytes are now kept** (wave W2.5): they travel with the inbox event as a
   content-addressed attachment and APPLY materialises `raw/_blob/<ab>/<sha256>.<ext>` + a sidecar;
-  `agora capture --file` is the no-server capture. Nothing serves them back yet —
-  [`docs/LIMITATIONS.md`](docs/LIMITATIONS.md) §6 and #169.
+  `agora capture --file` is the no-server capture. Following a citation back to them is the
+  drill-down below — [`docs/LIMITATIONS.md`](docs/LIMITATIONS.md) §6.
 - Korean/Unicode filenames (`core/pathsafe.py`); a human-owned `wiki/people/**` the curator can never
   write; `kb_id` in `_meta/kb.yaml`; `agora eval` plus the ranking golden that proves the flip moved no
   seed (`tests/rank_golden/FLIP-DIFF.md`); `?domain=` → `?subject=` on the web/graph routes (the old
   parameter is silently ignored). Search itself is unchanged: the same deterministic BM25F.
 
 The per-wave commit table is [`docs/ROADMAP.md`](docs/ROADMAP.md) → "Stratum".
+
+**Source drill-down — a `sources:` citation is now followable (#169 wave A, with #147 and #167).**
+Provenance was already recorded and lint-checked; nothing could follow it. Now every read face can,
+over one shared seam (`AgoraHandlers.raw()`) so the faces cannot describe a capture differently.
+
+### Added
+
+- **Web: `GET /raw/{path}` and `GET /api/raw/{path}`.** `{path}` is the citation with its stored
+  `raw/` prefix dropped (`sources: raw/general/psa-hca.md` → `/raw/general/psa-hca.md`). A text
+  capture renders into an escaped `<pre>` — deliberately *not* through the markdown renderer, so the
+  pre-flip relative links captures carry stay inert instead of being rewritten into `/note/` hrefs.
+  A blob streams as a download under a fixed header set: `Content-Type: application/octet-stream`
+  **always** (never the sidecar's uploader-supplied `media_type`), `X-Content-Type-Options:
+  nosniff`, `Content-Disposition: attachment` with the ASCII fallback
+  `filename="<sha256[:12]>.<ext>"`, plus the RFC 6266 `filename*=UTF-8''` form whenever the capture
+  recorded a filename that survives sanitisation, `Content-Security-Policy: default-src 'none'; frame-ancestors 'none'`,
+  an `ETag` derived from the content address, and a year of `immutable` caching. A `*.meta.yaml`
+  sidecar is not directly addressable (404 naming the artefact — lint L1-8b's rule).
+- **Web: a note's `sources:` rows are links.** Server-computed (`{text, href, kind}`), never decided
+  in the template: a row carries an href only when the same predicate the `/raw` route enforces says
+  the citation resolves, so an offered link always opens and a hostile string stays plain text.
+- **Web: `web.features.raw_enabled`** (default `true`), the `graph_enabled`-shaped kill switch —
+  off → both routes 404, `sources:` render plain, and a body link into `raw/` is left verbatim.
+- **MCP: `kb_read` follows `sources:` into `raw/`.** Still seven tools. A `raw/` answer is marked by
+  a `resource: "raw"` key (not `kind`, which is the closed note vocabulary) and carries `raw_kind`
+  (`"text"` | `"blob"`), `path`, `bytes`, and either `text` + `truncated` (capped at 1 MiB) or the
+  sidecar's capture facts as `meta`. **Blob bytes never leave over MCP** — no base64 channel, no
+  opt-in parameter; the download is the web route.
+- **CLI: `agora query <q>`, `agora read <path>`, `agora neighbors <path>`** — the three MCP read
+  answers from a terminal, each with `--repo`, `--json`, plus `--limit N` / `--depth N`. `--json`
+  prints the handler payload verbatim, so the CLI and the MCP tool cannot drift. `query` exits 0 on
+  no hits (an empty search is a result); `read` / `neighbors` exit 1 when the named target is
+  missing. Reads work on a schema-1 repo — they never route through the write gate.
+- **`agora doctor --agents`** (#147): an opt-in per-agent wiring table — session reader / CLI brain /
+  connector / source seen — derived from this repo's own config (connector `<agent>` tokens ∪
+  `adapters.yaml` backend names ∪ sources seen in wiki `provenance.agents`), never from a blessed
+  list of agent names. Observability only: it never moves the health verdict, and the connector
+  column counts glob matches without reading a byte of them.
+
+### Fixed
+
+- **A body link into `raw/` no longer resolves to a wiki note of the same basename** (#169 D13).
+  Body-link rewriting was basename-only, so `[…](../../raw/general/psa-hca.md)` inside
+  `wiki/concepts/psa-hca.md` rewrote to the concept **itself** — a plausible wrong answer, not a
+  404, and on the author's KB 8 of 9 `raw/` basenames collide with a wiki basename. Targets now
+  resolve against the rendering note's own path first, and a resolution landing under `raw/` becomes
+  a `/raw/…` link. Non-`raw/` rewriting is byte-identical to before.
+- **A non-ASCII repo directory gets a reader cache again** (#167). `_kb/index/<stem>.notes.json` now
+  accepts a stem under a union predicate (`core.pathsafe.is_safe_filename_stem`: the pathsafe
+  component rules **or** the legacy writer charset), so `내지식` addresses a cache instead of
+  silently falling back to a full scan, while every stem that worked before — `con`, `foo-`, `foo.`
+  — keeps its cache. No cache-schema bump; the write-namespace guards are untouched.
+- **`X-Content-Type-Options: nosniff` on every web response**, not only the new blob route.
 
 ## [0.1.0b1] - unreleased
 
@@ -303,6 +356,22 @@ against the code. The normative version lives in
     crossing is a conversion into a NEW repo — `agora import --from-kb <old-repo> <new-repo>` —
     which never modifies the source; there is no `agora repo upgrade` (#63/#98) and no dual-layout
     reader. Expanded in [`docs/LIMITATIONS.md`](docs/LIMITATIONS.md) §6a.
+13. **`raw/` captures are now reachable, and they are the least filtered content in the repo.** The
+    read faces follow a note's `sources:` down to the capture (`/raw`, `/api/raw`, `kb_read`,
+    `agora read`). That content passed none of the curator's PLAN/APPLY grading and no lint rule
+    grades it, and **redaction is asymmetric**: of the five producers that write text into `raw/`,
+    only the `session:` harvest connector redacts — the `file:` connector, the web upload,
+    `kb_remember` and `agora capture` never pass a redactor, and nothing redacts on the way out.
+    Blob bytes leave only over the web route, always as `application/octet-stream` + `nosniff` +
+    `attachment` (never the uploader-supplied `media_type`), and never over MCP. Note also that
+    "the curator is the sole writer of `raw/`" is a property of one curator run's FINAL-DIFF
+    allowlist, not a repo-wide invariant: a human can commit into `raw/` directly, and `raw/` is
+    git-tracked and pushed by `agora sync`, so the route makes an existing git-level exposure
+    HTTP-reachable rather than creating a new one. `web.features.raw_enabled: false` turns the **web**
+    surface off — the two routes, the linked `sources:` rows and the body-link rewrite. It does
+    not gate `kb_read` or `agora read` (there is no MCP/CLI kill switch, only not exposing the MCP
+    face), and it is a kill switch, not an access control (item 1 still applies). `assets/` is served
+    by nothing at all. Expanded in [`docs/LIMITATIONS.md`](docs/LIMITATIONS.md) §6.
 
 <!-- No version-compare link definitions here yet, on purpose: Keep a Changelog's footer links point
      at git tags. `v0.1.0b1` exists (see "Release status") but has no counterpart to compare against

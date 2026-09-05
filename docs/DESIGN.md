@@ -274,7 +274,7 @@ FastMCP over stdio (local) or Streamable HTTP (team). Tools:
 |---|---|---|
 | `kb_remember(text, target?, domain?, tags?, source?)` | write | append inbox item, return `{id, queued, inbox_depth}` — **non-blocking** |
 | `kb_query(question, scope?)` | read | return ordered evidence hits with path/anchor citations; optional later synthesis may use only those hits |
-| `kb_read(path)` | read | open one cited note: raw markdown body + frontmatter + outgoing link basenames; unknown/escaping path → `{error: "not_found"}` (#58, ADR-0012 rider) |
+| `kb_read(path)` | read | open one wiki note **or** one cited `raw/` artefact (a `sources:` string): a note answers with raw markdown body + frontmatter + outgoing link basenames; a raw answer is marked `resource: "raw"` + `raw_kind` (`text`\|`blob`) and a blob returns its capture facts only — bytes are never served over MCP (#169 D4/D5); unknown/escaping path → `{error: "not_found"}` (#58, ADR-0012 rider) |
 | `kb_neighbors(path, depth?)` | read | the ADR-0021 link ego-graph around a note — nodes (`id` = rel_path, feeds `kb_read`) + directed edges; `depth` server-clamped and echoed (#58) |
 | `kb_context(pack?)` | read | the ADR-0027 gold context pack — the built `_kb/gold/<pack>.md` served **byte-identically** (standing context, not retrieval); not-built → `status: "not_built"` + build guidance (#40; a `scopes` param is reserved for federation, ADR-0030) |
 | `kb_status(scope?)` | meta | `{inbox_depth, last_consolidation, processed_today, failed}` |
@@ -288,12 +288,14 @@ serves, and all are pull-only (nothing is auto-injected).
 
 ### 5.2 Web app (people)
 Implemented (Phase 3 — ADR-0019/0020). `faces/web/app.py` is a **FastAPI** face that is
-**API-first**: a first-class JSON API (`GET /api/{status,search,notes,notes/{path},graph,gold/{pack}}`,
+**API-first**: a first-class JSON API (`GET /api/{status,search,notes,notes/{path},graph,gold/{pack},raw/{path}}`,
 `POST /api/upload`) plus a thin **server-rendered HTMX + Jinja2** UI over it (`/`, `/search`,
-`/note/{path}`, `/upload`, `/graph`). Run it with `agora web` (the optional `web` extra). Localhost, no-auth
+`/note/{path}`, `/upload`, `/graph`, `/raw/{path}`). Run it with `agora web` (the optional `web` extra). Localhost, no-auth
 for now (auth is Phases 4–5). Both layers call the same core read helpers (`Wiki.list_notes` /
 `Wiki.get_note`, surfaced as `AgoraHandlers.browse` / `AgoraHandlers.note`) and the same inbox
-write path the MCP face uses — the web face never reads or mutates `wiki/` / git / `raw/` directly.
+write path the MCP face uses — the web face never mutates `wiki/` / git / `raw/`, and it never
+composes a `raw/` path itself: since #169 wave A it READS `raw/` only through `core.rawstore`'s
+validated `RawRef` (the `AgoraHandlers.raw()` seam), which is the sole door into the capture tier.
 - **Browse & search** the wiki (read path). Note bodies render via `markdown-it-py` with raw HTML
   disabled (`html=False`, XSS-safe) and intra-wiki `[Title](relative.md)` links rewritten to UI URLs.
 - **Upload** text / **one-or-many** files / URLs — drag-and-drop **multi-upload** is supported, and
@@ -316,8 +318,15 @@ write path the MCP face uses — the web face never reads or mutates `wiki/` / g
   content-addressed under `_kb/inbox/<writer>/_attach/` before the event that names them), and APPLY
   materialises `raw/_blob/<ab>/<sha256>.<ext>` plus its `<file>.meta.yaml` sidecar under the
   bytes-mode gate — the brain's bundle carries a text summary and never the bytes. The derived note
-  cites the blob in `sources:`. What is still deferred: serving the bytes back through any face
-  (#169), a size-tier/LFS policy (#48), and image/OCR extraction. Per-batch max-files / total-bytes caps shipped with the
+  cites the blob in `sources:`. **Serving them back landed with #169 wave A**: `core/rawstore.py` is
+  the read primitive (three gates — a textual `raw/` allowlist, containment against `raw_dir`, and a
+  symlink-identity refusal), `AgoraHandlers.raw()` is the one shared seam, and the faces over it are
+  `GET /raw/{path}` + `GET /api/raw/{path}` (behind `web.features.raw_enabled`, default on),
+  `kb_read` on a `sources:` string, and `agora read`. A blob's BYTES leave only through the web
+  route, always as `application/octet-stream` + `nosniff` + `attachment` and never as the sidecar's
+  uploader-supplied `media_type`; over MCP a blob returns its capture facts and no bytes at all.
+  What is still deferred: a curator-emitted inline citation in the note body (#169 wave B), a
+  size-tier/LFS policy (#48), and image/OCR extraction. Per-batch max-files / total-bytes caps shipped with the
   multi-upload surface (**ADR-0025**, Accepted); the untrusted-input hardening landed as the
   extractor-layer SSRF guard (#66) + zip decompression-bomb cap (#53) — see the ADR-0025 appendix —
   while SVG/HTML XSS stays covered at render time (markdown-it `html=False`).

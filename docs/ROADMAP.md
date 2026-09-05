@@ -132,10 +132,16 @@ deferral; the acceptance record is the second paragraph of the ADR. **Still open
   **OD-10** (D2.2's classification leg — a producer that actually emits `subjects: []` — is not
   reachable end to end, because PLAN check 5 still rejects a domain-less op and the reference brain
   still substitutes the ADR-0022 catch-all — #168 tracks the three coupled changes that close it;
-  #167 tracks OD-6's cache-stem follow-up).
-- **Source drill-down.** Provenance is recorded and lint-verified, but no face can follow it: the web
-  serves no `raw/`, `kb_read` refuses `raw/` paths, `sources:` renders as plain text, and the curator
-  emits no inline citation — #169.
+  OD-6's cache-stem follow-up, #167, is **done** — a derived `_kb/index/<stem>.notes.json` filename
+  now accepts a non-ASCII repo directory such as `내지식` via the pathsafe union predicate
+  `is_safe_filename_stem`, with no cache-schema bump and no name the old rule admitted lost).
+- **Source drill-down — read side landed, write side open (#169).** Wave A shipped: the web serves
+  `GET /raw/{path}` + `GET /api/raw/{path}` behind `web.features.raw_enabled` (default on), `kb_read`
+  follows a `sources:` string into `raw/` (blob bytes stay off MCP — the sidecar's facts only), a
+  note page's `sources:` rows are server-computed anchors, and `agora query`/`read`/`neighbors` give
+  the same three answers from a terminal. What remains is **wave B**: the curator emits no inline
+  citation, so a note body still carries no clickable link to its evidence in Obsidian. #167
+  (non-ASCII cache stems) and #147 (`agora doctor --agents`) landed alongside it.
 
 ## 0.1.0-beta — release cutline (next; the first tagged, installable release) — epic #93
 
@@ -408,6 +414,17 @@ Stated as user-facing risk, not as a feature backlog. Every line is a thing that
   asks, and the control for that pull surface is named and undesigned (ADR-0041 R1). The
   repo-internal `file:`-connector fence the same ADR specifies is also unimplemented
   ([`LIMITATIONS.md`](LIMITATIONS.md) §6b).
+- **`raw/` captures are reachable, ungraded, and unevenly redacted** — since #169 wave A the read
+  faces follow a note's `sources:` down to the capture (`/raw`, `/api/raw`, `kb_read`, `agora read`).
+  That content passed none of the curator's grading and no lint rule, and of the five producers that
+  write text into `raw/` exactly one redacts (the `session:` harvest connector); the `file:`
+  connector, the web upload, `kb_remember` and `agora capture` never pass a redactor, and nothing
+  redacts on the way out. Blob bytes are served by the web route only, always as
+  `application/octet-stream` + `nosniff` + `attachment` (never the uploader's `media_type`), and
+  never over MCP. `web.features.raw_enabled: false` turns the **web** surface off (both routes,
+  linked `sources:`, the body-link rewrite) — it does not gate `kb_read` or `agora read`, and it is
+  a kill switch, not an access control. Nothing serves `assets/` at all
+  ([`LIMITATIONS.md`](LIMITATIONS.md) §6).
 - **Embeddings / semantic search** — deliberately absent; deterministic BM25F ranking is the contract
   (ADR-0009/0012). ADR-0032 is reserved and evidence-triggered, not planned for beta.
 - **Cloud brains** — the default brain is a local Ollama model and an OSS path is mandatory
@@ -668,8 +685,10 @@ Gated on / co-developed with Phase-4 multi-tenancy where a source is team/shared
 ### Explicitly deferred from the backlog (with evidence-triggers)
 - **Image-OCR / audio extractors** (#29) — defer until a concrete format need + an OSS-pure engine
   (ADR-0005). *Binary staging on upload is no longer deferred*: since Stratum wave W2.5 every upload's
-  original bytes land as `raw/_blob/` (ADR-0041 D4.2); what #48 still owes is the size-tier/LFS policy
-  and the dedup-union rule, and serving the bytes back is #169.
+  original bytes land as `raw/_blob/` (ADR-0041 D4.2), and since #169 wave A the read faces serve
+  them back (`GET /raw/{path}`, `GET /api/raw/{path}`, `kb_read` on a `sources:` string —
+  blob bytes over the web route only, never over MCP); what #48 still owes is the size-tier/LFS
+  policy and the dedup-union rule.
 - **Intra-repo multi-writer** (#27) — defer pending an ADR **and** measured single-curator saturation on a
   real repo (sharding is by-repo only until then).
 - **Semantic/vector search** (#26) — already on the global deferred list; revisit only if FTS5 + the
