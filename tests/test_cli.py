@@ -8,7 +8,9 @@ not on PATH.
 
 from __future__ import annotations
 
+import builtins
 import hashlib
+import io
 import json
 import os
 import re
@@ -5254,6 +5256,298 @@ def test_doctor_reports_the_session_connector_format(
     assert "file:demo (scope=personal)" in out  # unchanged: no format column on a file: connector
 
 
+# --- doctor --agents (issue #147 second half / DRILLDOWN-169 D16) ---------------------------------
+
+
+def _agents_repo(tmp_path: Path) -> tuple[Path, Path, Path]:
+    """A repo declaring connectors ``file:alpha`` + ``session:beta`` and ONE backend ``gamma``.
+
+    Returns ``(repo, alpha_source, beta_source)``. The backend's ``argv[0]`` is this interpreter, so
+    the CLI BRAIN probe is a deterministic "on PATH" on any host with no daemon and no network — the
+    seeded ``qwen`` backend is REPLACED rather than added, which is also what makes the derived row
+    set (`alpha`, `beta`, `gamma`) exactly the set this repo's own config names.
+    """
+    target = tmp_path / "kb"
+    assert main(["repo", "init", str(target), "--kind", "personal", "--domain", "general"]) == 0
+    alpha = tmp_path / "alpha" / "MEMORY.md"
+    alpha.parent.mkdir(parents=True, exist_ok=True)
+    alpha.write_text("# m\n\n- alpha fact\n", encoding="utf-8")
+    beta = tmp_path / "beta" / "s.jsonl"
+    beta.parent.mkdir(parents=True, exist_ok=True)
+    beta.write_text("{}\n", encoding="utf-8")
+
+    ap = target / "adapters.yaml"
+    a = yaml.safe_load(ap.read_text(encoding="utf-8"))
+    a["backends"] = {"gamma": {"argv": [sys.executable, "-c", "pass"], "prompt": "stdin"}}
+    a["default_backend"] = "gamma"
+    a["connectors"] = {
+        "file:alpha": {"path": str(alpha), "scope": "personal"},
+        "session:beta": {"path": str(beta), "scope": "personal"},
+    }
+    ap.write_text(yaml.safe_dump(a, sort_keys=False), encoding="utf-8")
+    return target, alpha, beta
+
+
+def _agents_block(out: str) -> str:
+    """Slice doctor's ``agents:`` section out of a report (header line → footnote, inclusive)."""
+    lines = out.splitlines()
+    start = next(i for i, ln in enumerate(lines) if ln.startswith("  agents:"))
+    end = next(i for i, ln in enumerate(lines) if ln.startswith("    memory path:"))
+    assert start < end
+    return "\n".join(lines[start : end + 1])
+
+
+def _agent_rows(block: str) -> list[str]:
+    """The data rows of the ``agents:`` table (everything after the header, minus the footnote)."""
+    lines = block.splitlines()
+    header = next(i for i, ln in enumerate(lines) if ln.strip().startswith("AGENT"))
+    return [ln for ln in lines[header + 1 :] if not ln.startswith("    memory path:")]
+
+
+def _agent_row(block: str, agent: str) -> str:
+    """The one row whose AGENT cell is ``agent``."""
+    return next(ln for ln in _agent_rows(block) if ln.split()[0] == agent)
+
+
+@requires_git
+def test_doctor_agents_rows_come_from_config_not_a_name_list(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """D16 / invariant 6: the rows are DERIVED, never a blessed set of agent names.
+
+    This is the test that stops a hard-coded table being quietly reintroduced — the exact defect
+    #147 was raised about (`core/models.py`'s `FIXED_SOURCES` documents itself as backward
+    compatibility only). A repo that names `alpha`, `beta` and `gamma` gets those three rows and
+    nothing else: no `claude-code`, no `codex`, no `copilot`, no `aelix`.
+    """
+    target, _, _ = _agents_repo(tmp_path)
+    capsys.readouterr()
+    main(["doctor", "--repo", str(target), "--agents", "--skip-probe"])
+    block = _agents_block(capsys.readouterr().out)
+
+    names = [ln.split()[0] for ln in _agent_rows(block)]
+    assert names == ["alpha", "beta", "gamma"]
+    for blessed in ("claude-code", "codex", "copilot", "aelix", "hermes", "gemini"):
+        assert blessed not in names
+    # Nothing in the section mentions them at all either — the one `claude-code` substring the
+    # table can legitimately print is the DECLARED session grammar `claude-code-jsonl`, which is a
+    # parser name read out of this repo's config, not an agent this build believes in.
+    for absent in ("codex", "copilot", "aelix", "hermes", "gemini"):
+        assert absent not in block
+
+
+@requires_git
+def test_doctor_agents_declared_vs_probed_cells(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Every cell reads ``<declared> / <probed>``, and the three probes stay distinguishable.
+
+    The SESSION READER probe is tagged ``(registry)`` on purpose (D16): it is a lookup in
+    `SESSION_READERS`, not a live parse, and one "probed" column that blurred a registry hit, a
+    PATH probe and a filesystem count would make a tautology look like verification.
+    """
+    target, _, _ = _agents_repo(tmp_path)
+    capsys.readouterr()
+    main(["doctor", "--repo", str(target), "--agents"])
+    block = _agents_block(capsys.readouterr().out)
+
+    # SESSION READER: the DEFAULT grammar an undeclared `format:` resolves to, plus a registry hit.
+    assert "claude-code-jsonl / ok (registry)" in _agent_row(block, "beta")
+    # CLI BRAIN: argv[0] answered by the same `_probe_program` the brains block uses.
+    assert f"{sys.executable} / on PATH" in _agent_row(block, "gamma")
+    # CONNECTOR: the declared keys, and a count that came from a glob walk (never a read).
+    assert "file:alpha / 1 file" in _agent_row(block, "alpha")
+    assert "session:beta / 1 file" in _agent_row(block, "beta")
+    # SOURCE SEEN: a repo with no provenance at all says so — `never seen` would read as a wiring
+    # defect when the truth is that nothing has ever declared anything.
+    for agent in ("alpha", "beta", "gamma"):
+        assert "n/a (no provenance data)" in _agent_row(block, agent)
+
+
+@requires_git
+def test_doctor_agents_undeclared_is_not_none(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An absent declaration prints ``undeclared``, never ``none`` (DRILLDOWN-169 §8.1).
+
+    "This build was told nothing" and "there is nothing" are different facts, and only one of them
+    is a finding. `alpha` is a `file:` connector with no session grammar and no backend, so two of
+    its columns have nothing declared at all.
+    """
+    target, _, _ = _agents_repo(tmp_path)
+    capsys.readouterr()
+    main(["doctor", "--repo", str(target), "--agents"])
+    row = _agent_row(_agents_block(capsys.readouterr().out), "alpha")
+
+    assert row.count("undeclared / n/a") == 2  # SESSION READER + CLI BRAIN
+    assert "none" not in row
+
+
+@requires_git
+def test_doctor_agents_counts_the_sources_seen_in_wiki_provenance(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Union arm (c): an agent that only ever appears in `provenance.agents` still gets a row.
+
+    The count is REUSED from the single tolerant parse doctor already does for its `notes:` line
+    (D16) — the table never re-scans `wiki/`.
+    """
+    target, _, _ = _agents_repo(tmp_path)
+    note = target / "wiki" / "concepts" / "seen.md"
+    note.parent.mkdir(parents=True, exist_ok=True)
+    note.write_text(
+        "---\ntype: concept\nsubjects: [general]\nprovenance:\n  agents: [delta]\n---\n\n# Seen\n",
+        encoding="utf-8",
+    )
+    capsys.readouterr()
+    main(["doctor", "--repo", str(target), "--agents", "--skip-probe"])
+    block = _agents_block(capsys.readouterr().out)
+
+    assert [ln.split()[0] for ln in _agent_rows(block)] == ["alpha", "beta", "delta", "gamma"]
+    assert "1 note" in _agent_row(block, "delta")
+    assert "not seen" in _agent_row(block, "alpha")
+
+
+@requires_git
+def test_doctor_agents_never_moves_the_verdict(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Observation only: `--agents` can change what is PRINTED, never `status:` or the exit code.
+
+    Same contract as every other `_doctor_*` block (`_doctor_connectors`, `_doctor_notes`, …).
+    """
+    target, _, _ = _agents_repo(tmp_path)
+    capsys.readouterr()
+    rc_plain = main(["doctor", "--repo", str(target), "--skip-probe"])
+    plain = capsys.readouterr().out
+    rc_agents = main(["doctor", "--repo", str(target), "--agents", "--skip-probe"])
+    agents = capsys.readouterr().out
+
+    assert rc_plain == rc_agents
+    assert plain.rsplit("status: ", 1)[-1] == agents.rsplit("status: ", 1)[-1]
+
+
+@requires_git
+def test_doctor_agents_survives_malformed_adapters_yaml(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A malformed `adapters.yaml` costs the table its two config columns, never a traceback."""
+    target, _, _ = _agents_repo(tmp_path)
+    (target / "adapters.yaml").write_text('a: "unterminated', encoding="utf-8")
+    capsys.readouterr()
+    rc = main(["doctor", "--repo", str(target), "--agents", "--skip-probe"])
+    out = capsys.readouterr().out
+    block = _agents_block(out)
+
+    assert "unreadable" in block
+    assert "Traceback" not in out
+    assert "status: " in out
+    assert rc in (0, 1)
+
+
+@requires_git
+def test_doctor_agents_probe_reads_no_file_content(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The CONNECTOR count is a glob WALK: it stats matches and opens none of them (D16).
+
+    `agora doctor` is a diagnostic. The harvester's own resolver (`_resolve_glob_files`) reads and
+    decodes every match, so a table that reused it would open the operator's memory files and
+    transcripts just to print a number — a worse trade than the number is worth. Both halves are
+    pinned here: the reading resolver is replaced by a bomb, and every `open()` in the process is
+    recorded so the source files can be proven untouched while the count is still right.
+    """
+    from agora_kb.harvester import connectors as connectors_mod
+
+    target, alpha, beta = _agents_repo(tmp_path)
+
+    def _bomb(*args: object, **kwargs: object) -> None:
+        raise AssertionError("doctor must never call the READING glob resolver")
+
+    monkeypatch.setattr(connectors_mod, "_resolve_glob_files", _bomb)
+
+    opened: list[str] = []
+    real_open = io.open
+
+    def spy(file, *args, **kwargs):  # type: ignore[no-untyped-def]
+        try:
+            opened.append(os.fspath(file))
+        except TypeError:  # an already-open fd
+            pass
+        return real_open(file, *args, **kwargs)
+
+    monkeypatch.setattr(io, "open", spy)
+    monkeypatch.setattr(builtins, "open", spy)
+    capsys.readouterr()
+    # NOT `--skip-probe`: the count is exactly the probe under test, so it has to actually run.
+    main(["doctor", "--repo", str(target), "--agents"])
+    monkeypatch.undo()
+    block = _agents_block(capsys.readouterr().out)
+
+    assert "file:alpha / 1 file" in _agent_row(block, "alpha")  # it really did count the match
+    assert "session:beta / 1 file" in _agent_row(block, "beta")
+    assert opened  # the spy is wired: doctor opened its own config, just not the sources
+    assert str(alpha) not in opened
+    assert str(beta) not in opened
+
+
+@requires_git
+def test_doctor_agents_with_skip_probe_prints_declared_only(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`--skip-probe` prints the declared halves and runs no probe of any of the three kinds.
+
+    Both probes are replaced by bombs, so this pins the FLAG and not merely the rendering: a cell
+    that walked the filesystem or looked up PATH and then dropped the answer would still print the
+    right bytes while breaking the promise `--skip-probe` makes ("no daemon or PATH lookups").
+    """
+    target, _, _ = _agents_repo(tmp_path)
+
+    def _bomb(*args: object, **kwargs: object) -> None:
+        raise AssertionError("--skip-probe must not probe")
+
+    monkeypatch.setattr(cli_mod, "_probe_program", _bomb)
+    monkeypatch.setattr(cli_mod, "_count_glob_matches", _bomb)
+    capsys.readouterr()
+    main(["doctor", "--repo", str(target), "--agents", "--skip-probe"])
+    block = _agents_block(capsys.readouterr().out)
+
+    assert "probe skipped (--skip-probe): declared columns only" in block
+    assert " / " not in block  # no cell carries a probed half at all
+    for probed in ("(registry)", "on PATH", "MISSING", "1 file"):
+        assert probed not in block
+    assert "undeclared" in _agent_row(block, "alpha")  # the declared half still renders
+
+
+@requires_git
+def test_doctor_without_agents_output_is_byte_identical(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Without `--agents`, doctor's report is byte-for-byte what it was before this section existed.
+
+    The table is opt-in, and the ~40 substring assertions the rest of this suite makes about
+    doctor's output are the thing that must not move. The proof is subtractive: delete the inserted
+    block from the `--agents` run and the two reports are the same bytes — which also pins the
+    section's PLACEMENT (after `connectors:`, before `notes:`).
+    """
+    target, _, _ = _agents_repo(tmp_path)
+    capsys.readouterr()
+    main(["doctor", "--repo", str(target), "--skip-probe"])
+    plain = capsys.readouterr().out
+    main(["doctor", "--repo", str(target), "--agents", "--skip-probe"])
+    with_agents = capsys.readouterr().out
+
+    assert "agents:" not in plain
+    lines = with_agents.splitlines(keepends=True)
+    start = next(i for i, ln in enumerate(lines) if ln.startswith("  agents:"))
+    end = next(i for i, ln in enumerate(lines) if ln.startswith("    memory path:"))
+    assert "".join(lines[:start] + lines[end + 1 :]) == plain
+
+    # Placement: after the connectors block, before `notes:`.
+    assert with_agents.index("  harvest:") < with_agents.index("  agents:")
+    assert with_agents.index("  agents:") < with_agents.index("  notes:")
+
+
 @requires_git
 def test_a_targeted_harvest_is_not_hostage_to_another_connector(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
@@ -5932,3 +6226,390 @@ def test_eval_needs_no_git_no_model_and_no_server(
         "- id: q-deadlock\n  question: deadlock recovery\n  expect: not_found\n", encoding="utf-8"
     )
     assert main(["eval", "--repo", str(empty), "--queries", str(all_not_found)]) == 0
+
+
+# --- the read verbs: `agora query` / `read` / `neighbors` (DRILLDOWN-169 A5, H0-a) ---------------
+#
+# These are a THIN CLI over `AgoraHandlers` (D14), so the tests here deliberately do not re-assert
+# ranking or graph semantics — those are pinned in `tests/core` and `tests/faces`. What is only
+# testable here is the wiring: the rendering, the D15 exit codes, the `--json` pass-through, the
+# schema-1 read promise (ADR-0041 D6), the lazy face import, and the invariant that a READ verb
+# never writes.
+
+_RV_CONCEPT = "wiki/concepts/retrieval-augmented-generation.md"
+_RV_CENTER = "wiki/concepts/curator-concurrency.md"
+_RV_RAW = "raw/ai-tech/e1.md"
+_RV_RAW_TEXT = "# Extracted\n\nThe curator advances one repo at a time.\n"
+_RV_SECRET = "Retrieval augmented generation grounds an answer"
+
+
+def _read_verbs_repo(root: Path, *, schema_version: int = 2) -> Path:
+    """A small lint-clean corpus with the `raw/` tier on disk, under EITHER layout.
+
+    `build_kb` rather than hand-written markdown: the read verbs read whatever the production
+    schema says a note is, and a hand-rolled fixture drifts from it. `raw/` is byte-identical
+    across both schemas (ADR-0041 D1.4), which is what lets `schema_version` be a parameter here.
+    """
+    build_kb(
+        root,
+        [
+            NoteSpec(
+                kind="theme",
+                domain="ai-tech",
+                title="Retrieval Augmented Generation",
+                body=f"{_RV_SECRET} in retrieved documents.",
+                sources=[_RV_RAW],
+                tags=["rag"],
+            ),
+            NoteSpec(
+                kind="theme",
+                domain="ai-tech",
+                title="Curator Concurrency",
+                body="One curator advances the curated branch under a per-repo lock.",
+                sources=[_RV_RAW],
+                tags=["curator"],
+            ),
+        ],
+        schema_version=schema_version,
+        domains=["ai-tech"],
+    )
+    (root / _RV_RAW).write_text(_RV_RAW_TEXT, encoding="utf-8", newline="\n")
+    return root
+
+
+def test_query_prints_ranked_hits(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """The eval-style aligned table: a header line, then one ranked row per cited hit."""
+    repo = _read_verbs_repo(tmp_path / "kb")
+
+    assert main(["query", "retrieval augmented generation", "--repo", str(repo)]) == 0
+
+    out = capsys.readouterr().out
+    assert "query: retrieval augmented generation" in out
+    assert "status: ok" in out
+    assert "SCORE" in out and "PATH" in out and "ANCHOR" in out
+    assert _RV_CONCEPT in out
+    # Ranked, not merely listed: the row number leads the line and the top hit is row 1.
+    top_row = next(line for line in out.splitlines() if _RV_CONCEPT in line)
+    assert top_row.strip().startswith("1 ")
+
+
+def test_query_not_found_is_rc_0_with_status_line(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An empty search is a RESULT, not a failure (D15) — the same posture `gold status` takes."""
+    repo = _read_verbs_repo(tmp_path / "kb")
+
+    assert main(["query", "sourdough hydration ratios", "--repo", str(repo)]) == 0
+
+    captured = capsys.readouterr()
+    assert "status: not_found" in captured.out
+    assert "hits: 0" in captured.out
+    assert captured.err == ""
+
+
+def test_query_limit_is_honored_and_rejects_zero(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`--limit` reaches the ranker, and `--limit 0` is refused by argparse (`_positive_int`).
+
+    Zero is the `agora eval --limit 0` failure this project already fixed once: a limit that
+    silently records nothing looks exactly like a corpus that contains nothing.
+    """
+    repo = _read_verbs_repo(tmp_path / "kb")
+
+    assert main(["query", "curator", "--repo", str(repo), "--limit", "1", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert len(payload["hits"]) == 1
+
+    with pytest.raises(SystemExit) as exc:
+        main(["query", "curator", "--repo", str(repo), "--limit", "0"])
+    assert exc.value.code == 2
+
+
+def test_query_json_is_the_handler_payload_verbatim(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`--json` is a PASS-THROUGH (OD-6): byte-level proof the CLI cannot drift from the MCP face.
+
+    Not "looks similar" — the parsed stdout must equal what `AgoraHandlers.query` returns for the
+    same question, so a future CLI-side reshaping of the payload fails here rather than being
+    discovered by an agent whose CLI and MCP answers disagree.
+    """
+    from agora_kb.faces.mcp_server import AgoraHandlers
+
+    repo = _read_verbs_repo(tmp_path / "kb")
+
+    assert main(["query", "curator concurrency", "--repo", str(repo), "--json"]) == 0
+
+    printed = json.loads(capsys.readouterr().out)
+    assert printed == AgoraHandlers(Repo.resolve(repo)).query("curator concurrency")
+
+
+def test_read_prints_frontmatter_and_body(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The human rendering: a `key: value` block (frontmatter indented under it), then the body."""
+    repo = _read_verbs_repo(tmp_path / "kb")
+
+    assert main(["read", _RV_CONCEPT, "--repo", str(repo)]) == 0
+
+    out = capsys.readouterr().out
+    assert f"rel_path: {_RV_CONCEPT}" in out
+    assert "kind: concept" in out
+    assert "frontmatter:" in out
+    assert "  title: Retrieval Augmented Generation" in out
+    assert f"  sources: {_RV_RAW}" in out
+    # The body comes LAST and verbatim — it is the only multi-line value, so everything above it
+    # stays greppable.
+    assert out.rstrip().endswith(f"{_RV_SECRET} in retrieved documents.")
+
+
+def test_read_unknown_path_is_rc_1_with_the_kb_read_remedy(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Naming a target that does not exist is a FAILURE (D15) — and it borrows kb_read's sentence.
+
+    One wording across the faces: the operator and the agent are sent to the same place, which is
+    why the sentence lives as a module constant in `faces.mcp_server` rather than being retyped.
+    """
+    from agora_kb.faces import mcp_server
+
+    repo = _read_verbs_repo(tmp_path / "kb")
+
+    assert main(["read", "wiki/concepts/nope.md", "--repo", str(repo)]) == 1
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert mcp_server._kb_read_not_found("wiki/concepts/nope.md")["note"] in captured.err
+    assert "kb_query" in captured.err
+
+
+def test_read_json_not_found_is_the_kb_read_payload(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Even the refusal is the handler payload verbatim: `agora read --json` == `kb_read`."""
+    from agora_kb.faces import mcp_server
+
+    repo = _read_verbs_repo(tmp_path / "kb")
+
+    assert main(["read", "wiki/concepts/nope.md", "--repo", str(repo), "--json"]) == 1
+
+    assert json.loads(capsys.readouterr().out) == mcp_server._kb_read_not_found(
+        "wiki/concepts/nope.md"
+    )
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "../../etc/passwd",
+        "/etc/passwd",
+        f"raw/../{_RV_CONCEPT}",
+        "raw/./ai-tech/../../index.md",
+        "raw/../../etc/passwd",
+        "raw/_blob/../../etc/passwd",
+        "raw/ai-tech",  # a directory is not an artefact
+    ],
+)
+def test_read_traversal_prints_no_file_content(
+    path: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Every escape shape refuses with the same sentence — and prints no byte of any target.
+
+    Asserted against REAL bytes (a sentence only the concept's body contains), not against an
+    absence: a rendering that leaked the file would still "not crash".
+    """
+    repo = _read_verbs_repo(tmp_path / "kb")
+
+    assert main(["read", path, "--repo", str(repo)]) == 1
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert _RV_SECRET not in captured.err
+    assert "root:" not in captured.err  # nothing from /etc/passwd either
+    assert "no tracked note at path=" in captured.err
+
+
+def test_read_serves_a_raw_source_artifact(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The point of #169 from a terminal: a `sources:` string opens the capture behind the claim.
+
+    The payload is discriminated by `resource: raw` (D4), and the text is the artefact's own bytes
+    — no markdown rendering, no rewriting.
+    """
+    repo = _read_verbs_repo(tmp_path / "kb")
+
+    assert main(["read", _RV_RAW, "--repo", str(repo)]) == 0
+
+    out = capsys.readouterr().out
+    assert "resource: raw" in out
+    assert "raw_kind: text" in out
+    assert f"path: {_RV_RAW}" in out
+    assert "truncated: false" in out
+    assert out.rstrip().endswith(_RV_RAW_TEXT.rstrip())
+
+
+def test_read_serves_a_people_note_by_path(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """ADR-0041 D3.3: read is FIRST CLASS over `wiki/people/**` — the twin of the kb_read test.
+
+    A DECISION, not an accident: the same note is excluded from gold packs (and therefore from
+    `kb_context`) by construction, because a pull-shaped read an operator typed is a different risk
+    from a standing pack assembled without a prompt. The residual control is R1/#166.
+    """
+    repo = tmp_path / "kb"
+    build_kb(
+        repo,
+        [
+            NoteSpec(
+                kind="theme",
+                domain="ai-tech",
+                title="Retrieval Augmented Generation",
+                body="Retrieval augmented generation grounds an answer in retrieved documents.",
+            ),
+            NoteSpec(
+                kind="person", domain="ai-tech", person="hando", title="Desk", body="My own notes."
+            ),
+        ],
+        domains=["ai-tech"],
+    )
+
+    assert main(["read", "wiki/people/hando/desk.md", "--repo", str(repo)]) == 0
+
+    out = capsys.readouterr().out
+    assert "kind: person" in out  # DERIVED from the directory; the note declares no kind
+    assert out.rstrip().endswith("My own notes.")
+
+
+def test_neighbors_prints_counts_and_nodes(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Counts first, then the indented node list — each id feeds straight back into `agora read`."""
+    repo = _read_verbs_repo(tmp_path / "kb")
+
+    assert main(["neighbors", _RV_CENTER, "--repo", str(repo)]) == 0
+
+    out = capsys.readouterr().out
+    assert f"center: {_RV_CENTER}" in out
+    assert "nodes: " in out and "edges: " in out
+    # The center is a node of its own ego-graph and is marked as such.
+    assert f"* {_RV_CENTER}" in out
+
+
+def test_neighbors_depth_is_clamped_and_echoed(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`--depth 99` prints the EFFECTIVE depth, compared against the handler's own constant.
+
+    Against `mcp_server.MAX_GRAPH_DEPTH`, never a literal: the clamp belongs to the handler, and a
+    test that hard-codes 3 would keep passing while the CLI echoed a stale number.
+    """
+    from agora_kb.faces.mcp_server import MAX_GRAPH_DEPTH
+
+    repo = _read_verbs_repo(tmp_path / "kb")
+
+    assert main(["neighbors", _RV_CENTER, "--repo", str(repo), "--depth", "99"]) == 0
+
+    assert f"depth: {MAX_GRAPH_DEPTH}" in capsys.readouterr().out
+
+
+def test_neighbors_unknown_center_is_rc_1(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An unknown center is a named-target failure (D15), with the shared not-found sentence."""
+    repo = _read_verbs_repo(tmp_path / "kb")
+
+    assert main(["neighbors", "wiki/concepts/nope.md", "--repo", str(repo)]) == 1
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "no tracked note at path=" in captured.err
+
+
+def test_read_verbs_work_on_a_schema_1_repo(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The ADR-0041 D6 promise, kept: a repo this build will not WRITE still READS.
+
+    So no read verb may route through `assert_writable_repo_schema` — the write gate — and the #98
+    support gate (which `--repo` enrolls them in) must stay quiet at a supported version. The v1
+    layout puts the same note under `wiki/<domain>/themes/`, and `raw/` does not move at all.
+    """
+    repo = _read_verbs_repo(tmp_path / "kb", schema_version=1)
+    v1_note = "wiki/ai-tech/themes/retrieval-augmented-generation.md"
+    assert (repo / v1_note).is_file()  # guard: the fixture really is the v1 layout
+
+    assert main(["query", "retrieval augmented generation", "--repo", str(repo)]) == 0
+    assert "status: ok" in capsys.readouterr().out
+    assert main(["read", v1_note, "--repo", str(repo)]) == 0
+    assert "kind: concept" in capsys.readouterr().out  # v1 `type:` mapped through D2.5
+    assert main(["read", _RV_RAW, "--repo", str(repo)]) == 0
+    assert "resource: raw" in capsys.readouterr().out
+    assert main(["neighbors", v1_note, "--repo", str(repo)]) == 0
+    assert f"center: {v1_note}" in capsys.readouterr().out
+
+
+def test_read_verbs_do_not_import_fastmcp(tmp_path: Path) -> None:
+    """The face import is LAZY and transport-free (D14): no fastmcp is pulled in by a read verb.
+
+    Run in a SUBPROCESS on purpose: in a full pytest session another test module has already
+    imported fastmcp, so an in-process `sys.modules` check would assert nothing about this code
+    path. That laziness is what lets `agora read` work in an install without the MCP extra.
+    """
+    repo = _read_verbs_repo(tmp_path / "kb")
+    program = textwrap.dedent(f"""
+        import sys
+        from agora_kb.cli import main
+        assert main(["read", {_RV_CONCEPT!r}, "--repo", {str(repo)!r}]) == 0
+        assert main(["query", "curator", "--repo", {str(repo)!r}]) == 0
+        assert main(["neighbors", {_RV_CENTER!r}, "--repo", {str(repo)!r}]) == 0
+        leaked = sorted(m for m in sys.modules if m == "fastmcp" or m.startswith("fastmcp."))
+        assert not leaked, leaked
+    """)
+
+    proc = subprocess.run(
+        [sys.executable, "-c", program], capture_output=True, text=True, cwd=str(tmp_path)
+    )
+
+    assert proc.returncode == 0, proc.stderr
+
+
+@requires_git
+def test_read_verbs_never_write(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """Invariant 2, as a test: a read face creates nothing, queues nothing, commits nothing.
+
+    Three witnesses, because "no crash" is not evidence: the inbox depth, the git tip (a read verb
+    that touched a tracked file would have to be committed by someone to be durable, but the tip
+    moving at all would mean a read verb ran the curator), and a full byte-level snapshot of the
+    worktree — which is what catches a derived artifact (a cache, a lock, a state file) being
+    written on the way past.
+    """
+    repo = tmp_path / "kb"
+    assert main(["repo", "init", str(repo)]) == 0
+    _read_verbs_repo(repo)
+    capsys.readouterr()
+
+    def _snapshot() -> dict[str, str]:
+        return {
+            p.relative_to(repo).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest()
+            for p in sorted(repo.rglob("*"))
+            if p.is_file() and ".git/" not in p.relative_to(repo).as_posix()
+        }
+
+    layout = RepoLayout(repo)
+    before_depth = Inbox(layout).depth()
+    before_tip = _rev_parse(repo, "HEAD")
+    before_files = _snapshot()
+
+    assert main(["query", "retrieval augmented generation", "--repo", str(repo)]) == 0
+    assert main(["read", _RV_CONCEPT, "--repo", str(repo)]) == 0
+    assert main(["read", _RV_RAW, "--repo", str(repo)]) == 0
+    assert main(["neighbors", _RV_CENTER, "--repo", str(repo)]) == 0
+    assert main(["read", "raw/../../etc/passwd", "--repo", str(repo)]) == 1
+    capsys.readouterr()
+
+    assert Inbox(layout).depth() == before_depth
+    assert _rev_parse(repo, "HEAD") == before_tip
+    assert _snapshot() == before_files

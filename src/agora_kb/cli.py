@@ -13,6 +13,12 @@ A dependency-light :mod:`argparse` front-end over the core API. Subcommands:
   extractor claims the extension) and the file's ORIGINAL bytes ride along as the event's
   attachment (ADR-0041 D4.2). The local, no-server twin of the web face's upload route.
 - ``agora status [--repo PATH]`` — print inbox depth + curator state (last run/commit, counters).
+- ``agora query <q>`` / ``agora read <path>`` / ``agora neighbors <path>`` (each ``[--repo PATH]
+  [--json]``, plus ``--limit N`` / ``--depth N``) — the READ verbs: the same three answers the MCP
+  face gives (``kb_query`` / ``kb_read`` / ``kb_neighbors``), from a terminal. They wrap
+  ``AgoraHandlers`` rather than re-deriving anything, ``--json`` prints that handler payload
+  verbatim, and ``read`` follows a note's ``sources:`` down into ``raw/`` (#169). Reads work on a
+  repo this build will not WRITE (ADR-0041 D6) — they never route through the write gate.
 - ``agora curate [--repo PATH] [--force]`` — recover any in-flight run, then execute ONE real
   consolidation run via :mod:`agora_kb.curator` ``worker`` against the configured ``adapters.yaml``
   backend, and print the resulting :class:`~agora_kb.curator.worker.RunReport`.
@@ -65,6 +71,7 @@ import traceback
 from collections import Counter
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from pydantic import ValidationError
 
@@ -133,6 +140,13 @@ from .curator.subprocess_backend import (
 from .curator.worker import RunReport, recover, run
 from .schema import Taxonomy, emit_schema, lint
 from .schema.emit import materialize_kind_directories
+
+if TYPE_CHECKING:  # the read verbs import this LAZILY at call time (DRILLDOWN-169 D14)
+    from collections.abc import Callable, Sequence
+
+    from .config import ConnectorSpec
+    from .faces.mcp_server import AgoraHandlers
+    from .schema.notes import Note
 
 __all__ = ["main", "build_parser"]
 
@@ -291,6 +305,58 @@ def build_parser() -> argparse.ArgumentParser:
     p_status = sub.add_parser("status", help="show inbox depth + curator state")
     p_status.add_argument("--repo", default=".", help="repo root (default: .)")
     p_status.set_defaults(func=_cmd_status)
+
+    # --- the read verbs (DRILLDOWN-169 A5 / H0-a) -----------------------------------------------
+    # Deliberately NO `skip_schema_guard` and NO `assert_writable_repo_schema`: `--repo` alone
+    # enrolls them in the #98 support gate (`_schema_version_guard`), and routing a READ through
+    # the WRITE gate would break the ADR-0041 D6 promise that a schema-1 repo still reads.
+    p_query = sub.add_parser("query", help="search the wiki for evidence (the ADR-0012 ranker)")
+    p_query.add_argument("question", help="what to search for")
+    p_query.add_argument("--repo", default=".", help="repo root (default: .)")
+    p_query.add_argument(
+        "--limit",
+        type=_positive_int,
+        default=None,
+        metavar="N",
+        help="max hits to return (default: the core ranker's own limit)",
+    )
+    p_query.add_argument(
+        "--json",
+        action="store_true",
+        dest="as_json",
+        help="print the handler payload as JSON (identical to what the MCP tool returns)",
+    )
+    p_query.set_defaults(func=_cmd_query)
+
+    p_read = sub.add_parser("read", help="open one wiki note or one cited raw/ artifact by path")
+    p_read.add_argument("path", help="a note rel_path (wiki/…) or a `sources:` string (raw/…)")
+    p_read.add_argument("--repo", default=".", help="repo root (default: .)")
+    p_read.add_argument(
+        "--json",
+        action="store_true",
+        dest="as_json",
+        help="print the handler payload as JSON (identical to what the MCP tool returns)",
+    )
+    p_read.set_defaults(func=_cmd_read)
+
+    p_neighbors = sub.add_parser("neighbors", help="list one note's link neighborhood (ego-graph)")
+    p_neighbors.add_argument("path", help="the center note's rel_path")
+    p_neighbors.add_argument("--repo", default=".", help="repo root (default: .)")
+    p_neighbors.add_argument(
+        "--depth",
+        type=_positive_int,
+        default=1,
+        metavar="N",
+        help="hops from the center (default: 1; clamped server-side, the echoed depth is the "
+        "effective one)",
+    )
+    p_neighbors.add_argument(
+        "--json",
+        action="store_true",
+        dest="as_json",
+        help="print the handler payload as JSON (identical to what the MCP tool returns)",
+    )
+    p_neighbors.set_defaults(func=_cmd_neighbors)
 
     # curate
     p_curate = sub.add_parser("curate", help="evaluate consolidation triggers")
@@ -493,6 +559,14 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="skip the brain-availability probe (no daemon or PATH lookups; the health "
         "verdict then ignores brain reachability)",
+    )
+    p_doctor.add_argument(
+        "--agents",
+        action="store_true",
+        help=(
+            "also print the per-agent wiring table (session reader / CLI brain / connector / "
+            "source seen), derived from this repo's config — observability only"
+        ),
     )
     # `skip_schema_guard` EXEMPTS doctor from the #98 KB-schema support gate — the ONLY command that
     # names a repo with `--repo` and is allowed to run against one this build does not support.
@@ -1321,6 +1395,188 @@ def _record_pointer(layout: RepoLayout, record_path: str) -> str:
     except (OSError, InvalidWriterError):
         return record_path
     return record_path
+
+
+# --- the read verbs: `agora query` / `read` / `neighbors` (DRILLDOWN-169 A5, H0-a) ---------------
+def _handlers(repo_path: str) -> AgoraHandlers:
+    """Build the face handlers over ``repo_path``, importing them LAZILY (DRILLDOWN-169 D14).
+
+    The read verbs REUSE :class:`~agora_kb.faces.mcp_server.AgoraHandlers` instead of re-deriving
+    the same answers here, so the CLI cannot drift from what an agent sees over MCP or a human sees
+    on the web face — the ego-graph alone is ~200 lines that a second implementation would have to
+    copy or degrade. The import is lazy for the reason every other face import in this module is:
+    ``faces.mcp_server`` names fastmcp only under ``TYPE_CHECKING`` and inside ``build_server``, so
+    these verbs work in an install without the MCP transport — but importing it at module scope
+    would still pull the face (and its ``fastmcp`` type import path) into every ``agora status``.
+
+    Read-only by construction: :class:`AgoraHandlers` writes only through ``remember()``/
+    ``curate()``, which no read verb calls (invariant 2 — a read face never creates a file).
+    """
+    from .faces.mcp_server import AgoraHandlers
+
+    return AgoraHandlers(Repo.resolve(Path(repo_path)))
+
+
+def _print_json(payload: object) -> None:
+    """``--json``: the handler payload VERBATIM (OD-6 — read verbs only, no CLI-shaped wrapper).
+
+    ``ensure_ascii=False`` so a Korean title stays readable in a terminal rather than arriving as
+    ``\\uXXXX`` escapes; the bytes still parse back to exactly the handler's dict.
+    """
+    print(json.dumps(payload, indent=2, ensure_ascii=False))
+
+
+def _read_scalar(value: object) -> str:
+    """Render one payload value for the human ``key: value`` block (never for ``--json``)."""
+    if value is None:
+        return "-"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, list):
+        return ", ".join(str(item) for item in value) if value else "-"
+    if isinstance(value, dict):
+        return json.dumps(value, ensure_ascii=False, sort_keys=True)
+    return str(value)
+
+
+def _cmd_query(args: argparse.Namespace) -> int:
+    """``agora query <q>``: the deterministic ranker's cited hits, from a terminal.
+
+    Exit code is ALWAYS ``0``, ``not_found`` included (D15): an empty search is a RESULT, not a
+    failure — the same posture ``agora index status`` / ``agora gold status`` take on an absent
+    artifact. The verbs that name a target (``read`` / ``neighbors``) do exit ``1`` when it is
+    missing.
+
+    ``--limit`` is passed through only when given, so the default result size is the core's own
+    :data:`~agora_kb.core.wiki.MAX_HITS` and stays whatever the ranker says it is.
+    """
+    handlers = _handlers(args.repo)
+    payload = (
+        handlers.query(args.question)
+        if args.limit is None
+        else handlers.query(args.question, limit=args.limit)
+    )
+    if args.as_json:
+        _print_json(payload)
+        return 0
+    hits = payload["hits"]
+    assert isinstance(hits, list)
+    print(f"query: {payload['query']}")
+    print(f"  status: {payload['status']}  hits: {len(hits)}")
+    if not hits:
+        return 0
+    # `agora eval`'s aligned-table shape: widths derived from the data, so a long rel_path never
+    # wraps a column and a short corpus is not padded out to a guess.
+    n_width = max(1, len(str(len(hits))))
+    path_width = max([4, *(len(str(hit["path"])) for hit in hits)])
+    print(f"  {'#':<{n_width}}  {'SCORE':<8}  {'PATH':<{path_width}}  ANCHOR")
+    for number, hit in enumerate(hits, start=1):
+        anchor = hit["anchor"] or "-"
+        print(
+            f"  {number:<{n_width}}  {hit['score']:<8.6f}  "
+            f"{str(hit['path']):<{path_width}}  {anchor}"
+        )
+        excerpt = hit["excerpt"]
+        if isinstance(excerpt, str) and excerpt.strip():
+            print(f"  {'':<{n_width}}  {_one_line(excerpt, 100)}")
+    return 0
+
+
+def _read_payload(repo_path: str, path: str) -> dict[str, object]:
+    """``kb_read``'s EXACT algorithm: the note, else the ``raw/`` bridge, else its not-found dict.
+
+    Composed here rather than approximated: ``agora read --json`` prints this VERBATIM, so the CLI
+    and the MCP tool answer the same question with the same bytes, refusals included (D14). The
+    order and the discriminator are ``kb_read``'s too — the wiki is the curated fast path, and a
+    ``raw/`` payload is recognised by its ``resource`` key (D4).
+    """
+    from .faces.mcp_server import _kb_read_not_found
+
+    handlers = _handlers(repo_path)
+    payload = handlers.note(path)
+    if payload is not None:
+        return payload
+    raw = handlers.raw(path)
+    if raw["status"] == "ok":
+        return raw
+    return _kb_read_not_found(path, raw_note=str(raw.get("note", "")))
+
+
+def _cmd_read(args: argparse.Namespace) -> int:
+    """``agora read <path>``: one wiki note, or one cited ``raw/`` artifact, on stdout.
+
+    ``raw/`` paths work because A2 gave ``kb_read`` the provenance bridge and this verb wraps the
+    same seam: ``agora read raw/<domain>/<event-id>.md`` prints the capture a curated claim was
+    written from (#169). A ``raw/_blob/`` binary prints its capture facts and NO bytes (D5).
+
+    Exit ``1`` when nothing resolves (D15), with ``kb_read``'s OWN remedy sentence — the operator
+    and the agent are sent to the same place.
+    """
+    payload = _read_payload(args.repo, args.path)
+    found = "error" not in payload
+    if args.as_json:
+        _print_json(payload)
+        return 0 if found else 1
+    if not found:
+        print(f"{_PROG} read: {payload['note']}", file=sys.stderr)
+        return 1
+    # `key: value` block, then the content — a note's `body` or a text capture's `text`. Held to
+    # the end because it is the only multi-line value: everything above it stays greppable.
+    content = payload.get("body") if "body" in payload else payload.get("text")
+    for key, value in payload.items():
+        if key in ("body", "text"):
+            continue
+        if isinstance(value, dict):
+            print(f"{key}:")
+            for sub_key, sub_value in value.items():
+                print(f"  {sub_key}: {_read_scalar(sub_value)}")
+        else:
+            print(f"{key}: {_read_scalar(value)}")
+    if isinstance(content, str):
+        print()
+        print(content.rstrip("\n"))
+    return 0
+
+
+def _cmd_neighbors(args: argparse.Namespace) -> int:
+    """``agora neighbors <path>``: the note's ego-graph — nodes + directed edges, 1 hop default.
+
+    ``--depth`` is clamped by :meth:`AgoraHandlers.graph` itself (to
+    :data:`~agora_kb.faces.mcp_server.MAX_GRAPH_DEPTH`) and the printed ``depth:`` is the EFFECTIVE
+    value, never the requested one — the same echo the ``kb_neighbors`` tool documents.
+
+    Exit ``1`` on an unknown center (D15). ``--json`` still prints the handler payload verbatim —
+    an empty graph with ``center: null``, exactly what the MCP tool returns.
+    """
+    payload = _handlers(args.repo).graph(center=args.path, depth=args.depth)
+    found = payload["center"] is not None
+    if args.as_json:
+        _print_json(payload)
+        return 0 if found else 1
+    if not found:
+        from .faces.mcp_server import _kb_read_not_found
+
+        # ONE not-found wording across the read verbs: the remedy for "that path is not a note" is
+        # the same sentence whether the caller asked to read it or to walk from it.
+        print(f"{_PROG} neighbors: {_kb_read_not_found(args.path)['note']}", file=sys.stderr)
+        return 1
+    nodes = payload["nodes"]
+    edges = payload["edges"]
+    assert isinstance(nodes, list) and isinstance(edges, list)
+    print(f"center: {payload['center']}")
+    print(f"  depth: {payload['depth']}")
+    print(
+        f"  nodes: {len(nodes)}/{payload['node_total']}  "
+        f"edges: {len(edges)}/{payload['edge_total']}  "
+        f"truncated: {_read_scalar(payload['truncated'])}"
+    )
+    id_width = max([2, *(len(str(node["id"])) for node in nodes)])
+    for node in sorted(nodes, key=lambda n: str(n["id"])):
+        # `*` marks the center itself, which is a node of its own ego-graph.
+        marker = "*" if node["id"] == payload["center"] else " "
+        kind = node["kind"] or "-"
+        print(f"  {marker} {str(node['id']):<{id_width}}  {node['title']} [{kind}]")
+    return 0
 
 
 def _cmd_curate(args: argparse.Namespace) -> int:
@@ -2671,14 +2927,25 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
         and ok
     )
 
+    # ONE tolerant parse of `wiki/` feeds BOTH the `notes:` line (#152) and the `agents:` table's
+    # SOURCE SEEN column (DRILLDOWN-169 D16: reuse what doctor already loads, never re-scan). It
+    # runs here, above the connectors block, only so the two consumers share it; it prints nothing
+    # of its own, so `agora doctor` without `--agents` is byte-identical to before.
+    notes, notes_error = _doctor_parse_notes(layout)
+
     # ADR-0007: observability — the harvester policy + configured connectors with cursor state.
     # Reporting only; never affects the health verdict and never crashes on malformed config.
     _doctor_connectors(layout)
 
+    # Issue #147 / DRILLDOWN-169 D16: observability — the per-agent wiring table, opt-in behind
+    # `--agents`. Reporting only; never affects the health verdict and never crashes.
+    if args.agents:
+        _doctor_agents(layout, registry, registry_error, notes, skip_probe=args.skip_probe)
+
     # Issue #152: observability — how much of `wiki/` the curator does NOT own. Reporting only;
     # never affects the health verdict (a human note in the tree is not ill health) and never
     # crashes on an unreadable note.
-    _doctor_notes(layout)
+    _doctor_notes(notes, notes_error)
 
     # ADR-0012 §2 / issue #26: observability — the derived reader-cache state (present/fresh/stale).
     # Reporting only; never affects the health verdict and never crashes on malformed config.
@@ -2823,7 +3090,320 @@ def _doctor_connectors(layout: RepoLayout) -> None:
         print(f"    {spec.name} ({fields}): {counters}")
 
 
-def _doctor_notes(layout: RepoLayout) -> None:
+# --- doctor --agents (issue #147 second half / DRILLDOWN-169 D16) --------------------------------
+
+#: The ``agents:`` table's columns as ``(header, width)``. Widths are CONSTANTS, never derived from
+#: the data: a table whose columns move with the repo's longest agent name makes every operator's
+#: grep — and every substring assertion in the suite — repo-specific. A cell longer than its column
+#: OVERFLOWS (one space is always kept as the gutter); it is never clipped, because a truncated
+#: program name or connector key is exactly the byte an operator is running doctor to read.
+_AGENT_COLUMNS: tuple[tuple[str, int], ...] = (
+    ("AGENT", 18),
+    ("SESSION READER", 34),
+    ("CLI BRAIN", 30),
+    ("CONNECTOR", 30),
+    ("SOURCE SEEN", 0),  # 0 = last column, unpadded
+)
+
+#: Cap on the count-only glob walk behind the CONNECTOR column — a bound on ENTRIES VISITED, never
+#: a read. This diagnostic's own choice of value, not a brief decision.
+_AGENT_GLOB_MAX = 1000
+
+#: Printed when a column has no declaration at all. NOT ``none``: an absent declaration means "this
+#: build was told nothing", which is a different fact from "there is nothing" (DRILLDOWN-169 §8.1).
+_AGENT_UNDECLARED = "undeclared"
+
+
+def _agents_row(cells: tuple[str, ...]) -> str:
+    """Render one fixed-width row of the ``agents:`` table (overflowing cells keep a gutter)."""
+    out: list[str] = []
+    for cell, (_, width) in zip(cells, _AGENT_COLUMNS, strict=True):
+        out.append(cell if width == 0 else cell + " " * max(width - len(cell), 1))
+    return ("    " + "".join(out)).rstrip()
+
+
+def _count_glob_matches(pattern_raw: str) -> tuple[int, bool] | None:
+    """Count a connector glob's file matches WITHOUT reading one byte of them. ``(count, capped)``.
+
+    `agora doctor` is a DIAGNOSTIC: it must answer "does this connector's path match anything
+    today" without opening the operator's memory files or transcripts. The harvester's own resolver
+    (``harvester.connectors._resolve_glob_files``) reads and decodes every match, so it is
+    deliberately NOT reused here (DRILLDOWN-169 D16) — but its two path-safety guards are, imported
+    rather than re-spelled: the same non-magic base root and the same symlink-escape containment
+    check, so a ``**`` cannot be counted out through a symlink into another tree. ``None`` when the
+    base root cannot be resolved. Lazy ``iglob`` + the cap keep a hostile tree bounded.
+
+    The cap counts ENTRIES VISITED, not matches kept. Counting only the kept ones would not bound
+    the walk it exists to bound: every directory, symlink and out-of-root entry is filtered out
+    without advancing a match counter, so a ``**`` over a large or hostile tree would be enumerated
+    in full before a match-based cap could ever fire. ``capped`` therefore means "stopped early",
+    and the count it accompanies is a floor — which is what the rendered trailing ``+`` says.
+    ``_AGENT_GLOB_MAX`` is this diagnostic's own choice, not a brief decision.
+    """
+    import glob as _glob
+
+    from .harvester.connectors import _glob_base_root, _within
+
+    pattern = os.path.expanduser(pattern_raw)
+    root = _glob_base_root(pattern)
+    try:
+        resolved_root = root.resolve()
+    except OSError:
+        return None
+    count = 0
+    scanned = 0
+    for raw in _glob.iglob(pattern, recursive=True):
+        scanned += 1
+        if scanned > _AGENT_GLOB_MAX:
+            return count, True
+        try:
+            resolved = Path(raw).resolve()
+            if not _within(resolved, resolved_root) or not resolved.is_file():
+                continue
+        except OSError:
+            continue
+        count += 1
+    return count, False
+
+
+def _doctor_agents(
+    layout: RepoLayout,
+    registry: BackendRegistry | None,
+    registry_error: str | None,
+    notes: list[Note] | None,
+    *,
+    skip_probe: bool = False,
+) -> None:
+    """Print the per-agent wiring table behind ``--agents`` (issue #147 / DRILLDOWN-169 D16).
+
+    The rows are DERIVED from this repo's own configuration — the sorted union of the ``<agent>``
+    token of every configured connector, the ``adapters.yaml`` backend names, and the distinct
+    sources that appear in wiki ``provenance.agents`` — and never from a blessed list of agent
+    names. That is invariant 6 (tool-agnostic) made observable: the reason #147 exists is that
+    ``core/models.py``'s ``FIXED_SOURCES`` documents itself as backward-compatibility only, and a
+    hard-coded table here would quietly reintroduce exactly that.
+
+    Every cell reads ``<declared> / <probed>`` so the two kinds of knowledge stay separable, and
+    the SESSION READER probe is tagged ``(registry)`` because it is a pure registry lookup
+    (:func:`~agora_kb.harvester.session_sources.is_implemented_format`), not a live check — one
+    "probed" column that blurred three grades of certainty would make a tautology look like
+    verification.
+
+    Observability ONLY: it never moves the health verdict and never crashes (the whole table is
+    guarded; a malformed ``adapters.yaml`` becomes one error line, not a traceback), matching every
+    other ``_doctor_*`` block's contract.
+    """
+    print("  agents: derived from config (connector agents + backends + wiki provenance.agents)")
+    if skip_probe:
+        print("    probe skipped (--skip-probe): declared columns only")
+    try:
+        _doctor_agents_rows(layout, registry, registry_error, notes, skip_probe=skip_probe)
+    except Exception as exc:  # noqa: BLE001 — the table must never cost doctor its verdict line.
+        print(f"    table unavailable ({type(exc).__name__}: {_one_line(str(exc), 100)})")
+    # There is no `agents:` block in `adapters.yaml` in this build and no `agora link` (ADR-0029 is
+    # unauthored), so a MEMORY PATH column would be a column of blanks pretending to be a finding.
+    print("    memory path: undeclared (no agents: block in this build; ADR-0029 unauthored)")
+
+
+def _doctor_agents_rows(
+    layout: RepoLayout,
+    registry: BackendRegistry | None,
+    registry_error: str | None,
+    notes: list[Note] | None,
+    *,
+    skip_probe: bool = False,
+) -> None:
+    """Build + print the ``agents:`` rows. Called only from :func:`_doctor_agents`, which guards."""
+    from .harvester.connectors import ConnectorError, _parse_connector_agent
+    from .harvester.session_sources import DEFAULT_SESSION_FORMAT, is_implemented_format
+
+    specs_error: str | None = None
+    specs: list[ConnectorSpec] = []
+    try:
+        specs = list(load_connector_specs(layout.root / "adapters.yaml") or [])
+    except Exception as exc:  # noqa: BLE001 — doctor must never crash on a malformed adapters.yaml.
+        specs_error = _one_line(str(exc), 100)
+
+    # (a) the `<agent>` token of every connector key, parsed by the harvester's OWN identity
+    # boundary so this table can never name an agent the harvester would refuse to build.
+    by_agent: dict[str, list[ConnectorSpec]] = {}
+    for spec in specs:
+        prefix = spec.name.split(":", 1)[0] + ":" if ":" in spec.name else ""
+        try:
+            agent = _parse_connector_agent(spec.name, prefix)
+        except ConnectorError:
+            continue  # `agora harvest` fails loudly on it; doctor does not invent a row for it.
+        by_agent.setdefault(agent, []).append(spec)
+
+    # (b) the adapters.yaml backend names (the write-adapter family).
+    argv_by_agent: dict[str, tuple[str, ...]] = {}
+    if registry is not None:
+        for name in registry.names():
+            try:
+                argv_by_agent[name] = registry.get(name).argv
+            except Exception:  # noqa: BLE001 — a bad spec is a blank cell, not a crash.
+                argv_by_agent[name] = ()
+
+    # (c) the distinct sources seen in wiki `provenance.agents` — REUSED from the parse doctor
+    # already did for its `notes:` line (D16: never a second scan of the tree).
+    seen: Counter[str] = Counter()
+    if notes is not None:
+        for note in notes:
+            seen.update(note.provenance.agents)
+
+    if specs_error or registry_error:
+        detail = specs_error or _one_line(str(registry_error), 100)
+        print(f"    adapters.yaml unreadable ({detail}) — connector + brain columns undeclared")
+
+    rows = sorted(set(by_agent) | set(argv_by_agent) | set(seen))
+    if not rows:
+        print("    (no agents derived: no connectors, no backends, no provenance)")
+        return
+
+    print(_agents_row(tuple(header for header, _ in _AGENT_COLUMNS)))
+    for agent in rows:
+        print(
+            _agents_row(
+                (
+                    agent,
+                    _agent_session_cell(
+                        by_agent.get(agent, ()),
+                        skip_probe=skip_probe,
+                        default_format=DEFAULT_SESSION_FORMAT,
+                        implemented=is_implemented_format,
+                    ),
+                    _agent_brain_cell(argv_by_agent.get(agent), skip_probe=skip_probe),
+                    _agent_connector_cell(by_agent.get(agent, ()), skip_probe=skip_probe),
+                    _agent_seen_cell(agent, seen, notes_readable=notes is not None),
+                )
+            )
+        )
+
+
+def _agent_cell(declared: str | None, probed: str, *, skip_probe: bool) -> str:
+    """Compose one ``<declared> / <probed>`` cell (``--skip-probe`` prints the declared half only).
+
+    ``declared is None`` means nothing was declared for this column — rendered ``undeclared``, with
+    the probed half ``n/a`` because there is nothing to probe, never ``none``.
+
+    Under ``--skip-probe`` the probed half is dropped, and every caller returns here BEFORE doing
+    the work that would have produced it: the flag promises "no daemon or PATH lookups", so a cell
+    that walked the operator's filesystem and then threw the number away would be honouring the
+    rendering and not the promise.
+    """
+    if declared is None:
+        return _AGENT_UNDECLARED if skip_probe else f"{_AGENT_UNDECLARED} / n/a"
+    return declared if skip_probe else f"{declared} / {probed}"
+
+
+def _agent_session_cell(
+    specs: Sequence[ConnectorSpec],
+    *,
+    skip_probe: bool,
+    default_format: str,
+    implemented: Callable[[str], bool],
+) -> str:
+    """SESSION READER: the transcript grammar this agent's ``session:`` connector actually runs.
+
+    An undeclared ``format:`` shows the DEFAULT it resolves to, matching ``_doctor_connectors``:
+    the operator's question is which parser runs, not which key is present. The probe half is
+    tagged ``(registry)`` — it is a lookup in ``SESSION_READERS``, not a live parse.
+    """
+    session = next((s for s in specs if s.name.startswith("session:")), None)
+    if session is None:
+        return _agent_cell(None, "", skip_probe=skip_probe)
+    fmt = session.format or default_format
+    if skip_probe:
+        return _agent_cell(fmt, "", skip_probe=True)
+    probed = "ok (registry)" if implemented(fmt) else "NO READER (registry)"
+    return _agent_cell(fmt, probed, skip_probe=skip_probe)
+
+
+def _agent_brain_cell(argv: tuple[str, ...] | None, *, skip_probe: bool) -> str:
+    """CLI BRAIN: is this agent's backend ``argv[0]`` actually runnable on this host?
+
+    Same probe the brains block uses (:func:`_probe_program`), rendered short: the long remediation
+    sentence belongs on the ``brain <name>:`` line, this column answers yes/no. A ``{worktree}``
+    placeholder argv is unprobeable by construction and says so rather than claiming a verdict.
+    """
+    if argv is None:
+        return _agent_cell(None, "", skip_probe=skip_probe)
+    program = argv[0] if argv else ""
+    if not program:
+        return _agent_cell("(no argv)", "n/a", skip_probe=skip_probe)
+    if skip_probe:
+        return _agent_cell(program, "", skip_probe=True)
+    if _WORKTREE_TOKEN in program:
+        return _agent_cell(program, "not probed", skip_probe=skip_probe)
+    try:
+        _, healthy = _probe_program(program)
+    except Exception as exc:  # noqa: BLE001 — a probe defect is a cell, never a crash.
+        return _agent_cell(program, f"probe ERROR ({type(exc).__name__})", skip_probe=skip_probe)
+    return _agent_cell(program, "on PATH" if healthy else "MISSING", skip_probe=skip_probe)
+
+
+def _agent_connector_cell(specs: Sequence[ConnectorSpec], *, skip_probe: bool) -> str:
+    """CONNECTOR: which connector keys name this agent, and how many files their globs match.
+
+    The count comes from :func:`_count_glob_matches`, which stats but never READS — a diagnostic
+    that opened the operator's memory files to tell them a number would be a worse trade than the
+    number is worth (DRILLDOWN-169 D16).
+    """
+    if not specs:
+        return _agent_cell(None, "", skip_probe=skip_probe)
+    declared = "+".join(sorted(s.name for s in specs))
+    if skip_probe:
+        return _agent_cell(declared, "", skip_probe=True)
+    total = 0
+    capped = False
+    counted_any = False
+    for spec in specs:
+        if not spec.path:
+            continue  # a deferred API connector (Phase 4) declares no path to walk
+        result = _count_glob_matches(spec.path)
+        if result is None:
+            continue
+        counted_any = True
+        total += result[0]
+        capped = capped or result[1]
+    if not counted_any:
+        return _agent_cell(declared, "no path", skip_probe=skip_probe)
+    probed = f"{total} file{'' if total == 1 else 's'}{'+' if capped else ''}"
+    return _agent_cell(declared, probed, skip_probe=skip_probe)
+
+
+def _agent_seen_cell(agent: str, seen: Counter[str], *, notes_readable: bool) -> str:
+    """SOURCE SEEN: how many wiki notes RECORD this agent in ``provenance.agents`` (D2.3).
+
+    Recorded, never trusted — and when the whole repo carries no provenance at all (the measured
+    state of a converted KB), the cell says ``n/a (no provenance data)``. ``never seen`` there
+    would read as a wiring defect when the truth is that nothing has ever declared anything.
+    """
+    if not notes_readable:
+        return "unreadable"
+    if not seen:
+        return "n/a (no provenance data)"
+    count = seen.get(agent, 0)
+    return f"{count} note{'' if count == 1 else 's'}" if count else "not seen"
+
+
+def _doctor_parse_notes(layout: RepoLayout) -> tuple[list[Note] | None, str | None]:
+    """Parse ``wiki/`` ONCE for every doctor section that needs it. Never raises.
+
+    ``(notes, None)`` on success; ``(None, "<msg>")`` when the tree is unreadable — the caller
+    renders that message where its own section renders it, so hoisting the parse out of
+    :func:`_doctor_notes` (DRILLDOWN-169 D16 wants the ``agents:`` table to REUSE it rather than
+    re-scan) keeps doctor's output unchanged. TOLERANT, like every doctor read path (ADR-0014 D4).
+    """
+    from .schema.notes import parse_all_notes
+
+    try:
+        return parse_all_notes(layout), None
+    except Exception as exc:  # noqa: BLE001 — doctor must never crash on an unreadable tree.
+        return None, str(exc)
+
+
+def _doctor_notes(notes: list[Note] | None, error: str | None) -> None:
     """Print how many notes the curator owns vs does not (issue #152). Never crashes.
 
     A note carrying no curator stamp was written by a human: since #152 it is READ (query, graph,
@@ -2832,14 +3412,14 @@ def _doctor_notes(layout: RepoLayout) -> None:
     failed every run. This is the line that says "N of your notes are outside the curator's reach",
     so an operator can tell a quiet exclusion from a bug. Never moves the verdict: a human writing
     in `wiki/` is a supported thing to do, not ill health.
+
+    The parse itself lives in :func:`_doctor_parse_notes` so the ``agents:`` table can share it
+    (DRILLDOWN-169 D16); the rendering — including the unreadable-tree line — is unchanged.
     """
     from .curator.worker import is_curator_written
-    from .schema.notes import parse_all_notes
 
-    try:
-        notes = parse_all_notes(layout)  # TOLERANT: doctor is a read path (ADR-0014 D4)
-    except Exception as exc:  # noqa: BLE001 — doctor must never crash on an unreadable tree.
-        print(f"  notes: unreadable ({exc})")
+    if notes is None:
+        print(f"  notes: unreadable ({error})")
         return
     unmanaged = sum(1 for n in notes if not is_curator_written(n))
     detail = (
