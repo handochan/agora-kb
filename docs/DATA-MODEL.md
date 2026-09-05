@@ -136,8 +136,11 @@ preserved event is still counted by `failed_events` and still retrievable with `
 
 ## 2. Raw source — `raw/<domain>/<date>-<slug>.<ext>` (+ sidecar for binaries)
 
-Immutable original captured by an upload/harvest. Markdown sources carry frontmatter; binaries get a
-`<file>.meta.yaml` sidecar. The five keys below are the **`raw/<domain>/` binary** sidecar — a
+Immutable original captured by an upload/harvest. Binaries get a `<file>.meta.yaml` sidecar; a
+markdown source written by Agora carries **no** frontmatter — APPLY writes the event body bytes and
+nothing else, so a `raw/<domain>/<event_id>.md` begins with the first byte of the captured text (the
+capture facts live on the inbox event, and for a `raw/_blob/` artefact in its sidecar). The five
+keys below are the **`raw/<domain>/` binary** sidecar — a
 *re-ingest drift* record for a file that has a `source_url` and can be fetched again. The
 content-addressed `raw/_blob/` sidecar is a different record with its own closed key set, given
 further down ([ADR-0041](adr/0041-stratum-kind-first-layout.md) D1.4 addendum); which shape applies
@@ -230,7 +233,10 @@ model-supplied basename) and the `people/<person>` namespace.
 `created`, `updated`, `status`, `summary`, `derived` (bool, default `false`) and `provenance`
 (`writers:` = authenticated principals, TRUSTED; `agents:` = agent self-declarations, RECORDED and
 NEVER trusted). Per-kind additions carry over from v1 unchanged in shape: `concept`/`summary` add
-`sources`/`related`/`origin`/`confidence`/`body_status` + the contested triple, `note` adds
+`sources`/`related`/`origin`/`confidence`/`body_status` + the contested triple — plus, since #169
+wave B, a **derived** `source_links` (the `raw/` entries of `sources` rendered as `'[[raw/…]]'` so
+Obsidian linkifies them; never naming a source `sources` does not carry, absent rather than empty,
+re-derived on every write, never the provenance of record, and graded only by L1-25) — `note` adds
 `date`/`run_id`/`sources`/`body_status`, `map`/`index` add `children`, `entity` adds
 `sources`/`related`. APPLY additionally emits the ADR-0014 D2 OKF mirrors it already emitted —
 `description` beside `summary`, `timestamp` beside `updated`, `okf_version` on the root index — plus

@@ -787,14 +787,45 @@ That is the whole loop: capture → curate → query. Everything else in Agora i
 
 ### Step 6 — (optional) open it in Obsidian
 
-The repo is a plain folder of markdown, so "Open folder as vault" is the whole setup. One setting is
-worth changing on day 1, under **Settings → Files and links**: turn **"Use [[Wikilinks]]" OFF**.
+The repo is a plain folder of markdown, so "Open folder as vault" is the whole setup — **and open it
+at the repo root**, not at `wiki/`. A path inside a wikilink is resolved from the vault root, and the
+curator emits citations that start with `raw/`, so a vault rooted anywhere below the repo root leaves
+every one of them broken.
+
+One setting is worth changing on day 1, under **Settings → Files and links**: turn
+**"Use [[Wikilinks]]" OFF**.
 Agora's own body links are standard markdown links — `[Title](../concepts/foo.md)` in a map body,
-`[Title](wiki/maps/foo.md)` in the root index (ADR-0014 D3) — and only the frontmatter `related:`
-and `children:` arrays are `[[basename]]`. With wikilinks on, every link *you* create is a form the
+`[Title](wiki/maps/foo.md)` in the root index (ADR-0014 D3) — and the only frontmatter arrays it
+writes as wikilinks are `related:` / `children:` (`[[basename]]`) and the derived `source_links:`
+(`[[raw/path.md]]`, a full path rather than a basename — see below). With wikilinks on, every link
+*you* create is a form the
 curator does not write, and one of them will not resolve at all: `wiki/people/**` basenames are
 outside the `[[basename]]` identity space by design (ADR-0041 D3.3), so a `[[ ]]` pointing into your
 own people notes is a broken link, while a plain markdown link to the file works.
+
+**Following a claim to its evidence.** A concept's frontmatter carries `sources:` — the paths under
+`raw/` the claim came from — and, beside it, a derived `source_links:` list of the same `raw/` paths
+written as `'[[raw/…]]'`. Obsidian renders that property as **clickable chips**, so one click opens
+the capture the note was distilled from. `sources:` is still the record; `source_links:` is a view of
+it that exists only because Obsidian does not linkify plain strings in a property. Do not edit it —
+the curator re-derives it on every write, and lint rule `L1-25` (a warning, never a rejection) tells
+you when a citation anywhere in a note disagrees with its `sources:`.
+
+*Expect it on new work first.* The curator stamps the mirror when it creates, merges into or
+contests a note — there is no backfill pass — so notes that were already published before you
+upgraded show `sources:` and no chips until a run touches them again. Nothing is lost in the
+meantime: `sources:` is the record, and the web face's `/raw` links and `agora read` follow it
+directly.
+
+**Obsidian's graph will not match Agora's.** Agora ships no `.obsidian` configuration and excludes
+nothing from your vault, so Obsidian indexes **every** markdown file in the repo — the uncurated
+captures under `raw/**.md`, and also `_kb/`, which is git-ignored but is an ordinary (non-dotted)
+folder as far as Obsidian is concerned: inbox events at `_kb/inbox/<writer>/*.md` and gold packs at
+`_kb/gold/<pack>.md` all show up as vault notes. Agora's own graph (`/graph` in the web face) is
+built from curated notes only. Expect Obsidian to show extra nodes and extra edges; neither view is
+wrong, they are answering different questions. Obsidian's **Settings → Files and links → Excluded
+files** will de-emphasise `raw/` **and `_kb/`** if the noise bothers you; that is a display
+preference on Obsidian's side and changes nothing about what Agora stores, cites or serves.
 
 ## 5. Register the MCP face with your agent
 

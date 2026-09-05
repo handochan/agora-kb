@@ -14,7 +14,7 @@ Related, and deliberately not duplicated here:
 
 | Doc | Covers |
 |---|---|
-| [`../CHANGELOG.md`](../CHANGELOG.md) → "Known limitations" | The short list this document expands (12 items) |
+| [`../CHANGELOG.md`](../CHANGELOG.md) → "Known limitations" | The short list this document expands (15 items) |
 | [`ROADMAP.md`](ROADMAP.md) → "Not in 0.1.0-beta" | The **normative** list — if the two ever disagree, ROADMAP wins |
 | [`../SECURITY.md`](../SECURITY.md) | Threat model, supported scope, private vulnerability reporting |
 | [`DEPLOY-TEAM.md`](DEPLOY-TEAM.md) (**Korean**) | Running one KB for 2–10 people: hub topology, proxy auth, footguns |
@@ -354,6 +354,68 @@ differently:
   than pointed at a disabled route. It is a switch, not an access control: the face still has no
   authentication of any kind (§8).
 
+**The write side landed too (#169 wave B) — but in the frontmatter, not the body.** APPLY now stamps
+a derived `source_links:` mirror beside `sources:` on concepts and summaries: the `raw/` entries,
+rendered as `'[[raw/ai-tech/2026-09-01-cqrs-notes.md]]'` wikilinks, which is the one citation form
+Obsidian linkifies inside a list property. In a vault whose root is the repo root they render as
+clickable property chips, so a reader in Obsidian can follow a claim to its evidence without leaving
+the pane. The mirror is derived, never authoritative: it never names a source `sources:` does not
+carry and usually names fewer (only `raw/` entries enter, so a `harvest:<agent>` string is never
+wrapped in a link that resolves nowhere), it is removed rather than emitted empty, it is re-derived
+on every write that touches `sources:`, and journals never get one. Lint `L1-25` — the one L1 rule
+that is a **warning** rather than a hard reject — reports any citation, in the mirror or
+hand-written in the body, that `sources:` does not carry.
+
+**It is stamped going forward, not backfilled — so an existing KB starts with zero chips.** The
+mirror is written by the sites that write `sources:`: CREATE, MERGE and CONTEST. There is no
+re-render-all pass and no upgrade step, so every concept published before this change keeps no
+`source_links:` — and no clickable citation — until a curator run happens to merge or contest into
+it. On a KB that is no longer growing in a given area, that can be never. The read-side drill-down
+(the web routes, `kb_read`, `agora read`) is unaffected: it resolves `sources:` itself and never
+needed the mirror.
+
+**What wave B deliberately did NOT ship: a body footnote.** The original ask was a curator-emitted
+`[^n]` citation in the prose. It is not emitted, for two independent reasons, and neither is
+scheduled to change:
+
+- **It renders differently on the two faces this repo actually has.** CommonMark — the web face's
+  parser — reads `[^1]: raw/general/x.md` as a *link-reference definition*, so the marker becomes an
+  anchor at an unrewritten relative path (a 404), and a payload that is itself a markdown link is
+  mangled. Obsidian reads the same bytes as a footnote. Adding a footnote plugin would not be
+  additive either: it changes how already-committed `[^n]:` bytes parse.
+- **A body citation moves the merge oracle.** `Wiki.query_lexical` reads note bodies, the curator's
+  bundle feeds it every candidate's text to build the planning brain's `related/` view, and that
+  view picks `MERGE_INTO_THEME` targets — and a wrong merge is permanent, since the closed op
+  vocabulary has no DELETE. Measured once, owner-side, on a scratch copy of the author's private KB
+  over 24 fixed queries (2026-09-05): a body `## Sources` block changed the result order on 9 of
+  them; the frontmatter mirror changed 0 scores and 0 orders. The corpus is private and the harness
+  is not in this repo, so that figure records why the decision was taken rather than something you
+  can re-run; the committed gate is `tests/core/test_rank_neutrality.py`, which pins the same
+  property structurally.
+
+So: **Obsidian gets clickable provenance; a plain markdown renderer still shows `sources:` as text.**
+
+If you want an inline citation in a body you can write one by hand, but know which form you are
+choosing — none of the four is fully safe today:
+
+- **A footnote definition** (`[^1]: raw/general/x.md`) reaches no link rule at all. L1-25 warns if
+  `sources:` does not carry it, and warns only — your commit is not rejected. But the web face
+  renders it as a link-reference definition, not a footnote (above).
+- **A markdown link into `raw/**.md`** also meets **L1-2**, which is an ERROR and discards the whole
+  run's diff. L1-2 resolves every `.md` link target to a *basename*: if no note owns that basename
+  you get the hard reject; if a note does own it — the usual case, since a capture is normally named
+  after the thing it is about — L1-2 stays silent and your link quietly resolves to that other note
+  instead of the capture, entering the link graph the curator's merge oracle ranks on. This wave
+  added no carve-out for either outcome.
+- **A markdown link to a non-`.md` `raw/` artifact** (a `raw/_blob/**` PDF, say) reaches no basename
+  resolution, so L1-25 is again its only grader.
+- **An image embed** (`![scan](../../raw/_blob/ab/<sha256>.png)`) is graded by **nothing at all**.
+  Both body surfaces — L1-2's link resolution and L1-25's citation scan — read the same grammar,
+  which excludes `![…](…)` by construction: an image is an *asset* reference, not a link edge and
+  not a provenance claim (ADR-0010 §3.5). So the natural way to show a captured screenshot inline is
+  also the one form that is never reported. If that embed IS your provenance, also list the artifact
+  in `sources:`, which is the record either way.
+
 **When it bites.**
 1. **What you now reach is ungraded content.** `raw/` is the capture, not the curated answer: it
    passed none of the curator's PLAN/APPLY grading, no lint rule grades its content (L1-8 only
@@ -417,11 +479,18 @@ team deployment — both routes, the linked `sources:` rows, and the body-link r
 MCP/CLI kill switch, only the choice not to expose the MCP face. Keep your own copy of anything large or
 sensitive until (7) and (9) are decided.
 
-**Tracking.** The read-side gap is closed by
-[#169](https://github.com/handochan/agora-kb/issues/169) wave A — the `/raw` + `/api/raw` routes,
-linked `sources:`, the `kb_read` bridge, and the `agora query`/`read`/`neighbors` verbs. What #169
-still owes is **wave B**: a curator-*emitted* inline citation so Obsidian can click through from the
-note body (today `sources:` is a plain frontmatter list, which Obsidian does not linkify). The
+**Tracking.** [#169](https://github.com/handochan/agora-kb/issues/169) is closed on both sides —
+wave A (the `/raw` + `/api/raw` routes, linked `sources:`, the `kb_read` bridge, the
+`agora query`/`read`/`neighbors` verbs) and wave B (the `source_links:` mirror + lint L1-25). The one
+part of the original ask not delivered is the body footnote, which was rejected on measurement and
+recorded in [ADR-0041](adr/0041-stratum-kind-first-layout.md)'s `source_links:` addendum rather than
+left open. Two delivery caveats, both about REACH rather than behaviour. (a) L1-25 grades every
+schema-2 repo immediately, but the mirror arrives one note at a time: APPLY stamps it at CREATE,
+MERGE and CONTEST, there is no backfill, so notes published before this release carry no chips until
+a run touches them. (b) The **emitted schema doc** that tells a brain about both reaches new repos
+only — `emit_schema` skips a file that already exists and `agora repo upgrade` is
+[#63](https://github.com/handochan/agora-kb/issues/63), so an existing KB's `AGENTS.md` keeps
+recommending footnote citations until you refresh it by hand. The
 undesigned control over what these read paths may emit is ADR-0041 residual risk R1
 ([#166](https://github.com/handochan/agora-kb/issues/166)); the unimplemented repo-internal `file:`
 connector fence is [#165](https://github.com/handochan/agora-kb/issues/165) (§6b).

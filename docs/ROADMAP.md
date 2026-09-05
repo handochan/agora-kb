@@ -135,13 +135,26 @@ deferral; the acceptance record is the second paragraph of the ADR. **Still open
   OD-6's cache-stem follow-up, #167, is **done** — a derived `_kb/index/<stem>.notes.json` filename
   now accepts a non-ASCII repo directory such as `내지식` via the pathsafe union predicate
   `is_safe_filename_stem`, with no cache-schema bump and no name the old rule admitted lost).
-- **Source drill-down — read side landed, write side open (#169).** Wave A shipped: the web serves
-  `GET /raw/{path}` + `GET /api/raw/{path}` behind `web.features.raw_enabled` (default on), `kb_read`
-  follows a `sources:` string into `raw/` (blob bytes stay off MCP — the sidecar's facts only), a
-  note page's `sources:` rows are server-computed anchors, and `agora query`/`read`/`neighbors` give
-  the same three answers from a terminal. What remains is **wave B**: the curator emits no inline
-  citation, so a note body still carries no clickable link to its evidence in Obsidian. #167
-  (non-ASCII cache stems) and #147 (`agora doctor --agents`) landed alongside it.
+- **Source drill-down — LANDED, both waves (#169).**
+  - **Wave A — the read side.** The web serves `GET /raw/{path}` + `GET /api/raw/{path}` behind
+    `web.features.raw_enabled` (default on), `kb_read` follows a `sources:` string into `raw/` (blob
+    bytes stay off MCP — the sidecar's facts only), a note page's `sources:` rows are
+    server-computed anchors, and `agora query`/`read`/`neighbors` give the same three answers from a
+    terminal. #167 (non-ASCII cache stems) and #147 (`agora doctor --agents`) landed alongside it.
+  - **Wave B — the write side.** APPLY stamps a derived `source_links:` mirror of the `raw/` half of
+    `sources:` on concepts and summaries (`'[[raw/…]]'` — the one form Obsidian linkifies inside a
+    list property), absent rather than empty, re-derived on every write, never authoritative, and
+    never on a journal; lint **L1-25** (the one L1 rule that is a *warning*) reports any citation —
+    mirror, body link, or footnote payload — that `sources:` does not carry. A curator-emitted body
+    footnote was **rejected on measurement**, not deferred: CommonMark parses `[^1]: raw/x.md` as a
+    link-reference definition while Obsidian reads it as a footnote, and in a one-off owner-side
+    measurement (private corpus, harness out of tree) a body `## Sources` block moved the merge
+    oracle's result order on 9 of 24 fixed queries against the mirror's 0 of 24; the committed gate
+    is `tests/core/test_rank_neutrality.py` (no reader-cache bump; `CACHE_SCHEMA_VERSION` stays 3).
+    Recorded in the ADR-0041 `source_links:` addendum. **Caveats:** the mirror is stamped going
+    forward, not backfilled — an already-published concept gains one on its next merge or contest;
+    and the emitted schema doc's new guidance reaches NEW repos only — existing
+    KBs keep their `AGENTS.md` until `agora repo upgrade` (#63).
 
 ## 0.1.0-beta — release cutline (next; the first tagged, installable release) — epic #93
 
@@ -402,7 +415,12 @@ Stated as user-facing risk, not as a feature backlog. Every line is a thing that
   `curate`, `watch`, `requeue`, `harvest`, `kb_curate`, and `Inbox.write`, which covers
   `kb_remember` and the web upload. The sanctioned crossing is a **conversion into a NEW repo** —
   `agora import --from-kb <old-repo> <new-repo>`, which never modifies the source (ROADMAP
-  "Stratum" § W2.4). Expanded in [`LIMITATIONS.md`](LIMITATIONS.md) §6a.
+  "Stratum" § W2.4). Expanded in [`LIMITATIONS.md`](LIMITATIONS.md) §6a. **The same gap applies to
+  the emitted wiki schema doc**: each KB carries its own `AGENTS.md`, written once at `repo init`,
+  and `emit_schema` skips a file that already exists — so an existing repo keeps the schema doc it
+  was created with, including guidance later releases retire (today: the `[^n]` footnote-citation
+  advice #169 wave B reversed). Nothing in the curator's behaviour depends on the doc; the contracts
+  are enforced by APPLY and by lint.
 - **The two empty note tiers** — `wiki/summaries/` and `wiki/entities/` exist as directories with
   frontmatter shapes and lint rules and **nothing produces a note in either**. Long documents have no
   home: their contract, ADR-0040, is reserved and unauthored, and the `raw/_pages/` prefix held for
@@ -425,6 +443,14 @@ Stated as user-facing risk, not as a feature backlog. Every line is a thing that
   linked `sources:`, the body-link rewrite) — it does not gate `kb_read` or `agora read`, and it is
   a kill switch, not an access control. Nothing serves `assets/` at all
   ([`LIMITATIONS.md`](LIMITATIONS.md) §6).
+- **Inline citations are frontmatter-only** — since #169 wave B the curator emits a derived
+  `source_links:` property, which **Obsidian** linkifies; a plain markdown renderer shows it, and
+  `sources:`, as text. No footnote or body `## Sources` block is emitted (rejected on measurement,
+  not deferred — ADR-0041's `source_links:` addendum), and the mirror is stamped going forward
+  rather than backfilled: a concept published before the change shows no chips until a run merges or
+  contests into it. Hand-writing a body markdown link into `raw/**.md` is not the workaround — it
+  meets lint L1-2, a hard error when no note owns the target's basename and a silent mis-resolution
+  when one does.
 - **Embeddings / semantic search** — deliberately absent; deterministic BM25F ranking is the contract
   (ADR-0009/0012). ADR-0032 is reserved and evidence-triggered, not planned for beta.
 - **Cloud brains** — the default brain is a local Ollama model and an OSS path is mandatory

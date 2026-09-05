@@ -325,8 +325,14 @@ validated `RawRef` (the `AgoraHandlers.raw()` seam), which is the sole door into
   `kb_read` on a `sources:` string, and `agora read`. A blob's BYTES leave only through the web
   route, always as `application/octet-stream` + `nosniff` + `attachment` and never as the sidecar's
   uploader-supplied `media_type`; over MCP a blob returns its capture facts and no bytes at all.
-  What is still deferred: a curator-emitted inline citation in the note body (#169 wave B), a
-  size-tier/LFS policy (#48), and image/OCR extraction. Per-batch max-files / total-bytes caps shipped with the
+  **The citation itself became clickable with #169 wave B**, in the frontmatter rather than the
+  body: APPLY stamps a derived `source_links:` mirror of the `raw/` half of `sources:` on concepts
+  and summaries (`'[[raw/…]]'` — the one form Obsidian linkifies inside a list property), absent
+  rather than empty, re-derived on every write and never authoritative, with lint `L1-25` (a
+  warning) reporting any citation `sources:` does not carry. A curator-emitted body footnote was
+  **rejected on measurement, not deferred** — CommonMark and Obsidian parse `[^n]:` differently, and
+  a body citation moves the `query_lexical` merge oracle — see the ADR-0041 `source_links:`
+  addendum. What is still deferred: a size-tier/LFS policy (#48), and image/OCR extraction. Per-batch max-files / total-bytes caps shipped with the
   multi-upload surface (**ADR-0025**, Accepted); the untrusted-input hardening landed as the
   extractor-layer SSRF guard (#66) + zip decompression-bomb cap (#53) — see the ADR-0025 appendix —
   while SVG/HTML XSS stays covered at render time (markdown-it `html=False`).
