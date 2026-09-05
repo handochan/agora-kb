@@ -388,10 +388,16 @@ def _is_harvest_provenance(fm: dict[str, object]) -> bool:
     body. (In v1 the summary path means neither clause admits attacker text to an emitted line; the
     exclusion is the ADR-mandated posture that stays correct once pins render full bodies.)
     """
+    # `sources:` is read through the ONE shared accessor (#169 D19) rather than a local `_fm_list`
+    # spelling: the exclusion this predicate computes and the citations lint grades must be reading
+    # the same list. The import is call-time, like this module's other reaches into `schema`
+    # (`schema.lint` never imports `core.gold`, so the direction stays acyclic either way).
+    from agora_kb.schema.lint import sources_entries
+
     origin = (_fm_str(fm.get("origin")) or "").strip().lower()
     if origin.startswith("harvest:"):
         return True
-    sources = [s for s in _fm_list(fm.get("sources")) if isinstance(s, str)]
+    sources = [s for s in sources_entries(fm) if isinstance(s, str)]
     harvest_sources = [s for s in sources if s.strip().lower().startswith("harvest:")]
     return bool(harvest_sources) and len(harvest_sources) == len(sources)
 
@@ -514,6 +520,7 @@ class PackAssembler:
         the pack BODY never depends on it, preserving byte-identical rebuild). Raises
         :class:`agora_kb.core.repo.GitError` if the curated tip / committer instant cannot be read.
         """
+        from agora_kb.schema.lint import sources_entries
         from agora_kb.schema.notes import is_ungraded_people_note, parse_all_notes
 
         spec = spec or PackSpec()
@@ -543,7 +550,7 @@ class PackAssembler:
             recency = round(_recency(_parse_note_datetime(fm), reference), 6)
             confidence = (_fm_str(fm.get("confidence")) or "high").strip().lower()
             bucket = round(_status_confidence_bucket(confidence), 6)
-            provenance = round(_provenance_density(_fm_list(fm.get("sources"))), 6)
+            provenance = round(_provenance_density(sources_entries(fm)), 6)
             score = round(
                 _W_STRUCT * struct
                 + _W_RECENCY * recency

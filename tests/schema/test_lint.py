@@ -1299,10 +1299,56 @@ def test_the_v1_layout_is_rejected_when_graded_as_schema_2(tmp_path: Path) -> No
 
 
 def test_the_v2_only_rules_never_fire_under_schema_1(tmp_path: Path) -> None:
-    """L1-22 / L1-23 / L1-24 are ADDED by ADR-0041 and must be unreachable on a v1 repo."""
+    """L1-22 / L1-23 / L1-24 / L1-25 are ADDED rules and must be unreachable on a v1 repo."""
     layout = _valid_repo(tmp_path)
     result = lint(layout, taxonomy=_TAXONOMY, run_date=RUN_DATE, run_id=RUN_ID)
-    assert {"L1-22", "L1-23", "L1-24"}.isdisjoint({f.code for f in result.findings})
+    assert {"L1-22", "L1-23", "L1-24", "L1-25"}.isdisjoint({f.code for f in result.findings})
+
+
+def test_l1_25_citation_surfaces_do_not_move_a_schema_1_verdict(tmp_path: Path) -> None:
+    """L1-25 is schema-2 only (#169 D19): both citation surfaces added to a v1 theme, same result.
+
+    The mirror key and a footnote definition citing a ``raw/`` path that ``sources:`` does NOT carry
+    would each be an L1-25 warning at schema 2. Under schema 1 the verdict must not move by one
+    finding — the additive-wave contract ADR-0041 D6 states for every rule the banner adds.
+    """
+    layout = _valid_repo(tmp_path)
+    before = lint(layout, taxonomy=_TAXONOMY, run_date=RUN_DATE, run_id=RUN_ID)
+
+    _write(
+        layout,
+        "wiki/ai-tech/themes/curator-concurrency.md",
+        _theme_fm(
+            related=["[[single-writer-stub]]"],
+            source_links=["[[raw/ai-tech/ghost.md]]"],
+        ),
+        "Exactly one curator advances the branch. See [[single-writer-stub]].\n\n"
+        "[^1]: raw/ai-tech/ghost.md\n",
+    )
+    after = lint(layout, taxonomy=_TAXONOMY, run_date=RUN_DATE, run_id=RUN_ID)
+
+    assert after == before
+    assert after.ok is True
+    assert after.findings == ()
+
+
+def test_the_shared_sources_reader_is_tolerant_and_verbatim() -> None:
+    """The ONE ``sources:`` accessor (#169 D19), pinned because THREE modules now read through it.
+
+    Non-string entries are KEPT: L1-7 asks "is ``sources:`` empty?" and ``[42]`` is not empty (its
+    type error is L1-4's finding, reported once). A non-list is ``[]`` for readers and a type error
+    for :func:`sources_str_list` — the distinction the L1-4 gate needs and the tolerant read erases.
+    """
+    from agora_kb.schema.lint import sources_entries, sources_str_list
+
+    assert sources_entries({"sources": ["raw/a.md", 42]}) == ["raw/a.md", 42]
+    assert sources_entries({"sources": "raw/a.md"}) == []
+    assert sources_entries({}) == []
+
+    assert sources_str_list({"sources": ["raw/a.md"]}) == ["raw/a.md"]
+    assert sources_str_list({"sources": ["raw/a.md", 42]}) is None
+    assert sources_str_list({"sources": "raw/a.md"}) is None
+    assert sources_str_list({"sources": []}) == []
 
 
 def test_a_people_tree_is_still_graded_under_schema_1(tmp_path: Path) -> None:
