@@ -1,0 +1,44 @@
+{% extends "base.html" %}
+{% block title %}{% if artifact %}{{ rel_path }}{% else %}Capture not found{% endif %} — Agora{% endblock %}
+{% block content %}
+{% if artifact %}
+  <p class="muted"><a href="/">&larr; Browse</a></p>
+  {# `article.note` (not a new class) so the existing `article.note .body pre` rule gives the
+     capture the same scrollable code block a note body gets — no stylesheet change for a page
+     whose whole content is one <pre>. #}
+  <article class="note">
+    <header class="fm-header">
+      <h1>Capture</h1>
+      <p class="muted mono">
+        {{ artifact.path }}
+        <span class="badge-status">raw</span>
+        · {{ artifact.bytes }} bytes
+      </p>
+      {# A capture is the evidence a curated note was written FROM — not a curated artifact. It
+         passed none of the curator's PLAN/APPLY grading and, unless it arrived through the
+         `session:` harvest connector, no redaction either (DRILLDOWN-169 §4 T5). Say so on the
+         page, not only in the docs. #}
+      <p class="muted">
+        Stored evidence, shown verbatim. Captures are not curated, linted, or (except for
+        harvested sessions) redacted.
+      </p>
+    </header>
+    {% if artifact.truncated %}
+      <p class="empty">
+        Showing the beginning of this {{ artifact.bytes }}-byte capture; the remainder is not
+        rendered. Read the file in the repo for the whole artifact.
+      </p>
+    {% endif %}
+    {# NOT markdown-rendered (D7). The text is emitted through Jinja2 AUTOESCAPE into a <pre>, so a
+       <script> in a captured document is escaped text, and the pre-flip relative links these
+       captures carry stay inert instead of being rewritten into /note/ hrefs — which would enrol
+       uncurated content in the site's link graph. Never add |safe here. #}
+    <div class="body"><pre class="raw-text">{{ artifact.text }}</pre></div>
+  </article>
+{% else %}
+  <h1>Capture not found</h1>
+  <p class="empty">No readable artifact at <span class="mono">{{ rel_path }}</span>.</p>
+  {% if note %}<p class="muted">{{ note }}</p>{% endif %}
+  <p><a href="/">&larr; Back to browse</a></p>
+{% endif %}
+{% endblock %}

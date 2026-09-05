@@ -1224,11 +1224,22 @@ class WebExtensionsConfig(BaseModel):
 
 
 class WebFeaturesConfig(BaseModel):
-    """Web feature flags (ADR-0025). ``graph_enabled`` off → /graph routes 404 + nav link hides."""
+    """Web feature flags (ADR-0025). ``graph_enabled`` off → /graph routes 404 + nav link hides.
+
+    ``raw_enabled`` (DRILLDOWN-169 D11) is the same shape for the provenance drill-down: off → the
+    ``/raw`` + ``/api/raw`` routes 404, a note's ``sources:`` render as plain text again, and a
+    body link into ``raw/`` is left verbatim rather than pointed at a disabled route. It exists
+    because a team deployment (``docs/DEPLOY-TEAM.md``) needs a one-line answer to *"the wiki is a
+    reviewed artefact, the captures are not"* — ``raw/`` passes none of the curator's PLAN/APPLY
+    grading and only the ``session:`` harvest connector redacts on the way in. The default is
+    **on**, which is the personal install's promise (issue #169's Done-when); this is a kill
+    switch, never an access control (the face has no auth at all until Phase 4 — §4 T7).
+    """
 
     model_config = ConfigDict(extra="forbid")
 
     graph_enabled: bool = True
+    raw_enabled: bool = True
 
 
 class WebIdentityConfig(BaseModel):
@@ -1427,6 +1438,9 @@ def load_web_config(layout: RepoLayout) -> WebConfig:
         features=WebFeaturesConfig(
             graph_enabled=_opt_bool(
                 features.get("graph_enabled"), True, key="web.features.graph_enabled"
+            ),
+            raw_enabled=_opt_bool(
+                features.get("raw_enabled"), True, key="web.features.raw_enabled"
             ),
         ),
         identity=_load_identity_config(identity),

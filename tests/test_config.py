@@ -398,6 +398,9 @@ def test_web_config_absent_file_loads_defaults(tmp_path: Path) -> None:
     assert cfg.upload.url_enabled is True
     assert cfg.extensions.allowed is None
     assert cfg.features.graph_enabled is True
+    # The raw drill-down ships ON (DRILLDOWN-169 D11): it is the personal install's promise, and
+    # the flag exists as a team-deployment kill switch, not as the gate that makes it safe.
+    assert cfg.features.raw_enabled is True
 
 
 def test_web_config_absent_web_block_loads_defaults(tmp_path: Path) -> None:
@@ -407,6 +410,7 @@ def test_web_config_absent_web_block_loads_defaults(tmp_path: Path) -> None:
     cfg = load_web_config(layout)
     assert cfg.graph.max_nodes == 10_000
     assert cfg.features.graph_enabled is True
+    assert cfg.features.raw_enabled is True
 
 
 def test_web_config_overrides_each_field(tmp_path: Path) -> None:
@@ -427,7 +431,8 @@ def test_web_config_overrides_each_field(tmp_path: Path) -> None:
         "  extensions:\n"
         "    allowed: [PDF, .md, txt]\n"
         "  features:\n"
-        "    graph_enabled: false\n",
+        "    graph_enabled: false\n"
+        "    raw_enabled: false\n",
     )
     cfg = load_web_config(layout)
     assert cfg.graph.max_nodes == 250
@@ -440,6 +445,7 @@ def test_web_config_overrides_each_field(tmp_path: Path) -> None:
     # Each allowed extension is normalized to a lowercased, dot-prefixed form.
     assert cfg.extensions.allowed == [".pdf", ".md", ".txt"]
     assert cfg.features.graph_enabled is False
+    assert cfg.features.raw_enabled is False
 
 
 def test_web_config_bad_int_fails_loud(tmp_path: Path) -> None:
@@ -455,6 +461,18 @@ def test_web_config_bad_bool_fails_loud(tmp_path: Path) -> None:
     layout = _layout(tmp_path)
     _write_repo_yaml(layout, "web:\n  features:\n    graph_enabled: 'yes'\n")
     with pytest.raises(ConfigError, match="web.features.graph_enabled"):
+        load_web_config(layout)
+
+
+def test_web_config_bad_raw_enabled_fails_loud(tmp_path: Path) -> None:
+    """A non-boolean raw_enabled fails loud — an exposure switch must never truthy-coerce.
+
+    The YAML 1.1 trap this guards is real: an operator writing ``raw_enabled: 'no'`` to CLOSE the
+    drill-down would otherwise get a non-empty string, i.e. the feature left ON.
+    """
+    layout = _layout(tmp_path)
+    _write_repo_yaml(layout, "web:\n  features:\n    raw_enabled: 'no'\n")
+    with pytest.raises(ConfigError, match="web.features.raw_enabled"):
         load_web_config(layout)
 
 
