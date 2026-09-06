@@ -28,6 +28,15 @@ from .requeue import (
     StateUnreadable,
     run_requeue,
 )
+from .restamp import (
+    NoteChange,
+    RestampPlan,
+    RestampReport,
+    TagMatch,
+    TagSource,
+    plan_restamp,
+    run_restamp,
+)
 from .subprocess_backend import BackendUnavailableError, SubprocessBackend
 from .triggers import TriggerConfig, TriggerDecision, TriggerReason, evaluate
 from .worker import (
@@ -76,6 +85,15 @@ __all__ = [
     "Selector",
     "StateUnreadable",
     "run_requeue",
+    # `agora repo upgrade --restamp` — the engine-only frontmatter backfill (#175/#174, ADR-0010
+    # §5.2's admin path for the `--tags-from-vault` half).
+    "NoteChange",
+    "RestampPlan",
+    "RestampReport",
+    "TagMatch",
+    "TagSource",
+    "plan_restamp",
+    "run_restamp",
     "Candidate",
     "BundleResult",
     "build_bundle",
