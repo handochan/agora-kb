@@ -50,6 +50,9 @@ curator would reject:
 * every non-stub theme/concept (and, on schema 2, summary) gets non-empty ``sources:`` and the
   ``raw/<domain>/<event>.md`` evidence files those sources name are materialized (L1-7 / L1-8) —
   ``raw/`` is byte-identical across the two layouts, because ADR-0041 D1.4 never moves it;
+* ``blobs=`` additionally materializes the ORIGINAL-BYTES capture tier —
+  ``raw/_blob/<ab>/<sha256>.<ext>`` plus its closed-key ``.meta.yaml`` sidecar, in APPLY's own
+  shape and key order — and writes nothing at all when omitted, so no existing fixture moves;
 * each map's ``children:`` is generated from the SAME list as its body child bullets, so the two
   sides cannot disagree (L1-6); likewise the root ``index.md`` over the maps. On schema 2 those
   children are additionally kept inside D1.3's admitted kind set, which L1-24 enforces;
@@ -71,12 +74,15 @@ produces byte-identical bytes.
 
 from __future__ import annotations
 
+import hashlib
 import posixpath
 import re
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
+
+import yaml
 
 # The PRODUCTION slugger and the PRODUCTION canonical hash, imported rather than re-implemented.
 # A private-looking `_slugify` is reached into on purpose: a second slugger in the fixture would
@@ -87,7 +93,7 @@ from agora_kb.adapters.ollama_brain import _slugify as _production_slugify
 from agora_kb.config import KbIdentity, write_kb_identity
 from agora_kb.core.frontmatter import render
 from agora_kb.core.hashing import content_sha256
-from agora_kb.core.layout import KIND_DIRECTORIES, RepoLayout
+from agora_kb.core.layout import KIND_DIRECTORIES, SIDECAR_SUFFIX, RepoLayout, blob_ref
 from agora_kb.schema.emit import Taxonomy, emit_schema
 
 __all__ = [
@@ -524,6 +530,78 @@ def _materialize_sources(root: Path, basename: str, sources: list[str]) -> None:
             _write(root, src, f"# evidence: {basename}\n\nSynthetic evidence artifact.\n")
 
 
+#: The ``<blob>.meta.yaml`` capture sidecar's CLOSED key set, IN APPLY'S EMISSION ORDER
+#: (``curator/apply.py`` ``_render_blob_sidecar``). Order is part of the fixture's fidelity: the
+#: sidecar is rendered with ``sort_keys=False``, so a reader that ever grows an order expectation
+#: must meet the same bytes production writes.
+_SIDECAR_KEYS = (
+    "sha256",
+    "ext",
+    "media_type",
+    "bytes",
+    "filename",
+    "captured_at",
+    "writer",
+    "source",
+    "event_id",
+)
+
+#: The three sidecar keys the builder DERIVES from the blob itself. A caller may not supply them:
+#: APPLY writes ``bytes`` as the length actually written precisely so the sidecar can never
+#: disagree with the file beside it, and a fixture free to declare a different digest or size would
+#: be pinning a shape production cannot produce.
+_SIDECAR_DERIVED_KEYS = frozenset({"sha256", "ext", "bytes"})
+
+
+def _materialize_blobs(
+    root: Path, blobs: Sequence[tuple[str, str, bytes, Mapping[str, object]]]
+) -> None:
+    """Write each ``raw/_blob/<ab>/<sha256>.<ext>`` + its ``.meta.yaml`` sidecar, in APPLY's shape.
+
+    One entry is ``(sha256, ext, data, sidecar)``: the digest and extension that NAME the artefact,
+    its exact bytes, and the capture facts. The path is composed by the production
+    :func:`~agora_kb.core.layout.blob_ref` (never re-spelled here), the bytes are written verbatim
+    in binary mode — no newline translation, so a CRLF or a lone ``0xff`` survives and the file
+    still hashes to its own basename (ADR-0041 D1.4) — and the sidecar is rendered with APPLY's key
+    ORDER, its derived keys, and absent optionals OMITTED rather than emitted empty.
+
+    ``sha256`` must actually be the digest of ``data``: a fixture that files bytes under a name they
+    do not hash to would pin a tree APPLY refuses to produce (it re-verifies on every run) and would
+    make any digest assertion downstream vacuous.
+    """
+    for sha256, ext, data, sidecar in blobs:
+        digest = hashlib.sha256(data).hexdigest()
+        if sha256 != digest:
+            raise ValueError(
+                f"blob sha256 {sha256!r} is not the digest of its bytes ({digest!r}): "
+                "raw/_blob/ is content-addressed (ADR-0041 D1.4) and APPLY re-verifies it"
+            )
+        unknown = sorted(set(sidecar) - set(_SIDECAR_KEYS))
+        if unknown:
+            raise ValueError(
+                f"sidecar keys {unknown} are outside the closed capture key set "
+                f"{list(_SIDECAR_KEYS)} (DATA-MODEL §2)"
+            )
+        supplied_derived = sorted(set(sidecar) & _SIDECAR_DERIVED_KEYS)
+        if supplied_derived:
+            raise ValueError(
+                f"sidecar keys {supplied_derived} are derived from the blob itself and cannot be "
+                "supplied: APPLY writes them from the bytes it actually wrote"
+            )
+        ref = blob_ref(sha256, ext)
+        path = root / ref
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+        doc: dict[str, object] = {"sha256": sha256, "ext": ext, "bytes": len(data)}
+        doc.update(sidecar)
+        ordered = {key: doc[key] for key in _SIDECAR_KEYS if key in doc}
+        _write(
+            root,
+            f"{ref}{SIDECAR_SUFFIX}",
+            yaml.safe_dump(ordered, sort_keys=False, allow_unicode=True, default_flow_style=False),
+        )
+
+
 # --- the builder ---------------------------------------------------------------------------------
 
 
@@ -535,6 +613,7 @@ def build_kb(
     domains: list[str] | None = None,
     kb_id: str = FIXTURE_KB_ID,
     kb_name: str = FIXTURE_KB_NAME,
+    blobs: Sequence[tuple[str, str, bytes, Mapping[str, object]]] | None = None,
 ) -> Path:
     """Materialize a complete, lint-clean knowledge repo at ``root`` and return ``root``.
 
@@ -562,15 +641,27 @@ def build_kb(
     Raises :class:`ValueError` on a corpus that could not lint (duplicate basename, a map child that
     is not an admitted child of that domain, an unusable daily basename, a schema-2-only kind under
     schema 1) — the fixture fails loudly at build time rather than as a mystery lint finding later.
+
+    ``blobs`` materializes the ORIGINAL-BYTES capture tier: ``(sha256, ext, data, sidecar)`` per
+    entry becomes ``raw/_blob/<ab>/<sha256>.<ext>`` plus its closed-key ``.meta.yaml`` sidecar, in
+    the shape APPLY writes (see :func:`_materialize_blobs`). It is schema-INDEPENDENT and runs after
+    either layout for the same reason ``raw/`` is: ADR-0041 D1.4 never moves it. Default ``None``
+    writes nothing at all, so every existing call site produces byte-identical output. Blobs are NOT
+    auto-cited — a note that should cite one names it in its own ``sources:``, and
+    :func:`_materialize_sources` leaves an already-written path alone.
     """
+    root = Path(root)
     if schema_version == 2:
-        return _build_v2(Path(root), notes, domains=domains, kb_id=kb_id, kb_name=kb_name)
-    if kb_id != FIXTURE_KB_ID or kb_name != FIXTURE_KB_NAME:
-        raise ValueError(
-            "kb_id/kb_name are schema-2 only: _meta/kb.yaml does not exist in the v1 layout "
-            "(ADR-0041 D1.5)"
-        )
-    return _build_v1(Path(root), notes, domains=domains, schema_version=schema_version)
+        _build_v2(root, notes, domains=domains, kb_id=kb_id, kb_name=kb_name)
+    else:
+        if kb_id != FIXTURE_KB_ID or kb_name != FIXTURE_KB_NAME:
+            raise ValueError(
+                "kb_id/kb_name are schema-2 only: _meta/kb.yaml does not exist in the v1 layout "
+                "(ADR-0041 D1.5)"
+            )
+        _build_v1(root, notes, domains=domains, schema_version=schema_version)
+    _materialize_blobs(root, blobs or ())
+    return root
 
 
 def _build_v1(

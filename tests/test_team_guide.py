@@ -125,6 +125,9 @@ def test_repo_yaml_example_keys_land_via_real_loaders(tmp_path: Path) -> None:
     assert web.identity.trusted_header == "X-Remote-User"  # default: None (feature off)
     assert web.identity.strip_domain is True  # default: False
     assert web.upload.url_enabled is False  # default: True (#66 off-switch)
+    # web.features.raw_enabled (#169 D11) — false in the example, default true. Without this the
+    # guide's newest documented key is the one key the drift lock does not cover.
+    assert web.features.raw_enabled is False
 
     harvest = load_harvest_policy(layout)
     # The top-level `kind: team` must reach the scope gate's repo_kind input (§5).

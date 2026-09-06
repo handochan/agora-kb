@@ -28,6 +28,7 @@ from agora_kb.core.layout import RepoLayout
 from agora_kb.curator.apply import (
     DEFAULT_MAX_BODY_BYTES,
     ApplyError,
+    _source_links,
     apply_plan,
     body_sentinels,
     region_sentinel_id,
@@ -37,7 +38,7 @@ from agora_kb.curator.apply import (
 from agora_kb.curator.plan import Disposition, Plan
 from agora_kb.schema.emit import Taxonomy, emit_schema
 from agora_kb.schema.lint import lint
-from agora_kb.schema.notes import body_link_basenames, child_bullets
+from agora_kb.schema.notes import body_link_basenames, child_bullets, wikilinks
 
 RUN_ID = "2026-06-13T03-00-00.000Z--7f31ab"
 RUN_DATE = "2026-06-13"
@@ -243,6 +244,11 @@ def test_create_theme_produces_exact_bytes(tmp_path: Path) -> None:
         "  - claude-code\n"
         "sources:\n"
         f"- raw/ai-tech/{E1}.md\n"
+        # The #169 D18/D20 derived Obsidian mirror, IMMEDIATELY after the list it mirrors — a
+        # proper subset of `sources:` (raw/ entries only), single-quoted by the YAML emitter
+        # because `[` opens a flow sequence in plain style. Never authoritative (schema §3.4).
+        "source_links:\n"
+        f"- '[[raw/ai-tech/{E1}.md]]'\n"
         "related: []\n"
         "confidence: high\n"
         "body_status: pending\n"
@@ -1222,6 +1228,347 @@ def test_mark_contested_empty_links_raises(tmp_path: Path) -> None:
         apply_plan(_plan(disp), worktree=wt, run_date=RUN_DATE, provenance=_provenance("x1", E2))
 
 
+# --- #169 D18/D20: the derived `source_links:` mirror -------------------------------------------
+#
+# `sources:` stays the provenance of record (schema §3.4); `source_links:` is APPLY's DERIVED
+# rendering of its `raw/` half in the one syntax Obsidian links from inside a list property. Three
+# stamping sites (CREATE_THEME · MERGE_INTO_THEME · MARK_CONTESTED — the CLAIM-BEARING kinds, D20),
+# two deliberately-unmirrored journal sites, and one relation that makes the key derivable rather
+# than authoritative: the mirror is always a SUBSET of `sources:`, never a peer of it.
+#
+# The CREATE site's exact bytes are pinned by `test_create_theme_produces_exact_bytes` above (the
+# whole-file golden), so the byte asserts here cover the two RE-STAMP sites, which are the ones
+# that have to place the key correctly in a frontmatter block they did not compose.
+
+#: The mirror's rendered form, single-quoted by the YAML emitter because `[` opens a flow sequence.
+_MIRROR_E1 = f"- '[[raw/ai-tech/{E1}.md]]'\n"
+_MIRROR_E2 = f"- '[[raw/ai-tech/{E2}.md]]'\n"
+
+
+def _mirror_of(fm: dict[str, object]) -> list[str]:
+    value = fm.get("source_links")
+    assert isinstance(value, list), f"source_links is {value!r}, not a list"
+    return [v for v in value if isinstance(v, str)]
+
+
+def test_merge_stamps_the_mirror_onto_a_target_that_had_none(tmp_path: Path) -> None:
+    """A note that PREDATES the mirror gains one the next time a merge touches its `sources:`.
+
+    This is why the wiring is a RE-STAMP at the union site rather than a one-shot at creation: every
+    concept in an existing KB was written before this key existed, and a mirror that only ever
+    appeared on brand-new notes would leave the whole corpus unlinkable in Obsidian forever.
+    """
+    wt = _worktree(tmp_path)
+    _seed_theme(wt, "cqrs", sources=[f"raw/ai-tech/{E1}.md"], body="Existing CQRS prose.")
+    seeded, _ = frontmatter.parse(_concept(wt, "cqrs").read_text(encoding="utf-8"))
+    assert "source_links" not in seeded, "the fixture must start WITHOUT a mirror"
+
+    apply_plan(
+        _plan(_merge_disp()), worktree=wt, run_date=RUN_DATE, provenance=_provenance("m1", E2)
+    )
+
+    text = _concept(wt, "cqrs").read_text(encoding="utf-8")
+    # EXACT bytes: the mirror follows the unioned `sources:` immediately and in the same order, so
+    # the YAML diff of a run that adds one source is one contiguous hunk.
+    assert (
+        "sources:\n"
+        f"- raw/ai-tech/{E1}.md\n"
+        f"- raw/ai-tech/{E2}.md\n"
+        "source_links:\n" + _MIRROR_E1 + _MIRROR_E2 + "related: []\n"
+    ) in text
+
+
+def test_contested_restamps_a_stale_mirror_and_restores_its_place(tmp_path: Path) -> None:
+    """A pre-existing mirror is REPLACED (never extended) and moved back beside `sources:`.
+
+    The stale value here is written LAST, which is where a plain `fm["source_links"] = …` would
+    leave it and where a hand edit typically puts it. Both halves are the point: a mirror that is
+    appended to rather than recomputed would keep citing an artefact the note no longer sources.
+    """
+    wt = _worktree(tmp_path)
+    _seed_theme(wt, "cqrs", sources=[f"raw/ai-tech/{E1}.md"], body="The original CQRS claim.")
+    # A competing note must exist for the [[competing]] link to resolve (lint L1-2).
+    _seed_theme(wt, "event-sourcing", sources=[f"raw/ai-tech/{E3}.md"], body="Alt claim.")
+    theme = _concept(wt, "cqrs")
+    fm, body = frontmatter.parse(theme.read_text(encoding="utf-8"))
+    fm["source_links"] = ["[[raw/ai-tech/no-longer-sourced.md]]"]
+    theme.write_text(frontmatter.render(fm, body), encoding="utf-8")
+    assert theme.read_text(encoding="utf-8").index("source_links:") > theme.read_text(
+        encoding="utf-8"
+    ).index("confidence:"), "the stale mirror starts at the END of the block"
+
+    disp = Disposition(
+        candidate_id="x1",
+        event_ids=(E2,),
+        op="MARK_CONTESTED",
+        target_basename="cqrs",
+        summary="Curator uses two writers, not one.",
+        links=("event-sourcing",),
+        needs_prose=False,
+        reason="Contradiction.",
+    )
+    apply_plan(_plan(disp), worktree=wt, run_date=RUN_DATE, provenance=_provenance("x1", E2))
+
+    text = theme.read_text(encoding="utf-8")
+    assert "no-longer-sourced" not in text  # replaced, not extended
+    assert (
+        "sources:\n"
+        f"- raw/ai-tech/{E1}.md\n"
+        f"- raw/ai-tech/{E2}.md\n"
+        "source_links:\n" + _MIRROR_E1 + _MIRROR_E2 + "related: []\n"
+    ) in text
+
+
+def test_the_mirror_is_a_strict_subset_of_sources(tmp_path: Path) -> None:
+    """Only `raw/` entries are mirrored — the blob half of a capture included, a non-path excluded.
+
+    Not every `sources:` string is a repo path: `core.gold` still branches on a `harvest:<agent>`
+    shape that resolves nowhere, and lint L1-8 (a bare `exists()`) has never adjudicated which of
+    the two is stale (#169 R-9). The mirror takes no position on that — it declines to wrap a
+    non-path in `[[ ]]`, which is also what keeps it a PROPER subset of the record it mirrors.
+    """
+    wt = _worktree(tmp_path)
+    blob_rel = "raw/_blob/ab/" + "ab" * 32 + ".pdf"
+    blob = wt / blob_rel
+    blob.parent.mkdir(parents=True, exist_ok=True)
+    blob.write_bytes(b"%PDF-1.7 fixture")
+    prov = {
+        "c1": [
+            # (1) a free-text capture -> raw/<domain>/<event_id>.md, materialized by APPLY;
+            {"event_id": E1, "source": "claude-code", "writer": "d", "body": "capture"},
+            # (2) the BYTES half of the same kind of capture -> raw/_blob/<ab>/<sha>.<ext>;
+            {"event_id": E2, "source": "claude-code", "writer": "d", "raw_ref": blob_rel},
+            # (3) a non-path citation shape -> mirrored by NOTHING.
+            {"event_id": E3, "source": "claude-code", "writer": "d", "raw_ref": "harvest:bm/f-1"},
+        ]
+    }
+    apply_plan(_plan(_create_theme()), worktree=wt, run_date=RUN_DATE, provenance=prov)
+
+    fm, _ = frontmatter.parse(_concept(wt, "curator-concurrency").read_text(encoding="utf-8"))
+    sources = fm["sources"]
+    assert sources == [f"raw/ai-tech/{E1}.md", blob_rel, "harvest:bm/f-1"]
+    assert _mirror_of(fm) == [f"[[raw/ai-tech/{E1}.md]]", f"[[{blob_rel}]]"]
+    mirrored = {link[2:-2] for link in _mirror_of(fm)}
+    assert mirrored < set(sources), "a PROPER subset of sources: — never a second record"
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "raw/general/a|b.md",  # `|` opens the display-alias half -> names `raw/general/a`
+        "raw/general/e]]f.md",  # `]]` closes the link early
+        "raw/general/n[[m.md",  # `[[` re-opens it
+    ],
+)
+def test_a_raw_source_holding_a_wikilink_metacharacter_is_left_out_of_the_mirror(
+    source: str,
+) -> None:
+    """The mirror never emits a link that names a DIFFERENT artefact than `sources:` records.
+
+    APPLY's own refs (`raw/<domain>/<event_id>.md`, `raw/_blob/<ab>/<sha256>.<ext>`) can never hold
+    these characters, but `_sources_union` takes a provenance tuple's `raw_ref` verbatim and a
+    converted or hand-made KB can hold such a file. Emitting `[[raw/general/a|b.md]]` would make the
+    emitter trip L1-25 — the rule shipped in the same wave to keep it honest — and would make
+    Obsidian open the wrong file. The `sources:` row is untouched; only the chip is declined.
+    """
+    assert _source_links([source]) == []
+    # And the reason, stated as the property rather than as a character list: the guard is a
+    # round-trip through the SAME reader L1-25 grades the mirror with.
+    assert wikilinks(f"[[{source}]]") != [source]
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "raw/general/h#i.md",  # `#` opens the heading address -> names the file `raw/general/h`
+        "raw/general/b#^c.md",  # `#^` opens the block-reference address
+        "raw/general/caret^d.md",  # refused WITH the hash, not only in the `#^` pair
+    ],
+)
+def test_a_raw_source_holding_a_wikilink_address_sigil_is_left_out_of_the_mirror(
+    source: str,
+) -> None:
+    """The other half of "names a DIFFERENT artefact" — the one the round trip cannot see.
+
+    `wikilinks()` splits only on `|`, so these paths round-trip through it BYTE-FOR-BYTE while an
+    actual wikilink reader splits them at `#`: `[[raw/general/h#i.md]]` addresses the heading
+    `i.md` inside the file `raw/general/h`. The round-trip test alone would therefore have emitted
+    a chip that opens the wrong file, which is exactly what the guard exists to prevent — so the
+    two tests run together and this one asserts the round trip PASSES.
+
+    The refusal is deliberately stricter than L1-25, which drops a `#` address before comparing
+    against `sources:` and so tolerates a hand-written `[[raw/x.md#part-2]]`. APPLY declines to MINT
+    a chip whose faithfulness it cannot prove; the subset direction is the safe one.
+    """
+    assert _source_links([source]) == []
+    assert wikilinks(f"[[{source}]]") == [source]
+
+
+def test_the_mirror_round_trips_through_the_reader_that_grades_it() -> None:
+    """The positive half: an ordinary `raw/` path (Unicode and a blob ref) does get its chip."""
+    ok = ["raw/general/plain.md", "raw/한글/캡처.md", "raw/_blob/ab/" + "d" * 64 + ".pdf"]
+    assert _source_links(ok) == [f"[[{s}]]" for s in ok]
+    assert [link for entry in _source_links(ok) for link in wikilinks(entry)] == ok
+
+
+def test_a_concept_with_no_raw_source_carries_no_mirror_key(tmp_path: Path) -> None:
+    """An empty mirror is ABSENT, never `source_links: []` — a key nothing can read as a claim."""
+    wt = _worktree(tmp_path)
+    prov = {
+        "c1": [{"event_id": E1, "source": "claude-code", "writer": "d", "raw_ref": "harvest:x"}]
+    }
+    apply_plan(_plan(_create_theme()), worktree=wt, run_date=RUN_DATE, provenance=prov)
+
+    text = _concept(wt, "curator-concurrency").read_text(encoding="utf-8")
+    fm, _ = frontmatter.parse(text)
+    assert fm["sources"] == ["harvest:x"]
+    assert "source_links" not in fm
+    assert "source_links" not in text  # not even an empty list
+
+
+def test_a_restamp_that_empties_the_mirror_removes_the_key(tmp_path: Path) -> None:
+    """The pop half of the contract, at a RE-STAMP site: a stale mirror cannot outlive its sources.
+
+    Reachable today the moment a human edits `sources:` between two curator runs, which is exactly
+    the population the mirror is least able to defend itself against.
+    """
+    wt = _worktree(tmp_path)
+    _seed_theme(wt, "cqrs", sources=["harvest:bm/f-0"], body="Existing CQRS prose.")
+    theme = _concept(wt, "cqrs")
+    fm, body = frontmatter.parse(theme.read_text(encoding="utf-8"))
+    fm["source_links"] = ["[[raw/ai-tech/no-longer-sourced.md]]"]
+    theme.write_text(frontmatter.render(fm, body), encoding="utf-8")
+
+    prov = {
+        "m1": [{"event_id": E2, "source": "claude-code", "writer": "d", "raw_ref": "harvest:y"}]
+    }
+    apply_plan(_plan(_merge_disp()), worktree=wt, run_date=RUN_DATE, provenance=prov)
+
+    fm, _ = frontmatter.parse(theme.read_text(encoding="utf-8"))
+    assert fm["sources"] == ["harvest:bm/f-0", "harvest:y"]
+    assert "source_links" not in fm
+
+
+def test_journals_are_never_mirrored_at_either_write_site(tmp_path: Path) -> None:
+    """D20 gates the mirror on CLAIM_BEARING_KINDS, and `note` is not one — at BOTH journal sites.
+
+    The second site is the one a future flip would forget: the cross-run union that extends an
+    EXISTING journal. A mirror stamped by `_journal_frontmatter` on day 1 and not re-stamped there
+    would go stale the next time the same journal gained a source.
+    """
+    wt = _worktree(tmp_path)
+    # Site 1 — the fresh journal composed by `_journal_frontmatter`.
+    apply_plan(
+        _plan(_append_daily()), worktree=wt, run_date=RUN_DATE, provenance=_provenance("d1", E1)
+    )
+    fm, _ = frontmatter.parse(_journal(wt).read_text(encoding="utf-8"))
+    assert fm["sources"] == [f"raw/ai-tech/{E1}.md"]
+    assert "source_links" not in fm
+
+    # Site 2 — the union branch that appends into the journal that now exists.
+    apply_plan(
+        _plan(_append_daily(candidate_id="d2", event_ids=(E2,))),
+        worktree=wt,
+        run_date=RUN_DATE,
+        provenance=_provenance("d2", E2),
+    )
+    text = _journal(wt).read_text(encoding="utf-8")
+    fm, _ = frontmatter.parse(text)
+    assert fm["sources"] == [f"raw/ai-tech/{E1}.md", f"raw/ai-tech/{E2}.md"]  # the union ran
+    assert "source_links" not in text
+
+
+def test_the_mirror_changes_no_body_bytes_at_the_merge_site(tmp_path: Path) -> None:
+    """The mirror is frontmatter-only — the #144 determinism pin depends on it.
+
+    The planning brain's `related/` view is `Wiki.query_lexical` over note BODIES
+    (`curator/bundle.py`), and that view chooses MERGE_INTO_THEME targets, so a body-byte change
+    here would move a permanent merge decision that no committed test observes. Rendering the SAME
+    plan with the mirror's own inputs varied must leave every body byte-identical.
+
+    This drives ONE merge plan, which is what the name says: the property itself is structural
+    rather than per-site — `_stamp_source_links` takes the frontmatter mapping alone and has no
+    body to reach — and `tests/core/test_rank_neutrality.py` pins that structurally, comparing the
+    mirrored and unmirrored renders of the same note byte-for-byte below the frontmatter.
+    """
+    wt = _worktree(tmp_path)
+    _seed_theme(wt, "cqrs", sources=[f"raw/ai-tech/{E1}.md"], body="Existing CQRS prose.")
+    apply_plan(
+        _plan(_merge_disp(needs_prose=True)),
+        worktree=wt,
+        run_date=RUN_DATE,
+        provenance=_provenance("m1", E2),
+    )
+    mirrored_bodies = {
+        p.relative_to(wt).as_posix(): frontmatter.parse(p.read_text(encoding="utf-8"))[1]
+        for p in sorted((wt / "wiki").rglob("*.md"))
+    }
+    assert any("source_links" in p.read_text(encoding="utf-8") for p in (wt / "wiki").rglob("*.md"))
+
+    # The same run over a repo whose only difference is that NOTHING is mirrorable.
+    other = _worktree(tmp_path / "other")
+    _seed_theme(other, "cqrs", sources=["harvest:bm/f-0"], body="Existing CQRS prose.")
+    prov = {
+        "m1": [{"event_id": E2, "source": "claude-code", "writer": "d", "raw_ref": "harvest:y"}]
+    }
+    apply_plan(
+        _plan(_merge_disp(needs_prose=True)),
+        worktree=other,
+        run_date=RUN_DATE,
+        provenance=prov,
+    )
+    unmirrored_bodies = {
+        p.relative_to(other).as_posix(): frontmatter.parse(p.read_text(encoding="utf-8"))[1]
+        for p in sorted((other / "wiki").rglob("*.md"))
+    }
+    assert mirrored_bodies == unmirrored_bodies
+
+
+def test_a_mirrored_worktree_lints_clean_with_no_l1_25(tmp_path: Path) -> None:
+    """All three stamped sites in ONE worktree, graded by the REAL schema-2 ruleset.
+
+    L1-25 (#169 D19) grades a citation the note's `sources:` does not carry. The mirror is derived
+    FROM `sources:` and is a subset of it, so it can never be the thing that trips the rule — which
+    is the property that lets the emitter and the rule ship in the same wave without a repair pass.
+    """
+    wt = _worktree(tmp_path)
+    apply_plan(
+        _plan(_create_theme()),
+        worktree=wt,
+        run_date=RUN_DATE,
+        provenance=_provenance("c1", E1),
+    )
+    _seed_theme(wt, "cqrs", sources=[f"raw/ai-tech/{E1}.md"], body="Existing CQRS prose.")
+    apply_plan(
+        _plan(_merge_disp()), worktree=wt, run_date=RUN_DATE, provenance=_provenance("m1", E2)
+    )
+    apply_plan(
+        _plan(
+            Disposition(
+                candidate_id="x1",
+                event_ids=(E3,),
+                op="MARK_CONTESTED",
+                target_basename="cqrs",
+                summary="Curator uses two writers, not one.",
+                links=("curator-concurrency",),
+                needs_prose=False,
+                reason="Contradiction.",
+            )
+        ),
+        worktree=wt,
+        run_date=RUN_DATE,
+        provenance=_provenance("x1", E3),
+    )
+
+    for basename in ("curator-concurrency", "cqrs"):
+        fm, _ = frontmatter.parse(_concept(wt, basename).read_text(encoding="utf-8"))
+        assert _mirror_of(fm), f"{basename} carries a mirror"
+
+    result = lint(RepoLayout(wt), taxonomy=TAXONOMY, run_date=RUN_DATE, run_id=RUN_ID)
+    assert result.ok, [f"{f.code} {f.path}: {f.message}" for f in result.findings]
+    assert [f for f in result.findings if f.code == "L1-25"] == []
+
+
 # --- DROP / NOOP --------------------------------------------------------------------------------
 
 
@@ -1379,6 +1726,30 @@ def test_author_diff_rejects_frontmatter_edit() -> None:
         sentinels={"t.md": {"c1"}},
     )
     assert any("frontmatter changed" in e for e in errors)
+
+
+def test_author_diff_rejects_a_pass_2_edit_of_the_source_links_mirror() -> None:
+    """#169 D20: the mirror is frozen by the EXISTING check 2 — the wave adds no sixth check.
+
+    APPLY stamps `source_links:` BEFORE the PASS-2 snapshot, so the key is inside the frontmatter
+    block check 2 already compares byte-for-byte. A brain that rewrites a citation — the one edit
+    that would make a note point at an artefact its `sources:` never named — is rejected with the
+    message that already existed. Asserting the WHOLE error list (not `any(...)`) is the point: a
+    new, narrower check bolted on for the mirror would show up here as a second entry.
+    """
+    fm_block = _FM_BLOCK.replace(
+        "sources:\n- raw/ai-tech/e1.md\n",
+        "sources:\n- raw/ai-tech/e1.md\nsource_links:\n- '[[raw/ai-tech/e1.md]]'\n",
+    )
+    old = _note(fm_block, "_summary pending_")
+    new = _note(fm_block.replace("e1.md]]", "attacker.md]]"), "_summary pending_")
+    errors = validate_author_diff(
+        changed_paths=["t.md"],
+        per_file_old={"t.md": old},
+        per_file_new={"t.md": new},
+        sentinels={"t.md": {"c1"}},
+    )
+    assert errors == ["t.md: frontmatter changed during PASS 2 (frontmatter is owned by APPLY)"]
 
 
 def test_author_diff_rejects_out_of_sentinel_edit() -> None:

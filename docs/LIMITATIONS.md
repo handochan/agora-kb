@@ -14,7 +14,7 @@ Related, and deliberately not duplicated here:
 
 | Doc | Covers |
 |---|---|
-| [`../CHANGELOG.md`](../CHANGELOG.md) → "Known limitations" | The short list this document expands (12 items) |
+| [`../CHANGELOG.md`](../CHANGELOG.md) → "Known limitations" | The short list this document expands (15 items) |
 | [`ROADMAP.md`](ROADMAP.md) → "Not in 0.1.0-beta" | The **normative** list — if the two ever disagree, ROADMAP wins |
 | [`../SECURITY.md`](../SECURITY.md) | Threat model, supported scope, private vulnerability reporting |
 | [`DEPLOY-TEAM.md`](DEPLOY-TEAM.md) (**Korean**) | Running one KB for 2–10 people: hub topology, proxy auth, footguns |
@@ -149,10 +149,12 @@ Everything else that would let you retract something is also absent:
 - The inbox is append-only ([`DESIGN.md`](DESIGN.md):104, §2.2; ADR-0002) and events are immutable:
   their lifecycle is represented by *location*, never by mutation
   ([`DATA-MODEL.md`](DATA-MODEL.md):33-37).
-- No face offers a delete. `agora --help` lists `repo · import · status · curate · requeue ·
-  harvest · index · gold · eval · sync · watch · serve · web · doctor`. The MCP face exposes
+- No face offers a delete. `agora --help` lists `repo · import · capture · status · query · read ·
+  neighbors · curate · requeue · harvest · index · gold · eval · sync · watch · serve · web ·
+  doctor`. The MCP face exposes
   `kb_remember`, `kb_query`, `kb_read`, `kb_neighbors`, `kb_context`, `kb_status`, `kb_curate`
-  (`faces/mcp_server.py:1022-1134`). The web face has no delete route.
+  (the `@mcp.tool` registrations in `faces/mcp_server.py`'s `build_server`). The web face has no
+  delete route.
 - `wiki/` is git history. Retracting a published note means rewriting that history by hand, on
   every clone and every backup remote that already has it.
 - ADR-0031 (retention and right-to-delete) is **unwritten**: there is no `docs/adr/0031-*.md`.
@@ -317,7 +319,7 @@ temporary worktree and has no network, so a read alone cannot leave the machine
 
 ---
 
-## 6. An upload's original bytes are kept — but nothing serves them back
+## 6. An upload's original bytes are kept — and now reachable, ungraded and unevenly redacted
 
 **What is true.** Since the schema-2 work (ADR-0041 D1.4/D4.2, Stratum wave W2.5 — commits
 `37dd56e` · `d244e5e` · `7a30124`), an upload's original bytes travel with its inbox event as a
@@ -332,30 +334,168 @@ artefact); an identical re-upload is re-cited, never rewritten. `agora capture -
 no-server way in. The bundle the brain sees carries a text summary only — a test asserts no bytes
 reach it. The extracted markdown remains the searchable body; the blob is evidence, not corpus.
 
+**The read side landed (#169 wave A).** A `sources:` string is now followable on every read face,
+through one shared seam (`AgoraHandlers.raw()`), so the three faces cannot describe one capture
+differently:
+
+- **Web** — `GET /raw/{path}` (a page) and `GET /api/raw/{path}` (JSON), where `{path}` is the
+  citation with its stored `raw/` prefix dropped: `sources: raw/general/psa-hca.md` →
+  `/raw/general/psa-hca.md`. A note page's `sources:` rows are now anchors — but only the ones the
+  route would actually serve; the server computes each row with the same predicate the route
+  enforces, so a link that is offered always opens and anything else stays the plain text it was.
+- **MCP** — `kb_read` takes a `sources:` string as well as a note path; the tool count is still
+  seven. A `raw/` answer is marked by a `resource: "raw"` key and carries
+  `raw_kind` (`"text"` | `"blob"`), `path`, `bytes`, and either `text` + `truncated` or `meta`.
+- **CLI** — `agora read <path>` prints the same payload (`--json` prints it verbatim, byte-identical
+  to what the MCP tool returns), alongside the two other new read verbs `agora query` and
+  `agora neighbors`.
+- **Kill switch** — `web.features.raw_enabled` (default `true`, `_kb/repo.yaml`). Off → both routes
+  404, `sources:` render as plain text again, and a body link into `raw/` is left verbatim rather
+  than pointed at a disabled route. It is a switch, not an access control: the face still has no
+  authentication of any kind (§8).
+
+**The write side landed too (#169 wave B) — but in the frontmatter, not the body.** APPLY now stamps
+a derived `source_links:` mirror beside `sources:` on concepts and summaries: the `raw/` entries,
+rendered as `'[[raw/ai-tech/2026-09-01-cqrs-notes.md]]'` wikilinks, which is the one citation form
+Obsidian linkifies inside a list property. In a vault whose root is the repo root they render as
+clickable property chips, so a reader in Obsidian can follow a claim to its evidence without leaving
+the pane. The mirror is derived, never authoritative: it never names a source `sources:` does not
+carry and usually names fewer (only `raw/` entries enter, so a `harvest:<agent>` string is never
+wrapped in a link that resolves nowhere), it is removed rather than emitted empty, it is re-derived
+on every write that touches `sources:`, and journals never get one. Lint `L1-25` — the one L1 rule
+that is a **warning** rather than a hard reject — reports any citation, in the mirror or
+hand-written in the body, that `sources:` does not carry.
+
+**It is stamped going forward, not backfilled — so an existing KB starts with zero chips.** The
+mirror is written by the sites that write `sources:`: CREATE, MERGE and CONTEST. There is no
+re-render-all pass and no upgrade step, so every concept published before this change keeps no
+`source_links:` — and no clickable citation — until a curator run happens to merge or contest into
+it. On a KB that is no longer growing in a given area, that can be never. The read-side drill-down
+(the web routes, `kb_read`, `agora read`) is unaffected: it resolves `sources:` itself and never
+needed the mirror.
+
+**What wave B deliberately did NOT ship: a body footnote.** The original ask was a curator-emitted
+`[^n]` citation in the prose. It is not emitted, for two independent reasons, and neither is
+scheduled to change:
+
+- **It renders differently on the two faces this repo actually has.** CommonMark — the web face's
+  parser — reads `[^1]: raw/general/x.md` as a *link-reference definition*, so the marker becomes an
+  anchor at an unrewritten relative path (a 404), and a payload that is itself a markdown link is
+  mangled. Obsidian reads the same bytes as a footnote. Adding a footnote plugin would not be
+  additive either: it changes how already-committed `[^n]:` bytes parse.
+- **A body citation moves the merge oracle.** `Wiki.query_lexical` reads note bodies, the curator's
+  bundle feeds it every candidate's text to build the planning brain's `related/` view, and that
+  view picks `MERGE_INTO_THEME` targets — and a wrong merge is permanent, since the closed op
+  vocabulary has no DELETE. Measured once, owner-side, on a scratch copy of the author's private KB
+  over 24 fixed queries (2026-09-05): a body `## Sources` block changed the result order on 9 of
+  them; the frontmatter mirror changed 0 scores and 0 orders. The corpus is private and the harness
+  is not in this repo, so that figure records why the decision was taken rather than something you
+  can re-run; the committed gate is `tests/core/test_rank_neutrality.py`, which pins the same
+  property structurally.
+
+So: **Obsidian gets clickable provenance; a plain markdown renderer still shows `sources:` as text.**
+
+If you want an inline citation in a body you can write one by hand, but know which form you are
+choosing — none of the four is fully safe today:
+
+- **A footnote definition** (`[^1]: raw/general/x.md`) reaches no link rule at all. L1-25 warns if
+  `sources:` does not carry it, and warns only — your commit is not rejected. But the web face
+  renders it as a link-reference definition, not a footnote (above).
+- **A markdown link into `raw/**.md`** also meets **L1-2**, which is an ERROR and discards the whole
+  run's diff. L1-2 resolves every `.md` link target to a *basename*: if no note owns that basename
+  you get the hard reject; if a note does own it — the usual case, since a capture is normally named
+  after the thing it is about — L1-2 stays silent and your link quietly resolves to that other note
+  instead of the capture, entering the link graph the curator's merge oracle ranks on. This wave
+  added no carve-out for either outcome.
+- **A markdown link to a non-`.md` `raw/` artifact** (a `raw/_blob/**` PDF, say) reaches no basename
+  resolution, so L1-25 is again its only grader.
+- **An image embed** (`![scan](../../raw/_blob/ab/<sha256>.png)`) is graded by **nothing at all**.
+  Both body surfaces — L1-2's link resolution and L1-25's citation scan — read the same grammar,
+  which excludes `![…](…)` by construction: an image is an *asset* reference, not a link edge and
+  not a provenance claim (ADR-0010 §3.5). So the natural way to show a captured screenshot inline is
+  also the one form that is never reported. If that embed IS your provenance, also list the artifact
+  in `sources:`, which is the record either way.
+
 **When it bites.**
-1. **You cannot get the file back through Agora.** No web route serves `raw/` or `raw/_blob/`
-   (`faces/web/app.py` mounts `/static` only; `/note/raw/…` and `/api/notes/raw/…` answer 404 because
-   `Wiki.get_note` resolves `index.md` + `wiki/**` and nothing else), `kb_read` returns `not_found`
-   for a `raw/` path, and the web note page renders `sources:` as plain text, not links. The PDF is
-   in git; reaching it means the filesystem, Obsidian's file explorer, or `git show`.
-2. **One size tier, one cap.** Every attachment is stored inline in git and refused above
+1. **What you now reach is ungraded content.** `raw/` is the capture, not the curated answer: it
+   passed none of the curator's PLAN/APPLY grading, no lint rule grades its content (L1-8 only
+   checks that a cited path *exists*), and the read faces hand it to you exactly as stored.
+   Concretely, the web page renders a text capture into an **escaped `<pre>`** and deliberately
+   *not* through the markdown renderer, so the
+   pre-flip relative links these captures carry stay inert instead of being rewritten into `/note/`
+   hrefs — plain text now is reversible, enrolling uncurated text in the site's link graph is not.
+2. **Redaction is asymmetric, and reaching `raw/` makes that visible.** Of the five producers that
+   put text into `raw/`, exactly **one** redacts: the `session:` harvest connector, which runs
+   `core/redact.py` at its connector boundary before the fact is hashed or persisted
+   (`harvester/session_connector.py`). The `file:` connector never redacts (byte-identical write
+   path, #39), and the web upload, `kb_remember` and `agora capture` never pass a redactor at all —
+   `Inbox.write` has no redaction step. The `redact` call in `harvester/harvester.py` is
+   `_redaction_preview`, reached only on the `--dry-run` branch. Nothing redacts on the way *out*
+   either, and nothing will: the redactor is one-way with no reverse map, so read-time redaction
+   would make the served bytes disagree with the digest the note cites. **Never read "`raw/` has
+   already been redacted" into anything here.**
+3. **Blob bytes never leave over MCP, by decision.** `kb_read("raw/_blob/…")` returns the sidecar's
+   capture facts (`meta`: `sha256`, `ext`, `media_type`, `bytes`, `filename`, `captured_at`,
+   `writer`, `source`, `event_id` — only the keys the sidecar actually has) and a note pointing at
+   the web face. There is no base64 channel and no `bytes: true` parameter. The download is the web
+   route, which serves every blob as `application/octet-stream` + `X-Content-Type-Options: nosniff`
+   + `Content-Disposition: attachment` + `Content-Security-Policy: default-src 'none';
+   frame-ancestors 'none'`, **never** as the `media_type` the sidecar records — that field and the
+   stored `<ext>` are both uploader-chosen, so an uploaded `.html` or `.svg` is a download, never a
+   same-origin document. A PDF or an image therefore does not preview in the browser; that is the
+   trade, taken deliberately.
+   A `*.meta.yaml` sidecar is also not addressable on its own (404 naming the artefact instead) —
+   the URL space matches the citation space, where lint L1-8b already refuses a sidecar citation.
+4. **A large text capture is truncated on read.** Both faces cap a text read at
+   `core.rawstore.MAX_RAW_TEXT_BYTES` (1 MiB) and report `truncated: true` with the artefact's true
+   on-disk `bytes`; the rest is in the repo, not in the response.
+5. **`raw/` authorship is weaker than it looks.** The curator being "the sole writer of `raw/`" is a
+   property of *one curator run* — `raw_writes` is that run's FINAL-DIFF allowlist
+   (`curator/apply.py`), not a repo-wide invariant. A human can commit into `raw/` (including
+   `raw/_blob/`) directly, and nothing detects it. Note also what the route does and does not do:
+   `raw/` is git-tracked and `agora sync` already pushes it to the backup remote, so `/raw` does not
+   *create* an exposure — it makes an existing git-level one reachable over HTTP, which matters the
+   moment the face is behind anything more than loopback.
+6. **`assets/` is still unserved.** `assets/` is a curator-writable prefix
+   (`curator/constants.py` `ALLOWLIST_DIR_PREFIXES = ("wiki/", "assets/")`) that the schema template
+   tells authors to use, but no face serves it and the body-link rewriter skips image embeds by
+   construction, so a relative `<img src>` into `assets/` renders broken. Same defect shape as this
+   section had, and explicitly out of scope for #169 — it has no issue of its own yet.
+7. **One size tier, one cap.** Every attachment is stored inline in git and refused above
    `web.upload.max_bytes` — one constant, shared by the web upload and `agora capture`. There is no
    large-file pointer/LFS tier, so a repo that receives big originals grows its git history by
    exactly that much.
-3. **No drift tooling.** The sidecar records the digest; nothing re-fetches a `source_url` or diffs
+8. **No drift tooling.** The sidecar records the digest; nothing re-fetches a `source_url` or diffs
    a re-extraction against the kept bytes.
-4. **Retention is unchanged.** An artefact kept forever in git history meets the unwritten
+9. **Retention is unchanged.** An artefact kept forever in git history meets the unwritten
    right-to-delete ADR-0031 head-on (#42) — §2 applies to blobs exactly as to notes.
 
-**What you can do now.** Upload freely — the bytes are kept and cited. To retrieve one, open the path
-the note's `sources:` names (`raw/_blob/<ab>/<sha256>.<ext>`) in the repo directly. Keep your own copy
-of anything large or sensitive until (2) and (4) are decided.
+**What you can do now.** Upload freely — the bytes are kept, cited, and now followable: click a
+`sources:` row on the note page, or run `agora read <the sources: string>`. Read (1)–(3) before you
+expose the face to anyone: a capture is evidence, not a reviewed artefact, and it is the least
+filtered content in the repo. `web.features.raw_enabled: false` turns the **web** surface off for a
+team deployment — both routes, the linked `sources:` rows, and the body-link rewrite
+([`DEPLOY-TEAM.md`](DEPLOY-TEAM.md)). It does **not** gate `kb_read` or `agora read`: there is no
+MCP/CLI kill switch, only the choice not to expose the MCP face. Keep your own copy of anything large or
+sensitive until (7) and (9) are decided.
 
-**Tracking.** The read-side gap (1) is [#169](https://github.com/handochan/agora-kb/issues/169) —
-source drill-down: a web `raw/` route, linked `sources:`, `kb_read` over `raw/`, and curator-emitted
-footnote citations so Obsidian can click through. [#48](https://github.com/handochan/agora-kb/issues/48)
-keeps its remainder — the size-tier/LFS policy and the dedup-union rule, co-designed with ADR-0031
-(#42).
+**Tracking.** [#169](https://github.com/handochan/agora-kb/issues/169) is closed on both sides —
+wave A (the `/raw` + `/api/raw` routes, linked `sources:`, the `kb_read` bridge, the
+`agora query`/`read`/`neighbors` verbs) and wave B (the `source_links:` mirror + lint L1-25). The one
+part of the original ask not delivered is the body footnote, which was rejected on measurement and
+recorded in [ADR-0041](adr/0041-stratum-kind-first-layout.md)'s `source_links:` addendum rather than
+left open. Two delivery caveats, both about REACH rather than behaviour. (a) L1-25 grades every
+schema-2 repo immediately, but the mirror arrives one note at a time: APPLY stamps it at CREATE,
+MERGE and CONTEST, there is no backfill, so notes published before this release carry no chips until
+a run touches them. (b) The **emitted schema doc** that tells a brain about both reaches new repos
+only — `emit_schema` skips a file that already exists and `agora repo upgrade` is
+[#63](https://github.com/handochan/agora-kb/issues/63), so an existing KB's `AGENTS.md` keeps
+recommending footnote citations until you refresh it by hand. The
+undesigned control over what these read paths may emit is ADR-0041 residual risk R1
+([#166](https://github.com/handochan/agora-kb/issues/166)); the unimplemented repo-internal `file:`
+connector fence is [#165](https://github.com/handochan/agora-kb/issues/165) (§6b).
+[#48](https://github.com/handochan/agora-kb/issues/48) keeps its remainder — the size-tier/LFS
+policy and the dedup-union rule, co-designed with ADR-0031 (#42).
 
 ---
 
@@ -465,15 +605,17 @@ is a default, not a permanent rule; lifting it needs the boundary design, not a 
 
 **The gap this does NOT close, stated rather than papered over.** The exclusion covers the **push**
 surface only. `kb_query`, `kb_read` and `kb_neighbors` will return people content to an agent on
-demand — a pull-shaped, agent-initiated read — and the control for that surface is **distinct and
-still undesigned** (ADR-0041 residual risk R1; it amends ADR-0027 §8's scope sentence rather than
-claiming the push exclusion covers it).
+demand — a pull-shaped, agent-initiated read — and since #169 wave A so will the `raw/` bridge on
+the same surface: `/raw`, `/api/raw` and `agora read` (§6). The control for that surface is
+**distinct and still undesigned** (ADR-0041 residual risk R1; it amends ADR-0027 §8's scope
+sentence rather than claiming the push exclusion covers it).
 
 **Two further fences ADR-0041 specifies are NOT implemented yet.** (a) The `file:` connector fence —
 "a connector glob on a path inside the repo may cover `wiki/people/**` and nothing else" — has no
 code: `harvester/connectors.py` guards only the gold directory (`_is_within_gold`). Until it lands,
-do not point a `file:` connector at a glob inside your own KB, or the curator's own output can be
-fed back to it as candidates. (b) `raw/_pages/` is a reserved prefix with no writer and no gate
+do not point a `file:` connector at a glob inside your own KB: the curator's own output can be fed
+back to it as candidates, and a glob that covers `wiki/people/**` carries human-owned content into
+the inbox and thence into `raw/`, where the #169 read bridge will serve it (§6). (b) `raw/_pages/` is a reserved prefix with no writer and no gate
 exception.
 
 **When it bites.** You file something personal under `wiki/people/you/` expecting it to stay out of

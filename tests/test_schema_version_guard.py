@@ -84,12 +84,22 @@ def _cfg_at(version: int) -> RepoConfig:
 # `serve` and `web` are listed by the criterion and are safe to invoke here BECAUSE the guard runs
 # at dispatch, before the lazy face import — no fastmcp/fastapi/uvicorn is touched, nothing binds a
 # port. That ordering is itself part of what this asserts.
+#
+# The three READ verbs (DRILLDOWN-169 A5) are here for the reason the docstring above gives: they
+# name a repo with `--repo` and declare no `skip_schema_guard`, so the STRUCTURAL rule enrolled
+# them the day they were added — no edit to `_schema_version_guard` was needed, and this list is
+# where that gets witnessed. A repo declaring a version this build cannot READ stops them too:
+# "read-works" is the promise for an OLDER supported schema (ADR-0041 D6), never for a future one
+# this binary would have to guess at.
 _GUARDED_INVOCATIONS = [
     ["status"],
     ["curate"],
     ["harvest"],
     ["serve"],
     ["web"],
+    ["query", "anything"],
+    ["read", "wiki/concepts/anything.md"],
+    ["neighbors", "wiki/concepts/anything.md"],
 ]
 
 

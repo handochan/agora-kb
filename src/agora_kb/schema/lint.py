@@ -6,11 +6,15 @@
 byte-identical — the subject is the path segment and the kind is the ``type:`` enum. Schema 2 is
 the ADR-0041 ruleset recorded rule-by-rule in ADR-0010's supersession banner: the predicates that
 read ``type`` read ``kind`` instead (L1-6/7/8/8b/10/11/14/19, L2-1), the domain check reads
-``subjects:`` (L1-5), ``wiki/people/**`` is permanently ungraded (L1-9/D3.3), and three rules are
+``subjects:`` (L1-5), ``wiki/people/**`` is permanently ungraded (L1-9/D3.3), and four rules are
 added — **L1-22** (a ``wiki/`` segment-1 directory outside the closed kind set), **L1-23** (a
-taxonomy domain beginning with ``_``, the ``raw/`` reserved-prefix namespace) and **L1-24** (a map
-``children:`` bullet whose child kind is not admitted). **L1-21 stays pre-reserved** for the L2-6
-promotion after ``agora repo upgrade`` (#63) and is NOT reused. Every L1 severity stays ``error``.
+taxonomy domain beginning with ``_``, the ``raw/`` reserved-prefix namespace), **L1-24** (a map
+``children:`` bullet whose child kind is not admitted) and **L1-25** (an inline citation of a
+``raw/`` artifact that ``sources:`` does not carry — #169 wave B). **L1-21 stays pre-reserved** for
+the L2-6 promotion after ``agora repo upgrade`` (#63) and is NOT reused. Every L1 severity stays
+``error`` except **L1-25**, which is a ``warning`` deliberately: it fires on HAND-EDITED and
+imported notes, an error would discard the whole run's diff, and a run can never repair what failed
+it (the self-lock argument L2-6 records below). L1-7/L1-8/L1-8b stay errors.
 
 This is the model-free, wall-clock-free integrity gate that ADR-0011 §4.4 runs after APPLY +
 AUTHOR (before commit) and that the dashboard / ``kb_status`` reuse verbatim — the SAME code path,
@@ -60,8 +64,9 @@ not a producer artifact, and grading it as one stopped curation of the whole rep
 from __future__ import annotations
 
 import datetime
+import posixpath
 import re
-from collections.abc import Collection
+from collections.abc import Collection, Mapping
 from dataclasses import dataclass, field
 from typing import Literal
 
@@ -84,7 +89,15 @@ from agora_kb.core.sentinel import BODY_END_LINE_RE as _BODY_SENTINEL_END_RE
 from agora_kb.core.sentinel import BODY_START_LINE_RE as _BODY_SENTINEL_START_RE
 from agora_kb.core.sentinel import has_unauthored_region
 from agora_kb.schema.emit import Taxonomy
+
+# `_BODY_MDLINK_RE` is the ADR-0014 D3 body-link grammar itself: L1-25 needs the link TARGET where
+# every other caller wants the resolved basename (:func:`body_link_basenames`). Importing the
+# compiled pattern — rather than re-spelling it here — is the same anti-fork posture as the
+# ``core.sentinel`` import above, and has in-repo precedent (``core.gold`` imports
+# ``core.wiki._is_map_path`` for exactly this reason): a second copy of the link regex would let the
+# body graph and the citation rule drift apart silently.
 from agora_kb.schema.notes import (
+    _BODY_MDLINK_RE,
     KIND_BY_DIRECTORY,
     PARSE_EXEMPT_BASENAMES,
     SCHEMA2_DECLARABLE_KINDS,
@@ -100,7 +113,14 @@ from agora_kb.schema.notes import (
     wikilinks,
 )
 
-__all__ = ["LintFinding", "LintResult", "lint"]
+__all__ = [
+    "SOURCE_LINKS_KEY",
+    "LintFinding",
+    "LintResult",
+    "lint",
+    "sources_entries",
+    "sources_str_list",
+]
 
 Severity = Literal["error", "warning"]
 
@@ -131,6 +151,29 @@ _DATE_RE = re.compile(r"\A\d{4}-\d{2}-\d{2}\Z")
 
 # The contested-shape body callout (ADR-0010 §3.8 / L1-10): a line STARTING with `> [!contested]`.
 _CONTESTED_CALLOUT_RE = re.compile(r"^> \[!contested\]", re.MULTILINE)
+
+# L1-25 citation surface 3: a footnote DEFINITION line, `[^label]: <payload>` at column 0. The
+# label is one line and bracket-free; the payload is the rest of the line. This is a CITATION
+# grammar, not a link grammar — nothing resolves it (the two renderers disagree about these bytes,
+# #169 R-4), which is precisely why the rule reads it: an unresolvable citation is still a
+# provenance claim, and `sources:` is where that claim has to be recorded to be true.
+_FOOTNOTE_DEF_RE = re.compile(r"^\[\^[^\]\r\n]+\]:\s*(?P<payload>.+)$", re.MULTILINE)
+
+# The `raw/` reserved prefix (ADR-0041 D1.4) — the only citation target L1-25 grades. A body link
+# to another NOTE is L1-2's business; an external URL is nobody's.
+_RAW_PREFIX = "raw/"
+
+# A CommonMark link TITLE trailing the target inside the same parens: `[c](path "Title")` /
+# `[c](path 'Title')`. `_BODY_MDLINK_RE`'s target group is `[^)\r\n]+`, so it captures the title
+# along with the path; the citation is the path half alone.
+_MDLINK_TITLE_RE = re.compile(r"\s+(?:\"[^\"\r\n]*\"|'[^'\r\n]*')\s*\Z")
+
+#: The frontmatter key carrying the DERIVED Obsidian mirror of `sources:` (#169 D18): a list of
+#: `[[raw/<domain>/<id>.md]]` wikilinks that is always a proper subset of `sources:` and NEVER the
+#: provenance of record (§3.4). Named here because L1-25 is the rule that keeps the mirror honest;
+#: the emitter (curator APPLY) imports this name rather than re-spelling the string, so the key the
+#: curator writes and the key the grader reads can never drift.
+SOURCE_LINKS_KEY = "source_links"
 
 # A daily basename is `<domain>-YYYY-MM-DD`; the trailing 10 chars are the date (ADR-0010, L1-14).
 _DAILY_DATE_RE = re.compile(r"-(?P<date>\d{4}-\d{2}-\d{2})\Z")
@@ -201,13 +244,16 @@ class LintFinding:
     """One L1 lint finding (ADR-0010 §6).
 
     ``code`` is the rule id (e.g. ``"L1-7"``). ``severity`` is ``"error"`` for a hard-reject L1 rule
-    or ``"warning"`` for a soft L2 signal. Every L1 rule is ``"error"`` — ``kb_schema.md`` freezes
-    L1 as "STRUCTURAL (hard; reject the commit)" — while the L2 rules emitted from inside
-    :func:`lint` are warnings: L2-1 (orphan count, ADR-0022) and L2-6 (the #119 ``body_status``
-    invariant). The distinction is load-bearing, not cosmetic: ``LintResult.ok`` is False iff an
-    ERROR exists, and that is what the curator's §4.4 gate discards a whole run on. ``path`` is the
-    POSIX repo-relative path of the offending note (or the relevant metadata file for whole-repo
-    rules like schema_version drift). ``message`` is a human-readable one-liner.
+    or ``"warning"`` for a soft signal. Every L1 rule is ``"error"`` — ``kb_schema.md`` freezes L1
+    as "STRUCTURAL (hard; reject the commit)" — with ONE named exception, **L1-25** (#169 D19): a
+    citation the frontmatter does not carry is a provenance gap to REPORT, not a reason to throw
+    away a whole run's diff, and the notes it fires on (hand edits, vault imports) have no repair
+    path while ``agora repo upgrade`` (#63) is open. The L2 rules emitted from inside
+    :func:`lint` are warnings for the same reason: L2-1 (orphan count, ADR-0022) and L2-6 (the #119
+    ``body_status`` invariant). The distinction is load-bearing, not cosmetic: ``LintResult.ok`` is
+    False iff an ERROR exists, and that is what the curator's §4.4 gate discards a whole run on.
+    ``path`` is the POSIX repo-relative path of the offending note (or the relevant metadata file
+    for whole-repo rules like schema_version drift). ``message`` is a human-readable one-liner.
     """
 
     code: str
@@ -294,6 +340,36 @@ def _as_str_list(value: object) -> list[str] | None:
     if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
         return None
     return list(value)
+
+
+def sources_entries(fm: Mapping[str, object]) -> list[object]:
+    """The ONE ``sources:`` reader (#169 D19): every entry VERBATIM, ``[]`` when absent/not a list.
+
+    Public because it is shared ACROSS packages — :mod:`agora_kb.core.gold` reads the same key for
+    its harvest-provenance predicate, and three subtly different spellings of this line (here, the
+    L1-4 type gate, and gold's ``_fm_list``) is how a "sources" that means one thing to the grader
+    and another to the pack assembler gets born. Callers that reach up for it do so lazily at call
+    time; this module never imports ``core.gold``, so the direction stays acyclic.
+
+    NON-STRING ENTRIES ARE KEPT, deliberately. L1-7 asks "is ``sources:`` empty?" and ``sources:
+    [42]`` is NOT empty — it is a list with a type error that L1-4 reports and L1-7 must not
+    double-report as an absence. Every rule that needs strings filters them itself (L1-8/L1-10 do,
+    and so does :func:`_check_source_citations`), which keeps the reader honest about what is on
+    disk. Use :func:`sources_str_list` for the "is it well-typed?" question instead.
+    """
+    value = fm.get("sources")
+    return list(value) if isinstance(value, list) else []
+
+
+def sources_str_list(fm: Mapping[str, object]) -> list[str] | None:
+    """The TYPE view of the same key: ``None`` iff ``sources:`` is not a list of strings (L1-4).
+
+    The distinction :func:`sources_entries` erases on purpose — a caller reporting "must be a list
+    of strings" has to tell ``sources: "x"`` (a type error) from ``sources: []`` (a legal empty
+    list). Delegates to :func:`_as_str_list`, the generic list-key validator every other list key
+    already uses, so the *rule* lives in one place and only the *key* is named here.
+    """
+    return _as_str_list(fm.get("sources"))
 
 
 def _str_items(value: object) -> list[str]:
@@ -564,7 +640,7 @@ def _check_required_frontmatter_v2(note: Note) -> list[LintFinding]:
             miss("L1-4", "missing required 'date' on note")
         if fm.get("run_id") is None:
             miss("L1-4", "missing required 'run_id' on note")
-        if "sources" in fm and _as_str_list(fm.get("sources")) is None:
+        if "sources" in fm and sources_str_list(fm) is None:
             miss("L1-4", "'sources' must be a list of strings")
         findings.extend(_check_body_status_value(note))
     elif kind in _V2_MAP_KINDS:
@@ -632,7 +708,7 @@ def _check_required_frontmatter(note: Note, schema_version: int = 1) -> list[Lin
     # Type-specific required additions.
     if ntype == "theme":
         # sources is required-as-typed here (the non-empty rule is L1-7); related/confidence typed.
-        if "sources" in fm and _as_str_list(fm.get("sources")) is None:
+        if "sources" in fm and sources_str_list(fm) is None:
             miss("L1-4", "'sources' must be a list of strings")
         if "related" in fm and _as_str_list(fm.get("related")) is None:
             miss("L1-4", "'related' must be a list of strings")
@@ -883,6 +959,111 @@ def _check_admitted_children(
                 )
             )
     return findings
+
+
+def _without_address_fragment(target: str) -> str:
+    """Return ``target`` with any ``#fragment`` removed — the posture every link reader here holds.
+
+    A fragment addresses a POSITION INSIDE a file, never a second file: ``raw/general/x.md#part-2``
+    and Obsidian's wikilink halves (``#heading``, ``#^block-id``) all cite ``raw/general/x.md``.
+    Dropping it is exactly what :func:`agora_kb.core.wiki._mdlink_target_basename` already does for
+    the body graph, and what :func:`agora_kb.schema.notes.body_link_basenames` does by other means
+    (an anchored target no longer ends in ``.md``, so L1-2 skips it entirely).
+
+    L1-25 needs it for a sharper reason than consistency: without it the rule warns "citation not in
+    sources" about an artifact ``sources:`` DOES carry, and the only remedy the message implies —
+    putting the anchored string in ``sources:`` — is an L1-8 hard error, because L1-8 is a bare
+    ``(root / s).exists()``. Deep-linking into a capture is the natural next step for a reader of
+    the #169 drill-down, so this is the rule's likeliest real-world encounter.
+    """
+    return target.split("#", 1)[0].strip(" \t\r\n\f\v")
+
+
+def _raw_citation_target(rel_path: str, target: str) -> str | None:
+    """Return the repo-relative ``raw/`` path a link target cites, or ``None`` if it cites none.
+
+    A trailing CommonMark link title (``path "Title"``) and any ``#fragment``
+    (:func:`_without_address_fragment`) are removed FIRST, in that order — a title may itself hold a
+    ``#`` — so what is compared against ``sources:`` is the path alone.
+
+    A target is resolved RELATIVE TO THE CITING NOTE — ``../../raw/general/x.md`` from
+    ``wiki/concepts/x.md`` is ``raw/general/x.md`` — which is the ADR-0014 D3 body-link posture (and
+    the resolution the web face's rewriter was taught in #169 wave A). A target that is ALREADY
+    repo-relative (``raw/…``: the shape ``sources:`` carries and the shape the schema's own footnote
+    example writes) is taken VERBATIM, because joining it under the note's directory would produce
+    ``wiki/concepts/raw/…`` and the rule would silently never fire on the exact form the schema
+    teaches. An absolute target (``/raw/x.md``) resolves to an absolute path and is therefore never
+    a citation — a repo-relative claim is the only kind ``sources:`` can be checked against.
+    """
+    cleaned = _without_address_fragment(_MDLINK_TITLE_RE.sub("", target.strip(" \t\r\n\f\v")))
+    if not cleaned:
+        return None
+    if cleaned.startswith(_RAW_PREFIX):
+        resolved = posixpath.normpath(cleaned)
+    else:
+        resolved = posixpath.normpath(posixpath.join(posixpath.dirname(rel_path), cleaned))
+    return resolved if resolved.startswith(_RAW_PREFIX) else None
+
+
+def _check_source_citations(note: Note, sources: list[object]) -> list[LintFinding]:
+    """L1-25 (schema 2): a ``raw/`` citation in the note that ``sources:`` does not carry.
+
+    ``sources:`` is the provenance of RECORD (§3.4). Every other citation surface is a DERIVED view
+    of it — the ``source_links:`` Obsidian mirror APPLY emits (#169 D18), a hand-written body link,
+    a hand-written footnote — so a citation that appears in a view and nowhere in ``sources:`` is a
+    provenance claim no rule and no face can resolve: it is invisible to L1-8 (which grades only
+    ``sources:``), invisible to gold, and invisible to the drill-down route. One collector, three
+    surfaces, because a human hand-editing a note reaches for whichever one they know:
+
+    1. every ``[[X]]`` inside the frontmatter mirror key, ``X`` as written and WITHOUT a ``raw/``
+       prefix test — the key is DERIVED, holds nothing but ``raw/`` links when APPLY wrote it, and
+       an entry that is anything else is a hand edit to a key no rule reads as provenance, which is
+       exactly the claim this rule exists to surface. (Surfaces 2 and 3 are prefix-gated instead: a
+       body link to a sibling NOTE is L1-2's business and an external URL is nobody's.);
+    2. every BODY markdown-link target that resolves into ``raw/`` (:func:`_raw_citation_target`);
+    3. every footnote DEFINITION payload that is a ``raw/`` path, bare or inside a markdown link.
+
+    A citation matches ``sources:`` with the ``.md`` extension either present or absent on EITHER
+    side, because Obsidian resolves ``[[note.md]]`` and ``[[note]]`` identically and a hand edit may
+    spell the pair either way round. On all three surfaces the cited value is the PATH alone: an
+    ``#anchor`` / ``#heading`` / ``#^block-id`` address is dropped
+    (:func:`_without_address_fragment`), and on the two markdown-link surfaces a trailing link title
+    is dropped with it. A deep link into a declared capture is therefore silent — see that helper
+    for why warning on it would point a hand editor straight at an L1-8 hard error.
+
+    WARNING severity (D19) and NO existence re-check: whether the cited artifact is ON DISK is
+    L1-8's question and stays exactly one rule's business. The scope is inherited from the caller's
+    :func:`_is_sourced_kind` block, so a journal is unscored here exactly as it is for L1-7/8/8b.
+    """
+    declared = {s for s in sources if isinstance(s, str)}
+    cited: list[str] = []
+    seen: set[str] = set()
+
+    def cite(value: str | None) -> None:
+        if value and value not in seen:
+            seen.add(value)
+            cited.append(value)
+
+    for entry in _str_items(note.frontmatter.get(SOURCE_LINKS_KEY)):
+        for link in wikilinks(entry):
+            cite(_without_address_fragment(link))
+    for m in _BODY_MDLINK_RE.finditer(note.body):
+        cite(_raw_citation_target(note.rel_path, m.group("target")))
+    for m in _FOOTNOTE_DEF_RE.finditer(note.body):
+        payload = m.group("payload").strip()
+        # A markdown-link payload is ALSO caught by surface 2 (which scans the whole body); reading
+        # it here too keeps the three surfaces independently true rather than coupled by accident.
+        for inner in _BODY_MDLINK_RE.finditer(payload):
+            cite(_raw_citation_target(note.rel_path, inner.group("target")))
+        head = payload.split()
+        if head:
+            cite(_raw_citation_target(note.rel_path, head[0]))
+
+    return [
+        LintFinding("L1-25", "warning", note.rel_path, f"citation not in sources: {c!r}")
+        for c in cited
+        if c not in declared and f"{c}.md" not in declared and c.removesuffix(".md") not in declared
+    ]
 
 
 def _resolve_targets(notes: list[Note]) -> set[str]:
@@ -1308,8 +1489,7 @@ def lint(
         # provenance"; §3.4 frames source citation around themes), so they are not checked here.
         if _is_sourced_kind(n, version):
             status = fm.get("status")
-            sources_raw = fm.get("sources")
-            sources = sources_raw if isinstance(sources_raw, list) else []
+            sources = sources_entries(fm)
 
             # L1-19 origin ∈ inbox source enum (origin is OPTIONAL; present iff harvested).
             origin = fm.get("origin")
@@ -1338,6 +1518,13 @@ def lint(
                     findings.append(
                         LintFinding("L1-8", "error", path, f"sources path does not exist: {s!r}")
                     )
+
+            # L1-25 (schema 2 only): a citation the frontmatter mirror or the body makes that
+            # `sources:` does not carry (#169 D19). It rides the SAME `sources` read and the SAME
+            # `_is_sourced_kind` gate as L1-7/8/8b — so a journal stays unscored here too — and it
+            # is a WARNING, so a hand-edited or imported note can never self-lock a curator run.
+            if version >= 2:
+                findings.extend(_check_source_citations(n, sources))
 
             # L1-10 contested shape (full conjunction, ADR-0010 §3.8).
             if status == "contested":

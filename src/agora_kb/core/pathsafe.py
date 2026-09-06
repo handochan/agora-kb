@@ -41,9 +41,15 @@ What this module is NOT
 
 from __future__ import annotations
 
+import re
 import unicodedata
 
-__all__ = ["safe_slug_component", "is_safe_component", "DEFAULT_MAX_BYTES"]
+__all__ = [
+    "safe_slug_component",
+    "is_safe_component",
+    "is_safe_filename_stem",
+    "DEFAULT_MAX_BYTES",
+]
 
 # ~180 bytes leaves room inside the POSIX NAME_MAX of 255 for a ``.md`` suffix and a ``-2``-style
 # collision suffix appended by a caller. The cap is a UTF-8 BYTE cap, not a character count: the
@@ -74,6 +80,15 @@ _WINDOWS_RESERVED = frozenset(
 
 # Win32 resolves these superscript digits in a device stem the same as the plain digit.
 _SUPERSCRIPT_DIGITS = {"¹": "1", "²": "2", "³": "3"}
+
+# The LEGACY writer charset, mirrored from ``core/layout.py``'s ``_WRITER_RE``/``_WRITER_MAX``. It
+# is copied rather than imported because the dependency runs the other way (``layout`` imports this
+# module), and a lazy import inside the predicate would hide the duplication instead of removing
+# it. ``tests/core/test_index_cache.py`` pins the two definitions together so a change to either
+# one fails loudly rather than drifting. Used ONLY by :func:`is_safe_filename_stem` (DRILLDOWN-169
+# D17) — the write-side namespace guard stays in ``layout.validate_writer``.
+_LEGACY_WRITER_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._-]*\Z")
+_LEGACY_WRITER_MAX = 128
 
 
 def _is_allowed(ch: str) -> bool:
@@ -194,3 +209,40 @@ def is_safe_component(token: str, *, max_bytes: int = DEFAULT_MAX_BYTES) -> bool
     reported unsafe rather than trivially canonical.
     """
     return token != "" and safe_slug_component(token, max_bytes=max_bytes) == token
+
+
+def is_safe_filename_stem(value: str) -> bool:
+    """Is ``value`` safe as the stem of a DERIVED cache filename — the union predicate (D17, #167).
+
+    ``is_safe_component`` (this module's rules) **or** the legacy writer charset
+    (``core/layout.py``'s ``_WRITER_RE``, 1-128 chars). Only for the stem of
+    ``_kb/index/<stem>.notes.json``; it is **not** a write-namespace guard — an inbox writer or a
+    harvest cursor still goes through ``layout.validate_writer`` / ``layout.safe_path_component``,
+    which are unchanged.
+
+    Why a UNION and not just ``is_safe_component``: the two rulesets each reject names the other
+    admits, and both directions matter here.
+
+    * ``is_safe_component`` alone would newly REJECT ``con``/``CON``/``nul``/``com1``/``aux`` (the
+      Windows reserved device stems) and ``foo-``/``foo.`` (trailing separator/dot) — every one of
+      which addresses a cache file today. ``core/wiki.py`` swallows the resulting
+      ``InvalidWriterError`` and falls back to a full scan, so the regression would be a *silent*
+      performance loss with no operator-visible error.
+    * The legacy regex alone rejects every non-ASCII name (``내지식``, ``café``) and anything over
+      128 characters — which is issue #167 itself.
+
+    The union is therefore purely additive: no repo that has a cache today loses one, and
+    non-ASCII repo directories gain one. Path traversal stays refused by BOTH halves (``../escape``,
+    ``.hidden``, ``""``, and anything containing a separator fail each rule independently), and
+    neither half ever REWRITES: this predicate answers yes/no about ``value`` as given, which is
+    what keeps the layout guard from inventing a stem (``safe_slug_component('/etc/passwd')`` would
+    return ``'etc-passwd'`` — a different repo's cache file).
+
+    :param value: the candidate filename stem, exactly as it will be interpolated into the path.
+    :returns: ``True`` if ``value`` may be used verbatim as a single filename stem.
+    """
+    if not isinstance(value, str) or value == "":
+        return False
+    if is_safe_component(value):
+        return True
+    return bool(_LEGACY_WRITER_RE.match(value)) and len(value) <= _LEGACY_WRITER_MAX

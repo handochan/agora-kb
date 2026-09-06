@@ -22,7 +22,10 @@
          via Jinja2 AUTOESCAPE (no |safe) — sources `raw/` paths and `related` `[[..]]` entries
          are untrusted text and MUST be escaped, never interpreted as HTML. #}
       {% set fm = note.frontmatter %}
-      {% if fm.get("summary") or fm.get("sources") or fm.get("created") or fm.get("updated")
+      {# The Sources term keys on the SERVER-COMPUTED `sources` rows, so this gate must key on the
+         same value — gating on `fm.get("sources")` opened an empty <details> for any note whose
+         `sources:` produced no rows. #}
+      {% if fm.get("summary") or sources or fm.get("created") or fm.get("updated")
             or fm.get("aliases") or fm.get("related") or fm.get("confidence") or fm.get("origin") %}
         <details class="fm-meta">
           <summary>Metadata</summary>
@@ -58,11 +61,18 @@
                 </ul>
               </dd>
             {% endif %}
-            {% if fm.get("sources") %}
+            {% if sources %}
+              {# `sources` is SERVER-COMPUTED ({text, href, kind} rows, app.py `_source_rows`), not
+                 `fm.get("sources")` — a row carries an href only when the same predicate the /raw
+                 route enforces says the citation resolves to a servable artifact (D12). The
+                 template must never decide this itself: `sources:` is untrusted (lint L1-8 is a
+                 bare exists(), and a journal's sources: is graded by nothing), so a `startswith`
+                 here would offer links that 404 — or worse, hand a `javascript:` string to href.
+                 `src.text` stays autoescaped; `src.href` is synthesized. Never add |safe. #}
               <dt>Sources</dt>
               <dd>
                 <ul class="meta-list mono">
-                  {% for src in fm.get("sources") %}<li>{{ src }}</li>{% endfor %}
+                  {% for src in sources %}<li>{% if src.href %}<a href="{{ src.href }}"{% if src.kind == 'blob' %} download{% endif %}>{{ src.text }}</a>{% else %}{{ src.text }}{% endif %}</li>{% endfor %}
                 </ul>
               </dd>
             {% endif %}

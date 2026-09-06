@@ -70,7 +70,14 @@ from agora_kb.core.inbox import (
     parse_attachments,
     read_attachment,
 )
-from agora_kb.core.layout import KIND_DIRECTORIES, RepoLayout, attachment_basename
+from agora_kb.core.layout import (
+    CLAIM_BEARING_KINDS,
+    KIND_DIRECTORIES,
+    SIDECAR_SUFFIX,
+    RepoLayout,
+    attachment_basename,
+    blob_ref,
+)
 from agora_kb.core.models import Attachment
 from agora_kb.core.pathsafe import is_safe_component
 
@@ -85,6 +92,12 @@ from agora_kb.core.sentinel import BODY_END_LINE_RE as _SENTINEL_END_RE
 from agora_kb.core.sentinel import BODY_PLACEHOLDER
 from agora_kb.core.sentinel import BODY_START_LINE_RE as _SENTINEL_START_RE
 from agora_kb.curator.plan import Disposition, Plan
+
+# The `source_links:` key name is imported from the RULE that grades it (L1-25, #169 D19) rather
+# than re-spelled here. Same anti-fork posture as the `core.sentinel` import above: APPLY emits the
+# mirror and lint checks it against `sources:`, so a second spelling of the key would let the
+# emitter and the grader disagree in silence — the emitter writing a key no rule reads.
+from agora_kb.schema.lint import SOURCE_LINKS_KEY
 from agora_kb.schema.notes import is_people_path, path_kind, wikilinks
 
 __all__ = [
@@ -317,6 +330,107 @@ def _str_list(value: object) -> list[str]:
     return [v for v in value if isinstance(v, str)]
 
 
+# --- sources: -> the derived source_links: mirror (#169 WAVE B, D18/D20) ------------------------
+#
+# `sources:` stays the provenance of RECORD (schema §3.4). `source_links:` is a rendering of its
+# `raw/` half in the one syntax Obsidian links from inside a list property — the defect #169
+# reports ("plain strings — not clickable"). The key name itself is IMPORTED from lint (see the
+# import block above), because L1-25 reads the same key back to check the mirror against `sources:`.
+
+# The prefix a `sources:` entry must carry to enter the mirror. It is load-bearing, twice over:
+#
+# 1. it keeps the mirror a PROPER SUBSET of `sources:`, which is the literal relation the schema
+#    §3.4 states — the mirror is a rendering of the provenance of record, never a second record;
+# 2. it is the only thing standing between the mirror and a permanently-broken wikilink. Not every
+#    `sources:` string is a repo path: `core.gold` still branches on a `harvest:<agent>` shape
+#    (`core/gold.py`) that resolves NOWHERE as a path, and lint L1-8 — a bare
+#    `(layout.root / s).exists()` — has never adjudicated which of the two is stale. The filter
+#    takes no position on that open question; it simply declines to wrap a non-path in `[[ ]]`.
+_RAW_SOURCE_PREFIX = "raw/"
+
+# The wikilink ADDRESS sigils — the half of the grammar `wikilinks()` does NOT split on, which is
+# why they need naming separately from the round-trip test below. Inside `[[ ]]`, `#` opens
+# Obsidian's heading address (`[[file#heading]]`) and `#^` its block-reference address
+# (`[[file#^id]]`), so `[[raw/general/h#i.md]]` round-trips through `wikilinks()` byte-for-byte
+# while naming the FILE `raw/general/h` — exactly the "different artefact" failure the round trip
+# exists to prevent, passed straight through it. The caret is refused alongside the hash rather
+# than only in the `#^` pair: a chip is optional, a wrong chip is not.
+#
+# Refusing here is deliberately STRICTER than L1-25, which drops a `#` address before comparing and
+# so tolerates a hand-written `[[raw/x.md#part-2]]` against `sources: [raw/x.md]`. APPLY declines to
+# MINT a chip whose faithfulness it cannot prove; the rule still reads a hand-made one that is
+# faithful. The subset direction is the safe one.
+_WIKILINK_ADDRESS_SIGILS = ("#", "^")
+
+
+def _source_links(sources: list[str]) -> list[str]:
+    """Return the derived ``[[raw/…]]`` mirror of ``sources`` — a proper subset, never authority.
+
+    An entry is mirrored only if wrapping it in ``[[ ]]`` names the same artefact ``sources:``
+    records, which takes TWO tests because the wikilink grammar has two halves:
+
+    * it must ROUND-TRIP through :func:`wikilinks` — the same reader L1-25 grades the mirror with —
+      byte-for-byte, which rejects the DELIMITER metacharacters (``|`` opens the display-alias half,
+      ``]]`` and ``[[`` re-delimit);
+    * it must hold no ADDRESS sigil (``_WIKILINK_ADDRESS_SIGILS``), which ``wikilinks`` passes
+      through untouched even though a wikilink reader splits on it.
+
+    Either failure would emit a link naming a DIFFERENT artefact than ``sources:`` records: the
+    emitter would trip the rule shipped in the same wave to keep it honest, and Obsidian would
+    resolve the chip to the wrong file. APPLY's own generated refs
+    (``raw/<domain>/<event_id>.md``, ``raw/_blob/<ab>/<sha256>.<ext>``) can never contain any of
+    these characters, so both guards are for a converted or hand-made ``raw/`` name; an entry that
+    fails either keeps its ``sources:`` row (the record is untouched) and simply gets no chip.
+    """
+    links: list[str] = []
+    for s in sources:
+        if not (isinstance(s, str) and s.startswith(_RAW_SOURCE_PREFIX)):
+            continue
+        if any(sigil in s for sigil in _WIKILINK_ADDRESS_SIGILS):
+            continue
+        rendered = f"[[{s}]]"
+        if wikilinks(rendered) == [s]:
+            links.append(rendered)
+    return links
+
+
+def _stamp_source_links(fm: dict[str, object]) -> None:
+    """Refresh ``fm['source_links']`` from ``fm['sources']`` — or REMOVE it if the mirror is empty.
+
+    Call this at every site that finishes writing ``fm["sources"]`` on a CLAIM-BEARING kind (D20);
+    the kind gate lives at the call site because two of the three sites edit a note whose kind comes
+    from the resolved DIRECTORY, not from this dict.
+
+    An empty mirror is never LEFT BEHIND. Popping (rather than emitting ``source_links: []``) is
+    what makes the key incapable of going stale: a note whose ``sources:`` no longer holds a
+    ``raw/`` entry — a hand edit, a converted KB, an entry rewritten to some future non-path form —
+    loses the mirror in the same write that changed the record it mirrors.
+
+    The key is placed IMMEDIATELY AFTER ``sources:`` so the two always render adjacent: the diff of
+    a run that adds one source is then a two-line hunk in one place rather than two hunks at
+    opposite ends of the block. ``frontmatter.render`` dumps with ``sort_keys=False``, so insertion
+    order IS the byte order; a merge/contest target parsed from disk already has ``sources:``
+    somewhere in the middle, and a plain assignment would append the mirror at the very end.
+    """
+    links = _source_links(_str_list(fm.get("sources")))
+    if not links:
+        fm.pop(SOURCE_LINKS_KEY, None)
+        return
+    fm[SOURCE_LINKS_KEY] = links
+    keys = list(fm)
+    if keys.index(SOURCE_LINKS_KEY) == keys.index("sources") + 1:
+        return  # already adjacent (the CREATE path, and every re-stamp after the first)
+    reordered: dict[str, object] = {}
+    for key in keys:
+        if key == SOURCE_LINKS_KEY:
+            continue
+        reordered[key] = fm[key]
+        if key == "sources":
+            reordered[SOURCE_LINKS_KEY] = links
+    fm.clear()
+    fm.update(reordered)
+
+
 # --- provenance -> sources union (ADR-0011 §2 / ADR-0010 D3, L1-7/L1-8) ------------------------
 
 
@@ -380,12 +494,14 @@ def _sources_union(
         if ref is not None and ref not in seen:
             seen.add(ref)
             sources.append(ref)
-        for blob_ref in _materialize_attachments(
+        # Named ``captured_ref``, not ``blob_ref``: the composer of that name is now imported from
+        # ``core.layout`` and a loop variable would shadow it.
+        for captured_ref in _materialize_attachments(
             tup, worktree=worktree, attachments_dir=attachments_dir, raw_writes=raw_writes
         ):
-            if blob_ref not in seen:
-                seen.add(blob_ref)
-                sources.append(blob_ref)
+            if captured_ref not in seen:
+                seen.add(captured_ref)
+                sources.append(captured_ref)
     return sources
 
 
@@ -445,25 +561,13 @@ def _materialize_raw_source(
 
 
 # --- raw/_blob/: the ORIGINAL BYTES of a captured artefact (ADR-0041 D1.4 / D4.2) ---------------
-
-#: The reserved ``raw/`` prefix the content-addressed originals live under (ADR-0041 D1.4). A
-#: literal, not a token, so nothing model-supplied can ever reach this path segment.
-_BLOB_PREFIX = "raw/_blob"
-
-#: The ``.meta.yaml`` sidecar suffix. It is appended to the FULL blob filename (``<sha256>.<ext>``),
-#: never substituted for its extension — that is what keeps lint L1-8b (a pure ``endswith``
-#: sidecar test) working unmodified while ``.yaml`` stays a legal artefact extension (D1.4).
-_SIDECAR_SUFFIX = ".meta.yaml"
-
-
-def _blob_ref(record: Attachment) -> str:
-    """``raw/_blob/<ab>/<sha256>.<ext>`` for one attachment — the ONE composition of that path.
-
-    ``<ab>`` is the first two hex characters of the digest (a fan-out shard, ADR-0041 D1.4). Both
-    halves of the basename are re-validated by :func:`~agora_kb.core.layout.attachment_basename`, so
-    a record that reached here from a hand-edited spool file still cannot compose a path segment.
-    """
-    return f"{_BLOB_PREFIX}/{record.sha256[:2]}/{attachment_basename(record.sha256, record.ext)}"
+#
+# The prefix, the sidecar suffix and the ``<ab>``-sharded composer used to be private to this
+# module. They now live in :mod:`agora_kb.core.layout` (``BLOB_PREFIX`` / ``SIDECAR_SUFFIX`` /
+# :func:`~agora_kb.core.layout.blob_ref`) because the read face resolves a ``sources:`` citation
+# back to the same path (#169, DRILLDOWN-169 D2) and ``core`` may not import ``curator``. The
+# composed bytes are unchanged: ``blob_ref`` validates the basename first and slices the shard off
+# it, which is the same string this module built. ONE spelling for writer and readers.
 
 
 def _materialize_attachments(
@@ -532,8 +636,8 @@ def _materialize_one_blob(
     correct self-hash is still rejected, and content-addressing must never be offered as a reason
     to relax that (D1.4, normative).
     """
-    ref = _blob_ref(record)
-    sidecar_ref = f"{ref}{_SIDECAR_SUFFIX}"
+    ref = blob_ref(record.sha256, record.ext)
+    sidecar_ref = f"{ref}{SIDECAR_SUFFIX}"
     path = _contained(worktree, worktree / ref)
     sidecar = _contained(worktree, worktree / sidecar_ref)
 
@@ -833,7 +937,8 @@ def _concept_frontmatter(
 
     The model DECIDES ``title``/``summary``/``status``/``tags``/``aliases``/``links``; the WORKER
     MATERIALIZES ``kind``/``kb``/``subjects`` (D2/D2.2), ``created``/``updated`` (== ``run_date``,
-    ADR-0010 D1), ``sources`` (the provenance union, never the model), ``related`` (the plan
+    ADR-0010 D1), ``sources`` (the provenance union, never the model) and its derived
+    ``source_links`` mirror (#169 D18/D20 — see :func:`_stamp_source_links`), ``related`` (the plan
     ``links`` as ``"[[basename]]"`` tokens), ``origin`` (harvest only), ``confidence`` (MIRRORED
     from the candidate's worst-case value — NEVER decided by the model, ADR-0011 §2, so the backend
     can never inflate it) and ``body_status: pending`` when the note needs prose.
@@ -861,6 +966,12 @@ def _concept_frontmatter(
         provenance=provenance,
     )
     fm["sources"] = list(sources)
+    # D20: the derived `source_links:` mirror is emitted on the CLAIM-BEARING kinds only — the same
+    # population L1-7/L1-8/L1-8b grade `sources:` over. The gate reads the kind out of the dict this
+    # builder just stamped (`kind="concept"` above) rather than restating the literal, so a builder
+    # that is ever re-pointed at another kind carries its gate with it.
+    if fm["kind"] in CLAIM_BEARING_KINDS:
+        _stamp_source_links(fm)
     fm["related"] = [f"[[{link}]]" for link in disp.links]
     if origin is not None:
         fm["origin"] = origin
@@ -904,6 +1015,10 @@ def _journal_frontmatter(
     fm["date"] = run_date
     fm["run_id"] = run_id
     fm["sources"] = list(sources)
+    # NO `source_links:` mirror here: D20 gates the mirror on CLAIM_BEARING_KINDS and `note` is not
+    # one — the journal's `sources:` is graded by no lint rule at all (`_is_sourced_kind`), so a
+    # mirror over it would be the one derived key nothing checks. Flipping that decision means
+    # calling `_stamp_source_links` HERE **and** at the existing-journal union below.
     if disp.needs_prose:
         fm["body_status"] = "pending"
     return fm
@@ -1385,6 +1500,10 @@ def _apply_append_journal(
             if s not in merged_sources:
                 merged_sources.append(s)
         fm["sources"] = merged_sources
+        # NO `source_links:` mirror here either (D20, `kind: note`). This is the SECOND journal
+        # write site — the cross-run union that extends an existing journal — and it is the one a
+        # future flip would forget: a mirror stamped by `_journal_frontmatter` on day 1 and not
+        # re-stamped here would silently go stale the next time the same journal gains a source.
         # The journal is the ONE note schema 2 genuinely makes multi-subject: several domains now
         # share one file, so `subjects:` unions rather than being set (D2.6 / D6 step 4).
         _stamp_schema2_base(fm, kb=kb, kind="note", subject=disp.domain, widen_subjects=True)
@@ -1633,7 +1752,13 @@ def _apply_merge(
     # BOTH sourced kinds, so hard-coding `concept` would stamp `kind: concept` onto a note in
     # `wiki/summaries/` the day OD-7's producer lands — an L1-11 hard reject the curator wrote
     # itself. The directory is authoritative (D2.1), so it is also the right thing to mirror.
-    _stamp_schema2_base(fm, kb=kb, kind=_target_kind(worktree, path), subject=disp.domain)
+    target_kind = _target_kind(worktree, path)
+    # D20: RE-STAMP the mirror AFTER the union, on the CLAIM-BEARING kinds only. Re-stamping rather
+    # than appending is what lets a target that PREDATES the mirror gain one on its next merge, and
+    # what keeps a target that already has one exactly in step with the `sources:` it just grew.
+    if target_kind in CLAIM_BEARING_KINDS:
+        _stamp_source_links(fm)
+    _stamp_schema2_base(fm, kb=kb, kind=target_kind, subject=disp.domain)
     _merge_agents(fm, provenance)
     _set_updated(fm, run_date)
 
@@ -1704,7 +1829,12 @@ def _apply_contested(
     # BOTH sourced kinds, so hard-coding `concept` would stamp `kind: concept` onto a note in
     # `wiki/summaries/` the day OD-7's producer lands — an L1-11 hard reject the curator wrote
     # itself. The directory is authoritative (D2.1), so it is also the right thing to mirror.
-    _stamp_schema2_base(fm, kb=kb, kind=_target_kind(worktree, path), subject=disp.domain)
+    target_kind = _target_kind(worktree, path)
+    # D20: same re-stamp as MERGE — a contested note gains BOTH claims' evidence, so the mirror has
+    # to follow the union or the note that most needs its sources followed is the one that lies.
+    if target_kind in CLAIM_BEARING_KINDS:
+        _stamp_source_links(fm)
+    _stamp_schema2_base(fm, kb=kb, kind=target_kind, subject=disp.domain)
     _merge_agents(fm, provenance)
 
     # status: contested + contested_by (set-union, never replaced) + contested_at == run_date.

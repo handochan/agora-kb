@@ -231,6 +231,46 @@ http://127.0.0.1:8000/api/status` must print **400**. Unknown keys in this block
 This is **not** authentication (that is ROADMAP Phase 4 / ADR-0036); it is defense in depth on top
 of the unauthenticated premise, and it closes *browser-mediated* attacks only.
 
+## Source drill-down kill switch (`web.features.raw_enabled`, issue #169)
+
+The web face serves the captures a note was written from: `GET /raw/{path}` (a page) and
+`GET /api/raw/{path}` (JSON), plus a note's `sources:` rendered as links. `{path}` is the citation
+minus its stored `raw/` prefix. That content is the **least filtered** thing in the repo — it passed
+none of the curator's PLAN/APPLY grading, no lint rule grades it, and redaction is asymmetric: of
+the five producers that write text into `raw/`, only the `session:` harvest connector redacts (the
+`file:` connector, the web upload, `kb_remember` and `agora capture` never pass a redactor), and
+nothing redacts on the way out. Blob bytes are served only here — always
+`application/octet-stream` + `nosniff` + `attachment`, never the uploader-supplied `media_type` —
+and never over MCP.
+
+Turn the **web** surface off in the knowledge repo's `_kb/repo.yaml`:
+
+```yaml
+web:
+  features:
+    raw_enabled: false   # default: true
+```
+
+Off → both routes answer **404** (`raw feature is disabled (web.features.raw_enabled)`), `sources:`
+render as plain text again, and a body link into `raw/` is left verbatim rather than pointed at a
+disabled route. It gates the **web** face only: `kb_read` and `agora read` keep serving every
+capture, so an MCP key holder is unaffected — there is no MCP/CLI kill switch, only the choice not
+to expose the MCP face.
+
+Two caveats, both load-bearing:
+
+- **A kill switch is not an access control.** The face still has no authentication of any kind. The
+  rules above do not relax: keep the `127.0.0.1` bind, put an **authenticating reverse proxy** in
+  front, and treat *the proxy* — never this flag — as the security boundary. Note also that `raw/`
+  is git-tracked and `agora sync` already pushes it to the backup remote, so the route does not
+  *create* the exposure; it makes an existing git-level one reachable over HTTP.
+- **Unlike `web.security`, this block does not fail loud.** Unknown keys under `web.features` are
+  silently ignored, so `raw_enabld: false` leaves the default (`true`) in place with no error.
+  Verify with a citation that really exists — an absent path 404s either way: take a note's
+  `sources:` string, drop the `raw/` prefix, and check that
+  `curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8000/api/raw/<rest>` flips from 200 to
+  404 after the change.
+
 ## Rules & health
 
 - **127.0.0.1 only.** The web units hard-code `--host 127.0.0.1`. The web face has **no

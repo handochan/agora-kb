@@ -28,6 +28,7 @@ bypass host.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import shutil
 import subprocess
@@ -41,10 +42,20 @@ from fastapi.testclient import TestClient  # noqa: E402
 
 from agora_kb.core import Inbox, Repo  # noqa: E402
 from agora_kb.core.gold import build_gold  # noqa: E402
+from agora_kb.core.layout import blob_ref  # noqa: E402
 
 requires_git = pytest.mark.skipif(shutil.which("git") is None, reason="git not available")
 
 GEN_AT = datetime(2026, 7, 26, 12, 0, 0, tzinfo=UTC)
+
+#: The ``raw/`` capture tier the drill-down routes serve (DRILLDOWN-169). Both spellings are read
+#: surfaces an attacker page would exfiltrate through exactly like ``/api/notes`` — and the blob
+#: one hands back BYTES, so it belongs in the rebind/loopback loops rather than being covered only
+#: by its own suite's happy path.
+RAW_TEXT_REF = "raw/ai-tech/e1.md"
+BLOB_BYTES = b"%PDF-1.7\r\n\x00\xff binary\n"
+BLOB_SHA = hashlib.sha256(BLOB_BYTES).hexdigest()
+BLOB_REF = blob_ref(BLOB_SHA, "pdf")
 
 # The read routes an attacker page would exfiltrate through after a successful rebind.
 _READ_ROUTES = (
@@ -54,6 +65,8 @@ _READ_ROUTES = (
     "/api/gold/default",
     "/metrics",
     "/dashboard",
+    f"/{RAW_TEXT_REF}",
+    f"/{BLOB_REF}",
 )
 
 THEME_MD = (
@@ -87,16 +100,22 @@ def _init_repo(tmp_path: Path) -> Repo:
 
 
 def _full_repo(tmp_path: Path) -> Repo:
-    """A repo with one COMMITTED theme and the default gold pack BUILT.
+    """A repo with one COMMITTED theme, the default gold pack BUILT, and a populated ``raw/``.
 
-    Both are needed so ``/api/notes/{path}`` and ``/api/gold/{pack}`` can answer 200 — the point of
-    the Host tests is that a loopback Host reaches the real payload while an attacker Host does
-    not, which a 404-vs-400 comparison would state only weakly.
+    All three are needed so ``/api/notes/{path}``, ``/api/gold/{pack}`` and the two ``/raw``
+    surfaces can answer 200 — the point of the Host tests is that a loopback Host reaches the real
+    payload while an attacker Host does not, which a 404-vs-400 comparison would state only weakly.
     """
     repo = _init_repo(tmp_path)
     themes = tmp_path / "wiki" / "ai-tech" / "themes"
     themes.mkdir(parents=True, exist_ok=True)
     (themes / "curator-concurrency.md").write_text(THEME_MD, encoding="utf-8")
+    text_source = tmp_path / RAW_TEXT_REF
+    text_source.parent.mkdir(parents=True, exist_ok=True)
+    text_source.write_text("# evidence\n\nA captured document.\n", encoding="utf-8")
+    blob = tmp_path / BLOB_REF
+    blob.parent.mkdir(parents=True, exist_ok=True)
+    blob.write_bytes(BLOB_BYTES)
     _git(tmp_path, "add", "-A")
     _git(tmp_path, "commit", "-m", "theme")
     build_gold(repo, generated_at=GEN_AT)
@@ -482,7 +501,10 @@ def test_www_prefixed_entry_never_redirects(tmp_path: Path) -> None:
 def test_every_response_denies_framing(tmp_path: Path) -> None:
     """Clickjacking: a framed UI submits from the face's OWN origin, invisible to the CSRF guard.
 
-    Refusals carry the headers too — a 400/403 page is as frameable as a 200.
+    Refusals carry the headers too — a 400/403 page is as frameable as a 200. ``nosniff`` rides on
+    the same middleware (DRILLDOWN-169 D8): once this face serves uploaded capture bytes, a
+    browser that re-types a response by sniffing it is a same-origin document the CSRF and framing
+    guards never see.
     """
     _init_repo(tmp_path)
     client = _client(tmp_path)
@@ -496,3 +518,4 @@ def test_every_response_denies_framing(tmp_path: Path) -> None:
     ):
         assert resp.headers["x-frame-options"] == "DENY"
         assert resp.headers["content-security-policy"] == "frame-ancestors 'none'"
+        assert resp.headers["x-content-type-options"] == "nosniff"

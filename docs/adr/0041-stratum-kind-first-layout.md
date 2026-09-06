@@ -1218,3 +1218,172 @@ agora's own working-tree writes on Windows, and it applies only where the `text`
 which `raw/_blob/**` unsets. Repos created before this change have no such file; `agora doctor`
 answers with `git check-attr` (authoritative about ordering and the operator's own additions) and
 prints the one-line remedy.
+
+---
+
+## Addendum — `source_links:` and the read side of a citation (#169, landed 2026-09-05)
+
+D3.4 froze `sources:` as the provenance of record and D1.4 froze the `raw/` tree it points into.
+Neither said how a citation is *followed*. Issue #169 answered that in two waves — a read side that
+serves `raw/` back, and a write side that emits a followable citation form — and this addendum
+records the three decisions with a shape that binds later work. **Nothing normative in D1.4, D3.4 or
+D4.2 changes**: `sources:` stays the sole provenance of record, APPLY stays the only writer of
+`raw/`, admission stays membership in `raw_writes` with matching bytes, and the sidecar stays
+uncitable (L1-8b).
+
+**1. `source_links:` joins D2 as a DERIVED MIRROR of `sources:`, among the `concept` / `summary`
+additions and nowhere else.** D2 already carries derived keys beside the ones its common-base block
+lists — `type:`, the OKF mirror of `kind` (OD-3), and `description:`, the OKF mirror of `summary`
+(ADR-0014 D2) — and this is a third of exactly that species: a rendering of a key that already
+exists, kept in the frontmatter because a consumer needs the other spelling. The consumer here is
+Obsidian, which linkifies `[[…]]` inside a list property and renders plain strings as inert text;
+that inertness is the defect #169 reports.
+
+**How that Obsidian premise was established, since the whole wave rests on it.** The brief made it a
+hard gate precisely because nobody had checked it: every `[[ ]]` this repo emits elsewhere is a bare
+basename, so a *path* inside a wikilink had no in-repo precedent. It was resolved from Obsidian's own
+published documentation — a list property may contain quoted `[[Internal links]]`; a folder path
+inside a wikilink is resolved **from the vault root**; and `[[note.md]]` resolves identically to
+`[[note]]` — and **not** from an observation in a live vault. Two consequences are recorded here
+rather than discovered later: the vault must be opened at the REPO root for a `raw/…` chip to
+resolve, and nothing in this repository fails if the premise turns out to be wrong (the committed
+gate, `tests/core/test_rank_neutrality.py`, pins ranking neutrality, not rendering).
+
+```yaml
+sources:
+- raw/ai-tech/2026-09-01-cqrs-notes.md
+- harvest:claude-code
+source_links:
+- '[[raw/ai-tech/2026-09-01-cqrs-notes.md]]'
+```
+
+Its properties, all five load-bearing:
+
+- **Never authoritative.** No rule reads it as provenance. L1-7 (non-empty), L1-8 (existence) and
+  L1-8b (no sidecar) grade `sources:` and only `sources:`. Deleting the mirror from a note by hand
+  loses the click and nothing else; the next curator write restores it.
+- **It never names a source `sources:` does not carry, and usually names fewer.** Only entries
+  beginning with `raw/` enter it. That filter does two jobs: it keeps the D3.4 relation literally
+  true, and it declines to wrap a non-path entry — the `harvest:<agent>` shape `core.gold` still
+  branches on, which no path resolution has ever adjudicated against L1-8's `(root / s).exists()` —
+  in a wikilink that would resolve nowhere.
+  This ADR takes no position on that open disagreement; the filter simply never depends on it.
+- **Absent rather than empty, and re-derived on every write.** A mirror that comes out empty is
+  removed, not emitted as `source_links: []`. Every site that finishes writing `fm["sources"]` on a
+  claim-bearing kind re-stamps it (CREATE, MERGE, CONTEST), so a target that predates the mirror
+  gains one on its next merge and a target that has one stays in step with the union it just grew.
+  There is deliberately **no backfill pass**: a concept published before this change carries no
+  mirror, and no chip, until a run merges or contests into it. That is the cost of the "no re-render
+  of notes the run did not touch" posture APPLY already holds, and it is the shape a later
+  `agora repo upgrade` (#63) would relieve, not a gap this wave closes.
+  A journal (`kind: note`) never receives one: `CLAIM_BEARING_KINDS` gates the emission to the same
+  population `_is_sourced_kind` grades, and a derived view of a key no rule checks would be worse
+  than none.
+- **Never wrapped when the wrapping would lie.** An entry is mirrored only if `[[<entry>]]` reads
+  back through the wikilink grammar as the entry itself, so a `raw/` path holding `|`, `[[` or `]]`
+  keeps its `sources:` row and gets no chip. APPLY's own refs can never contain those characters;
+  a converted or hand-made KB can.
+- **Outside the brain's reach.** APPLY stamps the mirror before the PASS-2 snapshot, so the existing
+  §4.2 check ("frontmatter is byte-identical across PASS 2") already refuses a brain that edits it.
+  No sixth integrity check was added.
+
+**Why the mirror and not a body citation — the measurement that decided it.** A body-carried
+citation is not a display choice; it is a change to the ranking oracle. `Wiki.query_lexical` reads
+note BODIES, `curator/bundle.py` feeds it every candidate's text to build the planning brain's
+`related/` view, and that view picks `MERGE_INTO_THEME` targets — and a wrong merge is permanent,
+because the closed ADR-0011 op vocabulary has no DELETE. A body `## Sources` block moved the result
+order on **9 of 24** fixed queries; the frontmatter mirror moved **0 of 24** scores and **0 of 24**
+orders, which is what a derived key that never enters the token stream must do.
+
+*Where that figure comes from, and what is committed.* It is a ONE-OFF, owner-side measurement taken
+on 2026-09-05 against a scratch copy of the author's private KB (24 queries, `query_lexical(limit=5)`
+tuple comparison), and it is **not reproducible from this repository**: the corpus is private and the
+harness lived in the measuring session's scratchpad, per the design brief, which also forbids citing
+`tests/rank_golden/*.json` as neutrality evidence — those goldens never call APPLY and are
+structurally blind to a write-path change. Cite it as the reason the decision was taken, not as a
+figure a reader can re-derive. What IS committed, and what a future change has to keep green, is
+`tests/core/test_rank_neutrality.py`: the mirrored and unmirrored renders of the same note parse to
+equal `field_tokens` / `headings` / `outlinks` and to an equal `_note_to_dict`, `query_lexical`
+returns byte-identical results over a mirrored corpus, and a control shows the rejected body block
+moving all three.
+
+The mirror also leaves the reader cache alone — not because frontmatter cannot reach the cache (it
+plainly can: `_note_to_dict` serializes `kind`, `subjects`, `title`, `tags`, `status` and
+`field_tokens`, and a frontmatter key is exactly what forced the last 2→3 bump), but because
+`_note_to_dict`'s serialized field set is CLOSED and `source_links` is not one of its inputs. The
+`_Note` shape is unchanged, so `CACHE_SCHEMA_VERSION` stays **3**. A future frontmatter key that
+*does* feed one of those fields still bumps it. Footnotes were rejected on a second, independent
+ground (below).
+
+**2. L1-25 keeps the mirror honest, as the one L1 rule that is a WARNING.** A citation of a `raw/`
+artifact that `sources:` does not carry is reported on all three surfaces a hand edit can reach:
+
+- **every** `[[X]]` in the mirror key — deliberately with no `raw/` prefix test, because the key is
+  derived and holds nothing else when APPLY wrote it, so an entry that is anything else is a hand
+  edit to a key no rule reads as provenance. `X` is matched against `sources:` with the `.md`
+  extension present or absent on either side, because Obsidian resolves those identically;
+- each body markdown-link target that names a `raw/` artifact. Two spellings reach that: a target
+  resolved **relative to the citing note** (`../../raw/general/x.md` from `wiki/concepts/x.md`), and
+  a target already spelled repo-relative under `raw/`, which is taken **verbatim** — joining that
+  one under the note's directory would give `wiki/concepts/raw/…` and the rule would never fire on
+  the exact shape `sources:` carries and the schema's own example writes. Both branches are
+  ratified here; the asymmetry they imply (`./raw/x.md` from a `wiki/` note is not a citation) is
+  accepted as the price of the second one. The surface is the ADR-0014 D3 body-link grammar
+  (`_BODY_MDLINK_RE`) as-is, IMAGE-embed exclusion included: `![alt](../../raw/_blob/…)` is an
+  asset reference under ADR-0010 §3.5, not a provenance claim, so it reaches neither L1-2 nor
+  L1-25 and is graded by nothing. Widening the pattern here would fork the one grammar both rules
+  share; the exclusion is ratified and documented instead (schema §3.4 item 3, LIMITATIONS §6);
+- each footnote-definition payload naming a `raw/` path, bare or inside a markdown link.
+
+It inherits the `_is_sourced_kind` gate,
+so journals stay unscored, and it never re-asks L1-8's existence question. It is a **warning**
+deliberately: the notes it fires on are hand edits and vault imports, an error would discard the
+whole run's diff, and a run can never repair what failed it — while `agora repo upgrade` (#63) is
+open there is no repair path at all. This is the first L1 rule that does not reject; the emitted
+schema doc says so at the head of the L1 table.
+
+L1-25 being a warning does **not** make a hand-written body citation safe, and the schema doc says
+so where it teaches the form. A markdown link into `raw/**.md` also meets L1-2, which resolves every
+`.md` link target to a BASENAME: if no note owns that basename the link is a hard **error** that
+discards the run's whole diff; if a note does own it — the common case, since a capture is usually
+named after the thing it is about — L1-2 is silent and the link instead resolves to a *different*
+file than it names, entering the body link graph `query_lexical` ranks on. Neither outcome is
+repaired by this wave, and both are why the emitted form is a frontmatter key.
+
+**3. Footnote `[^n]` citations are demoted, and the reason is a permanent two-renderer split.** The
+schema doc recommended them since ADR-0010. Measured: CommonMark — the parser the web face uses —
+reads `[^1]: raw/general/x.md` as a **link-reference definition**, so the marker renders as an
+anchor pointing at an unrewritten relative path (a 404), and a payload that is itself a markdown
+link is mangled; Obsidian reads the same bytes as a footnote. The recommended form was therefore
+broken on one face and fine on the other, in a way no amount of care in the brain prompt fixes.
+Adding a footnote plugin is not additive either — it would change how already-committed `[^n]:`
+bytes parse. The schema now instructs the brain to write no inline `raw/` citation at all; the
+citation is attached for it.
+
+**4. Read-side decisions this addendum acknowledges as binding, though they change nothing in the
+layout.** They are recorded here because they are cheap to make and expensive to revoke, and because
+the ADR is where a later change has to come to argue with them:
+
+- **The web URL shape is `GET /raw/{path}`, where `{path}` is the citation with its stored `raw/`
+  prefix removed** (#169 D6 / #169 OD-7 — the design brief's own OD numbering, distinct from this
+  ADR's ratified OD-1..OD-10): `sources: raw/ai-tech/x.md` → `/raw/ai-tech/x.md`, and
+  `raw/_blob/<ab>/<sha256>.<ext>` → `/raw/_blob/<ab>/<sha256>.<ext>`. Keeping the prefix would give
+  `/raw/raw/…`. The stored identity D3.4 froze is never truncated — the handler, `kb_read` and the
+  CLI all take the citation string verbatim; only the URL drops the duplicated segment. This shape
+  ends up in bookmarks, agent transcripts and cross-face tests, so changing it later is a break.
+- **Blob bytes never leave over MCP** (#169 D5). `kb_read` on a `raw/_blob/…` citation returns the
+  sidecar's capture facts and no bytes: no base64 field, no opt-in parameter. Four reasons, one of
+  which is structural — blob bytes are the only content in the repo that passed neither the curator's
+  grading, nor the ADR-0007 candidate gate, nor ADR-0023 redaction — and one of which is arithmetic:
+  a 25 MiB PDF is ~33 MiB of base64 that no model can read. The download is the web route, which
+  serves every blob as `application/octet-stream` with `nosniff` and `attachment`, never as the
+  sidecar's `media_type` (that field and the stored `<ext>` are both uploader-chosen). **A future
+  proposal to reverse this must cite this paragraph and retire it explicitly**, the posture D1.4
+  takes on content-addressing.
+- **The `raw/` bridge is an Agora→agent emission path under ADR-0027 §8**, named there by an
+  append-only addendum of its own rather than folded silently under R1. It is the first such path
+  serving content the curator never graded, and it inherits R1 (#166) — the pull-surface control that
+  is still undesigned — rather than being covered by any control that exists today. Recorded per
+  **#169 OD-5** (the design brief's owner decision to ship wave A without #165 — *not* this ADR's own
+  ratified OD-5, which is the `agora export` / OpenKB interop format), and consistent with R1's own
+  prohibition on citing the push exclusion as a pull control.

@@ -549,6 +549,240 @@ def test_l1_19_harvest_origin_is_accepted(tmp_path: Path) -> None:
     assert _codes(_lint(layout), "wiki/concepts/org.md") == []
 
 
+# --- L1-25 (a citation `sources:` does not carry) ------------------------------------------------
+#
+# `sources:` is the provenance of RECORD (§3.4). The Obsidian mirror APPLY emits (#169 D18), a
+# hand-written body link and a hand-written footnote are DERIVED views of it, so the rule grades the
+# views against the record — never the record against the disk (that is L1-8, and only L1-8).
+
+
+def test_l1_25_a_mirror_entry_missing_from_sources_warns(tmp_path: Path) -> None:
+    layout = _valid_repo(tmp_path)
+    _raw_source(layout, _RAW_2)
+    _write(
+        layout,
+        "wiki/concepts/mirror.md",
+        _concept_fm(title="Mirror", source_links=[f"[[{_RAW}]]", f"[[{_RAW_2}]]"]),
+        "Body.",
+    )
+    findings = [f for f in _lint(layout).findings if f.code == "L1-25"]
+    assert [(f.path, f.message) for f in findings] == [
+        ("wiki/concepts/mirror.md", f"citation not in sources: {_RAW_2!r}")
+    ]
+
+
+def test_l1_25_a_mirror_that_is_a_proper_subset_of_sources_is_silent(tmp_path: Path) -> None:
+    """§3.4 makes the mirror a SUBSET of the record: a source with no mirror entry is legal."""
+    layout = _valid_repo(tmp_path)
+    _raw_source(layout, _RAW_2)
+    _write(
+        layout,
+        "wiki/concepts/subset.md",
+        _concept_fm(title="Subset", sources=[_RAW, _RAW_2], source_links=[f"[[{_RAW}]]"]),
+        "Body.",
+    )
+    assert _codes(_lint(layout), "wiki/concepts/subset.md") == []
+
+
+def test_l1_25_is_a_warning_and_never_flips_the_verdict(tmp_path: Path) -> None:
+    """The L2-6 severity test's mirror (D19), plus the no-double-check half of the rule.
+
+    ``raw/ai-tech/ghost.md`` is on no disk and the ONLY finding is still the citation one: existence
+    is L1-8's question about ``sources:``, and L1-25 never asks it a second time. WARNING severity
+    keeps ``ok`` True, so a hand-edited or imported note can never self-lock a curator run.
+    """
+    layout = _valid_repo(tmp_path)
+    _write(
+        layout,
+        "wiki/concepts/mirror.md",
+        _concept_fm(title="Mirror", source_links=["[[raw/ai-tech/ghost.md]]"]),
+        "Body.",
+    )
+    result = _lint(layout, run_date=RUN_DATE, run_id=RUN_ID)
+    assert [(f.code, f.severity, f.path) for f in result.findings] == [
+        ("L1-25", "warning", "wiki/concepts/mirror.md")
+    ]
+    assert result.ok is True
+
+
+def test_l1_25_fires_independently_on_each_of_the_three_citation_surfaces(tmp_path: Path) -> None:
+    """One collector, three surfaces — a hand edit reaches for whichever one it knows."""
+    layout = _valid_repo(tmp_path)
+    _write(
+        layout,
+        "wiki/concepts/mirror.md",
+        _concept_fm(title="Mirror", source_links=[f"[[{_RAW_2}]]"]),
+        "Body.",
+    )
+    _write(
+        layout,
+        "wiki/concepts/bodylink.md",
+        _concept_fm(title="Body link"),
+        f"See [the capture](../../{_RAW_2}).",
+    )
+    _write(
+        layout,
+        "wiki/concepts/footnote.md",
+        _concept_fm(title="Footnote"),
+        f"Claim.[^1]\n\n[^1]: {_RAW_2}\n",
+    )
+
+    result = _lint(layout)
+    assert {f.path: f.message for f in result.findings if f.code == "L1-25"} == {
+        "wiki/concepts/mirror.md": f"citation not in sources: {_RAW_2!r}",
+        "wiki/concepts/bodylink.md": f"citation not in sources: {_RAW_2!r}",
+        "wiki/concepts/footnote.md": f"citation not in sources: {_RAW_2!r}",
+    }
+    # HERE the `raw/` body target is ALSO a broken wiki link: L1-2 resolves every `.md` link to a
+    # basename and no note owns `2026-06-10-inbox`. That is NOT the general case — see the
+    # colliding-basename test below, where L1-2 stays silent and L1-25 is the note's only reader.
+    # The footnote payload is not a markdown link, so it reaches no link rule at all.
+    assert "L1-2" in _codes(result, "wiki/concepts/bodylink.md")
+    assert _codes(result, "wiki/concepts/footnote.md") == ["L1-25"]
+
+
+def test_l1_25_is_the_only_reader_of_a_body_citation_whose_basename_owns_a_note(
+    tmp_path: Path,
+) -> None:
+    """The DOMINANT real shape, and the honest reason L1-25 has to exist as its own rule.
+
+    L1-2 resolves a body markdown link to its BASENAME (``schema.notes.body_link_basenames``) and
+    complains only when no note owns it. A capture is normally named after the thing it is about,
+    so its basename normally DOES own a note — measured on the author's KB, 8 of 9 ``raw/``
+    basenames collide with a wiki basename. In that case the link is not "broken" at all: L1-2 is
+    silent, the citation is graded by nothing but L1-25, and the link silently resolves to a
+    DIFFERENT file than the one it names (here, the concept's own basename — a self-edge into the
+    lexical graph the curator merges on). Which is why the EMITTED citation form is the frontmatter
+    mirror (#169 D18) and why this wave adds no L1-2 carve-out.
+    """
+    layout = _valid_repo(tmp_path)
+    # A capture named after the concept `_valid_repo` already publishes.
+    colliding = "raw/ai-tech/curator-concurrency.md"
+    _raw_source(layout, colliding)
+    _write(
+        layout,
+        "wiki/concepts/bodylink.md",
+        _concept_fm(title="Body link"),
+        f"See [the capture](../../{colliding}).",
+    )
+
+    result = _lint(layout)
+    assert _codes(result, "wiki/concepts/bodylink.md") == ["L1-25"]  # L1-2 does NOT fire
+    assert [f.message for f in result.findings if f.path == "wiki/concepts/bodylink.md"] == [
+        f"citation not in sources: {colliding!r}"
+    ]
+    assert result.ok is True  # a warning, so the run still publishes
+
+
+def test_l1_25_does_not_grade_an_image_embed_of_a_raw_artifact(tmp_path: Path) -> None:
+    """An IMAGE embed of a ``raw/`` artifact is graded by NOTHING, and that is deliberate.
+
+    Both body surfaces read the one ADR-0014 D3 grammar (``schema.notes._BODY_MDLINK_RE``), whose
+    ``(?<!\\!)`` lookbehind excludes ``![alt](...)``: an image is an ASSET reference outside the
+    link graph (ADR-0010 §3.5), not a link edge for L1-2 and not a provenance claim for L1-25.
+    Embedding a captured screenshot is therefore silent on both. Widening the pattern for L1-25
+    alone would fork a grammar two rules share, so the carve-out is pinned here and documented
+    (schema §3.4 item 3 + the L1-25 row, ADR-0041's L1-25 addendum bullet, LIMITATIONS §6) rather
+    than closed. The same target spelled as a plain link DOES warn — the assertion below.
+    """
+    layout = _valid_repo(tmp_path)
+    blob = "raw/_blob/ab/deadbeef.png"
+    _raw_source(layout, blob)
+    _write(
+        layout,
+        "wiki/concepts/embed.md",
+        _concept_fm(title="Embed"),
+        f"![the scan](../../{blob})",
+    )
+    _write(
+        layout,
+        "wiki/concepts/plainlink.md",
+        _concept_fm(title="Plain link"),
+        f"[the scan](../../{blob})",
+    )
+
+    result = _lint(layout)
+    assert _codes(result, "wiki/concepts/embed.md") == []
+    assert _codes(result, "wiki/concepts/plainlink.md") == ["L1-25"]
+
+
+def test_l1_25_a_mirror_entry_without_the_md_extension_matches_the_source(tmp_path: Path) -> None:
+    """Obsidian resolves ``[[note.md]]`` and ``[[note]]`` identically (the #169 B0 pre-check), so
+    the extension-less mirror entry is the SAME citation rather than a missing one."""
+    layout = _valid_repo(tmp_path)
+    _write(
+        layout,
+        "wiki/concepts/mirror.md",
+        _concept_fm(title="Mirror", source_links=[f"[[{_RAW.removesuffix('.md')}]]"]),
+        "Body.",
+    )
+    assert _codes(_lint(layout), "wiki/concepts/mirror.md") == []
+
+
+def test_l1_25_matches_the_md_extension_in_both_directions(tmp_path: Path) -> None:
+    """The equivalence is symmetric: a ``.md`` citation also matches an extension-less source.
+
+    The pair can be spelled either way round by a hand edit, and grading only one direction would
+    warn about a citation that IS declared — the false positive the "with and without ``.md``"
+    contract in the schema doc promises not to make.
+    """
+    layout = _valid_repo(tmp_path)
+    _write(
+        layout,
+        "wiki/concepts/mirror.md",
+        _concept_fm(
+            title="Mirror",
+            sources=[_RAW.removesuffix(".md")],
+            source_links=[f"[[{_RAW}]]"],
+        ),
+        "Body.",
+    )
+    # L1-8 still owns the existence question and still fails on the extension-less path; L1-25 must
+    # not pile a second, WRONG complaint on top of it.
+    assert "L1-25" not in _codes(_lint(layout), "wiki/concepts/mirror.md")
+
+
+def test_l1_25_is_silent_on_a_note_with_no_citation_surface(tmp_path: Path) -> None:
+    """The legacy corpus: every note APPLY has written so far cites ONLY in ``sources:``.
+
+    A sibling note link and an external URL that merely CONTAINS ``raw/`` are not citations — the
+    target has to resolve into the repo's ``raw/`` tree, which a URL never does.
+    """
+    layout = _valid_repo(tmp_path)
+    _write(
+        layout,
+        "wiki/concepts/legacy.md",
+        _concept_fm(title="Legacy"),
+        "Prose with [a sibling](curator-concurrency.md) and "
+        "[an external](https://example.test/raw/x.html).",
+    )
+    assert _codes(_lint(layout), "wiki/concepts/legacy.md") == []
+
+
+def test_l1_25_does_not_grade_a_journal(tmp_path: Path) -> None:
+    """``kind: note`` is outside ``_is_sourced_kind`` — unscored here exactly as for L1-7/8/8b."""
+    layout = _valid_repo(tmp_path)
+    _write(
+        layout,
+        "wiki/notes/2026/06/2026-06-13.md",
+        _note_fm(title="Journal", date="2026-06-13", source_links=[f"[[{_RAW_2}]]"]),
+        f"## consolidated\n\n[^1]: {_RAW_2}\n",
+    )
+    assert "L1-25" not in _codes(_lint(layout), "wiki/notes/2026/06/2026-06-13.md")
+
+
+def test_l1_25_grades_a_summary_too(tmp_path: Path) -> None:
+    """The gate is the widened ``{concept, summary}`` predicate, not ``concept`` alone."""
+    layout = _valid_repo(tmp_path)
+    _write(
+        layout,
+        "wiki/summaries/deep-dive.md",
+        _summary_fm(title="Deep dive", source_links=[f"[[{_RAW_2}]]"]),
+        "Body.",
+    )
+    assert "L1-25" in _codes(_lint(layout), "wiki/summaries/deep-dive.md")
+
+
 # --- L1-11 (kind enum + directory cross-check) ---------------------------------------------------
 
 

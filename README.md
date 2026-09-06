@@ -89,6 +89,7 @@ pluggable — any headless CLI agent + any model (default: a local open-weight m
         entities/<slug>.md               (ships empty — no producer yet)
         people/<person>/**.md            yours — the curator never writes here
     raw/<domain>/…                       immutable captured sources (unchanged, never moved)
+        _blob/<ab>/<sha256>.<ext>        an upload's ORIGINAL bytes + a .meta.yaml sidecar
     _meta/{taxonomy.yaml,kb.yaml}        the closed vocabulary + this KB's identity
     _kb/                                 git-ignored engine spool (inbox, state, caches, packs)
   ```
@@ -184,11 +185,15 @@ claude mcp add agora-kb -- uv run --directory /path/to/agora-kb agora serve --re
 
 The loop: an agent calls **`kb_remember`** to capture a fact (it lands in the append-only inbox),
 **`kb_curate`** to consolidate the inbox into the wiki with the local model, and **`kb_query`** to
-get cited evidence back — then **`kb_read`** to open a cited note and **`kb_neighbors`** to walk
+get cited evidence back — then **`kb_read`** to open a cited note (or, given a `sources:` string,
+the `raw/` capture it was written from) and **`kb_neighbors`** to walk
 its link neighborhood before re-querying (the agentic navigation loop, no filesystem access
-needed). You can drive the same loop from the CLI without an agent —
-`agora status` (inbox depth + curator state), `agora curate` (one consolidation run), and
-`agora watch` (scheduler loop: cron + threshold + idle triggers).
+needed). You can drive the same loop from the CLI without an agent — `agora query <q>`,
+`agora read <path>` and `agora neighbors <path>` give the same three answers in a terminal (each
+takes `--json`, which prints the MCP payload verbatim), `agora capture --file PATH` is the
+no-server way to put a file in, and `agora status` (inbox depth + curator state), `agora curate`
+(one consolidation run) and `agora watch` (scheduler loop: cron + threshold + idle triggers) run the
+engine.
 
 **Phase 2 (pluggable brains + harvester).** To swap the curator's brain, add a `default_backend`
 (and optional `routing: {plan, author}`) to `adapters.yaml` and run `agora curate --backend NAME`
@@ -211,7 +216,11 @@ uv run agora web --repo ~/my-kb            # → http://127.0.0.1:8000
 
 You get a browse/search UI (markdown rendered XSS-safe via `markdown-it-py`), an **upload** page that
 runs URL/PDF/office extractors and writes the result through the inbox (the curator stays the sole
-writer of `raw/`; ADR-0020), a first-class JSON API under `/api/*`, an interactive **`/graph`**
+writer of `raw/`; ADR-0020), a first-class JSON API under `/api/*`, a provenance drill-down
+(**`GET /raw/{path}`** + **`GET /api/raw/{path}`**, and a note's `sources:` rendered as links —
+`{path}` is the citation minus its `raw/` prefix; text is served as escaped plain text, a blob as an
+`application/octet-stream` attachment, and `web.features.raw_enabled: false` turns the whole surface
+off), an interactive **`/graph`**
 knowledge graph (plus a per-note local/backlink graph; canvas drag/zoom/click → the note, vendored
 MIT force-graph, no Node — ADR-0021), a read-only **`/dashboard`**
 (KB health · curator · harvester · gold-pack status, HTMX-polled), and a Prometheus **`/metrics`**

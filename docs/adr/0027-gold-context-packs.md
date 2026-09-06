@@ -2,6 +2,8 @@
 
 **Status:** Accepted · 2026-07-05 (Step-0 ratified, #36) · Proposed 2026-07-04
 **AMENDED (append-only) — [ADR-0041](0041-stratum-kind-first-layout.md) (Proposed, KB wiki schema 2):** decision 4's structural-centrality term follows the ADR-0012 §2/§4 seed change (a map is `wiki/maps/**`, not `wiki/<domain>/<domain>-moc.md`), and its ELIGIBILITY set gains two DAY-1 exclusions — `wiki/people/**` (the outbound redaction boundary for a human-owned READ corpus is undesigned; the ADR-0023 connector boundary is not the same boundary) and `derived: true`. **§8's GRAMMAR, neutralization and loop-break rules are NORMATIVE and KEPT VERBATIM** — ADR-0041 cites them and does not restate or fork them. **§8's SCOPE SENTENCE is AMENDED.** §8 declares itself "the single normative spec for every Agora→agent emission path", and ADR-0041 D3.3 admits `wiki/people/**` — content that never passed the curator, the ADR-0007 candidate gate, or ADR-0023 redaction — into `kb_query` / `kb_read` / `kb_neighbors`. Those are Agora→agent emission paths §8 does not name. The day-1 gold + `kb_context` exclusion above is the control for the PUSH surface only; the PULL surface (agent-initiated MCP reads) is hereby named as an emission path whose control is DISTINCT and STILL UNDESIGNED, owned by ADR-0041 residual risk R1. Neither the push exclusion nor §8 may be cited as covering it. Decisions 1/2/3/5/6/7 and the byte-identical-rebuild contract are UNCHANGED. The prose below is retained verbatim for history.
+**AMENDED (append-only) — #169 wave A (2026-09-05), a SECOND scope amendment:** the `raw/` read bridge (`AgoraHandlers.raw()` behind `kb_read`, `GET /raw` + `GET /api/raw`, and `agora read`) is a further emission path on that same PULL surface — and the first to serve content that passed none of the curator's PLAN/APPLY grading. It is **named, not folded** under R1, and its accepted risk is recorded in the addendum "the `raw/` read bridge is an emission path under §8's scope" at the end of this document. This banner is the single index of scope changes; §8's grammar, neutralization and span-drop rules are again UNCHANGED.
+**AMENDED (append-only) — [ADR-0037](0037-local-multi-kb-federation.md) (Proposed, 2026-09-05), a THIRD scope amendment:** §8's cite-obligation list above names ADR-0023, reserved ADR-0026 and reserved ADR-0030 (federation) — it was written before the 0030/0037 split and does not name **ADR-0037**, whose declaration-order **bands** emit an attached KB's excerpts to an agent and are therefore a further emission path on the same PULL surface the ADR-0041 banner named. It is **named, not folded** under R1, and §8 is **not** cited as covering it: §8's operative rules are pack-shaped ("Every emitted pack is wrapped `<!-- agora:pack … -->`"; assembly-time neutralization is the PackAssembler's duty; §9's cite list enumerates pack PRODUCERS/COMPOSERS), and a band composes RESULTS, never a pack — 0030 remains the sole COMPOSER per §7's ROLE RULE. ADR-0037 therefore inherits §8 UNCHANGED for anything that IS a pack, and supplies its OWN controls for the band path, which are named here rather than left implicit: `core.redact.sanitize()` (strip_sentinel_spans + the redactor) on every remote excerpt; a `role: reader` KB's `wiki/people/**` entering no band result, no graph and no cache (#166, applied as a POPULATION filter the way decision 4's exclusion is); and a `role: reader` KB's `raw/` **refused on every face** — the mirror does contain it, since only `_kb/` is git-ignored, so the control is an explicit refusal and not an absence. Those three close the READER-KB half of R1 for this path. **The LOCAL KB's own pull surface is UNCHANGED and remains R1's undesigned control** (ADR-0041 D3.3), and neither §8 nor this banner may be cited as covering it. This banner remains the single index of scope changes.
 
 Adds a **derived, deterministic, token-budgeted context tier** ("gold packs") assembled from the
 existing validator-gated wiki, plus the **single normative outbound sentinel + loop-break contract**
@@ -348,3 +350,45 @@ asserts MCP and web return the identical payload):
 
 **Phase D (the `agora-bridge-aelix` reference bridge) remains future work** — a separate repo,
 zero agora-core changes (the decision-7 ROLE RULE is the test), deferred until aelix is available.
+
+## Addendum — the `raw/` read bridge is an emission path under §8's scope (2026-09-05, #169 wave A)
+
+**Append-only. Decisions 1/2/3/5/6/7, the §8 grammar, the assembly-time neutralization and the
+span-drop contract are UNCHANGED and are not restated here.** This addendum records one fact and one
+accepted risk, so the §8 scope sentence stays true after #169.
+
+**What landed.** A shared read seam `AgoraHandlers.raw()` (`faces/mcp_server.py`) serves ONE `raw/`
+artefact by its `sources:` citation string, over three faces: the `kb_read` bridge (a `raw/` payload
+is marked `resource: "raw"`), the web routes `GET /raw/{path}` + `GET /api/raw/{path}`, and the
+`agora read` CLI verb. Path decisions belong entirely to `core/rawstore.py`'s three gates.
+
+**§8 scope — named, not folded.** §8 declares itself "the single normative spec for every
+Agora→agent emission path". ADR-0041 already amended that sentence once, to name the *pull* surface
+(`kb_query` / `kb_read` / `kb_neighbors` reaching `wiki/people/**`) as an emission path whose control
+is distinct and undesigned. The `raw/` bridge is a **further** emission path on that same pull
+surface, and it is the first one that serves content which passed through **none** of the curator's
+PLAN/APPLY grading: `wiki/**` at least survived the lint ruleset, while `raw/` is whatever an
+extractor, a web upload, a harvest connector or `agora capture` produced. It is also not uniformly
+redacted — of the five producers that write text into `raw/`, only the ADR-0023 `session:` connector
+redacts at its boundary (`harvester/session_connector.py`); the `file:` connector, the web upload,
+`kb_remember` and `agora capture` never pass a redactor, and there is no read-time redaction (the
+redactor is one-way, and rewriting on the way out would make the served bytes disagree with the
+digest the note cites). Neither the day-1 gold/`kb_context` push exclusion nor §8 itself may be cited
+as covering this path — the same prohibition ADR-0041 records for the pull surface it named.
+
+**Accepted risk (owner decision OD-5, taken at its recommended default).** Wave A ships **before**
+the `wiki/people/**` fences ADR-0041 specifies exist: the repo-internal `file:`-connector rule is
+unimplemented (#165), so a repo-covering harvest glob can carry people content into the inbox and
+thence into `raw/`, where this bridge will serve it. The control that would gate it is ADR-0041
+residual risk **R1** (#166), still undesigned. This addendum **inherits** R1 rather than closing it;
+recording the inheritance here is the condition on which wave A shipped, so that a later reader
+cannot mistake silence for coverage. The operator-facing controls that DO exist today are the web
+kill switch `web.features.raw_enabled` (default on — a switch, not an access control; the face has
+no authn until Phase 4 / ADR-0036) and not exposing the face.
+
+**Two things this addendum does NOT change.** (1) It grants no new *push*: nothing auto-injects a
+capture anywhere, and packs still exclude `wiki/people/**` and `derived: true`. (2) It does not open
+a byte channel: blob BYTES are never served over MCP (`kb_read` on a `raw/_blob/…` returns the
+sidecar's capture facts and a pointer to the web download), and the web route serves them only as
+`application/octet-stream` + `nosniff` + `attachment`, never as the uploader-supplied `media_type`.
+A future proposal to serve bytes over MCP must cite and explicitly retire that decision.

@@ -183,6 +183,9 @@ provenance 사슬의 재작성이다(`stratum:66-73`).
 
 ### 4.2 페더레이션 — 밴드
 
+> **2026-09-05 갱신:** 아래 `FederatedHit` 9필드 스케치는 **ADR-0037 D6**(Proposed)이 대체한다 — `kb_local_score` 삭제(크로스 비교 금지),
+> `transport`/`commit`/`fetched_at`은 `BandProvenance`로 이동, `rank_in_kb`→`rank_in_band`. 필드 목록의 정본은 ADR 하나뿐이다.
+
 KB별 결정론 질의는 **손대지 않는다**(ADR-0012 무손상). 신규 필드는 `SearchHit`이 아니라 래퍼에 붙는다: `FederatedHit = {kb_id, kb_alias, kb_role,
 transport, commit, fetched_at, rank_in_kb, kb_local_score, hit: SearchHit}`. 기본 병합은 **선언 순서 밴드**, 옵션 `interleave`/`concat`.
 **크로스-코퍼스 원점수 비교 금지** — IDF가 레포별이라 비교 자체가 불가능하다. RRF는 기각한다(서로소 문서 집합에서 RRF ≡ interleave라 채택 이유가 없고,
@@ -204,7 +207,7 @@ kbs:
     mirror: "/Users/me/.agora/remotes/hana-research"
     role: reader                            # 부착 = 구조적 읽기 전용
 
-# $AGORA_HOME/profile.yaml    (DESIGN.md:395-402가 예약한 ~/.agora/profile.yaml)
+# $AGORA_HOME/profile.yaml    (DESIGN.md:469가 예약한 ~/.agora/profile.yaml — 정본은 ADR-0037 D5)
 version: 1
 read: [general, hana-research]              # 선언 순서 = 밴드 순서
 write: general                              # 기본 쓰기 대상

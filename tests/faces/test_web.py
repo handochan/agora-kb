@@ -598,6 +598,96 @@ def test_note_render_leaves_external_links(tmp_path: Path) -> None:
     assert 'href="https://cloud.google.com"' in resp.text
 
 
+# --- D13: base-aware link rewriting — a raw/ citation is a drill-down, not a wiki note -----------
+def test_note_render_rewrites_a_raw_body_link_to_the_raw_route(tmp_path: Path) -> None:
+    """A body link into ``raw/`` becomes ``/raw/<rest>`` (D6), never a ``/note/`` guess (D13).
+
+    The URL sheds the stored ``raw/`` prefix because the route itself is mounted at ``/raw``;
+    the citation STRING keeps its full identity everywhere else (ADR-0041 D3.4).
+    """
+    _init_repo(tmp_path)
+    _write_wiki_notes(tmp_path)
+    raw_dir = tmp_path / "raw" / "ai-tech"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    (raw_dir / "e1.md").write_text("captured bytes\n", encoding="utf-8")
+    (tmp_path / "wiki" / "concepts" / "cited.md").write_text(
+        "---\nstatus: active\nkind: concept\nsubjects: [ai-tech]\n"
+        "sources: [raw/ai-tech/e1.md]\n---\n"
+        "# Cited\n\nSee [the capture](../../raw/ai-tech/e1.md).\n",
+        encoding="utf-8",
+    )
+
+    html = _client(tmp_path).get("/note/wiki/concepts/cited.md").text
+    assert 'href="/raw/ai-tech/e1.md"' in html
+    assert 'href="/note/e1.md"' not in html
+    assert 'href="/raw/raw/ai-tech/e1.md"' not in html  # the prefix is dropped exactly once
+
+
+def test_note_render_does_not_self_link_on_a_colliding_basename(tmp_path: Path) -> None:
+    """REGRESSION PIN (§8 E-1): basename resolution sent a raw citation to the CONCEPT ITSELF.
+
+    ``[…](../../raw/general/psa-hca.md)`` inside ``wiki/concepts/psa-hca.md`` rendered as
+    ``href="/note/wiki/concepts/psa-hca.md"`` — a plausible WRONG answer, not a 404. On the owner's
+    KB 8 of 9 ``raw/`` basenames collide with a wiki basename, so the collision is the norm.
+    """
+    from agora_kb.faces.web.app import render_note_body
+
+    notes = [{"rel_path": "wiki/concepts/psa-hca.md", "basename": "psa-hca", "kind": "concept"}]
+    html = render_note_body(
+        "- [raw/general/psa-hca.md](../../raw/general/psa-hca.md)\n",
+        notes=notes,
+        base="wiki/concepts/psa-hca.md",
+    )
+    assert 'href="/raw/general/psa-hca.md"' in html
+    assert "/note/wiki/concepts/psa-hca.md" not in html
+    assert "/note/" not in html
+
+    # A blob capture is a drill-down target too: the .md requirement is relaxed for raw/ ONLY.
+    blob = render_note_body(
+        "- [r.pdf](../../raw/_blob/ab/dead.pdf)\n", notes=notes, base="wiki/concepts/psa-hca.md"
+    )
+    assert 'href="/raw/_blob/ab/dead.pdf"' in blob
+
+    # A ?query is split off before resolving and re-appended, not percent-encoded INTO the path:
+    # `/raw/general/a.md%3Fv%3D2` is a guaranteed 404 for a link the base build left alone.
+    query = render_note_body(
+        "- [x](../../raw/general/psa-hca.md?v=2)\n", notes=notes, base="wiki/concepts/psa-hca.md"
+    )
+    assert 'href="/raw/general/psa-hca.md?v=2"' in query
+    assert "%3F" not in query
+    # …and the #fragment case keeps working alongside it.
+    both = render_note_body(
+        "- [x](../../raw/general/psa-hca.md?v=2#sec)\n",
+        notes=notes,
+        base="wiki/concepts/psa-hca.md",
+    )
+    assert 'href="/raw/general/psa-hca.md?v=2#sec"' in both
+
+    # D11: with the feature off the target is left VERBATIM — never an href into a disabled route.
+    off = render_note_body(
+        "- [raw/general/psa-hca.md](../../raw/general/psa-hca.md)\n",
+        notes=notes,
+        base="wiki/concepts/psa-hca.md",
+        raw_enabled=False,
+    )
+    assert 'href="/raw/' not in off  # no href into the disabled route
+    assert 'href="../../raw/general/psa-hca.md"' in off  # left verbatim
+    assert "/note/" not in off  # and NEVER falls through to the wrong basename answer
+
+
+def test_raw_href_is_the_one_prefix_conversion_site() -> None:
+    """D6: ``raw/<rest>`` → ``/raw/<rest>``, percent-encoded, segments preserved."""
+    from agora_kb.faces.web.app import _raw_href
+
+    assert _raw_href("raw/ai-tech/e1.md") == "/raw/ai-tech/e1.md"
+    assert _raw_href("raw/_blob/ab/" + "d" * 64 + ".pdf") == "/raw/_blob/ab/" + "d" * 64 + ".pdf"
+    assert (
+        _raw_href("raw/general/보고서 2026.md")
+        == "/raw/general/%EB%B3%B4%EA%B3%A0%EC%84%9C%202026.md"
+    )
+    assert _raw_href("raw/general/a#b?c.md") == "/raw/general/a%23b%3Fc.md"
+
+
 def test_note_page_404(tmp_path: Path) -> None:
     _init_repo(tmp_path)
     client = _client(tmp_path)

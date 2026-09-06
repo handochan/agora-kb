@@ -141,6 +141,10 @@ _FM_ORDER: tuple[str, ...] = (
     "derived",
     "provenance",
     "sources",
+    # The #169 derived Obsidian mirror, at the position `curator.apply._stamp_source_links` puts it
+    # (immediately after the key it mirrors) — so a converted note that carries one still reads
+    # identically to an APPLY re-render rather than trailing the key at the end of the block.
+    "source_links",
     "related",
     "children",
     "date",

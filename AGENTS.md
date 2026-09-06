@@ -76,8 +76,10 @@ src/agora_kb/
                reading layer, derived for BOTH schemas) + lint (the L1 ruleset, dispatched by the
                same version; L1-22/23/24 are schema-2 only)
   config.py    load config (adapters.yaml, repo.yaml, triggers + harvest policy + connector specs)
-  cli.py       `agora` entry point (repo init · import · status · curate · harvest · index · gold ·
-               eval · sync · watch · serve · web · doctor)
+  cli.py       `agora` entry point (repo init · import · capture · status · query · read ·
+               neighbors · curate · requeue · harvest · index · gold · eval · sync · watch · serve ·
+               web · doctor [--agents]) — `query`/`read`/`neighbors` are the read verbs, thin
+               wrappers over `AgoraHandlers` so `--json` is the MCP payload verbatim (#169 A5/D14)
   # --- not yet implemented (later phases) ---
   auth/        (Phase 4+ — stub) authn/authz (tokens, OpenFGA/Forgejo delegation)
 deploy/        launchd/systemd unit templates for always-on watch/web + harvest schedule (#65)
@@ -165,6 +167,12 @@ re-targets pre-existing body markdown links — the `doctor`/`status` READ-ONLY 
 for a read-only repo). Still NOT shipped: any producer for `wiki/summaries/` or `wiki/entities/`
 (OD-7/OD-8, ADR-0040 unauthored), and the `people/` egress fences (the repo-internal
 `file:`-connector rule and the pull-surface control, residual risk R1).
+**The read-side source drill-down landed on top of it (#169 wave A):** `core/rawstore.py`'s
+three-gate `raw/` read primitive feeds one shared `AgoraHandlers.raw()` seam behind
+`GET /raw/{path}` + `GET /api/raw/{path}` (kill switch `web.features.raw_enabled`), the `kb_read`
+`sources:` bridge (blob BYTES never over MCP), server-computed linkable `sources:` rows, and the
+`agora query`/`read`/`neighbors` verbs — with `agora doctor --agents` (#147) and the non-ASCII cache
+stem (#167) alongside; the curator-emitted inline citation is wave B and is NOT shipped.
 ADR-0041 is **Accepted** (2026-09-05, OD-1..OD-10 ratified as recommended — OD-10 as a deliberate
 deferral) — read its acceptance record before changing anything it decides.
 

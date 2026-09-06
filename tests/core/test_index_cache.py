@@ -456,17 +456,22 @@ def test_cli_doctor_reports_index_line(tmp_path: Path, capsys: pytest.CaptureFix
 # --- unsafe repo DIRECTORY names: the write path degrades like the read path (issue #108) --------
 
 
-@pytest.mark.parametrize("name", ["My Knowledge", "내지식"])
+@pytest.mark.parametrize("name", ["My Knowledge"])
 def test_unsafe_repo_dir_name_never_tracebacks_and_reports_consistently(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], name: str
 ) -> None:
     """A repo DIRECTORY name that is not a safe filename component must never crash a build (#108).
 
-    ``~/My Knowledge`` and ``~/내지식`` are ordinary directories that ``agora repo init`` accepts,
-    but neither can address ``_kb/index/<repo>.notes.json``. The five READ call sites have always
-    degraded to a full scan; the WRITE path (``build_cache``) was unguarded and ``agora index
-    build`` exited with a raw ``InvalidWriterError`` traceback. No platform branch is involved —
-    this reproduces on POSIX and Windows alike.
+    ``~/My Knowledge`` is an ordinary directory that ``agora repo init`` accepts, but it cannot
+    address ``_kb/index/<repo>.notes.json`` — whitespace is outside the pathsafe allowlist AND
+    outside the legacy writer charset, so both halves of the union predicate refuse it. The five
+    READ call sites have always degraded to a full scan; the WRITE path (``build_cache``) was
+    unguarded and ``agora index build`` exited with a raw ``InvalidWriterError`` traceback. No
+    platform branch is involved — this reproduces on POSIX and Windows alike.
+
+    ``내지식`` used to be parametrized here too. It is now ACCEPTED (DRILLDOWN-169 D17, issue
+    #167) and its end-to-end behaviour is pinned by
+    :func:`test_non_ascii_repo_dir_name_now_addresses_a_cache` below.
     """
     from agora_kb.cli import main
 
@@ -527,6 +532,118 @@ def test_unsafe_repo_dir_name_does_not_abort_a_curator_publish(tmp_path: Path) -
     repo = _repo(tmp_path, name="My Knowledge")
     assert rebuild_index_cache(repo) is False
     assert not repo.layout.index_cache_dir.exists()
+
+
+# --- cache-stem predicate: the union rule (DRILLDOWN-169 D17, issue #167) ------------------------
+
+# The acceptance table measured on the pre-change build (brief §8 E-2). It is written out in full,
+# both halves, because the union's WHOLE point is that neither half alone reproduces it:
+#   * the legacy writer charset alone rejects every non-ASCII stem (#167 itself);
+#   * ``is_safe_component`` alone rejects the Windows device stems and the trailing ``-``/``.``
+#     forms, which today address real cache files — and ``core/wiki.py`` SWALLOWS the resulting
+#     InvalidWriterError and falls back to a full scan, so that regression would be a silent
+#     performance loss with no operator-visible error.
+_STEMS_ACCEPTED_BEFORE_AND_AFTER = ["con", "CON", "nul", "com1", "aux", "foo-", "foo."]
+_STEMS_NEWLY_ACCEPTED = ["내지식", "café", "a" * 130]
+#   * ``-foo`` is the one spelling made only of "always accepted" ASCII characters that BOTH
+#     halves still refuse (``is_safe_component`` rejects the leading ``-``; the legacy writer
+#     regex requires a leading ``[A-Za-z0-9]``), so the raise message must keep saying so.
+_STEMS_REFUSED = ["../escape", ".hidden", "My Knowledge", "", "-foo"]
+
+
+@pytest.mark.parametrize("stem", _STEMS_ACCEPTED_BEFORE_AND_AFTER)
+def test_cache_stem_keeps_every_stem_the_legacy_writer_charset_admitted(
+    tmp_path: Path, stem: str
+) -> None:
+    """No repo that has a cache today may lose it — the union is purely ADDITIVE (D17)."""
+    from agora_kb.core.pathsafe import is_safe_filename_stem
+
+    assert is_safe_filename_stem(stem) is True
+    layout = RepoLayout(tmp_path / "myrepo")
+    assert layout.index_notes_path(stem) == layout.kb_dir / "index" / f"{stem}.notes.json"
+
+
+@pytest.mark.parametrize("stem", _STEMS_NEWLY_ACCEPTED)
+def test_cache_stem_now_admits_non_ascii_and_long_names(tmp_path: Path, stem: str) -> None:
+    """Issue #167: a Unicode repo directory addresses a cache instead of silently losing one."""
+    from agora_kb.core.pathsafe import is_safe_filename_stem
+
+    assert is_safe_filename_stem(stem) is True
+    layout = RepoLayout(tmp_path / "myrepo")
+    assert layout.index_notes_path(stem) == layout.kb_dir / "index" / f"{stem}.notes.json"
+
+
+@pytest.mark.parametrize("stem", _STEMS_REFUSED)
+def test_cache_stem_still_refuses_traversal_dotfiles_and_whitespace(
+    tmp_path: Path, stem: str
+) -> None:
+    """Both halves of the union refuse these independently — widening admitted no separator."""
+    from agora_kb.core.pathsafe import is_safe_filename_stem
+
+    assert is_safe_filename_stem(stem) is False
+    with pytest.raises(InvalidWriterError):
+        RepoLayout(tmp_path / "myrepo").index_notes_path(stem)
+
+
+def test_cache_stem_predicate_never_invents_a_stem() -> None:
+    """The predicate ANSWERS about the value as given; it must not be a slugger (D17).
+
+    ``safe_slug_component('/etc/passwd')`` returns ``'etc-passwd'``. Routing the layout guard
+    through a REWRITER would silently address a different repo's cache file, which is exactly the
+    property ``test_unsafe_repo_dir_name_never_tracebacks_and_reports_consistently`` pins.
+    """
+    from agora_kb.core.pathsafe import is_safe_filename_stem, safe_slug_component
+
+    assert safe_slug_component("/etc/passwd") == "etc-passwd"  # the rewriter we did NOT use
+    assert is_safe_filename_stem("/etc/passwd") is False
+
+
+def test_cache_stem_legacy_charset_mirror_matches_layout() -> None:
+    """``pathsafe`` copies ``layout``'s writer charset (the dependency runs layout → pathsafe).
+
+    Pinned here so the two definitions cannot drift apart unnoticed.
+    """
+    from agora_kb.core import layout as layout_mod
+    from agora_kb.core import pathsafe
+
+    assert pathsafe._LEGACY_WRITER_RE.pattern == layout_mod._WRITER_RE.pattern
+    assert pathsafe._LEGACY_WRITER_MAX == layout_mod._WRITER_MAX
+
+
+def test_non_ascii_repo_dir_name_now_addresses_a_cache(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``~/내지식`` builds, reports and clears a cache end to end (issue #167, D17).
+
+    This is the leg flipped out of the #108 parametrize above: the directory is unchanged, only
+    the stem predicate widened. ``CACHE_SCHEMA_VERSION`` is untouched (3) because only the
+    FILENAME moved — the serialized ``_Note`` shape is byte-identical.
+    """
+    from agora_kb.cli import main
+
+    repo = _repo(tmp_path, name="내지식")
+    root = str(repo.root)
+
+    assert repo.layout.index_notes_path() == repo.layout.kb_dir / "index" / "내지식.notes.json"
+
+    assert main(["index", "build", "--repo", root]) == 0
+    assert "built" in capsys.readouterr().out
+    assert repo.layout.index_notes_path().is_file()
+
+    payload = json.loads(repo.layout.index_notes_path().read_text(encoding="utf-8"))
+    assert payload["cache_schema_version"] == index_cache.CACHE_SCHEMA_VERSION == 3
+
+    assert main(["index", "status", "--repo", root]) == 0
+    assert "FRESH" in capsys.readouterr().out
+
+    # …and the cache is byte-identical to what the query oracle produces (the load-bearing #26
+    # contract): a hit is still a hit, a miss is still a miss.
+    result = Wiki(repo.layout).query("curator concurrency control")
+    assert result.status == "ok" and result.hits
+    assert Wiki(repo.layout).query("quantum biology photosynthesis").status == "not_found"
+
+    assert main(["index", "clear", "--repo", root]) == 0
+    assert "cleared" in capsys.readouterr().out
 
 
 # --- Korean corpus: cache parity + bigram determinism (issue #56, ADR-0012 addendum) -------------

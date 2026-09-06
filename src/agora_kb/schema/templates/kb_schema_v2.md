@@ -193,6 +193,9 @@ sources: []        # REQUIRED & non-empty UNLESS status == stub. Array of raw/ p
                    #   e.g. ["raw/ai-tech/2026-09-04-foo.pdf"] or ["raw/ai-tech/2026-09-04T....md"].
                    # MUST cite the source artifact itself, NEVER a .meta.yaml sidecar (§3.4, L1-8b).
                    # Every claim on the page traces to one of these (Karpathy provenance).
+source_links: []   # DERIVED mirror of the raw/ half of `sources:`, as "[[raw/<domain>/<id>.md]]"
+                   #   wikilinks — worker-stamped, never yours, never authoritative, and ABSENT
+                   #   (not empty) when no source is a raw/ path. Graded by L1-25. See §3.4.
 related: []        # array of "[[basename]]" strings — typed-edge substitute (see §3)
 origin: claude-code | codex | qwen | gemini | opencode | hermes | manual
                    #   | agent:<name> | web:<user> | harvest:<agent>
@@ -257,13 +260,15 @@ updated: 2026-09-04
 status: active
 summary: One curator advances the curated branch per repo under a per-repo lock.
 sources: ["raw/ai-tech/2026-09-01-cqrs-notes.md"]
+source_links: ["[[raw/ai-tech/2026-09-01-cqrs-notes.md]]"]   # DERIVED from sources: (§3.4); worker-stamped
 related: ["[[inbox-event-log]]", "[[git-as-audit-log]]"]
 confidence: high
 ---
-Exactly one curator advances the curated branch per repo ... [^1]
-
-[^1]: raw/ai-tech/2026-09-01-cqrs-notes.md
+Exactly one curator advances the curated branch per repo ...
 ```
+
+(The evidence is followable from the `source_links:` property chip — the body carries no footnote
+marker, because no footnote form renders the same way on both faces, §3.4.)
 
 ```yaml
 # index.md  (repo root — the ONLY note named "index")
@@ -457,16 +462,79 @@ Backlinks are computed by scanning all links across the repo (as Obsidian / Quar
 and `stale` (§2.6) are derived from the same scan plus `run_date`. Storing any of these would violate
 Invariant 1 (indexes rebuildable from markdown), so none are persisted.
 
-### 3.4 Citing `raw/` from a concept (two ways that MUST agree)
+### 3.4 Citing `raw/` from a concept (`sources:` is the record; every other form is a VIEW of it)
 
-1. `sources:` frontmatter array of `raw/` paths (REQUIRED & non-empty for concepts/summaries, except `stub`).
-2. Inline citation markers in prose pointing at the same files (footnote `[^n]` style recommended).
+1. **`sources:` — the provenance of record.** A frontmatter array of `raw/` paths, REQUIRED &
+   non-empty for concepts/summaries except `stub`. It is the one authoritative citation surface: the
+   lint rules, the gold packs, the drill-down read routes and `kb_read` all resolve provenance out of
+   this key and nothing else.
+2. **`source_links:` — the DERIVED mirror, and the ONLY inline citation form the curator EMITS.**
+   Deterministic APPLY renders the `raw/` half of `sources:` as Obsidian wikilinks and stamps them
+   immediately after it, on `concept` and `summary` only:
 
-The set of files referenced inline SHOULD be a subset of `sources:`; `sources:` is the authoritative
-provenance. L1-7 / L1-8 / L1-8b enforce: non-stub concepts have a non-empty `sources:`; every listed path
-exists under `raw/`; and **no `sources:` entry is a `.meta.yaml` sidecar** — cite the source artifact
-itself (the binary or markdown), never its metadata. The sidecar schema is defined in DATA-MODEL §2
-(`source_url` / `ingested` / `ingested_by` / `sha256` / `mime`); this schema does not redefine it.
+   ```yaml
+   sources:
+   - raw/ai-tech/2026-09-01-cqrs-notes.md
+   - harvest:claude-code
+   source_links:
+   - '[[raw/ai-tech/2026-09-01-cqrs-notes.md]]'
+   ```
+
+   Its contract, in four sentences. It **never names a source `sources:` does not carry, and usually
+   names fewer** — only entries beginning with `raw/` enter it, so a non-path entry such as
+   `harvest:<agent>` is never wrapped in a wikilink that resolves nowhere. It is **never
+   authoritative**: no rule reads it as provenance, and deleting it by hand loses the click and
+   nothing else. It is **never left stale or empty** — every write that touches `sources:` re-derives
+   it, and when the mirror comes out empty the key is REMOVED rather than emitted as
+   `source_links: []`. And it is **not yours to write**: APPLY stamps it, PASS 2 may not touch it
+   (the frontmatter is byte-frozen between the two passes), and journals (`kind: note`) never receive
+   one — their `sources:` is graded by no rule, so a derived view of it would be a key nothing checks.
+
+   *Why a frontmatter list and not prose:* Obsidian linkifies `[[…]]` inside a list property and
+   renders it as a clickable chip, so the mirror is followable in the vault without putting a single
+   token into the note BODY — and the body is what the lexical ranker reads to decide which notes the
+   curator merges into which. A measured body citation block moved that ranking; the mirror moves it
+   by exactly zero.
+3. **Inline citations in the BODY are read and graded, but nothing emits them and one form is
+   DANGEROUS.** A hand-written markdown link resolving into `raw/`, or a footnote definition naming a
+   `raw/` path, is a provenance claim like any other and `sources:` must carry it — **L1-25**
+   (WARNING) reports every `raw/` citation the note makes that `sources:` does not carry, on all
+   three surfaces: the `source_links:` key, a body markdown link, and a footnote definition's
+   payload. But L1-25 being a warning is not a licence to write body citations, because it is not the
+   only rule the body form meets:
+
+   - A markdown link to a `raw/**.md` file also meets **L1-2**, which is an **error** and rejects the
+     whole run. L1-2 resolves *every* `.md` link target to a BASENAME and demands a note own it. Two
+     outcomes, neither good: if no note owns the capture's basename, the link is a hard reject; if one
+     does — the usual case, because a capture is normally named after the thing it is about — L1-2 is
+     silent and your link resolves to that OTHER note instead of the capture, adding a false edge to
+     the link graph the curator's merge oracle ranks on. This schema adds no `raw/` carve-out to L1-2.
+   - A markdown link to a NON-`.md` `raw/` artifact (a `raw/_blob/**` PDF, say) reaches no basename
+     resolution, so L1-25 is its only grader.
+   - An IMAGE embed `![alt](../../raw/_blob/…)` is an ASSET reference, not a citation (ADR-0010
+     §3.5 — assets live outside the link graph), so it is graded by NOTHING: the body surface L1-25
+     scans excludes image links by construction, and so does L1-2's. Embedding a captured screenshot
+     is therefore silent — if you want the capture graded as provenance, put it in `sources:`.
+   - A footnote definition reaches no link rule at all — L1-25 is again its only grader — but see the
+     two-renderer split below.
+
+   Body citations also put tokens into the note BODY, which is what the lexical ranker reads; the
+   emitted mirror deliberately puts none there. **Cite in `sources:` and let the mirror do the rest.**
+
+**Footnote `[^n]` citations are NOT recommended** (this reverses the earlier guidance in this
+document). The `[^1]: raw/general/x.md` form renders as two different things in the two renderers
+this repo actually has: CommonMark — which the web face uses — parses that line as a **link-reference
+definition**, so the marker becomes an `<a>` pointing at an unrewritten relative path (a 404), and a
+footnote whose payload is itself a markdown link is mangled outright; Obsidian reads the same bytes as
+a footnote. A citation form that is broken on one face and fine on the other is worse than no inline
+citation, which is why the machine-emitted form is the frontmatter mirror.
+
+L1-7 / L1-8 / L1-8b / L1-25 enforce: non-stub concepts have a non-empty `sources:`; every listed path
+exists under `raw/`; **no `sources:` entry is a `.meta.yaml` sidecar** — cite the source artifact
+itself (the binary or markdown), never its metadata; and no citation surface claims a `raw/` artifact
+`sources:` does not carry. Whether a cited file EXISTS is L1-8's question alone. The `raw/<domain>/`
+sidecar schema is defined in DATA-MODEL §2 (`source_url` / `ingested` / `ingested_by` / `sha256` /
+`mime`); this schema does not redefine it.
 
 **Two `raw/` shapes exist and both are citable the same way:** `raw/<domain>/…` (unchanged from schema 1)
 and the content-addressed capture tree `raw/_blob/<ab>/<sha256>.<ext>` with its
@@ -476,15 +544,25 @@ never begin with `_` (L1-23), so they can never collide with a real shard.
 #### 3.4.1 Free-text provenance (closing the gap)
 
 A `kb_remember` free-text capture has no uploaded file, yet durable knowledge from it must still be able
-to become a concept. Resolution (frozen): **`core.ingest` (deterministic engine code on the WRITE path, NOT
-the sandboxed curator brain) persists every `kb_remember` body as an immutable
-`raw/<domain>/<inbox-id>.md`** (basename = the inbox `id`, DATA-MODEL §1) at capture time, before the
-curator ever runs. That file carries the capture's `source` / `writer` / `created` / `content_sha256` as
-frontmatter and is git-tracked. Therefore a citable `raw/` artifact ALWAYS exists. You cite it in the
+to become a concept. Resolution (frozen): **deterministic engine code — the curator's APPLY pass, NEVER
+the sandboxed brain — persists the capture's body as an immutable `raw/<domain>/<inbox-id>.md`**
+(basename = the inbox event `id`, DATA-MODEL §1) in the same run that files the note citing it.
+Therefore a citable `raw/` artifact ALWAYS exists for the note that cites it. You cite it in the
 concept's `sources:`. **The curator brain still NEVER writes `raw/`** (it is not on the brain's allowlist);
-only deterministic engine code writes it. This makes L1-7 satisfiable for every concept, including
-free-text-origin ones. (`stub` concepts are still exempt from L1-7 — they may be created before their
-source is decided, §2.6 / §3.7.)
+only deterministic engine code writes it, and the final-diff gate admits exactly the paths-with-content
+the engine recorded. This makes L1-7 satisfiable for every concept, including free-text-origin ones.
+(`stub` concepts are still exempt from L1-7 — they may be created before their source is decided,
+§2.6 / §3.7.)
+
+Two properties of that file are easy to assume wrongly, so they are stated:
+
+- **It has NO frontmatter.** The engine writes the event body bytes and nothing else — no `source`,
+  no `writer`, no `created`, no `content_sha256` header is prepended. A `raw/<domain>/<inbox-id>.md`
+  file begins with the first byte of the captured text. Never parse one for metadata; the capture
+  facts live in the inbox event and, for a `raw/_blob/` artifact, in its `<file>.meta.yaml` sidecar.
+- **It is written only where a note cites it, and it is written once.** A candidate the curator
+  `DROP`s or `NOOP`s produces no note, no `sources:` entry and no `raw/` file; an existing file is
+  re-cited, never overwritten.
 
 ### 3.5 Assets
 
@@ -734,6 +812,9 @@ never GRADES `wiki/people/**` (§3.9). Two tiers.
 
 ### L1 — STRUCTURAL (hard; reject the commit, return events to inbox / failed)
 
+Every L1 rule below is an **error** and rejects the commit, with exactly one named exception:
+**L1-25 is a warning** and rejects nothing (its row says why).
+
 | # | Rule | Detection |
 |---|---|---|
 | L1-1 | Duplicate basename anywhere in repo | basename → path map has a collision (people notes excluded, §3.9) |
@@ -761,6 +842,7 @@ never GRADES `wiki/people/**` (§3.9). Two tiers.
 | L1-22 | Unknown `wiki/` kind directory | a note under `wiki/` whose segment-1 directory ∉ `{concepts, summaries, notes, maps, entities, people}`, or a note sitting directly under `wiki/` with no kind directory (§1) |
 | L1-23 | Reserved taxonomy domain | a `_meta/taxonomy.yaml: domains` entry beginning with `_` — the `raw/` reserved-prefix namespace (§3.4, §5) |
 | L1-24 | Inadmissible map child | a map `children:` / child-bullet entry whose child's kind ∉ `{concept, summary, map}` (§3.2) |
+| L1-25 | Citation not in `sources:` | **WARNING, not a reject — the one L1 rule that is not hard** (a hand edit or a vault import has no repair path yet, and rejecting would discard the whole run's diff). On a `concept`/`summary`: a citation the note makes that its `sources:` list does not carry — EVERY `[[X]]` of the derived `source_links:` mirror (that key is derived, so its entries are graded whether or not they name `raw/`; `X` matched with the `.md` extension present or absent on either side), each BODY markdown-link target naming a `raw/` artifact (resolved relative to the citing note, or taken verbatim when the target is already repo-relative under `raw/`; an IMAGE embed `![alt](…)` is an ASSET reference, not a citation — §3.4 item 3 — so it is excluded here exactly as it is from L1-2, and is graded by nothing), and each footnote-definition payload that is a `raw/` path. `sources:` is the provenance of record (§3.4) and every other citation surface is a derived view of it; whether the artifact EXISTS stays L1-8's question, and a body markdown link into `raw/**.md` still meets L1-2 as well (§3.4 item 3) |
 
 ### L2 — HEALTH (soft; DERIVED at read / dashboard time; never written to frontmatter; feeds Dashboard "KB health")
 
@@ -844,6 +926,8 @@ def lint_l1(worktree: Path, taxonomy: Taxonomy, run_date: str, run_id: str,
                 elif not (worktree / s).exists(): errors.append(MissingSource(n.path, s))
             if n.fm.status == "contested" and not contested_shape_ok(n, run_date): # L1-10 (§3.8)
                 errors.append(MalformedContested(n.path))
+            # L1-25 is evaluated on this same population, but it yields WARNINGS: they are reported
+            # beside the errors and never enter `errors`, so they never block a commit (§3.4).
         if n.kind == "note":                                                      # L1-14
             d = n.fm.date or n.basename          # the note's OWN date
             if not (is_yyyy_mm_dd(n.basename) and n.fm.date == n.basename
@@ -955,7 +1039,9 @@ The worker validates the plan (closed vocab, coverage, taxonomy, basename unique
 worktree re-scan, path / allowlist, link resolvability, provenance, the candidate gate) and then writes
 **ALL** structure and **ALL** frontmatter from the plan: file creation at the kind-first paths of §1,
 globally-unique basenames, frontmatter (`title`, `summary`, `kind`, `kb`, `subjects`, `tags`,
-`sources` = unioned provenance, `created` / `updated` = `run_date`, `status`, `aliases`, `origin` iff a
+`sources` = unioned provenance, `source_links` = the derived `raw/` mirror of `sources` on
+`concept` / `summary` (§3.4; absent when that mirror is empty), `created` / `updated` = `run_date`,
+`status`, `aliases`, `origin` iff a
 provenance source is `harvest:<agent>`, the contested fields §3.8, the §2.7 OKF mirrors, and
 `body_status: pending` for notes needing prose), the frontmatter `related:` / `children:` `[[basename]]`
 arrays, the map and `index.md` BODY child bullets as standard markdown links `- [Title](relative.md)`
@@ -980,8 +1066,11 @@ for enumerations (no top-level `#` title — that lives in the frontmatter; sub-
 separate note should exist). A `MERGE_INTO_THEME` augmentation is a small fragment — a bullet or short
 paragraph — and does NOT introduce its own `##` sub-headings. Do NOT edit frontmatter, do
 NOT add new `[[wikilinks]]` (links are structure, owned by APPLY — stray links you add are
-deterministically stripped to plain text), do NOT touch any other file or sentinel. Cite the relevant
-`raw/` source inline (footnote `[^n]` recommended) consistent with the note's `sources:`. If your prose
+deterministically stripped to plain text), do NOT touch any other file or sentinel. Do **not** write
+inline `raw/` citations — no footnote definitions, no markdown links into `raw/`: the citation is
+already emitted for you, in the frontmatter `source_links:` mirror APPLY stamps from `sources:`
+(§3.4), and an inline one you invent is both unrenderable on one of the two faces and reported by
+L1-25 if `sources:` does not carry it. Write the claim; the provenance is attached. If your prose
 fails validation for a note, the worker resets that body to a placeholder and sets `body_status: pending`
 — the run still publishes, because structure is already valid — and conversely, when your prose lands,
 the worker DROPS `body_status` for you in the same step, so the key is never stale. You never edit
@@ -1064,8 +1153,13 @@ SearchHit   = { repo, path, anchor, line, excerpt,
   byte-for-byte. It is worker-set from the candidate's provenance, never written by the brain.
 - `run_id` / `run_date` are injected by orchestration from the run manifest (DATA-MODEL §5), never read
   from the wall clock (§0.1).
-- `core.ingest` is the sole writer of `raw/<domain>/<inbox-id>.md` for free-text captures (§3.4.1); the
-  curator brain never writes `raw/`.
+- Deterministic engine code (the curator's APPLY pass) is the sole writer of
+  `raw/<domain>/<inbox-id>.md` for free-text captures, and that file carries **no frontmatter** —
+  the event body bytes only (§3.4.1); the curator brain never writes `raw/`.
+- `source_links:` is DERIVED from `sources:` and is never the provenance of record (§3.4). It is
+  worker-stamped on `concept` / `summary` only, never names a source `sources:` does not carry, is absent
+  rather than empty, and no rule reads it as provenance — L1-25 reads it only to check it back
+  against `sources:`.
 - `wiki/people/**` is human-owned: never written by the curator, never graded by lint, outside the
   basename identity space, and excluded from gold packs (§3.9).
 - Optional / later (publishing): at Quartz publish time, map `status: deprecated` and the derived `orphan`

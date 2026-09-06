@@ -70,14 +70,122 @@ the topic moves out of the path into a `subjects:` list (0..n). `raw/` does not 
   limitation 12 below and [`docs/LIMITATIONS.md`](docs/LIMITATIONS.md) §6a.
 - **An upload's original bytes are now kept** (wave W2.5): they travel with the inbox event as a
   content-addressed attachment and APPLY materialises `raw/_blob/<ab>/<sha256>.<ext>` + a sidecar;
-  `agora capture --file` is the no-server capture. Nothing serves them back yet —
-  [`docs/LIMITATIONS.md`](docs/LIMITATIONS.md) §6 and #169.
+  `agora capture --file` is the no-server capture. Following a citation back to them is the
+  drill-down below — [`docs/LIMITATIONS.md`](docs/LIMITATIONS.md) §6.
 - Korean/Unicode filenames (`core/pathsafe.py`); a human-owned `wiki/people/**` the curator can never
   write; `kb_id` in `_meta/kb.yaml`; `agora eval` plus the ranking golden that proves the flip moved no
   seed (`tests/rank_golden/FLIP-DIFF.md`); `?domain=` → `?subject=` on the web/graph routes (the old
   parameter is silently ignored). Search itself is unchanged: the same deterministic BM25F.
 
 The per-wave commit table is [`docs/ROADMAP.md`](docs/ROADMAP.md) → "Stratum".
+
+**Source drill-down — a `sources:` citation is now followable (#169, with #147 and #167).**
+Provenance was already recorded and lint-checked; nothing could follow it. Now every read face can,
+over one shared seam (`AgoraHandlers.raw()`) so the faces cannot describe a capture differently
+(wave A) — and in Obsidian the citation itself is clickable, from a derived frontmatter mirror the
+curator emits (wave B).
+
+### Added
+
+- **Web: `GET /raw/{path}` and `GET /api/raw/{path}`.** `{path}` is the citation with its stored
+  `raw/` prefix dropped (`sources: raw/general/psa-hca.md` → `/raw/general/psa-hca.md`). A text
+  capture renders into an escaped `<pre>` — deliberately *not* through the markdown renderer, so the
+  pre-flip relative links captures carry stay inert instead of being rewritten into `/note/` hrefs.
+  A blob streams as a download under a fixed header set: `Content-Type: application/octet-stream`
+  **always** (never the sidecar's uploader-supplied `media_type`), `X-Content-Type-Options:
+  nosniff`, `Content-Disposition: attachment` with the ASCII fallback
+  `filename="<sha256[:12]>.<ext>"`, plus the RFC 6266 `filename*=UTF-8''` form whenever the capture
+  recorded a filename that survives sanitisation, `Content-Security-Policy: default-src 'none'; frame-ancestors 'none'`,
+  an `ETag` derived from the content address, and a year of `immutable` caching. A `*.meta.yaml`
+  sidecar is not directly addressable (404 naming the artefact — lint L1-8b's rule).
+- **Web: a note's `sources:` rows are links.** Server-computed (`{text, href, kind}`), never decided
+  in the template: a row carries an href only when the same predicate the `/raw` route enforces says
+  the citation resolves, so an offered link always opens and a hostile string stays plain text.
+- **Web: `web.features.raw_enabled`** (default `true`), the `graph_enabled`-shaped kill switch —
+  off → both routes 404, `sources:` render plain, and a body link into `raw/` is left verbatim.
+- **MCP: `kb_read` follows `sources:` into `raw/`.** Still seven tools. A `raw/` answer is marked by
+  a `resource: "raw"` key (not `kind`, which is the closed note vocabulary) and carries `raw_kind`
+  (`"text"` | `"blob"`), `path`, `bytes`, and either `text` + `truncated` (capped at 1 MiB) or the
+  sidecar's capture facts as `meta`. **Blob bytes never leave over MCP** — no base64 channel, no
+  opt-in parameter; the download is the web route.
+- **CLI: `agora query <q>`, `agora read <path>`, `agora neighbors <path>`** — the three MCP read
+  answers from a terminal, each with `--repo`, `--json`, plus `--limit N` / `--depth N`. `--json`
+  prints the handler payload verbatim, so the CLI and the MCP tool cannot drift. `query` exits 0 on
+  no hits (an empty search is a result); `read` / `neighbors` exit 1 when the named target is
+  missing. Reads work on a schema-1 repo — they never route through the write gate.
+- **A curator-emitted, clickable citation: the `source_links:` frontmatter mirror** (#169 wave B).
+  APPLY now stamps `source_links:` immediately after `sources:` on concepts and summaries — the
+  `raw/` entries only, rendered as `'[[raw/ai-tech/2026-09-01-cqrs-notes.md]]'`, which is the one
+  citation form Obsidian linkifies inside a list property (it shows as a property chip; a vault
+  opened at the repo root resolves the path). It is **derived, never authoritative**: it never names
+  a source `sources:` does not carry (a non-path entry such as `harvest:<agent>` is never wrapped,
+  and neither is a `raw/` path holding a wikilink metacharacter, which would name a different file
+  than it cites), **absent rather than empty**, re-derived by every write that touches `sources:`
+  (create, merge, contest), and never
+  stamped on a journal. `sources:` remains the provenance of record and the only key the existing
+  rules grade. No reader-cache bump (`CACHE_SCHEMA_VERSION` stays 3 — `source_links` is not one of
+  the fields the cached note record serializes) and no new integrity check —
+  the mirror is written before the PASS-2 snapshot, so the existing "frontmatter is byte-identical
+  across PASS 2" check already refuses a brain that edits it.
+  **It is stamped going forward, not backfilled**: a concept published before this release gains its
+  mirror — and its chips — the first time a run merges or contests into it, not on upgrade.
+  **What was deliberately NOT emitted: a body footnote**, which was the original ask. Two
+  measurements killed it. (a) The two renderers disagree permanently: CommonMark — the web face's
+  parser — reads `[^1]: raw/general/x.md` as a *link-reference definition* (the marker becomes an
+  anchor at an unrewritten relative path, and a markdown-link payload is mangled), while Obsidian
+  reads the same bytes as a footnote. (b) A body citation moves the merge oracle: `query_lexical`
+  reads note bodies and the curator's bundle uses it to pick `MERGE_INTO_THEME` targets, and a wrong
+  merge is permanent because the op vocabulary has no DELETE. In a one-off, owner-side measurement
+  over 24 fixed queries against a scratch copy of the author's private KB (2026-09-05; the corpus and
+  its harness stay out of this repo, so the figure is a decision record rather than something you can
+  re-run), a body `## Sources` block changed the result order on 9, the mirror on 0 (and changed
+  0 scores). What ships as the enforced gate is `tests/core/test_rank_neutrality.py`. The decision is
+  recorded in the ADR-0041 `source_links:` addendum.
+- **Lint `L1-25` — "citation not in `sources:`", and the first L1 rule that is a WARNING** (#169
+  wave B, schema 2 only). On a concept or summary it reports every `raw/` citation the note makes
+  that `sources:` does not carry, across the three surfaces a hand edit can reach: **every** entry of
+  the `source_links:` mirror (that key is derived, so anything in it is graded, `raw/` prefix or not;
+  the `.md` extension may be present or absent on either side, since Obsidian resolves those
+  identically), each body markdown-link target naming a `raw/` artifact — resolved relative to the
+  citing note, or taken verbatim when the target is already repo-relative under `raw/` — and each
+  footnote-definition payload naming a `raw/` path. It inherits the same
+  concept/summary scope as L1-7/L1-8/L1-8b (a journal's `sources:` stays ungraded) and never re-asks
+  whether the file exists — that is L1-8's question. It is a warning by design: it fires on hand
+  edits and vault imports, an error would discard the whole run's diff, and a run cannot repair what
+  failed it while `agora repo upgrade` (#63) is open. `LintResult.ok` is unchanged. A warning here is
+  not a blessing for hand-written body links, though: a markdown link into `raw/**.md` still meets
+  L1-2, which is a hard error when no note owns the target's basename and — when one does, the usual
+  case — silently resolves the link to that *other* note instead.
+- **One shared `sources:` reader** (`schema.lint.sources_entries` / `sources_str_list`), now used by
+  the `sources:`-specific lint reads and by `core.gold`'s harvest-provenance and provenance-density
+  paths, so the grader and the pack assembler cannot read the key differently.
+- **`agora doctor --agents`** (#147): an opt-in per-agent wiring table — session reader / CLI brain /
+  connector / source seen — derived from this repo's own config (connector `<agent>` tokens ∪
+  `adapters.yaml` backend names ∪ sources seen in wiki `provenance.agents`), never from a blessed
+  list of agent names. Observability only: it never moves the health verdict, and the connector
+  column counts glob matches without reading a byte of them.
+
+### Fixed
+
+- **A body link into `raw/` no longer resolves to a wiki note of the same basename** (#169 D13).
+  Body-link rewriting was basename-only, so `[…](../../raw/general/psa-hca.md)` inside
+  `wiki/concepts/psa-hca.md` rewrote to the concept **itself** — a plausible wrong answer, not a
+  404, and on the author's KB 8 of 9 `raw/` basenames collide with a wiki basename. Targets now
+  resolve against the rendering note's own path first, and a resolution landing under `raw/` becomes
+  a `/raw/…` link. Non-`raw/` rewriting is byte-identical to before.
+- **A non-ASCII repo directory gets a reader cache again** (#167). `_kb/index/<stem>.notes.json` now
+  accepts a stem under a union predicate (`core.pathsafe.is_safe_filename_stem`: the pathsafe
+  component rules **or** the legacy writer charset), so `내지식` addresses a cache instead of
+  silently falling back to a full scan, while every stem that worked before — `con`, `foo-`, `foo.`
+  — keeps its cache. No cache-schema bump; the write-namespace guards are untouched.
+- **`X-Content-Type-Options: nosniff` on every web response**, not only the new blob route.
+- **The emitted wiki schema (`AGENTS.md`) no longer recommends footnote citations, and no longer
+  describes frontmatter that free-text `raw/` captures do not have.** §3.4 now documents the citation
+  form actually emitted (the `source_links:` mirror) and demotes `[^n]`; §3.4.1 said a
+  `raw/<domain>/<inbox-id>.md` carries `source`/`writer`/`created`/`content_sha256` frontmatter
+  written "at capture time" — it carries **no frontmatter at all** (APPLY writes the event body bytes
+  and nothing else) and is written by the curator run that files the citing note. New repos only, per
+  known limitation 14.
 
 ## [0.1.0b1] - unreleased
 
@@ -303,6 +411,32 @@ against the code. The normative version lives in
     crossing is a conversion into a NEW repo — `agora import --from-kb <old-repo> <new-repo>` —
     which never modifies the source; there is no `agora repo upgrade` (#63/#98) and no dual-layout
     reader. Expanded in [`docs/LIMITATIONS.md`](docs/LIMITATIONS.md) §6a.
+13. **`raw/` captures are now reachable, and they are the least filtered content in the repo.** The
+    read faces follow a note's `sources:` down to the capture (`/raw`, `/api/raw`, `kb_read`,
+    `agora read`). That content passed none of the curator's PLAN/APPLY grading and no lint rule
+    grades it, and **redaction is asymmetric**: of the five producers that write text into `raw/`,
+    only the `session:` harvest connector redacts — the `file:` connector, the web upload,
+    `kb_remember` and `agora capture` never pass a redactor, and nothing redacts on the way out.
+    Blob bytes leave only over the web route, always as `application/octet-stream` + `nosniff` +
+    `attachment` (never the uploader-supplied `media_type`), and never over MCP. Note also that
+    "the curator is the sole writer of `raw/`" is a property of one curator run's FINAL-DIFF
+    allowlist, not a repo-wide invariant: a human can commit into `raw/` directly, and `raw/` is
+    git-tracked and pushed by `agora sync`, so the route makes an existing git-level exposure
+    HTTP-reachable rather than creating a new one. `web.features.raw_enabled: false` turns the **web**
+    surface off — the two routes, the linked `sources:` rows and the body-link rewrite. It does
+    not gate `kb_read` or `agora read` (there is no MCP/CLI kill switch, only not exposing the MCP
+    face), and it is a kill switch, not an access control (item 1 still applies). `assets/` is served
+    by nothing at all. Expanded in [`docs/LIMITATIONS.md`](docs/LIMITATIONS.md) §6.
+14. **A change to the emitted schema doc reaches NEW repos only.** Each KB carries the wiki schema
+    as its own `AGENTS.md`/`SCHEMA.md`, written once at `agora repo init`; `emit_schema` skips a file
+    that already exists and `repo init` does not pass `force`. So an existing KB keeps the schema doc
+    it was created with — including, until you refresh it by hand, the now-retired advice to write
+    `[^n]` footnote citations. There is no `agora repo upgrade` (#63). Nothing in the curator's
+    behaviour depends on the doc: the citation contract is enforced by APPLY and by lint L1-25.
+15. **Inline citations are frontmatter-only.** The clickable citation the curator emits is the
+    `source_links:` property, which Obsidian linkifies; a plain markdown renderer shows it, and
+    `sources:`, as text. No footnote or body `## Sources` block is emitted — see the Unreleased
+    entry for the two measurements behind that.
 
 <!-- No version-compare link definitions here yet, on purpose: Keep a Changelog's footer links point
      at git tags. `v0.1.0b1` exists (see "Release status") but has no counterpart to compare against

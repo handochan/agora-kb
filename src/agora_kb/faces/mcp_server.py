@@ -51,6 +51,7 @@ For the local stdio MVP it defaults to ``"local"``.
 from __future__ import annotations
 
 import argparse
+import posixpath
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -60,9 +61,10 @@ from agora_kb.config import (
     load_backend_registry,
     load_repo_config,
 )
-from agora_kb.core import Inbox, Repo, StateStore, Wiki, failed_event_count
+from agora_kb.core import Inbox, Repo, StateStore, Wiki, failed_event_count, rawstore
 from agora_kb.core.inbox import assert_writable_repo_schema
-from agora_kb.core.layout import CLAIM_BEARING_KINDS, RepoLayout
+from agora_kb.core.layout import CLAIM_BEARING_KINDS, SIDECAR_SUFFIX, RepoLayout
+from agora_kb.core.wiki import MAX_HITS
 from agora_kb.curator.constants import DEFAULT_BODY_BYTE_BOUND
 from agora_kb.curator.subprocess_backend import (
     RoutedBackend,
@@ -151,13 +153,20 @@ class AgoraHandlers:
         return receipt.as_dict()
 
     # --- read -----------------------------------------------------------------------------------
-    def query(self, question: str) -> dict[str, object]:
+    def query(self, question: str, *, limit: int = MAX_HITS) -> dict[str, object]:
         """``kb_query``: deterministic evidence search; render the :class:`QueryResult` faithfully.
 
         Returns ``{query, status, hits}`` where ``status`` is ``'ok'`` or ``'not_found'`` and each
         hit carries ``{repo, path, anchor, line, excerpt, match_reason, score}`` citations.
+
+        ``limit`` is passed straight through to :meth:`agora_kb.core.wiki.Wiki.query` and defaults
+        to :data:`~agora_kb.core.wiki.MAX_HITS` — the SAME default the core applies, so this kwarg
+        is purely additive: every existing caller (the ``kb_query`` tool, the web face) keeps the
+        exact result size it had. It exists for the CLI read verb's ``--limit`` (DRILLDOWN-169 A5),
+        which must not re-implement a second query path to vary one number. Changing the default
+        here would silently change how much every face returns.
         """
-        result = self._wiki.query(question)
+        result = self._wiki.query(question, limit=limit)
         return {
             "query": result.query,
             "status": result.status,
@@ -256,6 +265,158 @@ class AgoraHandlers:
             "status": fm.get("status"),
             "tags": tags,
             "subjects": list(note.subjects),  # type: ignore[attr-defined]
+        }
+
+    # --- raw/ captures (read; the provenance drill-down — #169) ---------------------------------
+    def raw(self, rel_path: str) -> dict[str, object]:
+        """Serve ONE ``raw/`` artefact by its citation string. Three statuses, never an exception.
+
+        This is the shared seam every face uses to follow a note's ``sources:`` down to the capture
+        it was written from — the MCP ``kb_read`` bridge, the web ``/raw`` + ``/api/raw`` routes and
+        the ``agora read`` verb all wrap THIS method, so provenance cannot mean one thing on one
+        face and something else on another (DRILLDOWN-169 D3). The shape is
+        :meth:`gold_pack`'s, deliberately: a status dict rather than ``None``, because a caller has
+        to be able to tell ``../../etc/passwd`` (refused) from ``raw/gone.md`` (absent), and because
+        a ``None`` would put the not-found sentence in three closures instead of one.
+
+        ``rel_path`` is the citation VERBATIM (``raw/<domain>/<event-id>.md``,
+        ``raw/_blob/<ab>/<sha256>.<ext>``) — never trimmed, never re-spelled. Path safety is
+        :func:`agora_kb.core.rawstore.resolve`'s three gates, not this method's; the textual test
+        below only decides WHICH refusal to name.
+
+        Statuses:
+
+        - ``ok`` + ``raw_kind: "text"`` — ``text`` (tolerantly decoded, capped at
+          :data:`~agora_kb.core.rawstore.MAX_RAW_TEXT_BYTES` with ``truncated`` saying so) and
+          ``bytes``, the artefact's true on-disk size, so a truncated read is legible as one.
+        - ``ok`` + ``raw_kind: "blob"`` — the capture sidecar's facts as ``meta`` and NO bytes
+          (D5, argued at the call site below). ``meta`` is ``None`` when the sidecar is absent or
+          unreadable, the same way :meth:`gold_pack` treats its own advisory sidecar.
+        - ``not_found`` — no such artefact, a refused path that still LOOKED like a ``raw/``
+          citation (a symlink, an escape that resolves out of ``raw/``), an unreadable file, or a
+          ``*.meta.yaml`` asked for directly (D9: a sidecar is not a citable artefact — lint L1-8b
+          — so the note teaches the rule instead of dead-ending).
+        - ``invalid_path`` — the argument is not a repo-relative ``raw/`` path at all.
+
+        **ADR-0027 §8 note.** This is the FOURTH Agora→agent emission path, after ``kb_query`` /
+        ``kb_read`` / ``kb_neighbors``, and the first one that serves content which passed through
+        NONE of the curator's PLAN/APPLY grading: everything under ``wiki/`` at least survived the
+        lint ruleset, while ``raw/`` is whatever an extractor, an upload, a harvest connector or a
+        hand-run capture produced. Nor is it uniformly redacted — only the ``session:`` connector
+        redacts on the way in (§4 T5). The control that would gate this is the undesigned people /
+        egress control (residual R1, #166); until it exists the operator's controls are the web
+        face's ``raw_enabled`` kill switch and not exposing the face.
+        """
+        echo = rel_path if isinstance(rel_path, str) else ""
+        # A textual restatement of rawstore's gate 1, for MESSAGING ONLY: it decides which refusal
+        # to name, never whether to serve. The refusal itself is resolve()'s, and a path that passes
+        # here can still (and does) come back None from it — reported as not_found, with no hint of
+        # why, so a caller cannot walk the filesystem one status at a time (D2/D3).
+        if not _is_raw_citation(echo):
+            return {
+                "status": "invalid_path",
+                "resource": "raw",
+                "path": echo,
+                "note": (
+                    f"{echo!r} is not a raw/ citation: pass a repo-relative path exactly as it "
+                    "appears in a note's `sources:` (e.g. 'raw/<domain>/<event-id>.md' or "
+                    "'raw/_blob/<ab>/<sha256>.<ext>')."
+                ),
+            }
+
+        layout = self._repo.layout
+        ref = rawstore.resolve(layout, echo)
+        if ref is None:
+            return {
+                "status": "not_found",
+                "resource": "raw",
+                "path": echo,
+                "note": (
+                    f"no readable artefact at {echo!r}: a raw/ citation resolves only to a real "
+                    "file inside raw/. Open the citing note with kb_read to check the "
+                    "`sources:` spelling."
+                ),
+            }
+
+        if ref.kind == "sidecar":
+            # D9 / lint L1-8b: the sidecar is a record ABOUT an artefact, and the citation space
+            # excludes it, so the URL and tool space must exclude it too — but the dead end teaches
+            # the rule and names the artefact instead of merely refusing.
+            artefact = echo[: -len(SIDECAR_SUFFIX)]
+            return {
+                "status": "not_found",
+                "resource": "raw",
+                "path": echo,
+                "note": (
+                    "a sidecar is not a citable artefact (lint L1-8b); read the artefact at "
+                    f"{artefact}"
+                ),
+            }
+
+        if ref.kind == "blob":
+            # D5 IS NORMATIVE: no bytes and no base64 leave over MCP. Four reasons, so a later
+            # "just add the bytes" change has to argue with all of them: (1) a 25 MiB PDF is ~33
+            # MiB of base64 in a model's context — 4/3 the token cost for content no LLM can read;
+            # (2) the sidecar already carries everything an agent needs to DECIDE (digest, type,
+            # size, filename, capture provenance), and the web face serves the bytes to a human;
+            # (3) `grep -rn b64encode src/` is 0 hits — this codebase has never had a byte channel,
+            # and opening one makes the undesigned egress control (R1/#166) a content-type matrix
+            # instead of one surface; (4) blob bytes are the ONLY repo content that passed neither
+            # the curator, nor the ADR-0007 candidate gate, nor ADR-0023 redaction.
+            # Reversing this requires citing D5 and retiring it explicitly.
+            meta = rawstore.read_sidecar(layout, ref)
+            return {
+                "status": "ok",
+                "resource": "raw",
+                "raw_kind": "blob",
+                "path": ref.rel_path,
+                "bytes": ref.size_bytes,
+                # Exactly the keys the sidecar HAS: APPLY omits an absent optional rather than
+                # emitting it empty, and inventing one here would report a capture fact nobody
+                # recorded. No top-level `sha256` either — echoing the basename back as an
+                # integrity claim is a tautology (ADR-0041 D1.4); real digest verification is a
+                # later unit.
+                "meta": meta,
+                # The URL is composed by `rawstore.web_href`, the ONE site that knows D6's prefix
+                # rule — never by re-spelling it here. This seam is shared (`/api/raw` and `agora
+                # read` return this same note), and a second hand-rolled "/{rel_path}" agrees with
+                # `_raw_href` only by luck: it skips the percent-encoding, so the two drift the
+                # first time a capture path needs escaping. Hence also "not in this payload":
+                # the sentence has to stay true for a caller who is not on the MCP face.
+                "note": (
+                    "bytes are not served over MCP (DRILLDOWN-169 D5) and are not in this "
+                    "payload; the capture facts are in 'meta' and the bytes download from the "
+                    f"web face at {rawstore.web_href(ref.rel_path)}"
+                ),
+            }
+
+        try:
+            text, truncated = rawstore.read_text(ref)
+        except OSError as exc:
+            # rawstore lets I/O errors out on purpose (an unreadable file must not render as an
+            # empty one); this face owes its caller a status dict, so it is the layer that wraps.
+            return {
+                "status": "not_found",
+                "resource": "raw",
+                "path": ref.rel_path,
+                # `strerror` alone ("Permission denied"), never str(exc): the latter appends the
+                # ABSOLUTE path, and a face's error text is not the place to publish the host's
+                # directory layout.
+                "note": (
+                    f"raw/ artefact at {ref.rel_path} could not be read: "
+                    f"{exc.strerror or type(exc).__name__}"
+                ),
+            }
+        return {
+            "status": "ok",
+            "resource": "raw",
+            "raw_kind": "text",
+            "path": ref.rel_path,
+            "text": text,
+            # The artefact's on-disk size, NOT len(text): with `truncated` beside it that pair says
+            # how much was left behind, where a post-truncation length would just agree with itself.
+            "bytes": ref.size_bytes,
+            "truncated": truncated,
         }
 
     # --- meta -----------------------------------------------------------------------------------
@@ -1196,6 +1357,61 @@ def _is_ungraded_people_note(note: object) -> bool:
     return is_ungraded_people_note(note)  # type: ignore[arg-type]
 
 
+def _is_raw_citation(rel_path: str) -> bool:
+    """True iff ``rel_path`` is SPELLED as a repo-relative ``raw/`` citation (#169 D3).
+
+    A messaging predicate, not a security one. It restates rawstore's textual gate 1 — normalized,
+    relative, ``raw/``-prefixed — so :meth:`AgoraHandlers.raw` can answer ``invalid_path`` for an
+    argument that is not a ``raw/`` path at all and ``not_found`` for one that is but does not
+    resolve. Passing it grants nothing: :func:`agora_kb.core.rawstore.resolve` still runs all three
+    gates, and the paths it refuses there are reported as ``not_found`` with no explanation, so no
+    caller can tell "outside the repo" from "not on disk" and probe the filesystem one status at a
+    time. Keeping the two statements separate is deliberate — the safe answer to a path this
+    function accepts is still "no".
+    """
+    if not rel_path or rel_path.startswith("/") or posixpath.isabs(rel_path):
+        return False
+    if posixpath.normpath(rel_path) != rel_path:
+        return False
+    return rel_path.startswith("raw/")
+
+
+#: The ONE wording for "the read verb found nothing", as a ``str.format`` template.
+#:
+#: Hoisted out of the ``kb_read`` closure (DRILLDOWN-169 A5/D14) because the CLI read verbs are the
+#: THIRD consumer of this sentence: ``agora read`` runs kb_read's exact algorithm (note, then the
+#: ``raw/`` bridge, then this) and must not invent a second remedy that sends an operator somewhere
+#: else than the tool does. It is a template rather than a rendered string so both call sites format
+#: the SAME bytes, path repr included.
+_KB_READ_NOT_FOUND_NOTE = (
+    "no tracked note at path={path!r}: pass a `path` exactly as returned by a "
+    "kb_query hit or a kb_neighbors node id (e.g. 'wiki/concepts/<name>.md')."
+)
+
+
+def _kb_read_not_found(path: str, *, raw_note: str | None = None) -> dict[str, object]:
+    """The shared ``kb_read`` not-found payload — one shape, one sentence, two faces.
+
+    Module-private but deliberately imported by :mod:`agora_kb.cli` (in-package): ``agora read
+    --json`` prints the handler payload VERBATIM, so composing the dict here rather than twice is
+    what makes the CLI's JSON byte-identical to what an agent gets over MCP.
+
+    ``raw_note`` is the ``raw/`` seam's own explanation (:meth:`AgoraHandlers.raw` ``note``) and
+    is used ONLY when ``path`` is ``raw/``-shaped: a ``kb_query`` hit never names a ``raw/`` path,
+    so the wiki sentence alone would send the caller to the wrong tool. The raw sentence leads
+    (it names the L1-8b sidecar rule or the ``sources:`` spelling to check) and the wiki sentence
+    follows, so there is still exactly one place composing "kb_read found nothing".
+    """
+    note = _KB_READ_NOT_FOUND_NOTE.format(path=path)
+    if raw_note and path.startswith("raw/"):
+        note = f"{raw_note} (kb_read also opens wiki notes: {note})"
+    return {
+        "error": "not_found",
+        "path": path,
+        "note": note,
+    }
+
+
 def _parse_ops(value: str) -> dict[str, int]:
     """Parse a ``log.md`` ``dispositions`` value (``CREATE_THEME=2, DROP=1`` | ``no-op``) → counts.
 
@@ -1298,33 +1514,46 @@ def build_server(*, repo_path: Path, writer: str = DEFAULT_WRITER) -> FastMCP:
 
     @mcp.tool
     def kb_read(path: str) -> dict[str, object]:
-        """Open one wiki note by path: raw markdown body + frontmatter + outgoing link basenames.
+        """Open one wiki note OR one cited ``raw/`` source artifact by path.
+
+        A wiki note comes back as raw markdown body + frontmatter + outgoing link basenames. A
+        ``raw/`` path — one of the strings in a note's ``sources:`` — comes back as the captured
+        evidence itself: ``resource: "raw"`` plus the extracted ``text`` for a text capture, or the
+        capture facts (``meta``: digest, media type, size, filename, provenance) for a
+        ``raw/_blob/`` binary, whose BYTES are never served over MCP.
 
         Navigation protocol: kb_query (broad search) -> kb_read (open a hit's ``path``) ->
         kb_neighbors (follow that note's links) -> kb_query again with sharper terms; repeat —
-        re-querying erases vocabulary mismatch. ``path`` is a kb_query hit's ``path`` or a
-        kb_neighbors node ``id``. An unknown or out-of-repo path returns
-        ``{error: "not_found", ...}`` — never file contents outside the wiki.
+        re-querying erases vocabulary mismatch. To check a claim against its evidence, read the
+        note's ``sources:`` entries with kb_read too (kb_read("raw/...")) — that is the hop from a
+        curated sentence down to the capture it was written from. ``path`` is a kb_query hit's
+        ``path``, a kb_neighbors node ``id``, or a ``sources:`` string. An unknown or out-of-repo
+        path returns ``{error: "not_found", ...}`` — never file contents outside the wiki.
 
         Reads are FIRST CLASS over the whole tree, ``wiki/people/**`` included (ADR-0041 D3.3): a
         human-owned note is indexed, readable and navigable here. That is deliberately WIDER than
         the standing-context channel — ``kb_context`` serves gold packs, which exclude ``people/``
         by construction — because a pull-shaped, agent-initiated read is a different risk from a
         push-shaped pack assembled without a prompt. ADR-0027 §8's scope names the read tools as an
-        emission path whose control is distinct and still undesigned (residual R1).
+        emission path whose control is distinct and still undesigned (residual R1) — which now
+        covers the ``raw/`` captures this tool reaches as well, content no curator run ever graded.
         """
+        # Note first, then raw/: the wiki is the curated answer and stays the fast path, and the
+        # two namespaces cannot collide (a tracked note is never under raw/). The DISCRIMINATOR a
+        # caller reads is the `resource` key, present ONLY on a raw payload — not `kind`, which is
+        # the closed ADR-0041 note vocabulary that lint, gold, graph and browse all key on
+        # (DRILLDOWN-169 D4). Extending kb_read rather than adding an eighth tool keeps the
+        # client-facing tool count at seven, which is the expensive thing to reverse.
         payload = handlers.note(path)
-        if payload is None:
-            return {
-                "error": "not_found",
-                "path": path,
-                "note": (
-                    f"no tracked note at path={path!r}: pass a `path` exactly as returned by a "
-                    "kb_query hit or a kb_neighbors node id (e.g. "
-                    "'wiki/concepts/<name>.md')."
-                ),
-            }
-        return payload
+        if payload is not None:
+            return payload
+        raw = handlers.raw(path)
+        if raw["status"] == "ok":
+            return raw
+        # A raw/-shaped path that did not resolve falls through to the SAME not-found shape a bad
+        # note path gets, composed in ONE place (`agora read` is the third face that owes the
+        # caller that sentence); the raw seam's own explanation leads for raw/-shaped paths.
+        return _kb_read_not_found(path, raw_note=str(raw.get("note", "")))
 
     @mcp.tool
     def kb_neighbors(path: str, depth: int = 1) -> dict[str, object]:

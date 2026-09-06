@@ -274,7 +274,7 @@ FastMCP over stdio (local) or Streamable HTTP (team). Tools:
 |---|---|---|
 | `kb_remember(text, target?, domain?, tags?, source?)` | write | append inbox item, return `{id, queued, inbox_depth}` — **non-blocking** |
 | `kb_query(question, scope?)` | read | return ordered evidence hits with path/anchor citations; optional later synthesis may use only those hits |
-| `kb_read(path)` | read | open one cited note: raw markdown body + frontmatter + outgoing link basenames; unknown/escaping path → `{error: "not_found"}` (#58, ADR-0012 rider) |
+| `kb_read(path)` | read | open one wiki note **or** one cited `raw/` artefact (a `sources:` string): a note answers with raw markdown body + frontmatter + outgoing link basenames; a raw answer is marked `resource: "raw"` + `raw_kind` (`text`\|`blob`) and a blob returns its capture facts only — bytes are never served over MCP (#169 D4/D5); unknown/escaping path → `{error: "not_found"}` (#58, ADR-0012 rider) |
 | `kb_neighbors(path, depth?)` | read | the ADR-0021 link ego-graph around a note — nodes (`id` = rel_path, feeds `kb_read`) + directed edges; `depth` server-clamped and echoed (#58) |
 | `kb_context(pack?)` | read | the ADR-0027 gold context pack — the built `_kb/gold/<pack>.md` served **byte-identically** (standing context, not retrieval); not-built → `status: "not_built"` + build guidance (#40; a `scopes` param is reserved for federation, ADR-0030) |
 | `kb_status(scope?)` | meta | `{inbox_depth, last_consolidation, processed_today, failed}` |
@@ -288,12 +288,14 @@ serves, and all are pull-only (nothing is auto-injected).
 
 ### 5.2 Web app (people)
 Implemented (Phase 3 — ADR-0019/0020). `faces/web/app.py` is a **FastAPI** face that is
-**API-first**: a first-class JSON API (`GET /api/{status,search,notes,notes/{path},graph,gold/{pack}}`,
+**API-first**: a first-class JSON API (`GET /api/{status,search,notes,notes/{path},graph,gold/{pack},raw/{path}}`,
 `POST /api/upload`) plus a thin **server-rendered HTMX + Jinja2** UI over it (`/`, `/search`,
-`/note/{path}`, `/upload`, `/graph`). Run it with `agora web` (the optional `web` extra). Localhost, no-auth
+`/note/{path}`, `/upload`, `/graph`, `/raw/{path}`). Run it with `agora web` (the optional `web` extra). Localhost, no-auth
 for now (auth is Phases 4–5). Both layers call the same core read helpers (`Wiki.list_notes` /
 `Wiki.get_note`, surfaced as `AgoraHandlers.browse` / `AgoraHandlers.note`) and the same inbox
-write path the MCP face uses — the web face never reads or mutates `wiki/` / git / `raw/` directly.
+write path the MCP face uses — the web face never mutates `wiki/` / git / `raw/`, and it never
+composes a `raw/` path itself: since #169 wave A it READS `raw/` only through `core.rawstore`'s
+validated `RawRef` (the `AgoraHandlers.raw()` seam), which is the sole door into the capture tier.
 - **Browse & search** the wiki (read path). Note bodies render via `markdown-it-py` with raw HTML
   disabled (`html=False`, XSS-safe) and intra-wiki `[Title](relative.md)` links rewritten to UI URLs.
 - **Upload** text / **one-or-many** files / URLs — drag-and-drop **multi-upload** is supported, and
@@ -316,8 +318,21 @@ write path the MCP face uses — the web face never reads or mutates `wiki/` / g
   content-addressed under `_kb/inbox/<writer>/_attach/` before the event that names them), and APPLY
   materialises `raw/_blob/<ab>/<sha256>.<ext>` plus its `<file>.meta.yaml` sidecar under the
   bytes-mode gate — the brain's bundle carries a text summary and never the bytes. The derived note
-  cites the blob in `sources:`. What is still deferred: serving the bytes back through any face
-  (#169), a size-tier/LFS policy (#48), and image/OCR extraction. Per-batch max-files / total-bytes caps shipped with the
+  cites the blob in `sources:`. **Serving them back landed with #169 wave A**: `core/rawstore.py` is
+  the read primitive (three gates — a textual `raw/` allowlist, containment against `raw_dir`, and a
+  symlink-identity refusal), `AgoraHandlers.raw()` is the one shared seam, and the faces over it are
+  `GET /raw/{path}` + `GET /api/raw/{path}` (behind `web.features.raw_enabled`, default on),
+  `kb_read` on a `sources:` string, and `agora read`. A blob's BYTES leave only through the web
+  route, always as `application/octet-stream` + `nosniff` + `attachment` and never as the sidecar's
+  uploader-supplied `media_type`; over MCP a blob returns its capture facts and no bytes at all.
+  **The citation itself became clickable with #169 wave B**, in the frontmatter rather than the
+  body: APPLY stamps a derived `source_links:` mirror of the `raw/` half of `sources:` on concepts
+  and summaries (`'[[raw/…]]'` — the one form Obsidian linkifies inside a list property), absent
+  rather than empty, re-derived on every write and never authoritative, with lint `L1-25` (a
+  warning) reporting any citation `sources:` does not carry. A curator-emitted body footnote was
+  **rejected on measurement, not deferred** — CommonMark and Obsidian parse `[^n]:` differently, and
+  a body citation moves the `query_lexical` merge oracle — see the ADR-0041 `source_links:`
+  addendum. What is still deferred: a size-tier/LFS policy (#48), and image/OCR extraction. Per-batch max-files / total-bytes caps shipped with the
   multi-upload surface (**ADR-0025**, Accepted); the untrusted-input hardening landed as the
   extractor-layer SSRF guard (#66) + zip decompression-bomb cap (#53) — see the ADR-0025 appendix —
   while SVG/HTML XSS stays covered at render time (markdown-it `html=False`).
@@ -453,13 +468,16 @@ External editors are read/browse tools by default. Direct edits to `wiki/` are u
 curator owns the branch; human contributions use `kb_remember`/upload, or a review-mode PR that the
 repo owner imports. This preserves the single-writer invariant.
 
-**Personal + team compose at read time, not by merging** ([ADR-0030](adr/README.md) — reserved,
-not yet authored; Phase-4-coupled).
+**Personal + team compose at read time, not by merging** (the local read profile + declaration-order
+bands = [ADR-0037](adr/0037-local-multi-kb-federation.md), Proposed; outbound team-audience *pack*
+composition = [ADR-0030](adr/README.md) — reserved, not yet authored, Phase-4-coupled).
 Connecting to a team does not spin up a second Agora or merge repos: personal and team stay separate
 git repos, each with its own single-writer curator. A client-side scope profile
-(`~/.agora/profile.yaml`, outside every repo) lists the repos the caller reads, and queries/gold packs
-are *composed* at read time — team sections plus a personal overlay — so the agent experiences one
-memory while writes never cross a tenant boundary.
+(`$AGORA_HOME/profile.yaml`, default `~/.agora/`, outside every repo) lists the repos the caller
+reads, and **queries** are *composed* at read time as declaration-order bands (ADR-0037, Proposed) —
+so the agent experiences one memory while writes never cross a tenant boundary. Outbound
+**gold-pack** composition across an audience remains ADR-0030's and is not part of the local read
+profile.
 
 **Deployment topology (V12).** Exactly **one curation home per repo** — the machine or always-on host
 that runs its curator/`watch`; every other environment (laptops, cloud sessions, CI) is a *face* that
