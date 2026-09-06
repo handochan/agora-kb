@@ -35,6 +35,7 @@ from agora_kb.config import (
     WebUploadConfig,
     load_backend_registry,
     load_kb_identity,
+    read_canonical_kb_schema_version,
 )
 from agora_kb.core import Inbox, Repo, RepoLayout, StateStore, failed_event_count
 from agora_kb.core.ids import is_ulid
@@ -43,6 +44,7 @@ from agora_kb.core.state import LastFailure
 from agora_kb.core.wiki import Wiki
 from agora_kb.curator.claim import curator_lock
 from agora_kb.curator.isolation import SandboxUnavailable
+from agora_kb.curator.restamp import NoteChange, RestampPlan, RestampReport, TagMatch
 from agora_kb.curator.worker import RunFailure, RunReport
 from agora_kb.schema import lint
 from tests.support.kb_builder import NoteSpec, build_kb
@@ -635,6 +637,409 @@ def test_repo_without_subcommand_returns_2(capsys: pytest.CaptureFixture[str]) -
     rc = main(["repo"])
     assert rc == 2
     assert "subcommand" in capsys.readouterr().err
+
+
+# --- repo upgrade (#63's reserved verb; the #175/#174 restamp legs hang off it) ------------------
+def _upgradable_repo(root: Path, *, lint_warning: bool = False) -> Path:
+    """A committed schema-2 repo shaped like the owner's converted KB: `sources:` but NO mirror.
+
+    `build_kb` rather than hand-written markdown, for the reason every other fixture here uses it:
+    the restamp engine reads whatever the production schema says a note is. The shape that matters
+    is the one #175 was opened about — a concept citing `raw/` with no `source_links:` and
+    `tags: []` under an empty `allowed_tags` — which is exactly what the builder emits, because
+    the mirror and the tags are things APPLY and the importer stamp, not things a note is born
+    with. `Repo.init` afterwards makes it a real repo with one commit (it seeds nothing: `index.md`
+    already exists), so the publish path has a base commit to worktree from.
+
+    `lint_warning=True` adds a stale `body_status: pending` to the sourced concept, which is the
+    warning the owner's own KB reports (L2-6). It exists for ONE test — the preview/result line
+    equality — because a real run prints an INDENTED lint block that a preview never has, and a
+    fixture that lints finding-free would let that test pass while asserting nothing about it.
+    """
+    build_kb(
+        root,
+        [
+            NoteSpec(
+                kind="theme",
+                domain="ai-tech",
+                title="Agent Memory Landscape",
+                body="Agent memory is a landscape of stores.",
+                sources=["raw/ai-tech/agent-memory-landscape.md"],
+                extra_frontmatter={"body_status": "pending"} if lint_warning else {},
+            ),
+            # `status="stub"` is how the builder is asked NOT to invent a `raw/` citation, which
+            # gives the run the second case it must get right: a claim-bearing note with nothing
+            # under `raw/` to mirror correctly gains nothing at all.
+            NoteSpec(
+                kind="theme",
+                domain="ai-tech",
+                title="Deepsight Platform",
+                body="A platform with no cited source at all.",
+                status="stub",
+            ),
+        ],
+    )
+    Repo.resolve(root).init()
+    return root
+
+
+@requires_git
+def test_repo_upgrade_with_no_flag_reports_the_schema_and_changes_nothing(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """#63's first completion condition: the verb exists, it REPORTS, and it is a no-op at rest."""
+    target = tmp_path / "kb"
+    assert main(["repo", "init", str(target)]) == 0
+    capsys.readouterr()
+
+    assert main(["repo", "upgrade", "--repo", str(target)]) == 0
+
+    out = capsys.readouterr().out
+    assert f"repo: {target}" in out
+    assert "schema: 2" in out
+    assert "no operation requested" in out
+    # The report must not imply an in-place migrator exists — it does not (ADR-0041 D6).
+    assert "agora import --from-kb" in out
+    # Not one byte moved, and in particular no `_kb/` (which taking the curator lock would create).
+    porcelain = subprocess.run(
+        ["git", "-C", str(target), "status", "--porcelain"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert porcelain.stdout == ""
+
+
+@requires_git
+def test_repo_upgrade_refuses_a_read_only_schema_1_repo_as_a_schema_verdict(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`repo upgrade` is a WRITE verb, so ADR-0041 D6 refuses it — and says so as itself.
+
+    `ReadOnlySchemaVersionError` is a `ConfigError` is a `ValueError`, so the arms must be ordered
+    exactly as in `_cmd_curate`: caught by the blanket arm this would print as `invalid config:`
+    and send the operator to edit a `repo.yaml` that is perfectly fine. The refusal is also the
+    more USEFUL answer than a version number, because it names the one crossing that exists.
+    """
+    target = tmp_path / "kb"
+    assert main(["repo", "init", str(target), "--schema", "1"]) == 0
+    capsys.readouterr()
+
+    assert main(["repo", "upgrade", "--repo", str(target)]) == 1
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "Traceback" not in captured.err
+    assert "invalid config" not in captured.err
+    assert "READ-ONLY" in captured.err.upper()
+    assert "agora import --from-kb" in captured.err
+
+
+def test_repo_upgrade_refuses_an_uninitialized_directory(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A typoed `--repo` is a loud one-liner, never a report about a directory that is not one."""
+    assert main(["repo", "upgrade", "--repo", str(tmp_path / "nope")]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "not initialized" in captured.err
+    assert "Traceback" not in captured.err
+
+
+@requires_git
+def test_repo_upgrade_refuses_tags_from_vault_without_restamp(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The flag is a LEG of the restamp run: on its own it would parse, run, and recover nothing."""
+    target = tmp_path / "kb"
+    assert main(["repo", "init", str(target)]) == 0
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    capsys.readouterr()
+
+    assert main(["repo", "upgrade", "--repo", str(target), "--tags-from-vault", str(vault)]) == 1
+
+    captured = capsys.readouterr()
+    # Refused BEFORE the repo was even resolved: nothing was printed on stdout.
+    assert captured.out == ""
+    assert "--tags-from-vault requires --restamp" in captured.err
+
+
+@requires_git
+def test_repo_upgrade_refuses_a_vault_path_that_is_not_a_directory(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    target = tmp_path / "kb"
+    assert main(["repo", "init", str(target)]) == 0
+    capsys.readouterr()
+
+    rc = main(
+        [
+            "repo",
+            "upgrade",
+            "--repo",
+            str(target),
+            "--restamp",
+            "--tags-from-vault",
+            str(tmp_path / "missing-vault"),
+        ]
+    )
+
+    assert rc == 1
+    assert "is not a directory" in capsys.readouterr().err
+
+
+@requires_git
+def test_repo_upgrade_restamp_dry_run_previews_and_writes_nothing(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`--dry-run` is a pure read of the LIVE tree — no lock, no worktree, no `_kb/`.
+
+    Taking the curator lock would itself create `_kb/` and a zero-byte `_kb/curator.lock`, which is
+    a visible mutation of a repo the operator asked only to be told about.
+    """
+    target = _upgradable_repo(tmp_path / "kb")
+    layout = RepoLayout(target)
+
+    assert main(["repo", "upgrade", "--repo", str(target), "--restamp", "--dry-run"]) == 0
+
+    out = capsys.readouterr().out
+    assert "restamp [dry-run]: notes=2 changed=1" in out
+    assert "  wiki/concepts/agent-memory-landscape.md: source_links +1" in out
+    assert "  wiki/concepts/deepsight-platform.md: unchanged (no raw/ source)" in out
+    porcelain = subprocess.run(
+        ["git", "-C", str(target), "status", "--porcelain"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert porcelain.stdout == ""
+    assert not layout.kb_dir.exists()
+
+
+@requires_git
+def test_repo_upgrade_restamp_publishes_then_the_second_run_is_a_clean_no_op(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """One commit, then idempotence: a re-run finds nothing, commits nothing and still exits 0.
+
+    The no-op leg is what makes the command safe to leave in a script — and it is only reachable
+    because the engine appends to `log.md` AFTER deciding there is something to publish.
+    """
+    target = _upgradable_repo(tmp_path / "kb")
+    repo = Repo.resolve(target)
+    before = repo.branch_commit()
+
+    assert main(["repo", "upgrade", "--repo", str(target), "--restamp"]) == 0
+    first = capsys.readouterr().out
+    assert "restamp: notes=2 changed=1" in first
+    assert "published_commit:" in first
+    published = repo.branch_commit()
+    assert published != before
+
+    assert main(["repo", "upgrade", "--repo", str(target), "--restamp"]) == 0
+    second = capsys.readouterr().out
+    assert "note: nothing to change" in second
+    assert "published_commit:" not in second
+    assert repo.branch_commit() == published
+
+
+@requires_git
+def test_repo_upgrade_restamp_preview_lines_equal_the_result_lines(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """preview == result, as literal string equality on the PER-NOTE lines (the requeue rule).
+
+    The oracle is the per-note slice specifically, not "every indented line": a real run also
+    prints the INDENTED findings of `_print_import_lint`, a section a preview has no lint result
+    for and never prints. An oracle that swept those in would be false on any repo with a finding —
+    the owner's own KB has one — so the fixture deliberately carries a lint warning, which makes
+    this test fail if the slice is ever widened back.
+    """
+    target = _upgradable_repo(tmp_path / "kb", lint_warning=True)
+
+    assert main(["repo", "upgrade", "--repo", str(target), "--restamp", "--dry-run"]) == 0
+    preview_out = capsys.readouterr().out
+    preview = _restamp_note_lines(preview_out)
+    assert main(["repo", "upgrade", "--repo", str(target), "--restamp"]) == 0
+    result_out = capsys.readouterr().out
+    result = _restamp_note_lines(result_out)
+
+    assert preview == result
+    assert preview  # the equality would be vacuous on two empty lists
+    # The fixture really does exercise the difference the narrowed oracle exists for.
+    assert "L2-6" in result_out
+    assert "L2-6" not in preview_out
+
+
+def _restamp_note_lines(out: str) -> list[str]:
+    """The per-note block of a restamp report: the indented lines under the `restamp…:` header.
+
+    Bounded by the header and the first line that is not indented, so nothing printed later in the
+    report (the taxonomy lines, the tally, an indented lint finding) can leak into the comparison.
+    """
+    lines = out.splitlines()
+    start = next(i for i, ln in enumerate(lines) if ln.startswith("restamp")) + 1
+    end = next(
+        (i for i, ln in enumerate(lines[start:], start) if not ln.startswith("  ")), len(lines)
+    )
+    return lines[start:end]
+
+
+@requires_git
+def test_repo_upgrade_restamp_refuses_a_held_curator_lock(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """ADR-0008 step 1: contention is a REFUSAL naming the lock file — not a wait, not a crash."""
+    target = _upgradable_repo(tmp_path / "kb")
+    layout = RepoLayout(target)
+
+    with curator_lock(layout):
+        rc = main(["repo", "upgrade", "--repo", str(target), "--restamp"])
+
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert "_kb/curator.lock" in captured.err
+    assert "nothing was changed" in captured.err
+    assert "Traceback" not in captured.err
+
+
+@requires_git
+def test_repo_upgrade_tag_recovery_widens_allowed_tags_without_bumping_the_schema(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """#63's fourth completion condition: a purely ADDITIVE change bumps no schema version.
+
+    Recovering tags adds `allowed_tags` keys and sets `tags:` on notes — new CONTENT inside an
+    unchanged schema. The canonical declaration must read the same before and after, and the bare
+    `repo upgrade` report must keep saying so (the ADR-0022 §B pattern).
+    """
+    target = _upgradable_repo(tmp_path / "kb")
+    layout = RepoLayout(target)
+    before_version = read_canonical_kb_schema_version(layout)
+    vault = tmp_path / "vault"
+    (vault / "notes").mkdir(parents=True)
+    (vault / "notes" / "agent-memory-landscape.md").write_text(
+        "---\ntags: [agent, infra]\n---\n\n# Agent Memory Landscape\n", encoding="utf-8"
+    )
+
+    rc = main(
+        [
+            "repo",
+            "upgrade",
+            "--repo",
+            str(target),
+            "--restamp",
+            "--tags-from-vault",
+            str(vault),
+        ]
+    )
+
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "taxonomy: allowed_tags +2 (agent, infra)" in out
+    assert "matched: 1" in out
+    taxonomy = yaml.safe_load((layout.meta_dir / "taxonomy.yaml").read_text(encoding="utf-8"))
+    assert taxonomy["allowed_tags"] == {"agent": {}, "infra": {}}
+    assert read_canonical_kb_schema_version(layout) == before_version
+
+    capsys.readouterr()
+    assert main(["repo", "upgrade", "--repo", str(target)]) == 0
+    assert f"schema: {before_version}" in capsys.readouterr().out
+
+
+def test_repo_upgrade_has_no_json_flag(capsys: pytest.CaptureFixture[str]) -> None:
+    """`--json` is the READ verbs' MCP-payload echo (OD-6); there is no handler payload here."""
+    with pytest.raises(SystemExit) as exc:
+        main(["repo", "upgrade", "--repo", ".", "--json"])
+    assert exc.value.code == 2
+
+
+# --- the restamp report renderer (pure; no engine, no repo) --------------------------------------
+def _note_change(**kwargs: object) -> NoteChange:
+    """A `NoteChange` with the two required fields filled in, so a case names only what it means."""
+    return NoteChange(
+        rel_path=str(kwargs.pop("rel_path", "wiki/concepts/x.md")),
+        kind=str(kwargs.pop("kind", "concept")),
+        **kwargs,  # type: ignore[arg-type]
+    )
+
+
+def _render(
+    capsys: pytest.CaptureFixture[str],
+    notes: tuple[NoteChange, ...],
+    *,
+    status: str,
+    tags_requested: bool = False,
+    taxonomy_after: tuple[str, ...] = (),
+) -> str:
+    plan = RestampPlan(notes=notes, taxonomy_after=taxonomy_after)
+    report = RestampReport(status=status, run_id="R", plan=plan)  # type: ignore[arg-type]
+    cli_mod._print_restamp_report(report, tags_requested=tags_requested, dry_run=False)
+    return capsys.readouterr().out
+
+
+def test_restamp_report_keeps_the_four_tag_statuses_distinct(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """`unmatched` (no vault note) and `no-tags` (a vault note with none) are different facts.
+
+    Folding them into one word would leave an operator unable to tell a broken matcher from an
+    honestly empty result — the distinction #174 was opened to be able to see.
+    """
+    notes = (
+        _note_change(
+            rel_path="wiki/concepts/a.md",
+            source_links_after=("raw/x.md",),
+            tags_after=("agent", "infra"),
+            tag_match=TagMatch(status="matched", tags=("agent", "infra"), source="notes/a.md"),
+        ),
+        _note_change(rel_path="wiki/concepts/b.md", tag_match=TagMatch(status="no-tags")),
+        _note_change(rel_path="wiki/concepts/c.md", tag_match=TagMatch(status="unmatched")),
+        _note_change(
+            rel_path="wiki/concepts/d.md",
+            tag_match=TagMatch(status="ambiguous", source="one.md, two.md"),
+        ),
+        _note_change(
+            rel_path="wiki/concepts/f.md",
+            tag_match=TagMatch(
+                status="matched", tags=("Agent", "local llm"), invalid_tags=("Agent", "local llm")
+            ),
+        ),
+        _note_change(rel_path="wiki/concepts/e.md", skipped="not-round-trip-stable"),
+    )
+
+    out = _render(
+        capsys, notes, status="dry-run", tags_requested=True, taxonomy_after=("agent", "infra")
+    )
+
+    assert "  wiki/concepts/a.md: source_links +1, tags +2 (agent, infra)" in out
+    assert "  wiki/concepts/b.md: unchanged (no raw/ source), tags none-in-vault" in out
+    assert "  wiki/concepts/c.md: unchanged (no raw/ source), tags unmatched" in out
+    assert (
+        "  wiki/concepts/d.md: unchanged (no raw/ source), tags ambiguous (one.md, two.md)" in out
+    )
+    # Found and then NOT applied: reporting that as "unchanged" would hide a refusal.
+    assert (
+        "  wiki/concepts/f.md: unchanged (no raw/ source), "
+        "tags refused (not kebab-case: Agent, local llm)" in out
+    )
+    # A skip is rendered ALONE: pairing it with a would-have-changed clause reads as a half-write.
+    assert "  wiki/concepts/e.md: skipped (not-round-trip-stable)" in out
+    assert "taxonomy: allowed_tags +2 (agent, infra)" in out
+    assert "matched: 2  no-tags: 1  unmatched: 1  ambiguous: 1  skipped: 1" in out
+
+
+def test_restamp_report_tally_prints_at_zero_in_one_fixed_shape(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A script greps this report; it must not have to branch on which flags produced it."""
+    out = _render(capsys, (_note_change(),), status="noop")
+
+    assert "matched: 0  no-tags: 0  unmatched: 0  ambiguous: 0  skipped: 0" in out
+    assert "note: nothing to change" in out
+    # No tag recovery ran and nothing was added, so the taxonomy line stays off the report.
+    assert "taxonomy:" not in out
 
 
 # --- capture (the local file→inbox surface with the bytes attached; ADR-0041 D4.2) ---------------
