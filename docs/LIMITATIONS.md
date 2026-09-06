@@ -7,7 +7,7 @@
 > an issue number that was checked against the tree at commit `a8906bf` (`agora 0.1.0b1`). Where a
 > claim needed a run to prove it, the run is reproduced in §7.
 >
-> **§6 and §6a–§6c are newer than that commit** and were checked against the KB wiki schema 2 work
+> **§6 and §6a–§6d are newer than that commit** and were checked against the KB wiki schema 2 work
 > now on `main` (`e9ba6bb`, ADR-0041 Accepted 2026-09-05) rather than against `a8906bf`.
 
 Related, and deliberately not duplicated here:
@@ -366,13 +366,17 @@ on every write that touches `sources:`, and journals never get one. Lint `L1-25`
 that is a **warning** rather than a hard reject — reports any citation, in the mirror or
 hand-written in the body, that `sources:` does not carry.
 
-**It is stamped going forward, not backfilled — so an existing KB starts with zero chips.** The
-mirror is written by the sites that write `sources:`: CREATE, MERGE and CONTEST. There is no
-re-render-all pass and no upgrade step, so every concept published before this change keeps no
-`source_links:` — and no clickable citation — until a curator run happens to merge or contest into
-it. On a KB that is no longer growing in a given area, that can be never. The read-side drill-down
-(the web routes, `kb_read`, `agora read`) is unaffected: it resolves `sources:` itself and never
-needed the mirror.
+**It is stamped going forward — an existing KB starts with zero chips, and one command backfills
+them.** The mirror is written by the sites that write `sources:`: CREATE, MERGE and CONTEST. No
+ordinary curator run re-renders notes it did not touch, so every concept published before this
+change keeps no `source_links:` — and no clickable citation — until a run happens to merge or
+contest into it, which on a KB that is no longer growing in a given area can be never. Since #175
+that is repairable in one shot: `agora repo upgrade --restamp` is an engine-only curator run (no
+brain, no inbox, no plan) that re-derives the mirror on every claim-bearing note through the same
+APPLY code, asserts every body is byte-unchanged, refuses on any lint error and publishes one
+commit under the curator lock. It is not automatic and not part of an install — you run it. The
+read-side drill-down (the web routes, `kb_read`, `agora read`) never needed the mirror either way:
+it resolves `sources:` itself.
 
 **What wave B deliberately did NOT ship: a body footnote.** The original ask was a curator-emitted
 `[^n]` citation in the prose. It is not emitted, for two independent reasons, and neither is
@@ -486,11 +490,13 @@ part of the original ask not delivered is the body footnote, which was rejected 
 recorded in [ADR-0041](adr/0041-stratum-kind-first-layout.md)'s `source_links:` addendum rather than
 left open. Two delivery caveats, both about REACH rather than behaviour. (a) L1-25 grades every
 schema-2 repo immediately, but the mirror arrives one note at a time: APPLY stamps it at CREATE,
-MERGE and CONTEST, there is no backfill, so notes published before this release carry no chips until
-a run touches them. (b) The **emitted schema doc** that tells a brain about both reaches new repos
-only — `emit_schema` skips a file that already exists and `agora repo upgrade` is
-[#63](https://github.com/handochan/agora-kb/issues/63), so an existing KB's `AGENTS.md` keeps
-recommending footnote citations until you refresh it by hand. The
+MERGE and CONTEST, so notes published before this release carry no chips until a run touches them —
+or until you run the backfill `agora repo upgrade --restamp`, added for exactly this in
+[#175](https://github.com/handochan/agora-kb/issues/175). (b) The **emitted schema doc** that tells
+a brain about both still reaches new repos only — `emit_schema` skips a file that already exists,
+and re-emitting it is NOT something `--restamp` does (it would rewrite the schema symlinks, which
+the curator's own diff gate rejects), so refreshing an existing KB's `AGENTS.md` remains the open
+half of [#63](https://github.com/handochan/agora-kb/issues/63) and is a hand edit today. The
 undesigned control over what these read paths may emit is ADR-0041 residual risk R1
 ([#166](https://github.com/handochan/agora-kb/issues/166)); the unimplemented repo-internal `file:`
 connector fence is [#165](https://github.com/handochan/agora-kb/issues/165) (§6b).
@@ -529,9 +535,12 @@ producing a repo that is neither, that no lint ruleset can gate, and whose damag
 history. The inbox write refuses too, for a related reason — an inbox that can never drain, and that
 a re-import into a new repo would orphan, is silent data loss dressed as success.
 
-**There is no in-place migrator, and there will not be one for this bump.** No `agora repo upgrade`
-(#63), no dual-layout reader, no compatibility shim. The sanctioned crossing is a **conversion into
-a NEW repo**, and it is one command:
+**There is no in-place migrator, and there will not be one for this bump.** No dual-layout reader,
+no compatibility shim. `agora repo upgrade` (#63) now exists as a verb, but it MIGRATES nothing: with
+no flag it reports the repo's schema version, and its one operation (`--restamp`, §6d) is an additive
+maintenance run that re-derives frontmatter *within* a schema. On a schema-1 repo it refuses like
+every other write path. The sanctioned crossing is a **conversion into a NEW repo**, and it is one
+command:
 
 ```bash
 agora import --from-kb <old-repo> <new-repo>
@@ -651,6 +660,71 @@ closed kind set — but nothing produces or maintains such a note either.
 
 ---
 
+## 6d. A vault import strips every tag it cannot already name
+
+**What is true.** `agora import <vault> <dest>` keeps a source note's `tags:` **only** if the tag is
+already in the destination's `allowed_tags`, and the destination's `allowed_tags` is exactly the
+`--tag` flags you passed — which default to none. So the ordinary import of an Obsidian vault writes
+`tags: []` on every single note and `allowed_tags: {}` in `_meta/taxonomy.yaml`, and the whole tag
+vocabulary you had is gone from the new repo.
+
+That is not a bug in the filter: lint `L1-5` is a hard error on a tag the taxonomy does not declare,
+and ADR-0014 D5 rules that an importer **never silently widens the taxonomy** (widening it is a
+deliberate human/admin act, ADR-0010 §5.2). The import is honest about it — the receipt prints
+`stripped_tags=<n>` and lists the dropped tags per note — but the receipt scrolls past, and the
+result is a KB whose search has lost a real ranking signal (`tags` is a weighted BM25F field).
+
+**When it bites.** You import a tagged vault, then notice every note in the web face shows no tags,
+and a `tag`-flavoured query ranks worse than it did in Obsidian.
+
+**What you can do now.** Either declare the vocabulary up front —
+
+```bash
+agora import ~/vault ~/kb --tag agent --tag infra --tag technique    # repeatable
+```
+
+— or recover it afterwards from the original vault, which is what
+[#174](https://github.com/handochan/agora-kb/issues/174) added:
+
+```bash
+agora repo upgrade --repo ~/kb --restamp --tags-from-vault ~/vault --dry-run
+agora repo upgrade --repo ~/kb --restamp --tags-from-vault ~/vault
+```
+
+The vault is READ-ONLY input; nothing is written to it. Notes are matched by **basename** (the same
+identity the wiki uses — under both the vault filename's own stem and the importer's slug of it,
+since `Foo Bar.md` was imported as `foo-bar.md`), the recovered tags are unioned into `allowed_tags`
+and set on the notes in **one commit** — they must land together or the next curator run fails L1-5
+forever — and a basename that matches zero or two-or-more vault notes is reported and skipped, never
+guessed. Tags are taken verbatim: the importer's rule was "keep or drop", so the inverse does not
+lower-case or re-shape anything — a recovered tag that is not kebab-case is reported on that note's
+line and simply not applied (the tag never enters `allowed_tags`, and the note keeps the tags it
+had). Rename it in the vault and re-run; the pass is re-entrant.
+
+**Two losses to know about, both reported before they happen** (they show on `--dry-run`):
+
+- On a note, a match **REPLACES** `tags:` — it does not merge. This is a recovery of the import's
+  loss, and the vault is its source of truth, so a tag added to the note *after* the import is
+  dropped unless the vault carries it too. The line names the removals (`tags replaced (+infra,
+  -mine)`) as well as the additions, and the vault note it read them from.
+- `_meta/taxonomy.yaml` is **re-rendered** through repo-init's own emitter rather than patched
+  textually (one writer, one spelling of that file), so comments and hand formatting in it do not
+  survive the widening. Tag values and per-tag descriptors do. The report prints
+  `taxonomy: _meta/taxonomy.yaml re-rendered (comments and hand formatting are lost)` when the
+  file on disk is not already what this build renders.
+
+**What it does not do.** It does not touch notes the curator did not write (a hand-written note in
+`wiki/` with no `sources:`/`timestamp:` stamp is reported as `skipped (human-authored)` and keeps
+its own tags), it does not read `wiki/people/**` out of a vault that is itself an Agora repo
+(ADR-0041 D3.3), it does not recover tags for a note whose basename the import could not derive from
+the filename (a content-hash fallback), it does not touch `raw/`, and it cannot help a vault you no
+longer have.
+
+**Tracking.** [#174](https://github.com/handochan/agora-kb/issues/174) (recovery, shipped);
+the strip itself is ADR-0014 D5 auto-fix #6 and is working as designed.
+
+---
+
 ## 7. Recovering terminal failures — `agora requeue`
 
 This is the section that decides whether a broken week costs you knowledge. It does not, if you
@@ -663,7 +737,11 @@ A failing curator is **visible** as of [#96](https://github.com/handochan/agora-
 
 - `last_attempt:` — when a run last *started*, whether or not it published. `last_run` remains "last
   successful publish", so a repo whose curator fails every run shows `last_run: never` while
-  `last_attempt` moves.
+  `last_attempt` moves. Both mean *consolidation*: `agora repo upgrade --restamp` (§6d)
+  deliberately writes nothing to `_kb/state.json`, so a published restamp leaves `last_run` /
+  `last_commit` describing the last INGEST run and its own receipts are the `log.md` entry and
+  `git log`. The dashboard work log lists that entry but labels it `no-op` — it renders ADR-0011
+  dispositions only, and a maintenance run writes none.
 - `last_failure:` — verdict word first, so `agora status | grep UNRESOLVED` works
   (`cli.py:550-570`). `UNRESOLVED` means no successful publish has happened since; `superseded`
   means one has. It is **sticky** — a later success never clears it, it only downgrades the verdict

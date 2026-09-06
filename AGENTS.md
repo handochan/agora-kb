@@ -76,10 +76,16 @@ src/agora_kb/
                reading layer, derived for BOTH schemas) + lint (the L1 ruleset, dispatched by the
                same version; L1-22/23/24 are schema-2 only)
   config.py    load config (adapters.yaml, repo.yaml, triggers + harvest policy + connector specs)
-  cli.py       `agora` entry point (repo init · import · capture · status · query · read ·
-               neighbors · curate · requeue · harvest · index · gold · eval · sync · watch · serve ·
-               web · doctor [--agents]) — `query`/`read`/`neighbors` are the read verbs, thin
-               wrappers over `AgoraHandlers` so `--json` is the MCP payload verbatim (#169 A5/D14)
+  cli.py       `agora` entry point (repo init · repo upgrade · import · capture · status · query ·
+               read · neighbors · curate · requeue · harvest · index · gold · eval · sync · watch ·
+               serve · web · doctor [--agents]) — `query`/`read`/`neighbors` are the read verbs,
+               thin wrappers over `AgoraHandlers` so `--json` is the MCP payload verbatim
+               (#169 A5/D14); `repo upgrade` is #63's reserved schema-migration verb, which with
+               no flag only REPORTS the schema version of a WRITABLE repo (no migrator exists — the
+               crossing is `import --from-kb`; a schema-1 repo gets the read-only refusal, which
+               names its version) and whose additive `--restamp [--tags-from-vault PATH]` leg is
+               an engine-only curator run that re-derives `source_links:` and recovers
+               import-stripped `tags:` on CURATOR-written notes only (#175/#174)
   # --- not yet implemented (later phases) ---
   auth/        (Phase 4+ — stub) authn/authz (tokens, OpenFGA/Forgejo delegation)
 deploy/        launchd/systemd unit templates for always-on watch/web + harvest schedule (#65)

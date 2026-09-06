@@ -87,6 +87,61 @@ curator emits (wave B).
 
 ### Added
 
+- **`agora repo upgrade [--restamp] [--tags-from-vault PATH] [--dry-run]` — the maintenance verb
+  (#63 · #175 · #174).** #63 reserved `repo upgrade` for schema migration. No migrator exists and
+  ADR-0041 D6 ruled there will not be one for this bump, so with **no flag** the command reports the
+  repo's KB schema version and exits 0 on a repo this build can write, pointing at the one crossing
+  that does exist (`agora import --from-kb`); a schema-1 repo gets the read-only refusal every write
+  path gives instead, which names its version and exits 1. `--restamp` is the first *additive*
+  operation hung off it: an
+  **engine-only curator run** — no brain, no bundle, no PLAN — that
+  - re-derives `source_links:` on every claim-bearing note (concept, summary) by calling APPLY's own
+    stamper, so the bytes are exactly what a curate run would have written. This is the **backfill**
+    that #169 wave B did not have: a concept published before that release had `sources:` and no
+    clickable chips until some later run happened to merge into it. Journals, maps and
+    `wiki/people/**` are never touched, a note with no `raw/` citation correctly gains nothing, and
+    because `source_links:` is not a ranked field the run leaves `agora eval` byte-identical;
+  - with `--tags-from-vault PATH`, recovers `tags:` a vault import stripped (#174). `agora import`
+    keeps only tags already in the destination's `allowed_tags`, which for a fresh import is empty,
+    so an imported KB arrives with `tags: []` everywhere. The recovery matches notes to vault notes
+    by **basename** — under both the vault filename's own stem and the importer's slug of it, since
+    `Foo Bar.md` is imported as `foo-bar.md` and a join on the raw stem alone can silently answer
+    from a different note — reads the source frontmatter tolerantly (Obsidian's inline-wikilink
+    properties are not valid YAML and would otherwise lose most of the corpus), takes tags
+    **verbatim** — the importer's loss function was keep-or-drop, so its inverse invents no
+    normalization — and unions them into `_meta/taxonomy.yaml` `allowed_tags` **in the same commit**
+    as the notes, because a tag not in the taxonomy is a hard L1-5 lint error. That union widens the
+    file by re-rendering it through repo-init's own emitter, so tag values and per-tag descriptors
+    survive but **comments and hand formatting in `_meta/taxonomy.yaml` do not** — the report says
+    so, on the preview as well as the run. On the note itself a match **replaces** the `tags:` list
+    rather than merging into it (the vault is the source of truth for the recovery), and the report
+    names what was dropped as well as what was added, and which vault note answered. Zero or
+    two-plus basename matches are reported and skipped, never guessed; a non-kebab recovered tag is
+    reported on its note's line and not applied (lint L1-5 checks membership only, so admitting one
+    would mint a taxonomy the inbox model and the web upload face then reject); `wiki/people/**` in
+    the source vault is not indexed at all (ADR-0041 D3.3 puts those basenames outside the identity
+    space); the pass is re-entrant. Unlike the restamp leg this one **does** change ranking —
+    `tags` is a weighted BM25F field.
+
+  The run publishes like any other: under the curator lock, staged in a detached worktree, gated by
+  a lint pass and by an allowlist diff check, committed as `chore(kb): upgrade --restamp (…)` (never
+  `curate:` — a maintenance run must be distinguishable in git history) and swapped in by CAS. Three
+  invariants it enforces itself: every note's **body bytes are unchanged** (frontmatter-only diff),
+  the only frontmatter keys that may differ are `source_links` and `tags`, and a note whose
+  frontmatter does not round-trip is reported and left alone rather than silently reformatted. Only
+  notes the **curator** wrote are touched: a claim-bearing note in `wiki/` carrying no curator stamp
+  is somebody's own draft, so it is reported as `skipped (human-authored)`, keeps its hand-written
+  tags, and — because the run never touches it — cannot refuse the whole backfill over its own lint
+  findings. It writes **nothing** to `_kb/state.json` — a maintenance run is not a consolidation,
+  and stamping `last_run` there would silently postpone the next scheduled one; its receipts are
+  `log.md` and the commit, which is why `agora status` keeps reporting the last INGEST run's
+  `last_run`/`last_commit` after a published restamp. `--dry-run` prints the same per-note lines the
+  real run prints (on a clean working copy — it plans the tree in front of it and warns when that
+  tree is dirty or behind the curated ref) and the same refusals, holds no lock and creates no
+  `_kb/`. A second run finds nothing to change, commits nothing and exits 0. On a schema-1 repo
+  it refuses like every other write path (ADR-0041 D6). **The migration half of #63 is still open**,
+  as is re-emitting an existing repo's `AGENTS.md` schema doc — `--restamp` deliberately does not
+  touch it.
 - **Web: `GET /raw/{path}` and `GET /api/raw/{path}`.** `{path}` is the citation with its stored
   `raw/` prefix dropped (`sources: raw/general/psa-hca.md` → `/raw/general/psa-hca.md`). A text
   capture renders into an escaped `<pre>` — deliberately *not* through the markdown renderer, so the
@@ -127,8 +182,9 @@ curator emits (wave B).
   the fields the cached note record serializes) and no new integrity check —
   the mirror is written before the PASS-2 snapshot, so the existing "frontmatter is byte-identical
   across PASS 2" check already refuses a brain that edits it.
-  **It is stamped going forward, not backfilled**: a concept published before this release gains its
-  mirror — and its chips — the first time a run merges or contests into it, not on upgrade.
+  **It is stamped going forward**: a concept published before this release gains its mirror — and
+  its chips — the first time a run merges or contests into it, or all at once from the
+  `agora repo upgrade --restamp` backfill above (#175).
   **What was deliberately NOT emitted: a body footnote**, which was the original ask. Two
   measurements killed it. (a) The two renderers disagree permanently: CommonMark — the web face's
   parser — reads `[^1]: raw/general/x.md` as a *link-reference definition* (the marker becomes an
@@ -386,7 +442,9 @@ against the code. The normative version lives in
    not shipped. The compensating control ADR-0013 promises for `allow_reduced_isolation` (forced
    review mode) is not implemented (#91).
    The real last line of defense is the deterministic FINAL-DIFF gate, not the kernel.
-9. **No IN-PLACE schema upgrade command.** `agora repo upgrade` is #63, still open. The *read* side
+9. **No IN-PLACE schema upgrade command.** `agora repo upgrade` is #63, whose MIGRATION half is
+   still open (the verb itself now exists — see Unreleased — but it reports the schema version and
+   runs additive frontmatter repair; it migrates nothing). The *read* side
    is guarded as of #98 — a build that meets a repo whose `schema_version` it does not support
    refuses every acting command with one line and exit 1, and `agora doctor` says so on its
    `schema:` line — so an old binary can no longer silently misread a newer repo and write on top

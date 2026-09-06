@@ -152,9 +152,10 @@ deferral; the acceptance record is the second paragraph of the ADR. **Still open
     oracle's result order on 9 of 24 fixed queries against the mirror's 0 of 24; the committed gate
     is `tests/core/test_rank_neutrality.py` (no reader-cache bump; `CACHE_SCHEMA_VERSION` stays 3).
     Recorded in the ADR-0041 `source_links:` addendum. **Caveats:** the mirror is stamped going
-    forward, not backfilled — an already-published concept gains one on its next merge or contest;
-    and the emitted schema doc's new guidance reaches NEW repos only — existing
-    KBs keep their `AGENTS.md` until `agora repo upgrade` (#63).
+    forward — an already-published concept gains one on its next merge or contest, or in one shot
+    from the `agora repo upgrade --restamp` backfill added by #175; and the emitted schema doc's new
+    guidance reaches NEW repos only — existing KBs keep their `AGENTS.md`, which `--restamp`
+    deliberately does not re-emit, so that half of `agora repo upgrade` (#63) stays open.
 
 ## 0.1.0-beta — release cutline (next; the first tagged, installable release) — epic #93
 
@@ -407,13 +408,14 @@ Stated as user-facing risk, not as a feature backlog. Every line is a thing that
 - **Instant retrieval** — a capture is queryable only after a curator run publishes it. There is no
   read-your-own-write overlay (ADR-0033, reserved and unauthored), so "I just saved it and search
   can't find it" is expected behavior, not a bug.
-- **Schema migration** — `agora repo upgrade` is #63 and remains open; there is **no in-place
-  migrator, and ADR-0041 D6 decided there will not be one for this bump**. `schema_version` *is* now
-  compared against a supported range (`config.SUPPORTED_KB_SCHEMA_VERSIONS`, #98), and that range is
+- **Schema migration** — `agora repo upgrade` now exists, but only as #63's REPORT half plus the
+  additive `--restamp` maintenance leg (#175/#174); the MIGRATION half of #63 remains open and there
+  is **no in-place migrator, and ADR-0041 D6 decided there will not be one for this bump**.
+  `schema_version` *is* now compared against a supported range (`config.SUPPORTED_KB_SCHEMA_VERSIONS`, #98), and that range is
   `{1, 2}` since the wiki-schema flip: a repo on the older layout still **reads** (query, status,
   browse, doctor, the MCP read tools, the web read routes) while **every write path refuses** —
-  `curate`, `watch`, `requeue`, `harvest`, `kb_curate`, and `Inbox.write`, which covers
-  `kb_remember` and the web upload. The sanctioned crossing is a **conversion into a NEW repo** —
+  `curate`, `watch`, `requeue`, `harvest`, `repo upgrade`, `kb_curate`, and `Inbox.write`, which
+  covers `kb_remember` and the web upload. The sanctioned crossing is a **conversion into a NEW repo** —
   `agora import --from-kb <old-repo> <new-repo>`, which never modifies the source (ROADMAP
   "Stratum" § W2.4). Expanded in [`LIMITATIONS.md`](LIMITATIONS.md) §6a. **The same gap applies to
   the emitted wiki schema doc**: each KB carries its own `AGENTS.md`, written once at `repo init`,
@@ -446,11 +448,17 @@ Stated as user-facing risk, not as a feature backlog. Every line is a thing that
 - **Inline citations are frontmatter-only** — since #169 wave B the curator emits a derived
   `source_links:` property, which **Obsidian** linkifies; a plain markdown renderer shows it, and
   `sources:`, as text. No footnote or body `## Sources` block is emitted (rejected on measurement,
-  not deferred — ADR-0041's `source_links:` addendum), and the mirror is stamped going forward
-  rather than backfilled: a concept published before the change shows no chips until a run merges or
-  contests into it. Hand-writing a body markdown link into `raw/**.md` is not the workaround — it
-  meets lint L1-2, a hard error when no note owns the target's basename and a silent mis-resolution
+  not deferred — ADR-0041's `source_links:` addendum), and the mirror is stamped going forward: a
+  concept published before the change shows no chips until a run merges or contests into it, or
+  until you run the `agora repo upgrade --restamp` backfill (#175). Hand-writing a body markdown
+  link into `raw/**.md` is not the workaround — it meets lint L1-2, a hard error when no note owns the target's basename and a silent mis-resolution
   when one does.
+- **A vault import keeps no tag it cannot already name** — `agora import` preserves a source tag
+  only if it is already in the destination's `allowed_tags`, which for a fresh import is whatever
+  `--tag` flags you passed and by default nothing, so the ordinary import writes `tags: []` on every
+  note (ADR-0014 D5 auto-fix #6: an importer never silently widens a taxonomy). It is recoverable
+  after the fact — `agora repo upgrade --restamp --tags-from-vault <vault>` (#174) — but it is not
+  automatic, and the vault has to still exist ([`LIMITATIONS.md`](LIMITATIONS.md) §6d).
 - **Embeddings / semantic search** — deliberately absent; deterministic BM25F ranking is the contract
   (ADR-0009/0012). ADR-0032 is reserved and evidence-triggered, not planned for beta.
 - **Cloud brains** — the default brain is a local Ollama model and an OSS path is mandatory
