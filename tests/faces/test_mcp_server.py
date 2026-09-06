@@ -518,7 +518,7 @@ def _make_schema_1(repo: Repo) -> None:
 
 
 def test_kb_curate_refuses_a_schema_1_repo(tmp_path: Path) -> None:
-    """ADR-0041 D6: the ``kb_curate`` handler is one of the five exhaustive write-path call sites.
+    """ADR-0041 D6: the ``kb_curate`` handler is one of the exhaustive write-path call sites.
 
     A RAISE, not a ``{"status": ...}`` dict: the ``no_backend`` shape reports a repo that is fine
     but unconfigured, whereas this is a refusal to touch the repo at all, and the FastMCP tool

@@ -193,7 +193,11 @@ needed). You can drive the same loop from the CLI without an agent — `agora qu
 takes `--json`, which prints the MCP payload verbatim), `agora capture --file PATH` is the
 no-server way to put a file in, and `agora status` (inbox depth + curator state), `agora curate`
 (one consolidation run) and `agora watch` (scheduler loop: cron + threshold + idle triggers) run the
-engine.
+engine. `agora repo upgrade` reports which KB wiki schema a writable repo is on (a schema-1 repo
+gets the read-only refusal instead, which names its version) — there is no in-place migrator and
+none is planned for this bump (§6a of [`docs/LIMITATIONS.md`](docs/LIMITATIONS.md)) — and its
+`--restamp [--tags-from-vault PATH]` leg is a one-shot maintenance run that re-derives the
+`source_links:` citation mirror on existing notes and recovers `tags:` a vault import stripped.
 
 **Phase 2 (pluggable brains + harvester).** To swap the curator's brain, add a `default_backend`
 (and optional `routing: {plan, author}`) to `adapters.yaml` and run `agora curate --backend NAME`

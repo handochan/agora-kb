@@ -4,6 +4,14 @@ A dependency-light :mod:`argparse` front-end over the core API. Subcommands:
 
 - ``agora repo init <path>`` — initialize a knowledge repo: ``Repo.init`` + emit the KB schema +
   taxonomy + a starter ``_kb/repo.yaml``, committed as one admin commit (the result lints clean).
+- ``agora repo upgrade [--repo PATH] [--restamp] [--tags-from-vault PATH] [--dry-run]`` — the verb
+  #63 reserves for schema migration. This build has no in-place migrator (the one crossing is
+  ``agora import --from-kb``, ADR-0041 D6), so with no flag it REPORTS the repo's KB schema version
+  and exits 0. ``--restamp`` is the first additive operation: an engine-only curator run — no
+  brain, no bundle, no PLAN — that re-derives ``source_links:`` on every claim-bearing note through
+  the real APPLY stamper (#175) and, with ``--tags-from-vault``, recovers ``tags:`` an import
+  stripped by matching BASENAMES against a read-only source vault, unioning what it finds into
+  ``_meta/taxonomy.yaml`` ``allowed_tags`` in the same commit (#174).
 - ``agora import <src> <dest> [--from-kb]`` — write a NEW repo at ``dest`` in KB wiki schema 2,
   reading ``src`` without ever modifying it: by default ``src`` is a foreign Obsidian/markdown
   vault (ADR-0014 D5), and with ``--from-kb`` it is an existing schema-1 Agora repo, which the
@@ -131,6 +139,7 @@ from .curator.requeue import (
     rel_to_repo,
     run_requeue,
 )
+from .curator.restamp import NoteChange, RestampReport, run_restamp
 from .curator.subprocess_backend import (
     RoutedBackend,
     SubprocessBackend,
@@ -186,7 +195,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--version", action="version", version=f"{_PROG} {__version__}")
     sub = parser.add_subparsers(dest="command", metavar="<command>")
 
-    # repo (group) — currently only `repo init`.
+    # repo (group) — `repo init` (create/re-seed) and `repo upgrade` (report + maintenance).
     p_repo = sub.add_parser("repo", help="manage a knowledge repo")
     repo_sub = p_repo.add_subparsers(dest="repo_command", metavar="<subcommand>")
     p_repo_init = repo_sub.add_parser("init", help="initialize a knowledge repo")
@@ -230,6 +239,43 @@ def build_parser() -> argparse.ArgumentParser:
     )
     # Positional repo path — declared so the #98 guard covers a RE-init onto an existing repo.
     p_repo_init.set_defaults(func=_cmd_repo_init, schema_guard_attr="path")
+
+    # repo upgrade — the verb #63 reserves for schema MIGRATION. This build has no migrator (the
+    # only schema crossing is `agora import --from-kb`, ADR-0041 D6), so with no flag the command
+    # reports the repo's KB schema version and exits 0. `--restamp` is the first ADDITIVE operation
+    # to hang off it: an engine-only curator run — no brain, no bundle, no PLAN — that re-derives
+    # the frontmatter keys APPLY stamps but for which no backfill ever existed (#175/#174).
+    p_repo_up = repo_sub.add_parser(
+        "upgrade",
+        help="report the repo's KB schema version; optionally re-derive frontmatter (#63)",
+    )
+    p_repo_up.add_argument("--repo", default=".", help="repo root (default: .)")
+    p_repo_up.add_argument(
+        "--restamp",
+        action="store_true",
+        help=(
+            "re-derive source_links: on every claim-bearing note (concept/summary) through the "
+            "real APPLY stamper, so the bytes match what a curate run would have written (#175)"
+        ),
+    )
+    p_repo_up.add_argument(
+        "--tags-from-vault",
+        metavar="PATH",
+        default=None,
+        help=(
+            "recover tags: from a source vault by BASENAME and union the recovered tags into "
+            "_meta/taxonomy.yaml allowed_tags (#174). Requires --restamp; PATH is read-only"
+        ),
+    )
+    p_repo_up.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="report what WOULD change without writing one byte (no lock, no worktree)",
+    )
+    # `--repo` (rather than a positional) is deliberate: the #98 schema guard registers every
+    # parser that takes `--repo` STRUCTURALLY, so this command is covered the day it is added.
+    p_repo_up.set_defaults(func=_cmd_repo_upgrade)
+
     p_repo.set_defaults(func=_cmd_repo_missing)
 
     # import — TWO normalizers behind one verb, selected by `--from-kb`:
@@ -926,8 +972,273 @@ def _cmd_repo_init(args: argparse.Namespace) -> int:
 
 def _cmd_repo_missing(args: argparse.Namespace) -> int:
     # `agora repo` with no subcommand: usage to stderr, exit 2 (mirrors the no-command path).
-    print(f"{_PROG} repo: missing subcommand (try 'repo init <path>')", file=sys.stderr)
+    print(
+        f"{_PROG} repo: missing subcommand "
+        f"(try 'repo init <path>' or 'repo upgrade --repo <path>')",
+        file=sys.stderr,
+    )
     return 2
+
+
+_UPGRADE_NO_OPERATION = (
+    "no operation requested (--restamp re-derives source_links:); this build has no schema "
+    "migration — the crossing is 'agora import --from-kb'"
+)
+
+
+def _cmd_repo_upgrade(args: argparse.Namespace) -> int:
+    """``agora repo upgrade``: report the KB schema version; optionally re-derive frontmatter.
+
+    #63 reserves ``repo upgrade`` as the schema-MIGRATION verb. No migrator exists in this build
+    and none is planned in place — ADR-0041 D6 makes ``agora import --from-kb`` the one crossing —
+    so the bare command is a REPORT: repo root, schema version, and a note saying so, exit 0. That
+    is #63's first completion condition, and it is worth having on its own: an operator who types
+    the command the docs mention should learn where the repo stands, not hit an unknown-subcommand
+    error.
+
+    ``--restamp`` is the first ADDITIVE operation hung off the verb (#175/#174). It is an
+    ENGINE-ONLY curator run — no brain, no bundle, no PLAN — delegated whole to
+    :func:`~agora_kb.curator.restamp.run_restamp`, exactly as ``_cmd_curate`` delegates to
+    ``worker.run`` and ``_cmd_requeue`` to ``run_requeue``: the lock span, the publish gates and
+    the body-bytes invariant are curator-domain decisions, so a future ``kb_upgrade`` MCP tool gets
+    one call site instead of a second implementation. This face only renders.
+
+    REFUSALS, all before a byte is written: ``--tags-from-vault`` without ``--restamp`` (the flag
+    would silently do nothing), a repo that is not initialized, a repo this build reads but will
+    not WRITE (ADR-0041 D6 — another of its exhaustive write-path call sites), a vault
+    path that is not a directory, and every engine-side refusal the report carries in ``reasons``.
+    The schema refusal fires even for the bare report: ``repo upgrade`` is a write verb, and its
+    refusal message names the one crossing that exists, which is the more useful answer than a
+    version number. ``agora status`` and ``agora doctor`` report a read-only repo's version
+    without refusing anything.
+
+    EXIT CODES: 0 for the bare report, a published run, a second run with nothing to change, and
+    any ``--dry-run``; 1 for every refusal. ``_cmd_curate``'s "a failed run still returns 0" rule
+    does NOT apply — its justification is a self-healing scheduled run, and a refused maintenance
+    run needs hands.
+    """
+    # Cheapest refusal first, and it touches nothing: `--tags-from-vault` on its own would parse,
+    # run, and quietly recover no tags at all (the mutual-exclusion precedent is `--domain` vs
+    # `--from-kb` on `agora import`).
+    if args.tags_from_vault is not None and not args.restamp:
+        print(
+            f"{_PROG} repo upgrade: --tags-from-vault requires --restamp (tag recovery is a leg "
+            f"of the restamp run, not an operation of its own)",
+            file=sys.stderr,
+        )
+        return 1
+
+    repo = Repo.resolve(args.repo)
+    layout = repo.layout
+    try:
+        # ADR-0041 D6, the write-path call site for this verb. Ordered before `is_initialized` so a
+        # schema-1 repo hears the schema verdict (which names the crossing) rather than anything
+        # else, and read through the CANONICAL declaration alone — the same narrow read every
+        # other write path makes.
+        assert_writable_repo_schema(layout)
+    except UnsupportedSchemaVersionError as exc:
+        # ORDERED FIRST, as in `_cmd_curate`: `ReadOnlySchemaVersionError` is a `ConfigError` is a
+        # `ValueError`, so the broader arm below would render a schema verdict as `invalid config:`
+        # and send the operator to edit a repo.yaml that is perfectly fine.
+        print(f"{_PROG} repo upgrade: {exc}", file=sys.stderr)
+        return 1
+    except ConfigError as exc:
+        print(f"{_PROG} repo upgrade: invalid config: {exc}", file=sys.stderr)
+        return 1
+    if not repo.is_initialized():
+        print(
+            f"{_PROG} repo upgrade: repo not initialized (run 'agora repo init')", file=sys.stderr
+        )
+        return 1
+
+    print(f"repo: {layout.root}")
+    print(f"schema: {read_canonical_kb_schema_version(layout) or 1}")
+    if not args.restamp:
+        print(f"note: {_UPGRADE_NO_OPERATION}")
+        return 0
+
+    tag_source = None
+    if args.tags_from_vault is not None:
+        vault = Path(args.tags_from_vault)
+        if not vault.is_dir():
+            print(
+                f"{_PROG} repo upgrade: --tags-from-vault {vault} is not a directory",
+                file=sys.stderr,
+            )
+            return 1
+        # Imported at CALL time, like every other `ingest` entry point in this module: the vault
+        # reader is only needed by the one flag that names a vault.
+        from .ingest.vault_tags import build_vault_tag_index
+
+        tag_source = build_vault_tag_index(vault)
+
+    try:
+        cfg = load_repo_config(layout)
+    except ConfigError as exc:
+        # Deliberately AFTER the bare report: a repo with a typoed `repo.yaml` can still answer
+        # "which schema am I?", and only the restamp leg needs the taxonomy and the lint budget.
+        print(f"{_PROG} repo upgrade: invalid config: {exc}", file=sys.stderr)
+        return 1
+
+    try:
+        report = run_restamp(
+            repo,
+            taxonomy=cfg.taxonomy,
+            now=datetime.now(UTC),
+            tag_source=tag_source,
+            dry_run=args.dry_run,
+            max_orphans=cfg.max_orphans,
+        )
+    except LockHeld:
+        # ADR-0008 step 1: the lock is non-blocking, so contention is a REFUSAL, not a wait and not
+        # a traceback. `run_restamp` takes the lock before it writes anything.
+        print(
+            f"{_PROG} repo upgrade: a curator run is in progress (_kb/curator.lock is held); "
+            "nothing was changed — try again when it finishes",
+            file=sys.stderr,
+        )
+        return 1
+
+    _print_restamp_report(report, tags_requested=tag_source is not None, dry_run=args.dry_run)
+    for warning in report.warnings:
+        print(f"warning: {warning}", file=sys.stderr)
+    refused = report.status in ("refused", "conflict")
+    # A PREVIEW can carry reasons too — they are the refusal the real run would hit — and they must
+    # be as loud there as here, or `--dry-run` would report "nothing to worry about" over a run that
+    # cannot publish. Only the exit code differs: a preview attempted nothing, so it exits 0.
+    prefix = f"{_PROG} repo upgrade: " if refused else f"{_PROG} repo upgrade: would refuse — "
+    for reason in report.reasons:
+        print(f"{prefix}{reason}", file=sys.stderr)
+    if refused:
+        if not report.reasons:
+            print(f"{_PROG} repo upgrade: run {report.status}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def _print_restamp_report(report: RestampReport, *, tags_requested: bool, dry_run: bool) -> None:
+    """Render one :class:`RestampReport` in the house grammar (``key: value`` + 2-space items).
+
+    The INDENTED per-note lines are byte-identical in ``--dry-run`` and in the real run — the
+    ``_print_requeue_report`` rule, and for the same reason: it turns "the preview matches the
+    result" into a literal string equality a test (and an operator's ``diff``) can check. Only the
+    header carries the mode.
+
+    The tally line prints at 0, in one fixed shape, whether or not tag recovery ran: a script that
+    greps this report must not have to branch on which flags produced it. With no
+    ``--tags-from-vault`` every tag counter is honestly 0, because no match was attempted — and
+    ``skipped:`` still means something there (a note whose frontmatter does not round-trip is left
+    alone by the restamp leg too).
+    """
+    plan = report.plan
+    changed = [note for note in plan.notes if note.changed]
+    # The MODE comes from the flag, never from `report.status`: an engine that reports a preview
+    # with nothing to change as `noop` rather than `dry-run` must not make the header claim a run
+    # happened.
+    mode = " [dry-run]" if dry_run else ""
+    print(f"restamp{mode}: notes={len(plan.notes)} changed={len(changed)}")
+    for note in plan.notes:
+        print(f"  {note.rel_path}: {_restamp_note_line(note)}")
+
+    if tags_requested or plan.taxonomy_added:
+        added = plan.taxonomy_added
+        detail = f" ({', '.join(added)})" if added else ""
+        print(f"taxonomy: allowed_tags +{len(added)}{detail}")
+    if plan.taxonomy_reformatted:
+        # The file is RE-RENDERED, not patched: one emitter owns its bytes (#174 D7), so a comment
+        # or a hand layout in the operator's own vocabulary file does not survive the widening. Said
+        # out loud on the preview as well as the run, because that is when it can still be avoided.
+        print("taxonomy: _meta/taxonomy.yaml re-rendered (comments and hand formatting are lost)")
+
+    tally = Counter(note.tag_match.status for note in plan.notes if note.tag_match is not None)
+    skipped = sum(1 for note in plan.notes if note.skipped)
+    print(
+        f"matched: {tally['matched']}  no-tags: {tally['no-tags']}  "
+        f"unmatched: {tally['unmatched']}  ambiguous: {tally['ambiguous']}  skipped: {skipped}"
+    )
+    if report.lint is not None:
+        _print_import_lint(report.lint)
+    if report.status == "published":
+        print(f"published_commit: {report.published_commit or '-'}")
+    elif report.status == "noop":
+        print("note: nothing to change")
+
+
+def _restamp_note_line(note: NoteChange) -> str:
+    """One note's verdict, after the ``  <rel_path>: `` prefix.
+
+    A skip is rendered ALONE and with its reason: it is a correct refusal to touch the note at all
+    (unreadable bytes, unparseable frontmatter, a frontmatter round trip that would reformat it, or
+    a note in ``wiki/`` carrying no curator stamp — someone's own draft), and pairing it with a
+    would-have-changed clause would read as a partial write that never happened.
+    """
+    if note.skipped:
+        return f"skipped ({note.skipped})"
+    parts = [_restamp_mirror_part(note)]
+    tags = _restamp_tags_part(note)
+    if tags is not None:
+        parts.append(tags)
+    return ", ".join(parts)
+
+
+def _restamp_mirror_part(note: NoteChange) -> str:
+    """The ``source_links:`` half of a note's line."""
+    before, after = note.source_links_before, note.source_links_after
+    if before == after:
+        if note.mirror_rewritten:
+            # WRITTEN, though its value did not move: the mirror was correct but sat away from
+            # `sources:` and APPLY's stamper re-seated it. The note is in the commit, so the line
+            # may not say "unchanged" — a receipt smaller than its own diff is how an operator
+            # comes to distrust every other number on the page.
+            return "source_links re-seated"
+        # "no raw/ source" is the honest reason for the common zero case: `_stamp_source_links`
+        # POPS the key when a note's `sources:` names nothing under `raw/`, which is not a failure.
+        return "unchanged (no raw/ source)" if not after else "source_links unchanged"
+    if not before:
+        return f"source_links +{len(after)}"
+    if not after:
+        return f"source_links -{len(before)}"
+    return f"source_links ~{len(after)}"
+
+
+def _restamp_tags_part(note: NoteChange) -> str | None:
+    """The ``tags:`` half of a note's line, or ``None`` when tag recovery did not look at it.
+
+    The four match statuses stay FOUR words on the line. Folding ``unmatched`` (the matcher found
+    no vault note of that basename) into ``no-tags`` (it found exactly one, and that note carries
+    no tags) would leave an operator unable to tell a broken matcher from an honestly empty result.
+
+    A match REPLACES the note's ``tags:`` — it is not a union — so a note that already carried tags
+    renders the loss (``tags replaced (+a, -b)``) and never the additive-looking ``tags +N``, and
+    every applied match names the vault note it came from: basename is the whole join, and a
+    receipt that hides which file answered cannot be audited before the commit.
+    """
+    match = note.tag_match
+    if match is None:
+        return None
+    origin = f" from {match.source}" if match.source else ""
+    if match.status == "matched":
+        if match.invalid_tags:
+            # The tags were found and then NOT applied. Saying only "unchanged" here would report
+            # a refusal as a non-event and leave the operator with no way to know the vault holds
+            # tags this repo will never accept until they are renamed.
+            return f"tags refused (not kebab-case: {', '.join(match.invalid_tags)})"
+        before, after = note.tags_before, note.tags_after
+        if after == before:
+            return "tags unchanged"
+        if not before:
+            return f"tags +{len(after)} ({', '.join(after)}){origin}"
+        gained = [t for t in after if t not in before]
+        dropped = [t for t in before if t not in after]
+        delta = [f"+{t}" for t in gained] + [f"-{t}" for t in dropped]
+        if not delta:  # same set, new order — a rewrite with nothing gained and nothing lost
+            return f"tags reordered ({', '.join(after)}){origin}"
+        return f"tags replaced ({', '.join(delta)}){origin}"
+    if match.status == "no-tags":
+        return "tags none-in-vault"
+    if match.status == "unmatched":
+        return "tags unmatched"
+    return f"tags ambiguous ({match.source})" if match.source else "tags ambiguous"
 
 
 def _print_import_lint(lr: LintResult) -> None:
@@ -1617,7 +1928,7 @@ def _cmd_curate(args: argparse.Namespace) -> int:
     layout = repo.layout
     try:
         cfg = load_repo_config(layout)
-        # ADR-0041 D6, one of the five exhaustive write-path call sites. BEFORE `recover()` and
+        # ADR-0041 D6, one of its exhaustive write-path call sites. BEFORE `recover()` and
         # before any trigger evaluation: a schema-1 repo must not have its in-flight run finalized
         # by a build that writes schema 2 either. `assert_supported_kb_schema_version` (membership
         # in {1, 2}) has already passed inside the loader — this is the STRICTER equality check
@@ -1835,7 +2146,7 @@ def _cmd_requeue(args: argparse.Namespace) -> int:
     be moved; 2 from argparse for a missing/duplicated selector.
     """
     layout = RepoLayout(Path(args.repo))
-    # ADR-0041 D6, the third of the five exhaustive write-path call sites. Requeue puts events back
+    # ADR-0041 D6, the third of its exhaustive write-path call sites. Requeue puts events back
     # into `_kb/inbox/`, so on a schema-1 repo it would refill a queue this build's curator refuses
     # to drain — the same "silent data loss dressed as success" the `Inbox.write` refusal exists to
     # prevent, reached by the one path that does NOT go through `Inbox.write` (it is a location-only
@@ -2491,7 +2802,7 @@ def _watch_tick(repo: Repo) -> bool:
     # part of what may have changed. The raise lands in the loop's own guard (#97), so it surfaces
     # as one bounded tick error rather than a crash loop.
     guard_repo_schema_version(layout)
-    # ADR-0041 D6, the second of the five exhaustive write-path call sites, and it must be its OWN
+    # ADR-0041 D6, the second of its exhaustive write-path call sites, and it must be its OWN
     # call rather than a consequence of the guard above: with SUPPORTED_KB_SCHEMA_VERSIONS widened
     # to {1, 2} the guard PASSES for a schema-1 repo (by design — reads keep working), so `watch`
     # would otherwise happily curate schema-2 paths into a schema-1 tree once a minute, forever.

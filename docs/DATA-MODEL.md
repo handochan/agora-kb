@@ -346,6 +346,9 @@ unauthored `agora:body` region. Like `L2-1` it never flips `LintResult.ok`, so i
 gate: a repo published by a pre-#119 build keeps curating normally and heals a note's flag whenever a
 later run gives that note a `needs_prose` region. Bulk repair of notes the curator never re-touches
 belongs to `agora repo upgrade` (#63) — invariant 2 forbids any other component writing `wiki/`.
+That verb now exists and its `--restamp` leg is exactly such a bulk repair, but it repairs
+`source_links:` and `tags:` ONLY (#175/#174): a stale `body_status` is untouched, because clearing
+it needs a run that authors the note's prose, which an engine-only pass by definition does not do.
 Since #131 the curator can no longer MINT the shape that made a flag unclearable (an `APPEND_DAILY`
 region nothing would ever author). The converse check stays deliberately unasserted because that
 shape still exists at rest and `lint` grades the whole worktree: it survives in any pre-#131 daily

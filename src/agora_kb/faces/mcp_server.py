@@ -1176,8 +1176,8 @@ class AgoraHandlers:
         ``noop``. ``target`` defaults to ``"personal"`` (the only repo until multi-tenancy lands).
 
         RAISES :class:`~agora_kb.config.ReadOnlySchemaVersionError` on a repo whose KB wiki schema
-        this build will not write (ADR-0041 D6) — the fourth of D6's five exhaustive write-path
-        call sites. It is a RAISE rather than a ``{"status": ...}`` dict on purpose: the
+        this build will not write (ADR-0041 D6) — one of D6's exhaustive write-path call
+        sites. It is a RAISE rather than a ``{"status": ...}`` dict on purpose: the
         ``no_backend`` shape reports a repo that is fine but unconfigured, whereas this is a
         refusal to touch the repo at all, and the FastMCP tool error carries the one remedy
         (``agora import --from-kb``) to the calling agent verbatim. It sits BEFORE the backend

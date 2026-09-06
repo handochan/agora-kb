@@ -590,12 +590,14 @@ passes for a schema-1 repo, which is exactly the point: reads keep working. Writ
 with `MAX_SUPPORTED_KB_SCHEMA_VERSION` and raises `ReadOnlySchemaVersionError` (a subclass of
 `UnsupportedSchemaVersionError`, so existing handlers keep working) so a caller can tell *"this build
 cannot read your repo"* from *"this build will not write your repo"*. It is asserted per WRITE PATH,
-not per entry point: `agora curate` / `watch` (per tick) / `requeue` / `harvest` in `cli.py`, the
-`kb_curate` MCP handler, and `Inbox.write` itself — one call there covers `kb_remember`, the web
-upload, and every future writer. `agora doctor` keeps its diagnostic exemption. So the posture for
+not per entry point: `agora curate` / `watch` (per tick) / `requeue` / `harvest` / `repo upgrade` in
+`cli.py`, the `kb_curate` MCP handler, and `Inbox.write` itself — one call there covers
+`kb_remember`, the web upload, and every future writer. `agora doctor` keeps its diagnostic exemption. So the posture for
 this bump is read-works / **write-REFUSES**, not write-warns: a warn assumes the write is merely
-suboptimal, and here it would be corrupting. `agora repo upgrade` (#63) still does not exist and is
-not a prerequisite — the crossing is a conversion into a new repo, not an in-place migration.
+suboptimal, and here it would be corrupting. `agora repo upgrade` (#63) exists as a verb but
+MIGRATES nothing and is not a prerequisite — with no flag it reports the schema version, and its
+`--restamp` leg is an additive maintenance run *within* a schema (it refuses on a schema-1 repo like
+every other write path). The crossing is a conversion into a new repo, not an in-place migration.
 
 **Consumption reaches restricted environments (Q3).** Because corporate hosts often block MCP, the
 file-`@include` channel is first-class: a per-agent memory-path map (e.g. `CLAUDE.md`,

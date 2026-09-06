@@ -94,6 +94,7 @@ def _cfg_at(version: int) -> RepoConfig:
 _GUARDED_INVOCATIONS = [
     ["status"],
     ["curate"],
+    ["repo", "upgrade"],
     ["harvest"],
     ["serve"],
     ["web"],
@@ -820,10 +821,12 @@ def test_writable_predicate_rejects_a_non_config_non_int(bad: object) -> None:
 def test_the_write_refusal_is_wired_at_exactly_the_modules_D6_names() -> None:
     """ADR-0041 D6 names the write-refusal call sites EXHAUSTIVELY; this pins that they are it.
 
-    The list in the ADR: ``agora curate`` / ``watch`` / ``requeue`` in ``cli.py``, ``Inbox.write``
-    itself (ONE call covering ``kb_remember``, the web upload route and every future writer, which
-    is why it goes there rather than at each face), and the ``kb_curate`` MCP handler. Three
-    modules carry those five sites.
+    The list in the ADR: ``agora curate`` / ``watch`` / ``requeue`` (and, since #175, ``repo
+    upgrade``) in ``cli.py``, ``Inbox.write`` itself (ONE call covering ``kb_remember``, the web
+    upload route and every future writer, which is why it goes there rather than at each face), and
+    the ``kb_curate`` MCP handler. Three modules carry those sites — the assertion is on the MODULE
+    set, not on a count, precisely so an additive verb like ``repo upgrade`` joining an existing
+    module is a doc edit rather than a test failure.
 
     Two directions, and both matter. A module going MISSING is a write path that silently
     corrupts a schema-1 repo. A module APPEARING is a face growing its own copy of the gate —

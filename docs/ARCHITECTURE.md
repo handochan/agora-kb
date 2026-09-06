@@ -121,7 +121,7 @@ schema/               KB wiki schema emitted into each knowledge repo.
   templates/kb_schema.md      the AGENTS.md schema template — KB wiki schema 1
   templates/kb_schema_v2.md   the AGENTS.md schema template — KB wiki schema 2 (ADR-0041)
 
-cli.py                `agora` entry point: repo init · import · capture · status · query · read · neighbors · curate · requeue · harvest · index · gold · eval · sync · watch · serve · web · doctor (--agents)
+cli.py                `agora` entry point: repo init · repo upgrade [--restamp] · import · capture · status · query · read · neighbors · curate · requeue · harvest · index · gold · eval · sync · watch · serve · web · doctor (--agents)
 config.py             load config (adapters.yaml backends/routing + connectors, repo.yaml, triggers, harvest policy)
 ```
 

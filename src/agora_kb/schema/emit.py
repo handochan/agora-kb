@@ -30,6 +30,7 @@ reviewer that cites a section keeps working across the flip.
 from __future__ import annotations
 
 import os
+from collections.abc import Iterable
 from importlib import resources
 from pathlib import Path
 
@@ -40,7 +41,13 @@ from agora_kb.core.atomicio import atomic_write_text
 from agora_kb.core.layout import RepoLayout
 from agora_kb.schema.notes import DIRECTORY_BY_KIND
 
-__all__ = ["Taxonomy", "emit_schema", "materialize_kind_directories"]
+__all__ = [
+    "Taxonomy",
+    "emit_schema",
+    "materialize_kind_directories",
+    "merge_allowed_tags",
+    "taxonomy_document_text",
+]
 
 # The schema doc's canonical basename and its symlink aliases (ADR-0010 §1 / §4). All four agent
 # guides resolve to the same emitted schema doc, so any tool that reads CLAUDE/QWEN/GEMINI sees the
@@ -268,6 +275,69 @@ def _link_or_copy(symlink_path: Path, target_name: str, schema_text: str, *, for
         atomic_write_text(symlink_path, schema_text, exclusive=True)
 
 
+# --- the ONE _meta/taxonomy.yaml renderer + its append-only merge rule (issue #174) -------------
+
+
+def taxonomy_document_text(
+    *,
+    schema_version: int,
+    taxonomy_policy: str,
+    domains: Iterable[str],
+    allowed_tags: dict[str, object],
+) -> str:
+    """Render the ``_meta/taxonomy.yaml`` document text — the ONE spelling of that file's bytes.
+
+    Extracted verbatim out of :func:`emit_schema` (which now calls it) so that the SECOND legitimate
+    writer of this file — the admin taxonomy-evolution path of §5.2, today
+    ``agora repo upgrade --restamp --tags-from-vault`` (#174) — cannot drift from repo-init's key
+    order or dump settings. Two independent ``yaml.safe_dump`` call sites over the same document is
+    exactly how a repo ends up with two shapes of its own closed vocabulary.
+
+    ``allowed_tags`` is taken as the RAW mapping rather than a name list because the §5 shape admits
+    a per-tag descriptor (``allowed_tags: {architecture: {desc: "…"}}``) that
+    :class:`Taxonomy` — whose ``allowed_tags`` is a tuple of names — cannot carry. Repo init passes
+    ``{name: {} …}`` and is byte-unchanged; the evolution path passes the merged mapping from
+    :func:`merge_allowed_tags`, so an existing descriptor survives a tag addition.
+    """
+    doc: dict[str, object] = {
+        "schema_version": schema_version,
+        "taxonomy_policy": taxonomy_policy,
+        "domains": list(domains),
+        "allowed_tags": dict(allowed_tags),
+    }
+    return yaml.safe_dump(doc, sort_keys=False, allow_unicode=True)
+
+
+def merge_allowed_tags(
+    existing: dict[str, object] | list[str] | None, new_tags: Iterable[str]
+) -> dict[str, object]:
+    """Return ``existing`` widened by ``new_tags`` — APPEND-ONLY, existing values preserved.
+
+    The taxonomy-evolution merge rule (ADR-0010 §5.2, #174), stated once:
+
+    * **existing keys keep their VALUE and their POSITION.** A descriptor mapping is not flattened
+      to ``{}``, and an already-unsorted file is not re-sorted — re-sorting would put lines
+      unrelated to this run into its diff.
+    * **new keys are appended in sorted order**, so the addition is deterministic regardless of the
+      order the caller discovered the tags in.
+    * a LIST-shaped ``allowed_tags`` (the other shape every reader tolerates) is promoted to the
+      mapping form the emitter writes, since that is the shape being written back.
+
+    Absent/``None``/any other type degenerates to an empty mapping: the conservative direction, and
+    the same one :func:`agora_kb.schema.lint._load_taxonomy` takes for a missing file.
+    """
+    merged: dict[str, object]
+    if isinstance(existing, dict):
+        merged = dict(existing)
+    elif isinstance(existing, list):
+        merged = {str(t): {} for t in existing}
+    else:
+        merged = {}
+    for tag in sorted(set(new_tags) - set(merged)):
+        merged[tag] = {}
+    return merged
+
+
 def emit_schema(
     layout: RepoLayout,
     *,
@@ -328,14 +398,16 @@ def emit_schema(
         _link_or_copy(layout.root / name, _SCHEMA_DOC_NAME, schema_text, force=force)
 
     # _meta/taxonomy.yaml — deterministic key order matching the §5 documented shape. Tuples are
-    # converted to plain lists so safe_dump renders block-style YAML lists.
-    taxonomy_doc: dict[str, object] = {
-        "schema_version": tax.schema_version,
-        "taxonomy_policy": tax.taxonomy_policy,
-        "domains": list(tax.domains),
-        "allowed_tags": {t: {} for t in tax.allowed_tags},
-    }
-    taxonomy_yaml = yaml.safe_dump(taxonomy_doc, sort_keys=False, allow_unicode=True)
+    # converted to plain lists so safe_dump renders block-style YAML lists. Rendered through the
+    # shared :func:`taxonomy_document_text` so repo-init and the §5.2 evolution path write the same
+    # bytes for the same document (#174); the output here is byte-identical to the inline dump it
+    # replaced.
+    taxonomy_yaml = taxonomy_document_text(
+        schema_version=tax.schema_version,
+        taxonomy_policy=tax.taxonomy_policy,
+        domains=tax.domains,
+        allowed_tags={t: {} for t in tax.allowed_tags},
+    )
     meta_dir = layout.root / "_meta"
     _write_text(meta_dir / "taxonomy.yaml", taxonomy_yaml, force=force)
 

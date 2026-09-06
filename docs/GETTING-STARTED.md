@@ -811,11 +811,67 @@ it that exists only because Obsidian does not linkify plain strings in a propert
 the curator re-derives it on every write, and lint rule `L1-25` (a warning, never a rejection) tells
 you when a citation anywhere in a note disagrees with its `sources:`.
 
-*Expect it on new work first.* The curator stamps the mirror when it creates, merges into or
-contests a note — there is no backfill pass — so notes that were already published before you
-upgraded show `sources:` and no chips until a run touches them again. Nothing is lost in the
-meantime: `sources:` is the record, and the web face's `/raw` links and `agora read` follow it
-directly.
+*Expect it on new work first — or backfill it once.* The curator stamps the mirror when it creates,
+merges into or contests a note, so notes that were already published before you upgraded show
+`sources:` and no chips until a run touches them again. Nothing is lost in the meantime: `sources:`
+is the record, and the web face's `/raw` links and `agora read` follow it directly. To stamp them
+all now, run the backfill:
+
+```bash
+uv run agora repo upgrade --repo ~/my-kb --restamp --dry-run   # preview; writes nothing
+uv run agora repo upgrade --repo ~/my-kb --restamp             # one commit
+```
+
+That is an engine-only curator run — no model, no inbox, no plan. It re-derives `source_links:` on
+every concept and summary through the same code APPLY uses, so the bytes are what a curator run
+would have written; it asserts every note's body is unchanged, refuses to publish on any lint error,
+and publishes one commit under the curator lock like any other run. Notes with no `raw/` citation
+get nothing (correctly), journals are never touched, and a second run finds nothing to change and
+commits nothing. Notes **you** wrote by hand in `wiki/` — the ones with no `sources:`/`timestamp:`
+stamp — are listed as `skipped (human-authored)` and never rewritten, which also means an unfinished
+draft of yours cannot block the backfill of everything else. Because `source_links:` is not a ranked
+field, the backfill leaves search results byte-identical (`agora eval`).
+
+The publish is deliberately **not** recorded in curator state: nothing is written to
+`_kb/state.json`, so after a restamp `agora status` keeps reporting the last *consolidation* run's
+`last_run` / `last_commit` (stamping them here would postpone your next scheduled curate). The
+receipts are the `log.md` entry and `git log`. The dashboard's work log does list that entry, but
+it labels it `no-op`: that timeline renders ADR-0011 consolidation *dispositions*, and a maintenance
+run writes none (`faces/mcp_server.py` `_recent_log`) — read the `log.md` entry itself, whose
+`- upgrade: restamp` / `- restamped:` / `- tags-recovered:` bullets carry the counts.
+
+*If your KB came from a vault import, its tags may have been stripped.* `agora import` keeps only
+tags already declared in the destination's `allowed_tags`, which for a fresh import is empty — so
+every note arrives with `tags: []` (see [`LIMITATIONS.md`](LIMITATIONS.md) §6d). The same command
+recovers them from the original vault, matching notes by **basename**:
+
+```bash
+uv run agora repo upgrade --repo ~/my-kb --restamp \
+    --tags-from-vault ~/original-vault --dry-run     # preview; writes nothing
+uv run agora repo upgrade --repo ~/my-kb --restamp \
+    --tags-from-vault ~/original-vault               # one commit
+```
+
+The vault is only ever READ. Recovered tags are unioned into `_meta/taxonomy.yaml` `allowed_tags`
+and written onto the notes **in the same commit** (a tag that is not declared is a lint error, so
+the two must land together). Two things to know before you run it on a KB you have curated since
+the import:
+
+- On a note, the vault's tags **replace** that note's `tags:` — this is a recovery, not a merge — so
+  a tag added since the import is dropped unless the vault also has it. The report names what it
+  removes as well as what it adds (`tags replaced (+infra, -mine)`), and which vault note answered,
+  so `--dry-run` shows you the loss before the commit.
+- `_meta/taxonomy.yaml` is **re-rendered**, not patched, so comments and hand formatting in it are
+  lost (tag values and per-tag descriptors survive). The report says
+  `taxonomy: _meta/taxonomy.yaml re-rendered (comments and hand formatting are lost)` when that
+  applies — again on the preview, while you can still copy them somewhere.
+
+A basename that matches no vault note, or more than one, is reported and skipped rather than
+guessed — including the case where the importer's slug of one vault filename collides with another
+vault note's name — and a recovered tag that is not kebab-case is reported and left unapplied rather
+than rewritten. If the vault is itself an Agora repo, its `wiki/people/**` notes are not consulted
+at all. Unlike the `--restamp` leg this one **does** change ranking:
+`tags` is a weighted search field.
 
 **Obsidian's graph will not match Agora's.** Agora ships no `.obsidian` configuration and excludes
 nothing from your vault, so Obsidian indexes **every** markdown file in the repo — the uncurated
